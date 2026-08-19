@@ -1,0 +1,7 @@
+services:
+  xnc-server:
+    ports: ["8080:8080"]
+    environment:
+      XNC_HEARTBEAT_TIMEOUT: 10s
+  caddy:
+    profiles: ["never"]

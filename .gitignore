@@ -3,6 +3,8 @@ config.env
 *.pem
 *.key
 .env.*
+deploy/.env
+!deploy/.env.example
 
 # 构建产物
 bin/

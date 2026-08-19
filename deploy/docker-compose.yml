@@ -1,0 +1,44 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: xnc
+      POSTGRES_USER: xnc
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U xnc"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  xnc-server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      XNC_DATABASE_URL: postgres://xnc:${POSTGRES_PASSWORD}@postgres:5432/xnc
+      XNC_JWT_SECRET: ${XNC_JWT_SECRET}
+      XNC_ADMIN_EMAIL: ${XNC_ADMIN_EMAIL}
+      XNC_ADMIN_PASSWORD: ${XNC_ADMIN_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose: ["8080"]
+
+  caddy:
+    image: caddy:2-alpine
+    ports: ["80:80", "443:443"]
+    environment:
+      XNC_DOMAIN: ${XNC_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [xnc-server]
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
