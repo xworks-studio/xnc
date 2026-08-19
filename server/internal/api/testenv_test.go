@@ -36,6 +36,8 @@ func NewTestEnv(t *testing.T) *TestEnv {
 		AdminEmail:       "admin@t.local",
 		AdminPassword:    "pw-123456",
 		HeartbeatTimeout: 5 * time.Second,
+		// 零值 TTL 会让 token 立即过期（config.Load 的默认值只在生产路径生效），测试环境须显式给出。
+		EnrollTokenTTL: 30 * time.Minute,
 	}
 	require.NoError(t, bootstrap.EnsureAdmin(context.Background(), st, cfg))
 	h := NewRouter(st, cfg, registry.New())

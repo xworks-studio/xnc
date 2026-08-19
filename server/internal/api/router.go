@@ -38,5 +38,11 @@ func NewRouter(st *db.Store, cfg config.Config, reg *registry.Registry) http.Han
 		cr.Get("/", h.listClusters)
 		cr.Post("/", h.createCluster)
 	})
+
+	r.Route("/api/clusters/{id}/enrollment-tokens", func(tr chi.Router) {
+		tr.Use(auth.Middleware(cfg.JWTSecret, st))
+		tr.Post("/", h.createEnrollToken)
+	})
+	r.Post("/api/agent/enroll", h.agentEnroll)
 	return r
 }
