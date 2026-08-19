@@ -28,6 +28,7 @@ type TestEnv struct {
 	srv    *httptest.Server
 	Store  *db.Store
 	Cfg    config.Config
+	reg    *registry.Registry
 	nodes  map[string]ed25519.PrivateKey
 }
 
@@ -43,11 +44,12 @@ func NewTestEnv(t *testing.T) *TestEnv {
 		EnrollTokenTTL: 30 * time.Minute,
 	}
 	require.NoError(t, bootstrap.EnsureAdmin(context.Background(), st, cfg))
-	h := NewRouter(st, cfg, registry.New())
+	reg := registry.New()
+	h := NewRouter(st, cfg, reg)
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	return &TestEnv{
-		Router: h, srv: srv, Store: st, Cfg: cfg,
+		Router: h, srv: srv, Store: st, Cfg: cfg, reg: reg,
 		nodes: map[string]ed25519.PrivateKey{},
 	}
 }

@@ -36,6 +36,18 @@ func (r *Registry) Remove(nodeID string) {
 	delete(r.conns, nodeID)
 }
 
+// RemoveIf 仅当注册表中该节点的当前连接就是 c（指针相等）时才删除，返回是否真正移除。
+// 被顶替的旧连接调用时返回 false：在线状态已由新连接接管，旧连接的清理不得误删新表项。
+func (r *Registry) RemoveIf(nodeID string, c *NodeConn) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if cur, ok := r.conns[nodeID]; ok && cur == c {
+		delete(r.conns, nodeID)
+		return true
+	}
+	return false
+}
+
 func (r *Registry) Online(nodeID string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

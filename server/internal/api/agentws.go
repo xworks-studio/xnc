@@ -25,6 +25,8 @@ func (h *handlers) agentConnect(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	// 无论从哪条路径退出（认证失败、被顶替、读错误、超时）都关掉底层连接。
+	defer c.CloseNow()
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
@@ -87,7 +89,12 @@ func (h *handlers) agentConnect(w http.ResponseWriter, r *http.Request) {
 	conn := &registry.NodeConn{NodeID: node.ID.String(), Cancel: cancel, LastBeat: time.Now()}
 	h.reg.Add(conn)
 	defer func() {
-		h.reg.Remove(node.ID.String())
+		// identity-aware 清理：仅当本连接仍是该节点的当前连接时才落 offline/last_seen。
+		// 若已被新连接顶替（RemoveIf 返回 false），在线状态由新连接接管，此处什么都不做，
+		// 避免把仍在心跳的节点误翻 offline（fix round 1）。
+		if !h.reg.RemoveIf(node.ID.String(), conn) {
+			return
+		}
 		_ = h.st.Q().SetNodeStatus(context.Background(),
 			sqlc.SetNodeStatusParams{ID: node.ID, Status: "offline"})
 		_ = h.st.Q().TouchNode(context.Background(), node.ID)
@@ -130,8 +137,12 @@ func (h *handlers) writeJSON(ctx context.Context, c *websocket.Conn, typ string,
 func (h *handlers) readMsg(ctx context.Context, c *websocket.Conn, timeout time.Duration) (proto.Message, bool) {
 	rctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	_, data, err := c.Read(rctx)
+	typ, data, err := c.Read(rctx)
 	if err != nil {
+		return proto.Message{}, false
+	}
+	// 协议绑定（design §2.1）：控制连接只接受文本帧，二进制帧立即断开。
+	if typ != websocket.MessageText {
 		return proto.Message{}, false
 	}
 	var m proto.Message

@@ -31,4 +31,14 @@ func TestRegistryReplace(t *testing.T) {
 	r.Remove("n1")
 	assert.False(t, r.Online("n1"))
 	assert.Equal(t, 0, r.Count())
+
+	// RemoveIf（identity-aware）：被顶替的旧连接的清理请求必须被拒绝，
+	// 不得误删同节点新连接；当前连接的 RemoveIf 才真正移除。
+	r.Add(c2)
+	assert.False(t, r.RemoveIf("n1", c1), "replaced conn must not remove the new one")
+	assert.True(t, r.Online("n1"))
+	assert.Equal(t, 1, r.Count())
+	assert.True(t, r.RemoveIf("n1", c2))
+	assert.False(t, r.Online("n1"))
+	assert.Equal(t, 0, r.Count())
 }
