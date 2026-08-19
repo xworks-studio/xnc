@@ -156,8 +156,7 @@ Client
  Web / CLI ────────▶│ Auth                 │
                     │ Cluster Management   │
                     │ Node Management      │
-                    │ Session Router       │
-                    │ Tunnel Gateway       │
+                    │ 统一会话管理器       │
                     └──────────┬───────────┘
                                │
                          HTTPS / WSS :443
@@ -168,10 +167,10 @@ Client
                     │    Windows Agent     │
                     │   Windows Service    │
                     │                      │
-                    │ Connection Manager   │
-                    │ Shell Manager        │
-                    │ Exec Manager         │
-                    │ Tunnel Manager       │
+                    │ connection 控制连接  │
+                    │ session 统一会话引擎 │
+                    │ exec·shell·file·     │
+                    │ screen·tunnel        │
                     └───────┬────────┬─────┘
                             │        │
                          ConPTY     TCP
@@ -200,10 +199,11 @@ golang.org/x/crypto/bcrypt
 部署产物：
 
 ```text
-xnc-server 单静态二进制
-Ubuntu + systemd 运行
-无运行时依赖
+xnc-server 容器镜像（多阶段构建，distroless/static 基底）
+deploy/ Docker Compose 栈（caddy + xnc-server + postgres 三容器）
 ```
+
+单台 Ubuntu 云服务器 `docker compose up -d` 即完成部署，栈结构与运维要求见第 46 节。
 
 数据库决策：
 
@@ -215,23 +215,40 @@ Ubuntu + systemd 运行
 
 ## 5.2 Windows Agent
 
+Agent 与 Server / CLI 同为 Go，协议定义共享仓库根 `proto/` 包（唯一定义点），协议漂移在结构上不可能发生。
+
 选型：
 
+| 用途 | 选型 | 备注 |
+| ---- | ---- | ---- |
+| ConPTY | `x/sys/windows` CreatePseudoConsole 直接封装（约 200 行）或 `UserExistsError/conpty` | Phase 3 前置 spike 验证二选一（Gate B） |
+| Windows 服务 | `golang.org/x/sys/windows/svc` | Go 官方扩展库 |
+| WebSocket | `coder/websocket` | 与 server 同库 |
+| 设备身份 | 标准库 `crypto/ed25519` | |
+| 私钥保护 | `x/sys/windows` CryptProtectData（DPAPI） | Local Machine Scope |
+| CLI 参数 | `spf13/cobra` | install / upgrade 子命令 |
+
+内部结构：
+
 ```text
-Rust (stable, msvc toolchain)
-tokio（异步运行时）
-tokio-tungstenite（WebSocket 客户端）
-portable-pty（ConPTY / Unix PTY 统一抽象）
-windows-service（Windows 服务宿主）
-windows crate（DPAPI 等系统 API）
-ed25519-dalek（设备身份签名）
-clap（install / upgrade 命令行）
+agent/
+├── cmd/service.go           宿主：golang.org/x/sys/windows/svc（服务名 XNCAgent，Automatic）
+├── cmd/xnc-agent/main.go    install / upgrade 子命令
+├── internal/identity/       Ed25519 设备身份；DPAPI（CryptProtectData）保护私钥
+├── internal/enroll/         首次注册（流程不变，见第 8 节）
+├── internal/connection/     控制连接：挑战认证、心跳、指数退避重连（1/2/5/10/30s，上限 30s）
+├── internal/session/        统一会话管理器：SESSION_OPEN 分发 → 拨会话 WS → 统一清理
+│   ├── exec/                子进程 + 超时 kill 进程树
+│   ├── shell/               ConPTY + pwsh（shell_windows.go；未来 shell_unix.go build tag）
+│   ├── file/
+│   ├── screen/              Phase 6：helper 拉起 + named pipe
+│   └── tunnel/              TCP 转发 + 白名单校验
 ```
 
 产物：
 
 ```text
-xnc-agent.exe 单文件约 3-5 MB
+xnc-agent.exe 单文件约 8-12 MB（v1 Rust 版 3-5 MB），运维场景无实质影响
 无运行时依赖
 ```
 
@@ -294,7 +311,7 @@ Go 1.26+（与 Server 同语言）
 
 CLI 是 Server API 的客户端（REST + Shell/Tunnel WebSocket），不依赖 Agent 侧代码。
 
-Web UI 与 CLI 并行交付，共用同一套 REST API 与 WebSocket 协议。
+CLI 先行交付；Web UI 整体后置 Phase 7（Phase 1-6 全部经 CLI 交付与验收）。两者共用同一套 REST API 与 WebSocket 协议，Web UI 是纯消费方，无返工风险。
 
 Windows Remote Desktop 使用：
 
@@ -604,7 +621,7 @@ Public/Private Key Challenge
 Ed25519
 ```
 
-实现：Go 标准库 crypto/ed25519（Server）、ed25519-dalek（Agent），均为原生支持。
+实现：Go 标准库 crypto/ed25519（Server 与 Agent 同语言，均为原生支持）。
 
 认证流程：
 
@@ -677,85 +694,110 @@ Server 超过一定时间未收到 Heartbeat：
 
 # 11. Control Protocol
 
-MVP 使用 WebSocket。
+系统只有**两种连接**：常驻的**控制连接**与按需短连的**会话连接**。职责严格分离——控制连接只承载小 JSON 消息（认证、心跳、会话管理），一切数据流（含 exec 输出）都走会话连接。
 
-消息分：
+由此整类消除 v1 的正确性隐患：exec / shell 输出与心跳共享控制连接发送队列，10 MB 输出可能顶住心跳导致节点被误判离线；v2 控制连接只承载小 JSON，该问题不可能发生。会话限额也天然按连接执行。
+
+## 11.1 控制连接（agent ↔ server，常驻、每 agent 一条）
 
 ```text
-JSON control frame
-Binary data frame
+wss://server/api/agent/connect
 ```
 
-Control Message 包含：
+认证流程不变（第 9 / 13 节）：WS 建立后 server 下发 CHALLENGE（nonce，60s 有效，单次）→ agent 用设备私钥签名 → server 验签 → agent 发 HELLO → server 回 HELLO_ACK → 进入 Ready。
+
+之后控制连接上**只允许 JSON 文本帧**。收到二进制帧视为协议错误，立即断开。
+
+消息 envelope：
 
 ```json
-{
-  "type": "...",
-  "requestId": "...",
-  "sessionId": "...",
-  "payload": {}
-}
+{"type": "...", "payload": {}}
 ```
 
-`requestId` 用于请求响应关联。
+无请求关联字段——控制面是通知性质；会话数据与终态全部走会话连接，client 经 REST 响应中的 sessionId 关联。
 
-`sessionId` 用于 Shell/Tunnel 会话。
-
-Binary frame 用于 Shell 高频 I/O，避免 base64 膨胀（约 +33%）和逐帧 JSON 解析。
-
-格式：
+## 11.2 会话连接（按需短连，一条会话一条连接，两侧对称拨号）
 
 ```text
-[1 byte frameType][16 bytes sessionId (UUID)][payload bytes]
+client 侧：POST /api/nodes/{id}/{kind}
+          → {sessionId, token, expiresAt, websocketUrl}
+          → 连接 websocketUrl
+
+agent  侧：server 经控制连接下发 SESSION_OPEN {sessionId, kind, params, agentToken, wsUrl}
+          → agent 拨 wss://server/api/agent/session?token={agentToken}
+
+server：两侧都连上后双向粘合（byte stream forwarding）
 ```
 
-frameType：
+双侧 token 均为：随机生成、60 秒有效、单会话、单用途、使用后失效（语义同第 24 节会话 Token；v1 仅 Tunnel 使用，v2 泛化到所有 kind）。token 经 URL query 传递（CLI/Agent 侧可用 `Authorization: Bearer` 头；浏览器 WebSocket 无法设头，统一用 query，风险由单次 + 60s + TLS 约束）。
+
+建立时序（两侧到达顺序不限，先到者等待，TTL 60s）：
 
 ```text
-0x01 = SHELL_INPUT
-0x02 = SHELL_OUTPUT
+Client                    Server                          Agent
+  │ POST /nodes/{id}/{kind}  │                               │
+  │────────────────────────▶ │                               │
+  │                          │ SESSION_OPEN ────────────────▶│
+  │ ◀─ {sessionId,token,wsUrl}                               │
+  │                          │ ◀──── dial /agent/session ────│
+  │ ── connect wsUrl ──────▶ │                               │
+  │                          │ both up → glue                │
+  │ ◀══════════ 会话数据双向粘合（直至任一侧关闭）═══════════▶│
 ```
 
-Tunnel 数据走独立的 Tunnel WebSocket，连接本身即 Session，直接转发原始字节，不封装帧头。
+agent 拒绝（不支持的 kind、本地资源不足）：控制连接回 `SESSION_REFUSED {sessionId, code}`，server 关闭 client 侧并返回对应错误。
 
-File Session 同样走独立 WebSocket：控制消息（FILE_BEGIN / FILE_RESULT / FILE_ERROR）为 text frame，数据块为 binary WS message（默认 64 KB/条），不封装帧头。
+## 11.3 会话生命周期（所有 kind 一致）
+
+```text
+Created  POST 返回，sessionId/token 生成
+Opening  等两侧拨号（TTL 60s，超时清理）
+Open     粘合开始
+Closed   任一侧断开 / 会话超时 / 节点离线 / 主动关闭
+```
+
+关闭时 server **必经控制连接**下发 `SESSION_CLOSE {sessionId, reason}`，agent 据此执行统一清理：杀进程树、删临时文件、退 helper、关 TCP。这是 v2 新增的统一清理路径——v1 中每种会话各自处理清理是最易遗漏之处。
+
+超时责任划分：
+
+* exec：`params.timeoutSec` 由 **agent** 计时并 kill 进程树（单一计时器，server 不重复计时）。
+* shell：idle 30min / max 8h 由 **server** 计时（server 拥有两侧），到点关双侧。
+* Opening TTL 60s 由 server 计时。
+
+## 11.4 统一帧规则（一条会话 WS 内部）
+
+```text
+text frame   = 会话级控制 JSON {type, payload}
+binary frame = 不透明流字节，语义由 kind 决定
+```
+
+v1 的自定义二进制帧头（1 字节类型 + 16 字节会话 ID）删除——会话连接本身就是会话，无需复用标识。
+
+控制面消息共 10 个（v1 约 24 个），总表见第 12 节；各 kind 的会话词汇见第 14 节（exec）、第 15-20 节（shell）、第 23-26 节（tunnel）、第 43 / 58 节（file）、第 64 节（screen）。
 
 ---
 
 # 12. Agent 消息类型
 
-至少支持：
+控制面消息**全部 10 个**（v1 约 24 个），全部为控制连接上的 JSON 文本帧：
 
-```text
-HELLO
-HEARTBEAT
+| 方向 | type | payload |
+| ---- | ---- | ---- |
+| server → agent | `CHALLENGE` | `{nonce}` |
+| agent → server | `CHALLENGE_RESPONSE` | `{signature}` |
+| agent → server | `HELLO` | `{nodeId, hostname, agentVersion, shellType}` |
+| server → agent | `HELLO_ACK` | `{}` |
+| 双向 | `HEARTBEAT` / `HEARTBEAT_ACK` | `{}`（30s 间隔，90s 无心跳判 offline，可配置） |
+| server → agent | `SESSION_OPEN` | `{sessionId, kind, params, agentToken, wsUrl, expiresAt}` |
+| agent → server | `SESSION_REFUSED` | `{sessionId, code, message}` |
+| server → agent | `SESSION_CLOSE` | `{sessionId, reason}` |
+| 双向 | `ERROR` | `{code, message}` |
 
-EXEC_REQUEST
-EXEC_OUTPUT
-EXEC_RESULT
-EXEC_CANCEL
+说明：
 
-SHELL_OPEN
-SHELL_OPENED
-SHELL_INPUT
-SHELL_OUTPUT
-SHELL_RESIZE
-SHELL_CLOSE
-
-TUNNEL_OPEN
-TUNNEL_OPENED
-TUNNEL_CLOSE
-
-FILE_OPEN
-FILE_OPENED
-FILE_CLOSE
-
-SCREEN_OPEN
-SCREEN_OPENED
-SCREEN_CLOSE
-
-ERROR
-```
+* `kind ∈ {exec, shell, file, screen, tunnel}`。
+* `SESSION_OPEN` / `SESSION_REFUSED` / `SESSION_CLOSE` 为会话管理消息，**Phase 2 起随第一个会话 kind（exec）启用**；Phase 1 只有前 5 个消息 + ERROR。
+* 会话面 text 帧词汇按 kind 定义：exec 1 个 / shell 3 个（SHELL_BEGIN / SHELL_RESIZE / 通用 ERROR，见第 15 节）/ file 3 个 / screen 2 个 / tunnel 0 个，合计 9 个，且每个只在所属通道出现。
 
 ---
 
@@ -803,51 +845,30 @@ xnc exec web-01 "Get-Service"
 
 ```text
 Client
+   ↓ POST /api/nodes/{id}/exec
+Server（统一会话管理器）
+   ↓ 控制连接下发 SESSION_OPEN（kind=exec）
+Agent 拨会话 WS，双侧粘合
    ↓
-Control Server
-   ↓
-EXEC_REQUEST
-   ↓
-Agent
-   ↓
-PowerShell
+PowerShell 子进程
 ```
 
-消息：
-
-```json
-{
-  "type": "EXEC_REQUEST",
-  "requestId": "req-001",
-  "payload": {
-    "command": "Get-Service"
-  }
-}
-```
-
-Agent 返回：
+会话词汇（exec 会话 WS 内，text = 控制，binary = 数据）：
 
 ```text
-EXEC_OUTPUT
+SESSION_OPEN params: {command? | script?, timeoutSec=300, cwd?}
+binary frame: [1 字节流标识][字节块]     0x01=stdout  0x02=stderr
+text frame:   EXEC_RESULT {exitCode|null, timedOut, durationMs}
 ```
 
-最终：
+规则：
 
-```text
-EXEC_RESULT
-```
+* script ≤ 256 KB，agent 落地 `%TEMP%\xnc-<sessionId>.ps1` 执行后必删（含失败路径）。
+* 超时：agent 计时到点 kill 进程树，发 `EXEC_RESULT {exitCode: null, timedOut: true}` 后关会话。
+* 取消：client 断开会话 WS → server 发 SESSION_CLOSE → agent kill 进程树（无需回传结果，连接已断）。
+* 1 字节流前缀保住 CLI 契约：`--json` 的 data 含独立的 stdout / stderr 字段。
 
-示例：
-
-```json
-{
-  "type": "EXEC_RESULT",
-  "requestId": "req-001",
-  "payload": {
-    "exitCode": 0
-  }
-}
-```
+已论证接受的代价：每次 exec 多一次 agent 侧会话拨号（+1 RTT，几十 ms 量级），远小于 pwsh 子进程冷启动（100-500ms），属噪音级。
 
 Exec 长期保持进程外执行模型：
 
@@ -891,19 +912,27 @@ ConPTY
 pwsh.exe
 ```
 
-Shell 创建消息：
+Shell 会话建立：
 
-```json
-{
-  "type": "SHELL_OPEN",
-  "sessionId": "shell-123",
-  "payload": {
-    "cols": 120,
-    "rows": 30,
-    "shell": "pwsh.exe"
-  }
-}
+```text
+POST /api/nodes/{id}/shell
+→ 202 {sessionId, token, expiresAt, websocketUrl}
 ```
+
+会话词汇（shell 会话 WS 内，text = 控制，binary = 数据；统一帧规则见第 11.4 节）：
+
+```text
+SESSION_OPEN params: {cols, rows, shell?}       shell 缺省按探测结果
+text frame:   SHELL_BEGIN {shell}               实际 shell（pwsh / windows-powershell）
+text frame:   SHELL_RESIZE {cols, rows}         client → agent（详见第 18 节）
+text frame:   ERROR {code: SHELL_START_FAILED}  创建失败，随后关连接
+binary frame: 原始 VT 字节，双向，不区分方向（连接方向即语义）
+```
+
+说明：
+
+* `SHELL_BEGIN` 由 agent 在会话建立后首发，告知实际使用的 shell——请求省略 `shell` 或发生降级时，实际 shell 可能与客户端预期不同。
+* ConPTY / shell 创建失败：agent 发 `ERROR {code: SHELL_START_FAILED}` 后关闭会话连接（错误码定义见第 51 节）。
 
 `shell` 字段可省略，缺省由 Agent 按探测结果决定：
 
@@ -925,28 +954,10 @@ Start Process
 
 # 16. Shell Input
 
-客户端输入通过：
+客户端输入经 shell 会话 WebSocket 的 **binary frame** 传输：
 
 ```text
-SHELL_INPUT
-```
-
-实际编码为 binary frame：
-
-```text
-0x01 | sessionId(16 bytes) | "Get-Process\r" (UTF-8)
-```
-
-等价的 JSON 形式（仅用于文档说明与调试）：
-
-```json
-{
-  "type": "SHELL_INPUT",
-  "sessionId": "shell-123",
-  "payload": {
-    "data": "Get-Process\r"
-  }
-}
+原始 VT/ANSI 字节，无帧头
 ```
 
 Server 只负责转发。
@@ -957,13 +968,7 @@ Agent 将数据写入 ConPTY Input Pipe。
 
 # 17. Shell Output
 
-ConPTY Output 通过：
-
-```text
-SHELL_OUTPUT
-```
-
-返回客户端，编码为 binary frame（0x02），不经过 base64。
+ConPTY Output 经 shell 会话 WebSocket 的 **binary frame** 返回客户端：原始 VT 字节，双向不区分方向（连接方向即语义），不经过 base64。
 
 输出应该尽可能保持原始 VT/ANSI 数据。
 
@@ -979,12 +984,11 @@ bidirectional byte stream
 
 # 18. Terminal Resize
 
-Terminal 尺寸变化：
+Terminal 尺寸变化，经 shell 会话 WS 的 text frame（会话级控制 JSON）：
 
 ```json
 {
   "type": "SHELL_RESIZE",
-  "sessionId": "shell-123",
   "payload": {
     "cols": 160,
     "rows": 40
@@ -1125,57 +1129,27 @@ Agent
 
 ---
 
-# 23. Data Tunnel
+# 23. Tunnel 会话
 
-RDP 等高流量流量不得与 Agent 长期 Control Connection 共用同一个发送队列。
+RDP 等高流量数据不得与 Agent 长期控制连接共用同一个发送队列——v2 由架构直接保证：控制连接只承载小 JSON，一切数据流（含 tunnel）走独立的**会话连接**，一条会话一条连接。
 
-每个 Tunnel 使用独立连接。
-
-例如：
+tunnel 是统一会话模型的一种 kind，建立流程与所有 kind 一致（见第 11.2 节）：
 
 ```text
-Control:
-
-wss://control.example.com/api/agent/connect
+POST /api/nodes/{id}/tunnel
+请求体 { "target": "rdp" }
+→ 202 {sessionId, token, expiresAt, websocketUrl}
 ```
 
-Tunnel：
-
-```text
-wss://control.example.com/api/tunnel/{token}
-```
-
-创建 Tunnel：
-
-```text
-Client
-   ↓
-POST /api/nodes/{nodeId}/tunnels
-```
-
-Server 返回：
-
-```json
-{
-  "sessionId": "...",
-  "token": "...",
-  "expiresAt": "..."
-}
-```
-
-Agent 收到：
-
-```text
-TUNNEL_OPEN
-```
-
-然后建立临时 Tunnel WebSocket。
+Server 经控制连接下发 `SESSION_OPEN（kind=tunnel, params={target}）`，Agent 拨会话 WS（`wss://server/api/agent/session?token={agentToken}`），Client 凭返回的 websocketUrl + token 连接另一侧，Server 双向粘合。
 
 ---
 
-# 24. Tunnel Token
+# 24. 会话 Token（Tunnel Token 泛化）
 
-Tunnel Token 必须：
+v1 的 Tunnel Token 语义保留，并**泛化为所有 kind 的会话 token**（client 侧与 agent 侧对称各一枚，见第 11.2 节）。
+
+会话 Token 必须：
 
 * 随机生成。
 * 短期有效。
@@ -1186,22 +1160,24 @@ Tunnel Token 必须：
 建议有效时间：
 
 ```text
-30–60 seconds
+60 seconds
 ```
 
-其作用只是完成 Tunnel Connection 建立，不作为长期认证。
+其作用只是完成会话连接建立，不作为长期认证。
+
+token 经 URL query 传递：CLI/Agent 侧可用 `Authorization: Bearer` 头；浏览器 WebSocket 无法设置头，统一用 query，风险由单次 + 60s + TLS 约束。
 
 ---
 
 # 25. Tunnel 数据
 
-Tunnel 建立完成后：
+Tunnel 会话为**纯 binary 通道，零 text 帧**：建立即转发。
 
 ```text
 Client WS
         │
         ▼
-Tunnel Gateway
+Server 双向粘合（统一会话管理器）
         │
         ▼
 Agent WS
@@ -1221,23 +1197,25 @@ byte stream forwarding
 
 不得解析 RDP 数据。
 
+Agent 连不上目标（本机 3389 未监听等）：在 binary 首帧前发 text `ERROR {code: RDP_NOT_AVAILABLE}` 后关闭会话。
+
 ---
 
 # 26. Tunnel 限制
 
-MVP 默认 Agent Tunnel 只能访问：
+Client 只能传 **target 枚举**，永远不传 host/port：
 
 ```text
-127.0.0.1
+SESSION_OPEN params: {target}        枚举："rdp"
 ```
 
-允许的目的端口通过服务器下发。
-
-RDP：
+Server 端解析白名单：
 
 ```text
-127.0.0.1:3389
+"rdp" → {host: "127.0.0.1", port: 3389}
 ```
+
+解析结果随 SESSION_OPEN 下发，Agent 侧同时校验（只允许节点本机回环地址 + 白名单端口）。
 
 不得允许 Client 自行发送：
 
@@ -1248,7 +1226,7 @@ targetPort
 
 从而避免 Agent 成为任意网络代理。
 
-后续如果支持通用 TCP Tunnel，需要单独权限模型。
+Linux Agent 未来扩展 `target: "ssh"` → `{host: "127.0.0.1", port: 22}`（见第 60 节）。后续如果支持通用 TCP Tunnel，需要单独权限模型。
 
 ---
 
@@ -1302,71 +1280,37 @@ POST /api/nodes/{id}/enable
 
 ---
 
-## Exec
+## 会话端点（exec / shell / files / screen / tunnel）
+
+六个会话创建端点返回结构完全一致：
 
 ```text
-POST /api/nodes/{id}/exec
+POST /api/nodes/{id}/exec           {command|script, timeoutSec?, cwd?}
+POST /api/nodes/{id}/shell          {cols?, rows?, shell?}
+POST /api/nodes/{id}/files/upload   {path, size, sha256}
+POST /api/nodes/{id}/files/download {path}
+POST /api/nodes/{id}/screen         {fps?, quality?, maxWidth?}
+POST /api/nodes/{id}/tunnel         {target}
 ```
 
-创建 Exec Session，返回：
-
-```json
-{
-  "requestId": "...",
-  "token": "...",
-  "websocketUrl": "/api/exec/{requestId}"
-}
-```
-
-输出与终态经 Exec WebSocket 流式返回；客户端断开或超时触发 EXEC_CANCEL。
-
----
-
-## Shell
-
-```text
-POST /api/nodes/{id}/shell
-```
-
-返回：
+统一返回：
 
 ```json
 {
   "sessionId": "...",
+  "token": "...",
+  "expiresAt": "...",
   "websocketUrl": "..."
 }
 ```
 
----
+即 `202 {sessionId, token, expiresAt, websocketUrl}`。client 凭返回值连接 websocketUrl 建立会话；各 kind 的会话词汇见第 14、15-20、23-26、43 / 58、64 节。
 
-## Files
+说明：
 
-```text
-POST /api/nodes/{id}/files/upload
-POST /api/nodes/{id}/files/download
-```
-
-返回 File Session（websocketUrl + token）。
-
----
-
-## Screen
-
-```text
-POST /api/nodes/{id}/screen
-```
-
-返回 Screen Session（websocketUrl + token）。
-
----
-
-## RDP
-
-```text
-POST /api/nodes/{id}/rdp
-```
-
-返回 Tunnel Session。
+* v1 的独立 RDP 端点（`POST /api/nodes/{id}/rdp`）并入 `POST /api/nodes/{id}/tunnel {target: "rdp"}`。
+* v1 exec 响应中的请求关联字段统一为 `sessionId`。
+* 其余 REST（auth / clusters / members / enrollment-tokens / nodes / audit）全部不变。
 
 ---
 
@@ -1453,65 +1397,78 @@ xnc shell production/web-01
 
 ---
 
-# 30. Agent 内部模块
+# 30. Agent 内部结构
 
-Agent 采用简单模块化结构：
+Agent 为单一 Go 模块，按包划分职责（协议定义 import 自仓库根 `proto/` 共享包，与 server / cli / mockagent 共用唯一定义点）：
 
 ```text
-AgentWorker
-ConnectionManager
-EnrollmentManager
-ShellManager
-ExecManager
-TunnelManager
-FileManager
-ScreenManager
-CredentialStore
+agent/
+├── cmd/service.go           宿主：golang.org/x/sys/windows/svc（服务名 XNCAgent，Automatic）
+├── cmd/xnc-agent/main.go    install / upgrade 子命令
+├── internal/identity/       Ed25519 设备身份；DPAPI（CryptProtectData）保护私钥
+├── internal/enroll/         首次注册（流程不变，见第 8 节）
+├── internal/connection/     控制连接：挑战认证、心跳、指数退避重连（1/2/5/10/30s，上限 30s）
+├── internal/session/        统一会话管理器：SESSION_OPEN 分发 → 拨会话 WS → 统一清理
+│   ├── exec/                子进程 + 超时 kill 进程树
+│   ├── shell/               ConPTY + pwsh（shell_windows.go；未来 shell_unix.go build tag）
+│   ├── file/                upload / download、sha256 校验、临时文件清理
+│   ├── screen/              Phase 6：helper 拉起 + named pipe
+│   └── tunnel/              TCP 转发 + 白名单校验
 ```
 
-FileManager 职责：
+逐包职责：
 
 ```text
-接收 FILE_OPEN
-校验方向 / 大小 / 路径
-流式读写文件
-sha256 校验
-会话与半成品文件清理
+cmd/service.go           服务宿主：svc 运行循环、启动/停止控制
+cmd/xnc-agent/main.go    install / upgrade 子命令（cobra）
+internal/identity/       设备密钥对生成、DPAPI 私钥保护、签名
+internal/enroll/         Enrollment Token 注册、Node Identity 安全保存
+internal/connection/     控制连接生命周期、心跳、重连、入站消息分发
+internal/session/        会话生命周期（见第 11.3 节）、SESSION_OPEN 分发到各 kind、统一清理
+internal/session/exec/   exec 会话引擎（见第 34 节）
+internal/session/shell/  shell 会话引擎（见第 33 节）
+internal/session/file/   file 会话引擎（见第 43 / 58 节）
+internal/session/screen/ screen 会话引擎（见第 64 节）
+internal/session/tunnel/ tunnel 会话引擎（见第 35 节）
 ```
 
-内部：
+内部状态：
 
 ```text
-Dictionary<SessionId, FileSession>
+map[SessionID]Session（统一会话管理器持有，替代 v1 各 Manager 分持的会话表）
 ```
 
 ---
 
-# 31. AgentWorker
+# 31. 服务宿主与入口（cmd）
 
 职责：
 
 ```text
+cmd/service.go         Windows 服务宿主（svc Run 循环、启动/停止控制）
+cmd/xnc-agent/main.go  install / upgrade 子命令
 Initialize Agent
 Load Identity
 Enroll if required
-Start ConnectionManager
+Start Connection
 Handle shutdown
 ```
 
+服务名 `XNCAgent`、启动类型 `Automatic`、异常由 SCM 自动恢复（见第 5.2 节）。
+
 ---
 
-# 32. ConnectionManager
+# 32. internal/connection — 控制连接
 
 职责：
 
 ```text
 Connect to Server
-Authenticate Device
+Authenticate Device（CHALLENGE / CHALLENGE_RESPONSE）
 Send HELLO
 Maintain Heartbeat
 Reconnect
-Dispatch inbound messages
+Dispatch inbound messages（SESSION_OPEN → internal/session）
 ```
 
 重连策略：
@@ -1540,37 +1497,33 @@ exponential backoff
 
 ---
 
-# 33. ShellManager
+# 33. internal/session/shell — Shell 会话
 
 职责：
 
 ```text
 Create ConPTY
-Launch pwsh.exe
-Write input
-Read output
-Resize terminal
-Close session
-Cleanup process
+Launch pwsh.exe / powershell.exe
+Write input（会话 WS binary VT 字节 → ConPTY Input Pipe）
+Read output（ConPTY → 会话 WS binary）
+Resize terminal（SHELL_RESIZE）
+Close session（SESSION_CLOSE → 清理进程树）
 ```
 
-内部：
-
-```text
-Dictionary<SessionId, ShellSession>
-```
+平台文件：`shell_windows.go`；未来 Linux 增量 `shell_unix.go` build tag。
 
 ---
 
-# 34. ExecManager
+# 34. internal/session/exec — Exec 会话
 
 职责：
 
 ```text
 Execute PowerShell
-Stream stdout/stderr
-Return result
-Support cancellation
+Stream stdout/stderr（1 字节流前缀 binary 帧）
+Return result（EXEC_RESULT）
+Support cancellation（超时 / 会话断开 → kill 进程树）
+script 落地临时 .ps1 并保证清理
 ```
 
 直接启动子进程：
@@ -1583,23 +1536,16 @@ pwsh.exe / powershell.exe
 
 ---
 
-# 35. TunnelManager
+# 35. internal/session/tunnel — Tunnel 会话
 
 职责：
 
 ```text
-Receive Tunnel Request
-Validate allowed destination
+Receive Tunnel Request（SESSION_OPEN kind=tunnel）
+Validate allowed destination（白名单：本机回环 + 允许端口）
 Open TcpClient
-Open Tunnel WebSocket
-Relay bytes
-Close resources
-```
-
-内部：
-
-```text
-Dictionary<SessionId, TunnelSession>
+Dial 会话 WS 后纯 binary 双向转发
+Close resources（SESSION_CLOSE → 关 TCP）
 ```
 
 ---
@@ -1768,9 +1714,8 @@ exit status
 Central Server 维护：
 
 ```text
-ConnectedAgents
-ActiveShellSessions
-ActiveTunnelSessions
+map[NodeID]AgentConn（控制连接）
+map[SessionID]Session（统一会话管理器，覆盖全部 kind）
 ```
 
 MVP 不要求这些状态持久化。
@@ -1779,8 +1724,7 @@ Server 重启后：
 
 ```text
 Agent reconnect
-Shell terminated
-Tunnel terminated
+Sessions terminated（所有 kind 一致）
 ```
 
 这是允许的。
@@ -1884,16 +1828,15 @@ rollback
 
 # 46. 部署
 
-Server 最简单部署形式：
+部署产物为 `deploy/` 下的一套 Docker Compose 栈，单台 Ubuntu 云服务器 `docker compose up -d` 即完成部署：
 
 ```text
-control.example.com
-        │
-       :443
-        │
-  xnc-server
-        │
-   PostgreSQL
+deploy/
+├── docker-compose.yml     caddy + xnc-server + postgres 三容器
+├── Caddyfile              :443 TLS termination，Let's Encrypt 自动签发
+└── .env.example           域名 / PG 凭据 / Bootstrap Admin 环境变量
+
+Internet → :443 Caddy(容器) → xnc-server(容器) → PostgreSQL(容器)
 ```
 
 推荐 MVP 部署形态：
@@ -1901,18 +1844,16 @@ control.example.com
 ```text
 单台云服务器（Ubuntu 22.04+，2C4G 起步）
 域名：control.example.com
-Caddy 做 TLS termination（自动签发 Let's Encrypt）
-xnc-server（Go 静态二进制，systemd 托管）
-PostgreSQL（同机部署，Docker Compose 或本机安装）
 ```
 
-示例拓扑：
+要求：
 
-```text
-Internet → :443 Caddy → localhost:8080 xnc-server → localhost:5432 PostgreSQL
-```
-
-也可以使用 Nginx 或云 LB 做 TLS termination，或让 xnc-server 直接监听 TLS。
+* xnc-server 镜像：多阶段构建，distroless/static 基底（Go 静态二进制），CI 构建推送。
+* Caddy 对 WSS 的透传：WebSocket Upgrade 自动处理；tunnel / screen 等流式路径配置 `flush_interval -1` 禁用响应缓冲，保证转发低延迟。
+* 长连接：代理层不得设低于心跳判定窗口的 idle 超时（在线判定 90s，代理 idle timeout 需大于 90s 或禁用）。
+* PostgreSQL 数据卷持久化；全部凭据经 `.env` 注入，不入库。
+* 单实例约束不变：一套 compose 栈即单实例（见第 42 节）。
+* E2E 测试的 docker-compose 与本生产栈同构（仅追加 mockagent / cli 服务），开发与生产环境一致性由同一配方保证。
 
 ---
 
@@ -2008,6 +1949,8 @@ Exec concurrent:     10
 
 均可配置。
 
+注：会话限额 Phase 2 起随会话实现生效（Phase 1 只有控制连接，无会话）。
+
 限制目的主要是防止异常客户端耗尽资源，而不是构建复杂配额系统。
 
 ---
@@ -2038,13 +1981,14 @@ NODE_DISABLED
 
 ENROLLMENT_TOKEN_INVALID
 ENROLLMENT_TOKEN_EXPIRED
+NODE_ALREADY_ENROLLED
 
 SESSION_NOT_FOUND
 SESSION_EXPIRED
+KIND_UNSUPPORTED
 
 SHELL_START_FAILED
 
-TUNNEL_START_FAILED
 RDP_NOT_AVAILABLE
 
 FILE_NOT_FOUND
@@ -2057,11 +2001,15 @@ NO_INTERACTIVE_SESSION
 AGENT_VERSION_UNSUPPORTED
 ```
 
+v2 变更：新增 `NODE_ALREADY_ENROLLED`（machine_id 已注册，注册流程返回）、`KIND_UNSUPPORTED`（agent 不认识 SESSION_OPEN 的 kind，版本协商兜底）；删除 `TUNNEL_START_FAILED`（并入会话内 `ERROR {code: RDP_NOT_AVAILABLE}`）。
+
 ---
 
-# 52. MVP 页面
+# 52. Web UI 页面（Phase 7 交付）
 
-Web UI 只需要：
+Web UI 整体后置 Phase 7：Phase 1-6 全部经 CLI 交付与验收；shell（Phase 3）与 screen（Phase 6）协议就绪后，Web UI 作为纯消费方一次性交付，无返工风险。
+
+页面清单（全部 Phase 7）：
 
 ```text
 Login
@@ -2072,7 +2020,8 @@ Cluster Details
 Nodes
 Node Details
 
-Terminal
+Terminal（消费 shell 会话）
+预览面板（消费 screen 会话）
 ```
 
 Node 页面：
@@ -2088,7 +2037,7 @@ Last Seen: now
 
 [Terminal]
 [Remote Desktop]
-[Screen Preview]（Phase 6）
+[Screen Preview]（消费 Phase 6 screen 能力）
 [Info]
 ```
 
@@ -2102,60 +2051,61 @@ xnc rdp web-01
 
 ---
 
-# 53. MVP 开发顺序
+# 53. 开发顺序
 
 推荐按以下顺序实现。各 Phase 所需测试设备见第 59 节测试设备矩阵，凭据读自 `config.env`。
 
-## Phase 1 — Agent Connection
+只重排不砍：v1 的全部功能能力保留，Web UI 独立成相（Phase 7），Linux 远期（Phase 8）。
 
-完成：
+```text
+Phase 1  连接面      Bootstrap Admin、JWT login、enrollment、设备身份、控制连接、心跳、
+                     node list（CLI）、xnc login/whoami/status/version、compose 部署
+Phase 2  exec 会话   exec + run、超时取消、退出码契约、（CLI golden 测试随之建立）
+Phase 3  shell 会话  ConPTY、resize、Ctrl+C、xnc shell（CLI 交互终端；Web Terminal 后置）
+Phase 4  数据通道    file 会话（upload/download）、tunnel 会话、RDP + mstsc
+Phase 5  多用户      Cluster、成员角色（owner/operator/viewer）、审计查询
+Phase 6  桌面预览    screen 会话 + helper（三态验收见本节 Phase 6）
+Phase 7  Web UI      React 整体交付：登录、节点列表、Terminal、预览面板
+Phase 8  Linux       远期不变（第 60 节）
+```
+
+## Phase 1 — 连接面
+
+交付：
 
 ```text
 Bootstrap Admin 账号（环境变量首次初始化）
 JWT Login
-Windows Service
-Enrollment
-Device Identity
-WebSocket Connection
-Heartbeat
-Node online/offline
-Node 列表（Web 页面 + xnc node list）
+Enrollment（Enrollment Token 注册流程）
+设备身份（Ed25519 + DPAPI）
+控制连接（纯 JSON 控制面：CHALLENGE / HELLO / HEARTBEAT）
+心跳与 online / offline 判定
+xnc node list（CLI）
+xnc login / whoami / status / version
+deploy/ Docker Compose 栈部署（caddy + xnc-server + postgres，见第 46 节）
 ```
 
 说明：完整多用户与 Cluster 权限在 Phase 5 实现，Phase 1 只需单管理员账号即可验收。
 
 验收标准：
 
-用户可以看到节点：
-
 ```text
-online
-```
-
-并在 Agent 停止后变：
-
-```text
-offline
+compose 栈部署后，节点注册即出现并显示 online
+Agent 停止后变 offline
 ```
 
 ---
 
-## Phase 2 — Exec
+## Phase 2 — exec 会话
 
-实现：
-
-```text
-POST /nodes/{id}/exec
-```
-
-以及：
+交付：
 
 ```text
-EXEC_REQUEST（command 与 script 两种 payload）
-EXEC_OUTPUT
-EXEC_RESULT
-超时取消与进程树清理
-xnc run（脚本即传即执行即清理）
+POST /nodes/{id}/exec（command 与 script 两种参数）
+exec 会话词汇（binary 1 字节流前缀 + text EXEC_RESULT）
+超时取消与进程树清理（agent 侧单一计时器）
+xnc exec / xnc run（脚本即传即执行即清理）
+退出码契约（CLI golden 测试随之建立）
 ```
 
 验收：
@@ -2180,26 +2130,20 @@ xnc run web-01 --file test.ps1
 
 ---
 
-## Phase 3 — Interactive Shell
+## Phase 3 — shell 会话
 
-实现：
+交付：
 
 ```text
-ConPTY
+ConPTY（Go 封装，二选一选型落地）
 pwsh.exe / powershell.exe 自动降级
-Shell WebSocket（binary frame）
-Terminal Resize
-Ctrl+C
-```
-
-并行交付两个客户端入口：
-
-```text
+shell 会话 WS（binary 原始 VT 字节，无帧头）
+Terminal Resize（SHELL_RESIZE）
+Ctrl+C（经终端输入传递）
 xnc shell <node>        CLI 交互终端
-Web Terminal            xterm.js
 ```
 
-两端共用同一条 Shell WebSocket 协议。
+Web Terminal 后置 Phase 7，与 CLI 共用同一条 shell 会话协议。
 
 验收：
 
@@ -2225,16 +2169,14 @@ Session State 必须保持。
 
 ---
 
-## Phase 4 — 文件传输与 RDP Tunnel
+## Phase 4 — 数据通道（file / tunnel / RDP）
 
-实现：
+交付：
 
 ```text
-File Session（upload / download / sha256）
-Tunnel Session
-Local Port Forward
-Agent TCP Forward
-mstsc launch
+file 会话（upload / download / sha256）
+tunnel 会话（target 枚举白名单 + 纯 binary 转发）
+RDP：本地随机端口转发 + mstsc launch
 ```
 
 验收：
@@ -2247,7 +2189,7 @@ xnc rdp web-01
 
 ---
 
-## Phase 5 — Cluster / User
+## Phase 5 — 多用户
 
 增加：
 
@@ -2257,7 +2199,7 @@ Membership
 Owner
 Operator
 Viewer
-Audit
+Audit（审计查询，xnc audit list）
 ```
 
 完成基本多用户能力。
@@ -2266,22 +2208,54 @@ Audit
 
 ## Phase 6 — 桌面预览
 
-实现：
+交付：
 
 ```text
-ScreenManager + session helper（用户会话捕获）
-Screen WebSocket（低频 JPEG 帧）
-Web 预览面板（含状态提示）
+screen 会话 + session helper（用户会话捕获）
+会话 WS 低频 JPEG 帧
 xnc screen --snapshot
+（Web 预览面板后置 Phase 7）
 ```
 
 验收：
 
 ```text
-Node 页面打开预览，1 fps 看到当前桌面
+打开预览，1 fps 看到当前桌面
 未登录 / 锁屏返回状态而非黑屏
 关闭预览后节点无捕获进程残留
 预览期间 RDP 会话状态不受影响
+```
+
+---
+
+## Phase 7 — Web UI
+
+交付：
+
+```text
+React 整体交付：登录、节点列表、Terminal、预览面板（页面清单见第 52 节）
+```
+
+依赖说明：Web Terminal / 预览面板依赖的 shell / screen 协议在 Phase 3 / 6 已就绪，Phase 7 纯消费方，无返工风险。
+
+---
+
+## Phase 8 — Linux（远期）
+
+不变，见第 60 节。
+
+---
+
+## Phase 验收映射
+
+各 Phase 验收 = v1 Scenario A-H 映射不变：
+
+```text
+Phase 1    Scenario A / B / G
+Phase 2    Scenario C / H
+Phase 3    Scenario D
+Phase 4    Scenario E / H
+Phase 5    Scenario F
 ```
 
 ---
@@ -2493,8 +2467,7 @@ Agent 端临时文件已清理
      Web / xnc ────────▶│ REST API              │
                         │ Auth                   │
                         │ Cluster / Node         │
-                        │ Session Router         │
-                        │ Tunnel Gateway         │
+                        │ 统一会话管理器         │
                         │                       │
                         │ PostgreSQL             │
                         └───────────┬───────────┘
@@ -2507,11 +2480,10 @@ Agent 端临时文件已清理
                   │        Windows Agent           │
                   │        Windows Service         │
                   │                                │
-                  │ ConnectionManager              │
-                  │ ShellManager                   │
-                  │ ExecManager                    │
-                  │ TunnelManager                  │
-                  │                                │
+                  │ connection（控制连接）          │
+                  │ session（统一会话引擎）         │
+                  │  exec / shell / file /         │
+                  │  screen / tunnel               │
                   └──────────┬───────────┬─────────┘
                              │           │
                            ConPTY        TCP
@@ -2524,13 +2496,13 @@ Agent 端临时文件已清理
 ```text
 Remote Shell
 =
-ConPTY over reverse authenticated connection
+ConPTY over reverse authenticated session connection
 ```
 
 ```text
 Remote Desktop
 =
-RDP over reverse authenticated TCP tunnel
+RDP over reverse authenticated TCP tunnel（统一会话的一种 kind）
 ```
 
 ```text
@@ -2544,7 +2516,7 @@ outbound HTTPS/WSS only
 ```text
 认证
 节点连接
-消息路由
+消息路由（现为：控制面路由 + 会话粘合）
 ConPTY
 TCP Tunnel
 Cluster ACL
@@ -2677,15 +2649,17 @@ exec / run 的 data：
 ## 一次性命令（exec）
 
 ```text
-CLI → POST /exec → Server → EXEC_REQUEST → Agent → pwsh 子进程
+CLI → POST /exec → 会话 WS（双侧粘合）→ Agent → pwsh 子进程
 ```
+
+通道描述：exec 会话 WS（text=EXEC_RESULT 终态，binary=1 字节流前缀+字节块）。
 
 回调语义：
 
 ```text
-EXEC_OUTPUT    流式增量输出（payload.stream 区分 stdout/stderr，data 为 base64）
-EXEC_RESULT    终态：exitCode（超时/取消为 null）+ timedOut + durationMs
-EXEC_CANCEL    客户端断开 / 超时 → Server 下发 → Agent kill 进程树
+binary 前缀块   流式增量输出（0x01=stdout / 0x02=stderr）
+EXEC_RESULT     终态：exitCode（超时/取消为 null）+ timedOut + durationMs（会话 WS text 帧）
+取消            客户端断开 / 超时 → Server 下发 SESSION_CLOSE → Agent kill 进程树
 CLI 行为       阻塞至 EXEC_RESULT 或超时；输出实时打印（两流交错展示）
 CLI 退出码     已执行 → 透传；未执行 → 240+
 ```
@@ -2693,30 +2667,26 @@ CLI 退出码     已执行 → 透传；未执行 → 240+
 超时取消：
 
 ```text
-CLI/Server 超时 → 下发 EXEC_CANCEL → Agent kill 进程树 → EXEC_RESULT {exitCode: null, timedOut: true}
+agent 侧 timeoutSec 计时到点 → kill 进程树 → EXEC_RESULT {exitCode: null, timedOut: true} → 关会话
 ```
 
 ## 脚本（run）
 
-复用 EXEC_REQUEST，payload 扩展：
+复用 exec 会话，SESSION_OPEN params 扩展 script 字段：
 
 ```json
 {
-  "type": "EXEC_REQUEST",
-  "requestId": "req-002",
-  "payload": {
-    "script": "<UTF-8 脚本内容>",
-    "timeout": 300
-  }
+  "script": "<UTF-8 脚本内容>",
+  "timeoutSec": 300
 }
 ```
 
 Agent 行为：
 
 ```text
-1. 写入 %TEMP%\xnc-<requestId>.ps1
+1. 写入 %TEMP%\xnc-<sessionId>.ps1
 2. pwsh -NoLogo -NonInteractive -File 执行
-3. 流式 EXEC_OUTPUT，最终 EXEC_RESULT（exitCode）
+3. 流式 binary 输出，最终 EXEC_RESULT（exitCode）
 4. finally 删除临时文件（失败路径同样清理）
 ```
 
@@ -2724,23 +2694,23 @@ Agent 行为：
 
 ## 文本（交互 Shell 流）
 
-向既有 Shell 会话注入文本属于交互终端能力（第 15-19 节）：SHELL_INPUT / SHELL_OUTPUT binary frame 双向流，Server 纯转发。
+向既有 Shell 会话注入文本属于交互终端能力（第 15-19 节）：shell 会话 WS 的 binary frame 双向原始 VT 字节流，Server 纯转发。
 
 Agent 驱动终端的原则：优先 exec / run 组合，仅在确需会话状态延续时用 shell。
 
 ## 文件（upload / download）
 
-会话建立复用 Tunnel 模式：
+会话建立走统一会话模式（kind=file，见第 11.2 节）：
 
 ```text
 POST /api/nodes/{id}/files/upload    {path, size, sha256}
 POST /api/nodes/{id}/files/download  {path}
-→ {sessionId, token, expiresAt, websocketUrl}
+→ 202 {sessionId, token, expiresAt, websocketUrl}
 ```
 
-Server 经 Control Connection 下发 FILE_OPEN，Agent 回 FILE_OPENED 后拨号 File WebSocket；Client 凭 token 连接另一侧，Server 双向粘合。
+Server 经控制连接下发 SESSION_OPEN（kind=file），Agent 拨会话 WS；Client 凭 token 连接另一侧，Server 双向粘合。
 
-File WebSocket 消息（WS message 本身即分帧）：
+会话 WS 消息（WS message 本身即分帧）：
 
 ```text
 text    FILE_BEGIN  {direction, path, size, sha256}
@@ -2761,7 +2731,7 @@ File Session ≤ 4 per Node
 ## 回调总则
 
 ```text
-一切操作 = 流式增量（OUTPUT/CHUNK）+ 终态结果（RESULT），requestId 关联
+一切操作 = 流式增量（会话 WS binary 数据帧）+ 终态结果（会话 WS text RESULT），sessionId 关联
 MVP 无 webhook：CLI 进程即任务载体，Agent 后台执行 + 轮询退出码
 ```
 
@@ -2772,12 +2742,15 @@ MVP 无 webhook：CLI 进程即任务载体，Agent 后台执行 + 轮询退出�
 ## 分层与工具
 
 ```text
-Server       Go unit + testcontainers-go(PostgreSQL) + httptest
-Agent        cargo test 单元 + #[cfg(windows)] 集成
-协议一致性   Go 编写 MockAgent，与 Server 测试共用协议定义；Agent 侧用同一套用例镜像验证
-E2E          docker-compose：xnc-server + PostgreSQL + MockAgent 矩阵 + xnc CLI
-负载         MockAgent × 1000 并发连接
+Server             Go unit + testcontainers-go(PostgreSQL) + httptest
+Agent              go test 单元 + build tag `windows` 集成（ConPTY / 服务 / DPAPI，真机 NODE_MAIN）
+协议 conformance   同一套用例跑两遍：mockagent（内存传输）+ agent 真实会话引擎
+E2E                docker-compose：server + PostgreSQL + mockagent×N + cli（与 deploy/ 生产栈同构，仅追加 mockagent / cli 服务）
+负载               mockagent × 1000 并发连接（不占真机）
+CLI                golden 测试：--json envelope 快照、退出码表逐条、选择器歧义
 ```
+
+MockAgent 不再是第三份协议实现——就是 agent 核心包 + 内存虚拟传输；协议定义 import 自仓库根 `proto/` 共享包。
 
 ## 测试设备矩阵
 
@@ -2788,7 +2761,7 @@ E2E          docker-compose：xnc-server + PostgreSQL + MockAgent 矩阵 + xnc C
 | NODE_MAIN（开发机本体） | Windows 11 + pwsh 7，LABS-XIAOXIN，常驻交互登录 | 主 Windows 测试节点：新版功能、RDP、桌面预览 helper 三态（capturing / locked / no_session）；兼日常开发 | 全程 |
 | SRV | Ubuntu，阿里云国际区域，域名 control.xnc.app | xnc-server / Caddy / PostgreSQL 真机部署验证；NAT 场景对端 | Phase 1 起 |
 | NODE2019（预留） | Windows Server 2019，不装 pwsh | 最低版本线：1809 ConPTY、powershell.exe 5.1 降级；Hyper-V / 云 VM 后补 | Phase 2-4（后补） |
-| NODELINUX（预留，可选） | Ubuntu x64 | 跨平台守门：编译目标、PTY 抽象冒烟 | Phase 7 预研 |
+| NODELINUX（预留，可选） | Ubuntu x64 | 跨平台守门：编译目标、PTY 抽象冒烟 | Phase 8 预研 |
 
 要求与技巧：
 
@@ -2812,7 +2785,7 @@ E2E          docker-compose：xnc-server + PostgreSQL + MockAgent 矩阵 + xnc C
 | run 脚本 | 真机 | exitCode、失败路径临时文件清理、256 KB 上限 |
 | Shell / ConPTY | Windows 集成 | 回显、resize、Ctrl+C 后会话存活、$x=42 状态保持、断连后 pwsh 进程无残留 |
 | 文件传输 | 集成 + 真机 | sha256 校验、故意损坏 → HASH_MISMATCH、256 MB 上限、下载不存在 → FILE_NOT_FOUND |
-| Tunnel / RDP | MockAgent + 手工 | tunnel token 单次有效、白名单拒绝非 3389 目标、mstsc 实连（手工） |
+| Tunnel / RDP | MockAgent + 手工 | 会话 token 单次有效、target 枚举外目标拒绝、mstsc 实连（手工） |
 | RBAC | 表驱动 API 测试 | viewer 全 403、operator 可 exec 不可管 Cluster、owner 全通 |
 | 审计 | 集成 | 每动作有记录；日志 grep 扫描无 token / 密码 / 私钥 |
 | CLI | golden 测试 | --json envelope 快照、退出码表逐条、选择器歧义报错 |
@@ -2841,24 +2814,24 @@ Windows Server 2019 无 pwsh → powershell.exe 降级
 
 ---
 
-# 60. Linux 支持演进（Phase 7+）
+# 60. Linux 支持演进（Phase 8，远期）
 
 定位：MVP 只交付 Windows Agent，但架构从第一天就跨平台。
 
 现在锁定的设计：
 
-* Agent 代码分层：协议层 / 会话层平台无关，平台层（PTY、服务宿主、凭据存储）按 OS 实现。
-* PTY 统一使用 portable-pty 抽象：Windows = ConPTY，Linux = openpty。
+* Agent 代码分层：协议层 / 会话层平台无关，平台层（PTY、服务宿主、凭据存储）按 OS 源文件 + build tag 实现。
+* PTY 平台层：Windows = ConPTY（`shell_windows.go`），Linux = openpty（未来 `shell_unix.go` build tag）。
 * 协议消息不包含 Windows 专有字段。
 * shell_type 预留 bash / zsh。
 
 Linux Agent 未来的增量工作：
 
 ```text
-平台层实现：systemd 单元、Unix 凭据存储（0600 文件或 keyring）
+平台层实现：服务单元、Unix 凭据存储（0600 文件或 keyring）
 Exec：sh -c <command>
-Tunnel 白名单：默认目标 127.0.0.1:22（SSH），按平台下发
-编译目标：x86_64-unknown-linux-gnu / aarch64
+Tunnel 白名单：target "ssh" → 127.0.0.1:22，按平台下发
+编译目标：linux/amd64 / linux/arm64（Go 交叉编译）
 ```
 
 Linux 无 RDP 概念，Remote Desktop 仅作为 Windows 节点能力。
@@ -2871,29 +2844,35 @@ Linux 无 RDP 概念，Remote Desktop 仅作为 Windows 节点能力。
 | ---- | ---- | ---- |
 | 产品定位 | 内部工具起步（≤10 用户），未来商业化 | 多用户保留，MVP 单租户 |
 | 项目命名 | XNC；CLI 为 xnc，Server 为 xnc-server，Agent 为 xnc-agent | 短名全局统一 |
-| Server 技术栈 | Go 1.26+（chi + pgx + sqlc） | 单静态二进制部署 Ubuntu，长连接网关原生并发，1 人迭代最快 |
-| Agent 技术栈 | Rust（tokio + portable-pty + windows-service） | 单文件 3-5MB 无运行时；portable-pty 统一 ConPTY / Unix PTY |
+| Server 技术栈 | Go 1.26+（chi + pgx + sqlc） | 单静态二进制容器化部署，长连接网关原生并发，1 人迭代最快 |
+| Agent 技术栈 | v1 曾选 Rust；v2 改为 Go（见文末 v2 变更） | 全栈单语言、协议单一定义，1 人团队可维护 |
 | CLI 技术栈 | Go，与 Server 同语言 | CLI 是 Server API 客户端，交叉编译单二进制 |
 | 设备认证 | Key Challenge + Ed25519 | 1 人可维护，不受 TLS 终止位置影响 |
 | 数据库 | 统一 PostgreSQL（含测试容器），无 SQLite 双轨 | 商业化方向避免中途迁移 |
 | Web 前端 | React + TypeScript + xterm.js | 生态成熟，AI 协作效率高 |
-| 客户端节奏 | CLI 与 Web 并行交付 | 共用同一套 API 与 WS 协议 |
+| 客户端节奏 | v1 曾 CLI 与 Web 并行；v2 改为 CLI 先行、Web UI 后置 Phase 7（见文末 v2 变更） | 共用同一套 API 与 WS 协议，Web 为纯消费方 |
 | 节点 shell | pwsh.exe 优先，自动降级 powershell.exe | 兼容未装 PowerShell 7 的节点 |
 | Exec 模型 | 长期进程外执行，不引入 Runspace | 与轻量 Agent 定位一致 |
-| Linux 演进 | Agent 第一天跨平台架构，MVP 只发 Windows 版 | portable-pty 已抽象双平台 PTY |
-| 部署形态 | 单台 Ubuntu 云服务器 + Caddy + 同机 PostgreSQL | 运维最简 |
+| Linux 演进 | Agent 第一天跨平台架构，MVP 只发 Windows 版 | 平台层按 OS 源文件 + build tag 隔离 |
+| 部署形态 | v1 曾为裸机二进制直装 + 同机 PG；v2 改为 Docker Compose（见文末 v2 变更） | 单台 Ubuntu 运维最简 |
 | Agent-First | CLI 机器可读（--json + 退出码契约），Skills 随发布同步交付 | 主要操作者是 AI Agent |
 | 文件传输 | 最小 upload/download 进入 MVP，独立 File WebSocket | 脚本与文件场景的前置能力 |
 | 痛点基线 | 无统一方案；合规禁穿透 / VPN / 开端口 | XNC 填补"合规 + 命令行"空档 |
 | 合规边界 | 仅出站长连接；中转 Shell/RDP 属允许范围，Server 可在公网 | 反向连接架构不变 |
 | 桌面预览 | 只读低频 JPEG（默认 1 fps），helper 进用户会话捕获 | RDP 会扰动会话状态，预览提供无扰动观察 |
 | 测试设备 | NODE_MAIN（开发机本体）+ SRV(Ubuntu 公网)；NODE2019 / NODELINUX 预留；凭据入 config.env | 真机覆盖版本线与 NAT 场景，负载用 MockAgent |
+| 协议模型（v2，2026-08） | 统一会话模型：控制连接纯 JSON；一切数据流（含 exec）走同一会话模式 | v1 五种通道三种帧规则并存、双实现漂移，不可维护 |
+| Agent 语言（v2，2026-08） | 换 Go，全栈单语言，proto/ 单一定义 | Go/Rust 双协议实现 + MockAgent 第三份镜像，1 人团队不可持续 |
+| Web UI（v2，2026-08） | 整体后置 Phase 7，CLI 先行 | 定位 Agent-First，第一版不应并行交付全套 React |
+| 部署形态（v2，2026-08） | Docker Compose：caddy + xnc-server + postgres 三容器 | compose 一键部署；E2E compose 同构保证环境一致 |
 
 ---
 
 # 62. 假设与待验证
 
-> ⚠️ 假设：Rust Agent 依赖的 portable-pty、windows-service 生态满足生产稳定性，Phase 1 原型期（Enrollment → WSS 长连 → 心跳）先行验证。推翻影响：第 5.2 节。
+> ⚠️ 假设：Go 侧 ConPTY 封装（x/sys/windows CreatePseudoConsole 或 UserExistsError/conpty）满足生产稳定性，Phase 3 验证。推翻影响：第 5.2、15 节。
+
+> ⚠️ 假设：coder/websocket 双向粘合在 RDP 流量（数 MB/s）下吞吐与延迟可接受，Phase 4 用 mstsc 实连验证。推翻影响：第 11、48 节。
 
 > ⚠️ 假设：目标节点均为 Windows 10 1809+ / Server 2019+。若存在更老节点，ConPTY 需另行降级方案。推翻影响：第 5.2、15 节。
 
@@ -2909,18 +2888,18 @@ Linux 无 RDP 概念，Remote Desktop 仅作为 Windows 节点能力。
 
 | P0 能力（对应目标） | 架构组件 | 里程碑 | 验收 |
 | ---- | ---- | ---- | ---- |
-| 注册与上线（目标 4-8） | EnrollmentManager、EnrollmentToken、ConnectionManager | Phase 1 | Scenario A |
+| 注册与上线（目标 4-8） | internal/enroll、EnrollmentToken、internal/connection | Phase 1 | Scenario A |
 | NAT 穿透（核心原则） | 反向 WSS 连接 | Phase 1 | Scenario B |
-| 一次性 Exec（目标 9） | ExecManager、EXEC_* 消息 | Phase 2 | Scenario C |
-| 交互式 Shell（目标 10） | ShellManager、ConPTY、binary frame | Phase 3 | Scenario D |
-| Remote Desktop（目标 11） | TunnelManager、Tunnel Gateway、mstsc | Phase 4 | Scenario E |
+| 一次性 Exec（目标 9） | internal/session/exec、SESSION_OPEN + EXEC_RESULT 会话词汇 | Phase 2 | Scenario C |
+| 交互式 Shell（目标 10） | internal/session/shell、ConPTY、会话 WS binary VT 流 | Phase 3 | Scenario D |
+| Remote Desktop（目标 11） | internal/session/tunnel、统一会话管理器、mstsc | Phase 4 | Scenario E |
 | 权限检查（目标 12） | ClusterMember、SessionToken | Phase 5 | Scenario F |
 | 审计日志（目标 13） | AuditLog | Phase 5 | 随 Scenario F 验证 |
 | 断线恢复（目标 7） | Heartbeat、指数退避重连 | Phase 1 | Scenario G |
-| 脚本执行（目标 15） | ExecManager（script payload）、临时文件生命周期 | Phase 2 | Scenario H |
-| 文件传输（目标 14） | FileManager、File WebSocket、sha256 校验 | Phase 4 | Scenario H |
-| Agent 调用体验（目标 16） | xnc CLI（--json、退出码）+ skills/xnc | Phase 1-4 随功能交付 | CLI golden 测试 |
-| 桌面预览（目标 17） | ScreenManager、session helper、Screen WebSocket | Phase 6 | Phase 6 验收场景（第 53 节） |
+| 脚本执行（目标 15） | internal/session/exec（script 参数）、临时文件生命周期 | Phase 2 | Scenario H |
+| 文件传输（目标 14） | internal/session/file、会话 WS、sha256 校验 | Phase 4 | Scenario H |
+| Agent 调用体验（目标 16） | xnc CLI（--json、退出码）+ skills/xnc | Phase 1-6 随功能交付 | CLI golden 测试 |
+| 桌面预览（目标 17） | internal/session/screen、session helper、会话 WS | Phase 6 | Phase 6 验收场景（第 53 节） |
 
 每条 P0 目标均有架构组件、里程碑与验收场景对应，无悬空项。
 
@@ -2953,14 +2932,14 @@ RDP 连接本身会改变会话状态：
 Agent 是 Session 0 服务，无法直接访问用户桌面（Session 1+）：
 
 ```text
-ScreenManager (service, session 0)
+screen 会话引擎 internal/session/screen (service, session 0)
    │ WTSQueryUserToken + CreateProcessAsUser
    ▼
 xnc-screen-helper.exe (user console session)
    │ GDI BitBlt → 缩放 → JPEG
    ▼ named pipe
-ScreenManager
-   ▼ Screen WebSocket（JPEG binary frame）
+screen 会话引擎
+   ▼ 会话 WS（JPEG binary frame）
 Server（纯转发，不解析不落盘）
    ▼
 Web 预览面板 / xnc screen --snapshot
@@ -2980,21 +2959,20 @@ capturing     正常出帧
 
 ## 协议
 
-控制连接：SCREEN_OPEN / SCREEN_OPENED / SCREEN_CLOSE。
-
-Screen WebSocket（复用 File/Tunnel 会话模式，短期 token）：
+screen 会话（统一会话模型的一种 kind，Phase 6 交付、协议现在锁定；建立流程见第 11.2 节）：
 
 ```text
-text    SCREEN_BEGIN {width, height, state}
-text    SCREEN_STATE {state}        # 状态变化
-binary  单帧完整 JPEG               # WS message 即一帧
+SESSION_OPEN params: {fps=1, quality=60, maxWidth=1280}
+text frame:   SCREEN_BEGIN {width, height, state}
+text frame:   SCREEN_STATE {state}            capturing / locked / no_session
+binary frame: 单帧完整 JPEG（WS message 即一帧）
 ```
 
 REST：
 
 ```text
 POST /api/nodes/{id}/screen    {fps?, quality?, maxWidth?}
-→ {sessionId, token, expiresAt, websocketUrl}
+→ 202 {sessionId, token, expiresAt, websocketUrl}
 ```
 
 ## 权限与隐私

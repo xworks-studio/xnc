@@ -1,0 +1,9 @@
+services:
+  xnc-server:
+    # Loopback-only: the dev stack's plaintext JWT channel must not be
+    # reachable from other hosts.
+    ports: ["127.0.0.1:8080:8080"]
+    environment:
+      XNC_HEARTBEAT_TIMEOUT: 10s
+  caddy:
+    profiles: ["never"]

@@ -1,0 +1,9 @@
+go 1.26
+
+use (
+	./agent
+	./cli
+	./mockagent
+	./proto
+	./server
+)

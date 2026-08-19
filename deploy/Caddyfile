@@ -1,0 +1,5 @@
+{$XNC_DOMAIN} {
+	reverse_proxy xnc-server:8080 {
+		flush_interval -1
+	}
+}
