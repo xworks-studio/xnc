@@ -1,0 +1,16 @@
+# 凭据与环境（严禁入库）
+config.env
+*.pem
+*.key
+.env.*
+
+# 构建产物
+bin/
+dist/
+target/
+node_modules/
+
+# IDE / 系统
+.idea/
+.vscode/
+*.log
