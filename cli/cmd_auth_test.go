@@ -74,6 +74,23 @@ func TestAPIErrorEnvelopeAndExitCodes(t *testing.T) {
 }
 
 func TestUsageErrors(t *testing.T) {
+	// Isolate the home dir: a developer's real ~/.xnc/config.json (written by
+	// xnc login or an E2E run) would give node list a server+token, turning
+	// these usage errors into network dials (exit 245/0) instead of exit 2.
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir) // os.UserHomeDir fallback on unix
+
+	// Covering guard: a config with a server (but no token) in the isolated
+	// home must still yield usage exit 2 (missing token, never a dial). If the
+	// isolation above regresses, the real home's full config is read instead
+	// and this test goes red on any machine that has logged in.
+	err := os.MkdirAll(filepath.Join(dir, ".xnc"), 0o700)
+	require.NoError(t, err)
+	err = os.WriteFile(filepath.Join(dir, ".xnc", "config.json"),
+		[]byte(`{"server": "http://127.0.0.1:1"}`), 0o600)
+	require.NoError(t, err)
+
 	// Missing server is a usage error (exit 2), not an API error.
 	_, code := captureStdout(t, func() int {
 		return runCLI(t.Context(), []string{"node", "list"})
