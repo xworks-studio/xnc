@@ -12,6 +12,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"xnc/server/internal/auth"
 	"xnc/server/internal/bootstrap"
 	"xnc/server/internal/config"
 	"xnc/server/internal/db"
@@ -44,6 +45,20 @@ func NewTestEnv(t *testing.T) *TestEnv {
 		Router: h, srv: srv, Store: st, Cfg: cfg,
 		nodes: map[string]ed25519.PrivateKey{},
 	}
+}
+
+func (e *TestEnv) AdminToken(t *testing.T) string {
+	t.Helper()
+	tok, err := auth.MakeToken(e.Cfg.JWTSecret, e.adminID(t), time.Hour)
+	require.NoError(t, err)
+	return tok
+}
+
+func (e *TestEnv) adminID(t *testing.T) string {
+	t.Helper()
+	u, err := e.Store.Q().GetUserByEmail(context.Background(), e.Cfg.AdminEmail)
+	require.NoError(t, err)
+	return u.ID.String()
 }
 
 func decodeJSON(r io.Reader, v any) error {

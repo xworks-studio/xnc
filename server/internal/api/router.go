@@ -32,5 +32,11 @@ func NewRouter(st *db.Store, cfg config.Config, reg *registry.Registry) http.Han
 			g.Get("/me", h.me)
 		})
 	})
+
+	r.Route("/api/clusters", func(cr chi.Router) {
+		cr.Use(auth.Middleware(cfg.JWTSecret, st))
+		cr.Get("/", h.listClusters)
+		cr.Post("/", h.createCluster)
+	})
 	return r
 }
