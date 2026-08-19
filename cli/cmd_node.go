@@ -1,9 +1,12 @@
 package main
 
 import (
+	"fmt"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -92,7 +95,8 @@ var uuidRe = regexp.MustCompile(
 	`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 // resolveNode: UUIDs pass through; other args are matched against node names
-// via the list endpoint, erroring with candidates when ambiguous.
+// via the list endpoint. Ambiguous names error with the candidates listed
+// (sorted by cluster then id) so callers need no extra node-list round trip.
 func resolveNode(cl *Client, arg string) (string, *proto.APIError) {
 	if uuidRe.MatchString(arg) {
 		return arg, nil
@@ -101,21 +105,31 @@ func resolveNode(cl *Client, arg string) (string, *proto.APIError) {
 	if e != nil {
 		return "", e
 	}
-	var matches []string
+	var matches []nodeDTO
 	for _, n := range nodes {
 		if n.Name == arg {
-			matches = append(matches, n.ID)
+			matches = append(matches, n)
 		}
 	}
 	switch len(matches) {
 	case 1:
-		return matches[0], nil
+		return matches[0].ID, nil
 	case 0:
 		return "", proto.Err(404, proto.CodeNodeNotFound, "no node named "+arg)
-	default:
-		return "", proto.Err(404, proto.CodeNodeNotFound,
-			"ambiguous node name "+arg+" matches "+strconv.Itoa(len(matches))+" nodes; use a UUID")
 	}
+	sort.Slice(matches, func(i, j int) bool {
+		if matches[i].Cluster != matches[j].Cluster {
+			return matches[i].Cluster < matches[j].Cluster
+		}
+		return matches[i].ID < matches[j].ID
+	})
+	cands := make([]string, len(matches))
+	for i, m := range matches {
+		cands[i] = fmt.Sprintf("%s (%s, %s)", m.Name, m.Cluster, m.ID)
+	}
+	return "", proto.Err(404, proto.CodeNodeNotFound,
+		"ambiguous node "+strconv.Quote(arg)+": "+strings.Join(cands, ", ")+
+			"; use a UUID or cluster/name")
 }
 
 func newNodeShowCmd() *cobra.Command {
