@@ -221,7 +221,7 @@ Agent 与 Server / CLI 同为 Go，协议定义共享仓库根 `proto/` 包（�
 
 | 用途 | 选型 | 备注 |
 | ---- | ---- | ---- |
-| ConPTY | `x/sys/windows` CreatePseudoConsole 直接封装（约 200 行）或 `UserExistsError/conpty` | Phase 1 原型验证二选一 |
+| ConPTY | `x/sys/windows` CreatePseudoConsole 直接封装（约 200 行）或 `UserExistsError/conpty` | Phase 3 前置 spike 验证二选一（Gate B） |
 | Windows 服务 | `golang.org/x/sys/windows/svc` | Go 官方扩展库 |
 | WebSocket | `coder/websocket` | 与 server 同库 |
 | 设备身份 | 标准库 `crypto/ed25519` | |
@@ -797,7 +797,7 @@ v1 的自定义二进制帧头（1 字节类型 + 16 字节会话 ID）删除—
 
 * `kind ∈ {exec, shell, file, screen, tunnel}`。
 * `SESSION_OPEN` / `SESSION_REFUSED` / `SESSION_CLOSE` 为会话管理消息，**Phase 2 起随第一个会话 kind（exec）启用**；Phase 1 只有前 5 个消息 + ERROR。
-* 会话面 text 帧词汇按 kind 定义：exec 1 个 / shell 3 个（含通用 ERROR）/ file 3 个 / screen 2 个 / tunnel 0 个，合计 9 个，且每个只在所属通道出现。
+* 会话面 text 帧词汇按 kind 定义：exec 1 个 / shell 3 个（SHELL_BEGIN / SHELL_RESIZE / 通用 ERROR，见第 15 节）/ file 3 个 / screen 2 个 / tunnel 0 个，合计 9 个，且每个只在所属通道出现。
 
 ---
 
@@ -917,9 +917,22 @@ Shell 会话建立：
 ```text
 POST /api/nodes/{id}/shell
 → 202 {sessionId, token, expiresAt, websocketUrl}
-
-SESSION_OPEN params: {cols, rows, shell?}
 ```
+
+会话词汇（shell 会话 WS 内，text = 控制，binary = 数据；统一帧规则见第 11.4 节）：
+
+```text
+SESSION_OPEN params: {cols, rows, shell?}       shell 缺省按探测结果
+text frame:   SHELL_BEGIN {shell}               实际 shell（pwsh / windows-powershell）
+text frame:   SHELL_RESIZE {cols, rows}         client → agent（详见第 18 节）
+text frame:   ERROR {code: SHELL_START_FAILED}  创建失败，随后关连接
+binary frame: 原始 VT 字节，双向，不区分方向（连接方向即语义）
+```
+
+说明：
+
+* `SHELL_BEGIN` 由 agent 在会话建立后首发，告知实际使用的 shell——请求省略 `shell` 或发生降级时，实际 shell 可能与客户端预期不同。
+* ConPTY / shell 创建失败：agent 发 `ERROR {code: SHELL_START_FAILED}` 后关闭会话连接（错误码定义见第 51 节）。
 
 `shell` 字段可省略，缺省由 Agent 按探测结果决定：
 
