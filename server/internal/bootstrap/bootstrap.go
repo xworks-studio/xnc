@@ -29,20 +29,29 @@ func EnsureAdmin(ctx context.Context, st *db.Store, cfg config.Config) error {
 	if err != nil {
 		return err
 	}
-	u, err := st.Q().CreateUser(ctx, sqlc.CreateUserParams{
+	// 三条写入同事务：任一失败整体回滚，保证零用户短路前不留半成品（幂等恢复）。
+	tx, err := st.Pool().Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) // 提交后为无害空操作
+	u, err := st.Q().WithTx(tx).CreateUser(ctx, sqlc.CreateUserParams{
 		ID: uuid.New(), Email: cfg.AdminEmail, DisplayName: "Admin", PasswordHash: hash,
 	})
 	if err != nil {
 		return err
 	}
-	if _, err := st.Pool().Exec(ctx,
+	if _, err := tx.Exec(ctx,
 		`INSERT INTO clusters(id, name, owner_id) VALUES($1,'default',$2)`,
 		uuid.New(), u.ID); err != nil {
 		return err
 	}
-	if _, err := st.Pool().Exec(ctx,
+	if _, err := tx.Exec(ctx,
 		`INSERT INTO cluster_members(cluster_id, user_id, role)
 		 SELECT id, $1, 'owner' FROM clusters WHERE name='default'`, u.ID); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
 	slog.Info("bootstrap admin created", "email", cfg.AdminEmail)
