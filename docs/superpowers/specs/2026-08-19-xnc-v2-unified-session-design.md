@@ -24,7 +24,8 @@
 | Agent 语言 | Rust（tokio + portable-pty） | **Go**（全栈单语言，协议单一定义） |
 | Web UI | 与 CLI 从 Phase 1 并行交付 | **整体后置 Phase 7**，CLI 先行 |
 | 功能范围 | Phase 1-6 | **只重排不砍**，Web UI 独立成相 |
-| 合规模型 / 数据模型 / 认证 / DB / 部署 / CLI 契约 | — | **全部不变**（见第 8 节） |
+| 部署形态 | 二进制 systemd 托管 + PG 同机安装/容器 | **Docker Compose**：caddy + xnc-server + postgres 三容器（见 §4.5） |
+| 合规模型 / 数据模型 / 认证 / DB / CLI 契约 | — | **全部不变**（见第 8 节） |
 
 ## 1.3 顺带修复的 v1 正确性隐患
 
@@ -239,6 +240,7 @@ xnc/
 ├── agent/                  xnc-agent：Windows Service + 会话引擎
 ├── cli/                    xnc：与 Server 同语言（本就 Go，不变）
 ├── mockagent/              测试替身：import agent 核心包 + 内存传输
+├── deploy/                 Docker Compose 生产栈：compose + Caddyfile + .env.example
 └── web/                    React（Phase 7 动工，目录预留）
 ```
 
@@ -277,6 +279,28 @@ agent/
 ## 4.4 Server 变化
 
 架构角色不变（REST / 控制面网关 / 会话粘合 / PostgreSQL）。唯一实质变化：v1 的 Session Router + Tunnel Gateway + File/Screen 各自的连接管理**合并为一个统一会话管理器**（一个类型、五种 kind 参数化）。控制面网关变薄为纯 JSON 转发 + 心跳。内存态 `map[NodeID]AgentConn` + `map[SessionID]Session` 不变，单实例约束不变。
+
+## 4.5 部署（Docker Compose）
+
+部署产物为 `deploy/` 下的一套 compose 栈，单台 Ubuntu 云服务器 `docker compose up -d` 即完成部署：
+
+```text
+deploy/
+├── docker-compose.yml     caddy + xnc-server + postgres 三容器
+├── Caddyfile              :443 TLS termination，Let's Encrypt 自动签发
+└── .env.example           域名 / PG 凭据 / Bootstrap Admin 环境变量
+
+Internet → :443 Caddy(容器) → xnc-server(容器) → PostgreSQL(容器)
+```
+
+要求：
+
+- xnc-server 镜像：多阶段构建，distroless/static 基底（Go 静态二进制），CI 构建推送。
+- Caddy 对 WSS 的透传：WebSocket Upgrade 自动处理；tunnel / screen 等流式路径配置 `flush_interval -1` 禁用响应缓冲，保证转发低延迟。
+- 长连接：代理层不得设低于心跳判定窗口的 idle 超时（在线判定 90s，代理 idle timeout 需大于 90s 或禁用）。
+- PostgreSQL 数据卷持久化；全部凭据经 `.env` 注入，不入库。
+- 单实例约束不变：一套 compose 栈即单实例。
+- E2E 测试的 docker-compose 与本生产栈同构（仅追加 mockagent / cli 服务），开发与生产环境一致性由同一配方保证。
 
 ---
 
@@ -337,7 +361,7 @@ Node Connectivity = outbound HTTPS/WSS only
 认证模型      Enrollment Token（一次性）→ Ed25519 设备挑战；JWT + bcrypt；不用 mTLS
 数据模型      User / Cluster / ClusterMember / Node / EnrollmentToken / AuditLog 不变
 数据库        PostgreSQL（含 testcontainers），不引入 SQLite
-部署          单台 Ubuntu + Caddy + 同机 PostgreSQL；单实例约束
+部署          单台 Ubuntu + Docker Compose（caddy + xnc-server + postgres 三容器）；单实例约束
 CLI 契约      命令树、--json envelope、退出码表、错误码表不变（skills/xnc 文档零改动）
 Node 选择器    唯一名 / cluster/name / UUID / --cluster，歧义报错
 桌面预览技术  helper + named pipe + GDI 不变，仅 Phase 后移
@@ -354,6 +378,7 @@ Exec 模型     进程外 pwsh 子进程，不引入 Runspace
 
 | spec.md 章节 | 处理 |
 | ---- | ---- |
+| §5.1 部署产物 | systemd 二进制 → 容器镜像 + compose 栈（本设计 §4.5） |
 | §5.2 Agent 技术栈 | 重写为 Go 选型（本设计 §4.3） |
 | §5.3 Client | Web UI 后置说明，CLI 不变 |
 | §11 Control Protocol | 重写为控制连接纯 JSON（本设计 §2.1、§3.1） |
@@ -364,6 +389,7 @@ Exec 模型     进程外 pwsh 子进程，不引入 Runspace
 | §27 REST API | 统一返回结构（本设计 §3.4） |
 | §30-35 Agent 内部模块 | 替换为 Go 结构（本设计 §4.2） |
 | §42-50 | 原则不变，仅引用改为统一会话管理器；错误码表按 §3.5 微调 |
+| §46 部署 | 重写为 Docker Compose 栈（本设计 §4.5） |
 | §52 MVP 页面 | 移至 Phase 7 |
 | §53 开发顺序 | 替换为本设计 §6 |
 | §58 场景数据流 | 通道描述按会话模式重写，语义不变 |
