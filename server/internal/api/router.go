@@ -44,5 +44,11 @@ func NewRouter(st *db.Store, cfg config.Config, reg *registry.Registry) http.Han
 		tr.Post("/", h.createEnrollToken)
 	})
 	r.Post("/api/agent/enroll", h.agentEnroll)
+	r.Get("/api/agent/connect", h.agentConnect)
+	r.Route("/api/nodes", func(nr chi.Router) {
+		nr.Use(auth.Middleware(cfg.JWTSecret, st))
+		nr.Get("/", h.listNodes)
+		nr.Get("/{id}", h.getNode)
+	})
 	return r
 }

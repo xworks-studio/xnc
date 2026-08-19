@@ -3,10 +3,13 @@ package api
 import (
 	"context"
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -69,4 +72,81 @@ func decodeJSON(r io.Reader, v any) error {
 		return err
 	}
 	return json.Unmarshal(b, v)
+}
+
+type enrolledNode struct {
+	ID   string
+	Priv ed25519.PrivateKey
+}
+
+// EnrollNode 生成新密钥对并走真实 enroll 端点注册节点，返回 nodeID（私钥存入 e.nodes）。
+func (e *TestEnv) EnrollNode(t *testing.T, hostname, machineID string) string {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	tok := e.CreateEnrollToken(t)
+	body := fmt.Sprintf(`{"token":%q,"hostname":%q,"machineId":%q,
+		"osVersion":"Windows","agentVersion":"0.1.0","publicKey":%q}`,
+		tok, hostname, machineID, base64.StdEncoding.EncodeToString(pub))
+	resp, err := http.Post(e.srv.URL+"/api/agent/enroll", "application/json",
+		strings.NewReader(body))
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, 201, resp.StatusCode)
+	var out struct {
+		NodeID string `json:"nodeId"`
+	}
+	require.NoError(t, decodeJSON(resp.Body, &out))
+	e.nodes[out.NodeID] = priv
+	return out.NodeID
+}
+
+func (e *TestEnv) CreateEnrollToken(t *testing.T) string {
+	t.Helper()
+	req, _ := http.NewRequest("POST", e.srv.URL+"/api/clusters/default/enrollment-tokens",
+		strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer "+e.AdminToken(t))
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, 201, resp.StatusCode)
+	var out struct {
+		Token string `json:"token"`
+	}
+	require.NoError(t, decodeJSON(resp.Body, &out))
+	return out.Token
+}
+
+func (e *TestEnv) Priv(t *testing.T, nodeID string) ed25519.PrivateKey {
+	t.Helper()
+	return e.nodes[nodeID]
+}
+
+func (e *TestEnv) listNodes(t *testing.T, withToken bool) ([]map[string]any, int) {
+	t.Helper()
+	req, _ := http.NewRequest("GET", e.srv.URL+"/api/nodes", nil)
+	if withToken {
+		req.Header.Set("Authorization", "Bearer "+e.AdminToken(t))
+	}
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, resp.StatusCode
+	}
+	var out []map[string]any
+	require.NoError(t, decodeJSON(resp.Body, &out))
+	return out, 200
+}
+
+func (e *TestEnv) ListNodes(t *testing.T) []map[string]any {
+	t.Helper()
+	nodes, code := e.listNodes(t, true)
+	require.Equal(t, 200, code)
+	return nodes
+}
+
+func (e *TestEnv) ListNodesStatus(t *testing.T, _ string) ([]map[string]any, int) {
+	t.Helper()
+	return e.listNodes(t, false)
 }
