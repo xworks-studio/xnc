@@ -1,2 +1,2 @@
-// Package cli is part of XNC v2.
-package cli
+// Command xnc is the XNC v2 command line interface.
+package main
