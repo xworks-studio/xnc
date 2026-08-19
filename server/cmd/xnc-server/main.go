@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"xnc/server/internal/api"
+	"xnc/server/internal/bootstrap"
 	"xnc/server/internal/config"
 	"xnc/server/internal/db"
 	"xnc/server/internal/registry"
@@ -43,6 +44,11 @@ func main() {
 		os.Exit(1)
 	}
 	defer st.Close()
+
+	if err := bootstrap.EnsureAdmin(ctx, st, cfg); err != nil {
+		slog.Error("bootstrap", "err", err)
+		os.Exit(1)
+	}
 
 	reg := registry.New()
 	h := api.NewRouter(st, cfg, reg)

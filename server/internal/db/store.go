@@ -6,6 +6,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"xnc/server/internal/config"
+	"xnc/server/internal/db/sqlc"
 )
 
 type Store struct {
@@ -30,5 +31,8 @@ func OpenStore(ctx context.Context, cfg config.Config) (*Store, error) {
 }
 
 func (s *Store) Pool() *pgxpool.Pool { return s.pool }
+
+// Q 返回基于连接池的 sqlc 查询对象。
+func (s *Store) Q() *sqlc.Queries { return sqlc.New(s.pool) }
 
 func (s *Store) Close() { s.pool.Close() }
