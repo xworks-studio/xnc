@@ -267,7 +267,7 @@ agent/
 
 | 用途 | 选型 | 备注 |
 | ---- | ---- | ---- |
-| ConPTY | `x/sys/windows` CreatePseudoConsole 直接封装（约 200 行）或 `UserExistsError/conpty` | Phase 1 原型验证二选一 |
+| ConPTY | `x/sys/windows` CreatePseudoConsole 直接封装（约 200 行）或 `UserExistsError/conpty` | Phase 3 前置 spike 验证二选一（roadmap Gate B） |
 | Windows 服务 | `golang.org/x/sys/windows/svc` | Go 官方扩展库 |
 | WebSocket | `coder/websocket` | 与 server 同库 |
 | 设备身份 | 标准库 `crypto/ed25519` | |
@@ -382,7 +382,7 @@ Exec 模型     进程外 pwsh 子进程，不引入 Runspace
 | §5.2 Agent 技术栈 | 重写为 Go 选型（本设计 §4.3） |
 | §5.3 Client | Web UI 后置说明，CLI 不变 |
 | §11 Control Protocol | 重写为控制连接纯 JSON（本设计 §2.1、§3.1） |
-| §12 Agent 消息类型 | 替换为 9 个控制面消息（本设计 §3.1） |
+| §12 Agent 消息类型 | 替换为 10 个控制面消息（本设计 §3.1） |
 | §14 Exec | 重写为会话模式（本设计 §3.2 exec） |
 | §16 Shell Input 的 binary 帧头 | 删除；shell 会话 WS binary（本设计 §3.2 shell） |
 | §23-26 Tunnel | 重写为统一会话 + target 枚举（本设计 §3.2 tunnel） |
@@ -404,7 +404,7 @@ Exec 模型     进程外 pwsh 子进程，不引入 Runspace
 
 # 10. 风险与待验证
 
-> ⚠️ 假设：Go 侧 ConPTY 封装（x/sys/windows CreatePseudoConsole 或 UserExistsError/conpty）满足生产稳定性。Phase 1 原型期（enrollment → 控制连接 → 心跳 → 一个 exec 会话）先行验证。推翻影响：§4.2/§4.3。
+> ⚠️ 假设：Go 侧 ConPTY 封装（x/sys/windows CreatePseudoConsole 或 UserExistsError/conpty）满足生产稳定性。Phase 3 前置 spike（roadmap Gate B）先行验证。推翻影响：§4.2/§4.3。
 
 > ⚠️ 假设：coder/websocket 双向粘合在 RDP 流量（数 MB/s）下吞吐与延迟可接受。Phase 4 用 mstsc 实连验证。推翻影响：§2.2/§4.4。
 
