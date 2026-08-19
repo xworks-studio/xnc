@@ -96,6 +96,35 @@ func TestClientConnectHeartbeat(t *testing.T) {
 	}
 }
 
+// TestRunOnce（Task 12）：单次生命周期——握手（dial → 认证 → HELLO_ACK）
+// 成功即正常关闭并返回 nil，不进入心跳循环。
+func TestRunOnce(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	helloOK := make(chan struct{}, 1)
+	beats := make(chan int, 8)
+	srv := fakeServer(t, pub, helloOK, beats)
+	defer srv.Close()
+
+	k := &identity.Key{NodeID: "node-x", Priv: priv}
+	c := NewClient("ws"+srv.URL[4:], k, machineinfo.Info{})
+	c.Beat = 50 * time.Millisecond
+
+	done := make(chan error, 1)
+	go func() { done <- c.RunOnce(context.Background()) }()
+
+	select {
+	case <-helloOK:
+	case <-time.After(3 * time.Second):
+		t.Fatal("no HELLO_ACK")
+	}
+	select {
+	case err := <-done:
+		assert.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("RunOnce did not return after HELLO_ACK")
+	}
+}
+
 // --- Fix round 1: drain reader, backoff reset, error diagnostics ---
 
 // challenge 完成挑战-应答（复用 fakeServer 的流程），写 HELLO_ACK 后返回写帧助手。

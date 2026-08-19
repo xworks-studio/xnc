@@ -62,45 +62,76 @@ func (c *Client) Run(ctx context.Context) error {
 	}
 }
 
-// once 完成一次完整连接生命周期：dial → CHALLENGE → CHALLENGE_RESPONSE → HELLO
-// → HELLO_ACK → 心跳循环，出错返回（由 Run 重连）。
-func (c *Client) once(ctx context.Context) error {
-	url := wsURL(c.ServerURL) + "/api/agent/connect"
-	ws, _, err := websocket.Dial(ctx, url, nil)
+// RunOnce 完成一次 dial → 认证 → HELLO_ACK，随即以正常关闭码收线并返回 nil。
+// 供 E2E/load（mockagent --once）验证注册+认证+连接就绪后即刻退出；
+// 不维持心跳，offline 判定由 E2E kill 进程实现。
+func (c *Client) RunOnce(ctx context.Context) error {
+	ws, err := c.handshake(ctx)
 	if err != nil {
 		return err
 	}
-	defer ws.CloseNow()
+	// 正常关闭握手；对端即时 CloseNow 亦算成功（认证已达成本次目标），
+	// 关闭帧交互的残余错误不作为失败上报，CloseNow 兜底回收。
+	_ = ws.Close(websocket.StatusNormalClosure, "once")
+	ws.CloseNow()
+	return nil
+}
+
+// handshake 拨号并完成认证：dial → CHALLENGE → CHALLENGE_RESPONSE → HELLO →
+// HELLO_ACK。成功返回就绪连接（调用方负责关闭）；任何失败路径连接已关闭。
+func (c *Client) handshake(ctx context.Context) (*websocket.Conn, error) {
+	ws, _, err := websocket.Dial(ctx, wsURL(c.ServerURL)+"/api/agent/connect", nil)
+	if err != nil {
+		return nil, err
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			ws.CloseNow()
+		}
+	}()
 
 	// CHALLENGE
 	m, err := readMsg(ctx, ws, 30*time.Second)
 	if err != nil {
-		return fmt.Errorf("read challenge: %w", err)
+		return nil, fmt.Errorf("read challenge: %w", err)
 	}
 	if m.Type != proto.TypeChallenge {
-		return fmt.Errorf("expected CHALLENGE, got %q", m.Type)
+		return nil, fmt.Errorf("expected CHALLENGE, got %q", m.Type)
 	}
 	var ch proto.Challenge
 	if err := m.Decode(&ch); err != nil {
-		return err
+		return nil, err
 	}
 	if err := writeMsg(ctx, ws, proto.TypeChallengeResponse, proto.ChallengeResponse{
 		NodeID: c.Key.NodeID, Signature: c.Key.Sign([]byte(ch.Nonce))}); err != nil {
-		return err
+		return nil, err
 	}
 	if err := writeMsg(ctx, ws, proto.TypeHello, proto.Hello{
 		NodeID: c.Key.NodeID, Hostname: c.Info.Hostname,
 		AgentVersion: c.Info.AgentVersion, ShellType: c.Info.ShellType}); err != nil {
-		return err
+		return nil, err
 	}
 	m, err = readMsg(ctx, ws, 30*time.Second)
 	if err != nil {
-		return fmt.Errorf("read HELLO_ACK: %w", err)
+		return nil, fmt.Errorf("read HELLO_ACK: %w", err)
 	}
 	if m.Type != proto.TypeHelloAck {
-		return fmt.Errorf("auth rejected: expected HELLO_ACK, got %q", m.Type)
+		return nil, fmt.Errorf("auth rejected: expected HELLO_ACK, got %q", m.Type)
 	}
 	c.Log.Info("control connection ready", "node", c.Key.NodeID)
+	ok = true
+	return ws, nil
+}
+
+// once 完成一次完整连接生命周期：dial → CHALLENGE → CHALLENGE_RESPONSE → HELLO
+// → HELLO_ACK → 心跳循环，出错返回（由 Run 重连）。
+func (c *Client) once(ctx context.Context) error {
+	ws, err := c.handshake(ctx)
+	if err != nil {
+		return err
+	}
+	defer ws.CloseNow()
 
 	// 泄读循环：消费 HEARTBEAT_ACK 等入站帧。不读的话 ACK 积压（~39B/30s）
 	// 会撑满接收窗口（~64KB ≈ 14h），服务器写超时掐线 → 节点周期性 offline
