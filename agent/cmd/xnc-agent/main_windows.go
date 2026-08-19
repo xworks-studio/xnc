@@ -3,7 +3,6 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 
@@ -20,17 +19,24 @@ func runAgent(server, token, stateDir string) error {
 	return a.Run(cmdContext())
 }
 
-// installService 以当前可执行文件安装 XNCAgent 服务，服务参数携带 run 及其旗标。
+// installService 以当前可执行文件安装 XNCAgent 服务。
+// 服务参数必须逐词传递：CreateService 对每个元素单独做 EscapeArg，
+// 任何含空格的整串（以及含空格的 --state-dir 路径）才能被正确引用。
 func installService(server, token, stateDir string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	args := fmt.Sprintf("run --server=%s --state-dir=%s", server, stateDir)
+	return svcapp.Install(exe, buildServiceArgs(server, token, stateDir)...)
+}
+
+// buildServiceArgs 构造服务命令行参数，每个旗标一个独立 argv 元素。
+func buildServiceArgs(server, token, stateDir string) []string {
+	args := []string{"run", "--server=" + server, "--state-dir=" + stateDir}
 	if token != "" {
-		args += " --token=" + token
+		args = append(args, "--token="+token)
 	}
-	return svcapp.Install(exe, args)
+	return args
 }
 
 func uninstallService() error { return svcapp.Uninstall() }

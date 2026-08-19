@@ -60,8 +60,11 @@ func IsService() bool {
 // Run 将 agent 交给 SCM 调度（服务模式入口，阻塞直至服务停止）。
 func Run(a *agent.Agent) error { return svc.Run(ServiceName, &handler{A: a}) }
 
-// Install 创建 XNCAgent 服务（Automatic）、传入 args 作为命令行参数并立即启动。
-func Install(exePath, args string) error {
+// Install 创建 XNCAgent 服务（Automatic）并立即启动。
+// args 的每个元素必须是独立的 argv 词（如 "run"、"--server=…"）：
+// x/sys 对各元素分别做 syscall.EscapeArg 引用处理，拼好的整串会被
+// 整体加引号成一个 argv 词，导致服务启动后 cobra 解析失败。
+func Install(exePath string, args ...string) error {
 	m, err := mgr.Connect()
 	if err != nil {
 		return err
@@ -75,7 +78,7 @@ func Install(exePath, args string) error {
 		StartType:   mgr.StartAutomatic,
 		DisplayName: "XNC Agent",
 		Description: "XNC node agent (outbound control connection)",
-	}, args)
+	}, args...)
 	if err != nil {
 		return err
 	}
