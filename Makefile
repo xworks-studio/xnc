@@ -15,3 +15,7 @@ dev-up:
 	cd deploy && docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 dev-down:
 	cd deploy && docker compose -f docker-compose.yml -f docker-compose.dev.yml down -v
+
+.PHONY: e2e
+e2e:
+	bash scripts/e2e_phase1.sh
