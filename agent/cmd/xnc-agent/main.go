@@ -1,0 +1,60 @@
+// xnc-agent：XNC 节点代理宿主 CLI。
+// 命令树在本文件定义（跨平台共用）；Windows 专属的服务宿主逻辑
+// 隔离在 main_windows.go / main_other.go 的平台钩子中。
+package main
+
+import (
+	"context"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/spf13/cobra"
+)
+
+func main() {
+	var server, token, stateDir string
+	root := &cobra.Command{
+		Use:          "xnc-agent",
+		Short:        "XNC Windows node agent",
+		SilenceUsage: true,
+	}
+	run := &cobra.Command{
+		Use:   "run",
+		Short: "run the agent (foreground debug entry; service mode when launched by the SCM)",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return runAgent(server, token, stateDir)
+		},
+	}
+	install := &cobra.Command{
+		Use:   "install",
+		Short: "install and start the XNCAgent Windows service",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return installService(server, token, stateDir)
+		},
+	}
+	uninstall := &cobra.Command{
+		Use:   "uninstall",
+		Short: "stop and remove the XNCAgent Windows service",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return uninstallService()
+		},
+	}
+	for _, c := range []*cobra.Command{run, install} {
+		c.Flags().StringVar(&server, "server", "", "control server URL (required)")
+		c.Flags().StringVar(&token, "token", "", "enrollment token (first run)")
+		c.Flags().StringVar(&stateDir, "state-dir", defaultStateDir(), "state directory")
+		_ = c.MarkFlagRequired("server")
+	}
+	root.AddCommand(run, install, uninstall)
+	if err := root.Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+// cmdContext 将 Ctrl+C / SIGTERM 转为 ctx 取消（前台调试模式用）。
+func cmdContext() context.Context {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	_ = stop // 进程随 main 退出，无需显式释放
+	return ctx
+}
