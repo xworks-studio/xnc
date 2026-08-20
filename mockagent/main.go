@@ -101,6 +101,8 @@ func runOne(ctx context.Context, server, token, dir string, i int, beat, disc ti
 		engine := session.NewEngine(log, sendControl)
 		engine.Register(proto.KindExec, session.NewExec(log))
 		engine.Register(proto.KindShell, session.NewShell(log))
+		engine.Register(proto.KindFile, session.NewFile(log))
+		engine.Register(proto.KindTunnel, session.NewTunnel(log))
 		c.Handler = engine
 	}
 

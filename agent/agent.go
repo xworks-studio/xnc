@@ -56,6 +56,8 @@ func (a *Agent) Run(ctx context.Context) error {
 		engine := session.NewEngine(slog.Default(), sendControl)
 		engine.Register(proto.KindExec, session.NewExec(slog.Default()))
 		engine.Register(proto.KindShell, session.NewShell(slog.Default()))
+		engine.Register(proto.KindFile, session.NewFile(slog.Default()))
+		engine.Register(proto.KindTunnel, session.NewTunnel(slog.Default()))
 		c.Handler = engine
 	}
 	return c.Run(ctx)
