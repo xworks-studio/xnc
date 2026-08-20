@@ -21,6 +21,13 @@ import (
 // errConnDead 表示 drain 检测到连接死亡（读超时/对端关闭/二进制帧）。
 var errConnDead = errors.New("control connection dead")
 
+// Handler 处理 server → agent 的控制消息。nil 安全：Client.Handler 为 nil 时
+// 维持 Phase 1 行为（ack 丢弃、ERROR 记日志）。
+type Handler interface {
+	HandleSessionOpen(ctx context.Context, so proto.SessionOpen)
+	HandleSessionClose(ctx context.Context, sc proto.SessionClose)
+}
+
 type Client struct {
 	ServerURL string
 	Key       *identity.Key
@@ -30,6 +37,7 @@ type Client struct {
 	// 下一次抖动应快速重试。NewClient 默认 1min；测试可缩短。
 	BackoffReset time.Duration
 	Log          *slog.Logger
+	Handler      Handler // nil 安全：会话消息分发；nil 时仅丢弃
 }
 
 func NewClient(serverURL string, k *identity.Key, info machineinfo.Info) *Client {
@@ -165,9 +173,11 @@ func (c *Client) once(ctx context.Context) error {
 }
 
 // drain 持续消费入站帧直至连接判定死亡：HEARTBEAT_ACK 丢弃；ERROR 帧记
-// Warn（含错误码）不致命；其他帧忽略（前向兼容）。每次读携带 max(3×Beat,1s)
-// 的存活超时——读错误（超时=对端沉默、连接关闭、二进制帧）即调用 dead（恰
-// 好一次）并返回。pctx 取消属正常拆除，静默退出。
+// Warn（含错误码）不致命；SESSION_OPEN/SESSION_CLOSE 解码后交 Handler 在
+// 独立 goroutine 分发（会话处理不得阻塞心跳/读取，Handler 为 nil 时跳过）；
+// 其他帧忽略（前向兼容）。每次读携带 max(3×Beat,1s) 的存活超时——读错误
+// （超时=对端沉默、连接关闭、二进制帧）即调用 dead（恰好一次）并返回。
+// pctx 取消属正常拆除，静默退出；分发 goroutine 同以 pctx 为生命周期。
 func (c *Client) drain(pctx context.Context, ws *websocket.Conn, dead func()) {
 	for {
 		m, err := readMsg(pctx, ws, c.readDeadline())
@@ -179,6 +189,18 @@ func (c *Client) drain(pctx context.Context, ws *websocket.Conn, dead func()) {
 				var e proto.ErrorPayload
 				_ = m.Decode(&e)
 				c.Log.Warn("server ERROR frame", "code", e.Code, "message", e.Message)
+			case proto.TypeSessionOpen:
+				var so proto.SessionOpen
+				if err := m.Decode(&so); err == nil && c.Handler != nil {
+					h := c.Handler
+					go h.HandleSessionOpen(pctx, so) // 会话处理不得阻塞心跳/读取
+				}
+			case proto.TypeSessionClose:
+				var sc proto.SessionClose
+				if err := m.Decode(&sc); err == nil && c.Handler != nil {
+					h := c.Handler
+					go h.HandleSessionClose(pctx, sc)
+				}
 			}
 			continue
 		}

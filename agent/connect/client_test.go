@@ -323,3 +323,81 @@ func TestBackoffResetAfterHealthyConnection(t *testing.T) {
 	assert.LessOrEqual(t, gap, 4*time.Second,
 		"backoff not reset after healthy connection: expected ~1s retry, got slow retry")
 }
+
+// --- Task 5: drain 重构为消息分发 ---
+
+// fakeServerWithHooks 在 fakeServer 的握手流程上增加 afterHello 钩子：
+// HELLO_ACK 写出后立刻以 write 注入额外 server → agent 帧，随后照常 echo 心跳。
+func fakeServerWithHooks(t *testing.T, pub ed25519.PublicKey, afterHello func(write func(typ string, p any))) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		write := challenge(t, c, pub)
+		afterHello(write)
+		for { // 心跳 echo：维持连接存活，验证分发不阻塞读取循环
+			_, data, err := c.Read(context.Background())
+			if err != nil {
+				return
+			}
+			var hm proto.Message
+			require.NoError(t, json.Unmarshal(data, &hm))
+			if hm.Type == proto.TypeHeartbeat {
+				write(proto.TypeHeartbeatAck, struct{}{})
+			}
+		}
+	}))
+}
+
+// stubHandler 把分发的会话消息送入 channel 供测试断言。
+type stubHandler struct {
+	open  chan proto.SessionOpen
+	close chan proto.SessionClose
+}
+
+func (s stubHandler) HandleSessionOpen(_ context.Context, so proto.SessionOpen) { s.open <- so }
+func (s stubHandler) HandleSessionClose(_ context.Context, sc proto.SessionClose) {
+	s.close <- sc
+}
+
+// TestDispatchesSessionMessages（Task 5）：HELLO_ACK 后 server 依次下发
+// SESSION_OPEN 与 SESSION_CLOSE，两者必须经 Client.Handler 分发到独立
+// goroutine（不阻塞心跳/读取循环）并完整到达测试桩。
+func TestDispatchesSessionMessages(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	openCh := make(chan proto.SessionOpen, 1)
+	closeCh := make(chan proto.SessionClose, 1)
+
+	srv := fakeServerWithHooks(t, pub, func(write func(typ string, p any)) {
+		write(proto.TypeSessionOpen, proto.SessionOpen{
+			SessionID: "s1", Kind: proto.KindExec, Params: []byte(`{}`)})
+		write(proto.TypeSessionClose, proto.SessionClose{SessionID: "s1", Reason: "test"})
+	})
+	defer srv.Close()
+
+	k := &identity.Key{NodeID: "node-x", Priv: priv}
+	c := NewClient("ws"+srv.URL[4:], k, machineinfo.Info{})
+	c.Beat = 50 * time.Millisecond
+	c.Handler = stubHandler{open: openCh, close: closeCh}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+
+	select {
+	case so := <-openCh:
+		assert.Equal(t, "s1", so.SessionID)
+		assert.Equal(t, proto.KindExec, so.Kind)
+	case <-time.After(3 * time.Second):
+		t.Fatal("no SESSION_OPEN dispatched")
+	}
+	select {
+	case sc := <-closeCh:
+		assert.Equal(t, "s1", sc.SessionID)
+	case <-time.After(3 * time.Second):
+		t.Fatal("no SESSION_CLOSE dispatched")
+	}
+}
