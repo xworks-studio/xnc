@@ -2758,7 +2758,7 @@ MockAgent 不再是第三份协议实现——就是 agent 核心包 + 内存虚
 
 | 设备 | 系统 | 用途 | 阶段 |
 | ---- | ---- | ---- | ---- |
-| NODE_MAIN（开发机本体） | Windows 11 + pwsh 7，LABS-XIAOXIN，常驻交互登录 | 主 Windows 测试节点：新版功能、RDP、桌面预览 helper 三态（capturing / locked / no_session）；兼日常开发 | 全程 |
+| NODE_MAIN（主测试节点） | Windows 11 Pro（10.0.26200），LABS-TB16G7，23 GB；pwsh 7 暂未安装（当前走 powershell.exe 5.1 降级路径，如需 pwsh 用例再装）；管理通道 = WinRM PS Remoting | 主 Windows 测试节点：新版功能、RDP、桌面预览 helper 三态（capturing / locked / no_session） | 全程 |
 | SRV | Ubuntu，阿里云国际区域，域名 control.xnc.app | xnc-server / Caddy / PostgreSQL 真机部署验证；NAT 场景对端 | Phase 1 起 |
 | NODE2019（预留） | Windows Server 2019，不装 pwsh | 最低版本线：1809 ConPTY、powershell.exe 5.1 降级；Hyper-V / 云 VM 后补 | Phase 2-4（后补） |
 | NODELINUX（预留，可选） | Ubuntu x64 | 跨平台守门：编译目标、PTY 抽象冒烟 | Phase 8 预研 |
