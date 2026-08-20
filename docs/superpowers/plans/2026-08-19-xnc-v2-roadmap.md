@@ -138,7 +138,7 @@ skills/xnc 同步    CLI 每新增命令，核对 skills/xnc/references/cli.md �
 | Phase | 计划文件 | 状态 |
 | ---- | ---- | ---- |
 | 1 | `docs/superpowers/plans/2026-08-19-xnc-v2-phase1.md` | ✅ 就绪待执行 |
-| 2 | `docs/superpowers/plans/<date>-xnc-v2-phase2-exec.md` | ⏳ P1 完成后编写 |
+| 2 | `docs/superpowers/plans/2026-08-20-xnc-v2-phase2-exec.md` | ✅ 就绪待执行 |
 | 3 | `<date>-xnc-v2-phase3-shell.md`（先做 Gate B spike） | ⏳ |
 | 4 | `<date>-xnc-v2-phase4-data-channels.md` | ⏳ |
 | 5 | `<date>-xnc-v2-phase5-multiuser.md` | ⏳ |
