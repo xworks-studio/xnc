@@ -4,6 +4,8 @@ services:
     # reachable from other hosts.
     ports: ["127.0.0.1:8080:8080"]
     environment:
-      XNC_HEARTBEAT_TIMEOUT: 10s
+      # E2E wants a short offline window; load runs (Gate A) override to the
+      # production 90s via the shell: XNC_HEARTBEAT_TIMEOUT=90s docker compose ...
+      XNC_HEARTBEAT_TIMEOUT: ${XNC_HEARTBEAT_TIMEOUT:-10s}
   caddy:
     profiles: ["never"]

@@ -33,6 +33,8 @@ func main() {
 	dir := flag.String("identity-dir", filepath.Join(os.TempDir(), "xnc-mockagent"),
 		"identity dir; per-node key file node-N.json")
 	count := flag.Int("count", 1, "number of simulated nodes (each: own key + enroll + connection)")
+	first := flag.Int("first", 0, "starting node index: nodes are numbered first..first+count-1 "+
+		"(identity files, MOCK-xxx names, machine IDs) — enables multi-wave load runs sharing one identity dir")
 	beat := flag.Duration("beat", 30*time.Second, "heartbeat interval")
 	disc := flag.Duration("disconnect-after", 0,
 		"accepted but a no-op: E2E simulates drops by killing the process")
@@ -53,8 +55,9 @@ func main() {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			if err := runOne(ctx, *server, *token, *dir, i, *beat, *disc, *once); err != nil {
-				slog.Error("node failed", "node", i, "err", err)
+			idx := *first + i
+			if err := runOne(ctx, *server, *token, *dir, idx, *beat, *disc, *once); err != nil {
+				slog.Error("node failed", "node", idx, "err", err)
 				failed.Add(1)
 			}
 		}(i)
