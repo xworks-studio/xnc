@@ -44,6 +44,76 @@ func TestEscapeDetector(t *testing.T) {
 	}
 }
 
+// win32 键盘增强协议序列（取自真实 stdin 转储）。
+const (
+	seqTildeDown = "\x1b[192;41;126;1;48;1_" // Shift+` → ~  按下
+	seqTildeUp   = "\x1b[192;41;96;0;32;1_"  // ~ 抬起（无 shift，char 回落 96）
+	seqShiftUp   = "\x1b[16;42;0;0;32;1_"
+	seqDotDown   = "\x1b[190;52;46;1;32;1_"  // . 按下
+	seqEnterDown = "\x1b[13;28;13;1;32;1_"
+	seqEnterUp   = "\x1b[13;28;13;0;32;1_"
+	seqEDown     = "\x1b[69;18;101;1;32;1_" // e 按下
+	seqEUp       = "\x1b[69;18;101;0;32;1_"
+)
+
+func TestEscapeDetectorWin32Protocol(t *testing.T) {
+	t.Run("~. via key sequences disconnects and swallows only the escape keys", func(t *testing.T) {
+		d := newEscapeDetector()
+		var out []byte
+		var esc bool
+		for _, chunk := range []string{seqTildeDown, seqShiftUp, seqTildeUp, seqDotDown} {
+			var o []byte
+			o, esc = d.feed([]byte(chunk))
+			out = append(out, o...)
+		}
+		require.True(t, esc)
+		// tilde-down 被悬置（断开成立则吞掉），shift-up / tilde-up 原样放行
+		assert.Equal(t, seqShiftUp+seqTildeUp, string(out))
+	})
+
+	t.Run("bare ~ + Enter via sequences disconnects", func(t *testing.T) {
+		d := newEscapeDetector()
+		_, _ = d.feed([]byte(seqTildeDown))
+		_, _ = d.feed([]byte(seqTildeUp))
+		_, esc := d.feed([]byte(seqEnterDown))
+		require.True(t, esc)
+	})
+
+	t.Run("typing via sequences passes through unchanged", func(t *testing.T) {
+		d := newEscapeDetector()
+		out, esc := d.feed([]byte(seqEDown + seqEUp + seqEnterDown + seqEnterUp))
+		require.False(t, esc)
+		assert.Equal(t, seqEDown+seqEUp+seqEnterDown+seqEnterUp, string(out))
+	})
+
+	t.Run("~ then e flushes held and forwards all", func(t *testing.T) {
+		d := newEscapeDetector()
+		var out []byte
+		for _, chunk := range []string{seqTildeDown, seqTildeUp, seqEDown} {
+			o, _ := d.feed([]byte(chunk))
+			out = append(out, o...)
+		}
+		assert.Equal(t, seqTildeDown+seqTildeUp+seqEDown, string(out))
+	})
+
+	t.Run("exact dump sequence: shift-down + tilde-down + tilde-up + shift-up + enter", func(t *testing.T) {
+		// dump 里用户 ~+Enter 的真实序列（shift 修饰在 tilde 之前按下）
+		d := newEscapeDetector()
+		out1, esc := d.feed([]byte("\x1b[16;42;0;1;48;1_" + seqTildeDown))
+		require.False(t, esc) // shift-down 放行，tilde-down 悬置
+		assert.Equal(t, "\x1b[16;42;0;1;48;1_", string(out1))
+		out2, esc := d.feed([]byte(seqTildeUp))
+		require.False(t, esc)
+		assert.Empty(t, out2) // 悬置期积压
+		out3, esc := d.feed([]byte(seqShiftUp))
+		require.False(t, esc)
+		assert.Empty(t, out3)
+		out4, esc := d.feed([]byte(seqEnterDown))
+		require.True(t, esc) // 裸 ~ + 回车 → 断开，积压放行
+		assert.Equal(t, seqTildeUp+seqShiftUp, string(out4))
+	})
+}
+
 func TestEscapeDetectorAcrossChunks(t *testing.T) {
 	d := newEscapeDetector()
 	out1, esc := d.feed([]byte("ls\r\n~"))

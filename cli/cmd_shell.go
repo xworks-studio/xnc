@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strings"
+	"strconv"
 	"os"
 	"time"
 
@@ -216,24 +218,31 @@ func runShell(cmd *cobra.Command, args []string, flagCols, flagRows int) error {
 }
 
 // escapeDetector 识别行首的断开序列（ssh 风格）：`~.` 或裸 `~`+回车。
-// 同时接受全角变体（～ ． 。）——中文 IME 下用户极易打出全角字符。
+// 输入有两层形态，都要处理：
+//  1. 纯字节（终端未启用键盘增强协议）：`~` = 0x7E，全角变体 ～ ． 。；
+//  2. win32 键盘增强协议（Windows Terminal 应远端 PSReadLine 请求启用）：
+//     每个键是 `ESC [ vk;scan;char;down;... _` 序列——断开判定须在按键
+//     事件层做（char=126/46/13），序列本身原样转发保真。
 // 其余字节原样转发；状态跨 chunk 保持。
 type escapeDetector struct {
 	lineStart bool
-	held      []byte // 行首悬置的 tilde 字节（ASCII 或全角），待下一个字节裁决
+	held      []byte // 行首悬置的 tilde（原始字节或整个按键序列），待裁决
+	deferred  []byte // 悬置期间按序积压的事件（up/修饰键/其它序列），裁决时统一放行
+	inCSI     bool
+	csi       []byte // 累积中的 CSI 序列（含 ESC [）
 }
 
 func newEscapeDetector() *escapeDetector { return &escapeDetector{lineStart: true} }
 
 var (
 	tildeForms = [][]byte{
-		{'~'},                   // ASCII
-		{0xEF, 0xBD, 0x9E},      // ～ U+FF5E（全角波浪）
+		{'~'},              // ASCII
+		{0xEF, 0xBD, 0x9E}, // ～ U+FF5E（全角波浪）
 	}
 	dotForms = [][]byte{
-		{0x2E},              // ASCII .
-		{0xEF, 0xBC, 0x8E},  // ． U+FF0E（全角句点）
-		{0xE3, 0x80, 0x82},  // 。 U+3002（CJK 句号）
+		{0x2E},             // ASCII .
+		{0xEF, 0xBC, 0x8E}, // ． U+FF0E（全角句点）
+		{0xE3, 0x80, 0x82}, // 。 U+3002（CJK 句号）
 	}
 )
 
@@ -261,43 +270,123 @@ func matchForm(b []byte, forms [][]byte) int { // 返回匹配长度，0 = 无
 // feed 返回（应转发的字节, 是否触发本地断开）。
 func (d *escapeDetector) feed(in []byte) ([]byte, bool) {
 	var out []byte
-	for len(in) > 0 {
+	i := 0
+	for i < len(in) {
+		if d.inCSI {
+			b := in[i]
+			i++
+			d.csi = append(d.csi, b)
+			if b >= 0x40 && b <= 0x7E { // 终止字节，序列完成
+				seq := d.csi
+				d.inCSI = false
+				d.csi = nil
+				fwd, esc := d.handleSeq(seq)
+				out = append(out, fwd...)
+				if esc {
+					return out, true
+				}
+			}
+			continue
+		}
+		if in[i] == 0x1b && i+1 < len(in) && in[i+1] == '[' {
+			d.inCSI = true
+			d.csi = []byte{0x1b, '['}
+			i += 2
+			continue
+		}
+		// 纯字节路径。
+		b := in[i]
 		if d.held != nil {
 			held := d.held
 			d.held = nil
 			switch {
-			case matchForm(in, dotForms) > 0:
+			case matchForm(in[i:], dotForms) > 0:
 				return out, true
-			case in[0] == '\r' || in[0] == '\n':
+			case b == '\r' || b == '\n':
 				return out, true // 裸 ~ + 回车
-			case matchForm(in, tildeForms) > 0:
+			case matchForm(in[i:], tildeForms) > 0:
 				out = append(out, '~') // `~~` 输出单个字面 ~
-				in = in[matchLen(in, tildeForms):]
+				i += matchForm(in[i:], tildeForms)
 				d.lineStart = false
 				continue
 			default:
-				// 普通跟随字节：tilde 原样 + 该字节（UTF-8 后续字节由主循环透传）
 				out = append(out, held...)
-				b := in[0]
 				out = append(out, b)
 				d.lineStart = b == '\r' || b == '\n'
-				in = in[1:]
+				i++
 				continue
 			}
 		}
 		if d.lineStart {
-			if n := matchForm(in, tildeForms); n > 0 {
-				d.held = append([]byte(nil), in[:n]...)
-				in = in[n:]
+			if n := matchForm(in[i:], tildeForms); n > 0 {
+				d.held = append([]byte(nil), in[i:i+n]...)
+				i += n
 				continue
 			}
 		}
-		b := in[0]
 		out = append(out, b)
 		d.lineStart = b == '\r' || b == '\n'
-		in = in[1:]
+		i++
 	}
 	return out, false
 }
 
-func matchLen(b []byte, forms [][]byte) int { return matchForm(b, forms) }
+// handleSeq 裁决一个完整 CSI 序列。win32 键盘序列（`ESC [ vk;scan;char;down;.. _`）
+// 按按键事件处理；其它 CSI（方向键等）原样转发。
+// 悬置（held）期间到达的 up 事件/修饰键/其它序列按序积压（deferred），
+// 由下一个 key-DOWN 统一裁决：断开则积压物放行、tilde 与触发键吞掉；
+// 非触发键则 held+积压+当前按序全部放行——保证转发流不乱序。
+func (d *escapeDetector) handleSeq(seq []byte) ([]byte, bool) {
+	if len(seq) < 4 || seq[len(seq)-1] != '_' {
+		return d.deferOrForward(seq), false // 非键盘序列
+	}
+	body := string(seq[2 : len(seq)-1]) // 去掉 ESC [ 与 _
+	parts := strings.Split(body, ";")
+	if len(parts) < 4 {
+		return d.deferOrForward(seq), false
+	}
+	n := make([]int, len(parts))
+	for j, p := range parts {
+		v, err := strconv.Atoi(p)
+		if err != nil {
+			return d.deferOrForward(seq), false
+		}
+		n[j] = v
+	}
+	charCode, isDown := n[2], n[3] != 0
+
+	if !isDown || charCode == 0 {
+		// 抬起事件与纯修饰键（shift/ctrl/alt，char=0）：不改行状态、不裁决。
+		return d.deferOrForward(seq), false
+	}
+	switch {
+	case d.held != nil && (charCode == '.' || charCode == 0x0D):
+		out := d.deferred // 断开：积压物放行，悬置 tilde 与本触发键吞掉
+		d.held, d.deferred = nil, nil
+		return out, true
+	case d.held != nil: // 其它键：悬置+积压+当前按序放行（含 ~~ 语义：两 tilde 都进流）
+		out := append(d.held, d.deferred...)
+		out = append(out, seq...)
+		d.held, d.deferred = nil, nil
+		d.lineStart = false
+		return out, false
+	case d.lineStart && charCode == '~':
+		d.held = append([]byte(nil), seq...)
+		return nil, false
+	case charCode == 0x0D:
+		d.lineStart = true
+		return seq, false
+	default:
+		d.lineStart = false
+		return seq, false
+	}
+}
+
+// deferOrForward：悬置期间积压，否则直接放行。
+func (d *escapeDetector) deferOrForward(seq []byte) []byte {
+	if d.held == nil {
+		return seq
+	}
+	d.deferred = append(d.deferred, seq...)
+	return nil
+}
