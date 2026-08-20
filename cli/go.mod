@@ -3,6 +3,7 @@ module xnc/cli
 go 1.26
 
 require (
+	github.com/coder/websocket v1.8.15
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.12.1
 	xnc/proto v0.0.0
