@@ -14,6 +14,10 @@ import (
 	"xnc/proto"
 )
 
+// wsReadLimit 会话 WS 单帧读上限：file kind 以 64KiB chunk 收发，需高于
+// coder/websocket 默认 32768（详见 HandleSessionOpen 内注释）。
+const wsReadLimit = 1 << 20
+
 // Handler 会话 kind 处理器（与会话 WS 一一对应）。ctx 由 Engine 持有：
 // SESSION_CLOSE 到来即取消；ws 归 Engine 关闭（处理器返回后 CloseNow）。
 type Handler interface {
@@ -73,6 +77,9 @@ func (e *Engine) HandleSessionOpen(_ context.Context, so proto.SessionOpen) {
 			e.log.Warn("session dial failed", "session", so.SessionID, "err", err)
 			return // Opening TTL 兜底
 		}
+		// 读限在 handler 读帧前生效：file upload 的 64KiB binary chunk 超
+		// coder/websocket 默认 32768，不抬会首帧即断（1MiB 留余量仍防滥用）。
+		ws.SetReadLimit(wsReadLimit)
 		defer ws.CloseNow()
 		h.Handle(ctx, ws, so.SessionID, so.Params)
 	}()

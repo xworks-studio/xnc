@@ -22,6 +22,11 @@ func wsBaseURL(r *http.Request) string {
 	return scheme + "://" + r.Host
 }
 
+// wsReadLimit 会话 WS 单帧读上限：file kind 以 64KiB chunk 收发（cli 上传/
+// agent 下载），coder/websocket 默认 32768 会在首帧即杀会话（pump 的 Reader
+// 按 conn 读限执行）。1MiB 留 chunk 余量且仍防滥用；控制连接帧小，不受影响。
+const wsReadLimit = 1 << 20
+
 // clientSessionWS 处理 GET /api/session/{id}?token=（client 侧）。
 // token 即凭证，不走 JWT：会话 token 单用途且 60s TTL，比长期 JWT 更收紧。
 func (h *handlers) clientSessionWS(w http.ResponseWriter, r *http.Request) {
@@ -50,6 +55,8 @@ func (h *handlers) sessionWS(w http.ResponseWriter, r *http.Request, id, token s
 	if err != nil {
 		return
 	}
+	// 读限须在 attach（pump 开始读帧）前生效：file 64KiB chunk 超默认 32768。
+	c.SetReadLimit(wsReadLimit)
 	attached := false
 	defer func() {
 		if !attached {

@@ -8,6 +8,11 @@ import (
 	"github.com/coder/websocket"
 )
 
+// wsReadLimit 会话 WS 单帧读上限：download 收 agent 推来的 64KiB binary
+// chunk，coder/websocket 默认 32768 会首帧即断（"session ended without
+// result"）。1MiB 留 chunk 余量且仍防滥用。
+const wsReadLimit = 1 << 20
+
 // dialSession connects to a session WS. wsPath is the relative websocketUrl
 // from the exec 202 response (includes ?token=); https servers need wss.
 func dialSession(server, wsPath string) (*websocket.Conn, error) {
@@ -16,7 +21,11 @@ func dialSession(server, wsPath string) (*websocket.Conn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	c, _, err := websocket.Dial(ctx, url, nil)
-	return c, err
+	if err != nil {
+		return nil, err
+	}
+	c.SetReadLimit(wsReadLimit)
+	return c, nil
 }
 
 // readWS reads one frame, returning its kind ("text" or "binary") and data.
