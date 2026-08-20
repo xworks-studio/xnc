@@ -17,6 +17,7 @@ const (
 	CodeKindUnsupported         = "KIND_UNSUPPORTED"
 	CodeRdpNotAvailable         = "RDP_NOT_AVAILABLE"
 	CodeHashMismatch            = "HASH_MISMATCH"
+	CodeFileNotFound            = "FILE_NOT_FOUND"
 	CodeFileTooLarge            = "FILE_TOO_LARGE"
 	CodeAgentVersionUnsupported = "AGENT_VERSION_UNSUPPORTED"
 	CodeInternal                = "INTERNAL"

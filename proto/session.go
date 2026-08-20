@@ -11,6 +11,12 @@ const KindExec = "exec"
 // KindShell 交互式终端会话（ConPTY，Phase 3）。
 const KindShell = "shell"
 
+// KindFile 文件上传/下载会话（Phase 4）。
+const KindFile = "file"
+
+// KindTunnel 端口隧道会话（RDP 等，Phase 4）。
+const KindTunnel = "tunnel"
+
 // SessionOpen 经控制连接下发：agent 按 WsURL（含 token 的绝对 URL）拨号。
 type SessionOpen struct {
 	SessionID  string          `json:"sessionId"`
@@ -66,4 +72,37 @@ type ShellBegin struct {
 type ShellResize struct {
 	Cols int `json:"cols"`
 	Rows int `json:"rows"`
+}
+
+// FileParams SESSION_OPEN params：upload 必带 size+sha256，download 只带 path。
+type FileParams struct {
+	Direction string `json:"direction"` // "upload" | "download"
+	Path      string `json:"path"`      // 绝对路径
+	Size      int64  `json:"size,omitempty"`
+	Sha256    string `json:"sha256,omitempty"`
+}
+
+// FileBegin agent → client 的数据流开始标记。
+type FileBegin struct {
+	Direction string `json:"direction"`
+	Path      string `json:"path"`
+	Size      int64  `json:"size"`
+	Sha256    string `json:"sha256"`
+}
+
+// FileResult 终态：写入方计算实际 sha256 与声明比对。ok=false 表示校验失败。
+type FileResult struct {
+	Bytes  int64  `json:"bytes"`
+	Sha256 string `json:"sha256"`
+	Ok     bool   `json:"ok"`
+}
+
+// FileError 错误终态。
+type FileError struct {
+	Code string `json:"code"` // FILE_NOT_FOUND / FILE_TOO_LARGE / HASH_MISMATCH
+}
+
+// TunnelParams SESSION_OPEN params：target 枚举（server 白名单解析为 host/port）。
+type TunnelParams struct {
+	Target string `json:"target"` // "rdp"
 }

@@ -83,6 +83,28 @@ func TestShellVocabulary(t *testing.T) {
 	_ = rb
 }
 
+func TestFileVocabulary(t *testing.T) {
+	fp := FileParams{Direction: "upload", Path: `C:\temp\f.zip`, Size: 1024, Sha256: "abc"}
+	b, _ := json.Marshal(fp)
+	assert.JSONEq(t, `{"direction":"upload","path":"C:\\temp\\f.zip","size":1024,"sha256":"abc"}`, string(b))
+
+	dp := FileParams{Direction: "download", Path: `C:\temp\f.zip`}
+	b2, _ := json.Marshal(dp)
+	assert.JSONEq(t, `{"direction":"download","path":"C:\\temp\\f.zip"}`, string(b2))
+
+	fb, _ := json.Marshal(FileBegin{Direction: "upload", Path: "p", Size: 1, Sha256: "s"})
+	assert.JSONEq(t, `{"direction":"upload","path":"p","size":1,"sha256":"s"}`, string(fb))
+
+	fr, _ := json.Marshal(FileResult{Bytes: 42, Sha256: "h", Ok: true})
+	assert.JSONEq(t, `{"bytes":42,"sha256":"h","ok":true}`, string(fr))
+
+	fe, _ := json.Marshal(FileError{Code: CodeFileNotFound})
+	assert.JSONEq(t, `{"code":"FILE_NOT_FOUND"}`, string(fe))
+
+	tp, _ := json.Marshal(TunnelParams{Target: "rdp"})
+	assert.JSONEq(t, `{"target":"rdp"}`, string(tp))
+}
+
 func mustRaw(t *testing.T, v any) json.RawMessage {
 	t.Helper()
 	b, err := json.Marshal(v)
