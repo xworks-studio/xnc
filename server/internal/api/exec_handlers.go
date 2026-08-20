@@ -19,9 +19,13 @@ const (
 	execScriptMaxBytes = 256 * 1024
 	execTimeoutDefault = 300
 	execTimeoutMax     = 86400
-	// auditFinishTimeout：exec.finish 在会话关闭（可能在 POST 返回很久之后）
-	// 才触发，r.Context() 届时已取消，须用独立 background ctx。
-	auditFinishTimeout = 5 * time.Second
+	// execBodyMaxBytes：请求体上限 512KB——覆盖 256KB script 加 JSON 结构与
+	// 其余字段的转义开销，先于解码生效，杜绝无限缓冲。
+	execBodyMaxBytes = 512 * 1024
+	// auditInsertTimeout：审计写入用独立 background ctx，不用 r.Context()。
+	// exec.start 写入发生在 SESSION_OPEN 已下发之后——客户端此刻断连即取消
+	// r.Context()，start 行会丢；exec.finish 更是在 POST 返回很久之后才触发。
+	auditInsertTimeout = 5 * time.Second
 )
 
 // execReq 的 TimeoutSec 为指针：缺省（nil）→ 默认 300；显式给出则必须
@@ -44,6 +48,7 @@ func mustJSON(v any) []byte {
 // → 校验 → Create（双侧 token）→ 装配 finish/notify 钩子 → 经控制连接下发
 // SESSION_OPEN → 审计 exec.start → 202 统一异步响应。
 func (h *handlers) execStart(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, execBodyMaxBytes)
 	u := auth.UserFrom(r.Context())
 	nodeID, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
@@ -100,7 +105,7 @@ func (h *handlers) execStart(w http.ResponseWriter, r *http.Request) {
 	// 返回后异步关闭会话，届时 finish/notify 必须已就位。
 	// finish 不含命令内容，仅 reason/kind/sessionId。
 	h.sess.SetFinishFn(res.Session, func(reason string) {
-		ctx, cancel := context.WithTimeout(context.Background(), auditFinishTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), auditInsertTimeout)
 		defer cancel()
 		_ = h.st.Q().InsertAuditLog(ctx, sqlc.InsertAuditLogParams{
 			UserID: pgUUID(u.ID), NodeID: pgUUID(nodeID), Action: "exec.finish",
@@ -146,7 +151,11 @@ func (h *handlers) execStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.st.Q().InsertAuditLog(r.Context(), sqlc.InsertAuditLogParams{
+	// 独立 background ctx：此刻 SESSION_OPEN 已下发，客户端随时可能断连
+	// 取消 r.Context()，审计 start 行必须不受影响。
+	actx, acancel := context.WithTimeout(context.Background(), auditInsertTimeout)
+	defer acancel()
+	_ = h.st.Q().InsertAuditLog(actx, sqlc.InsertAuditLogParams{
 		UserID: pgUUID(u.ID), NodeID: pgUUID(nodeID), Action: "exec.start",
 		Metadata: mustJSON(map[string]string{"kind": proto.KindExec, "sessionId": res.Session.ID}),
 	})

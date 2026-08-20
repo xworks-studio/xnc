@@ -22,7 +22,10 @@ echo "== build =="
 echo "== dev stack up =="
 COMPOSE="docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.dev.yml"
 $COMPOSE up -d --build
-trap '$COMPOSE down -v' EXIT
+# EXIT 清理三件事：杀 mock（若已启动）、拆 compose 栈、删身份临时目录。
+# ${VAR:-} 防 set -u：trap 早于 IDDIR/MPID 赋值触发时两者可能未定义；
+# rm -rf 只作用于 mktemp -d 的目录变量，且仅在非空时执行。
+trap 'kill ${MPID:-} 2>/dev/null || true; $COMPOSE down -v; [ -n "${IDDIR:-}" ] && rm -rf "$IDDIR" || true' EXIT
 for i in $(seq 1 30); do curl -sf "$SERVER/api/health" >/dev/null && break; sleep 1; done
 curl -sf "$SERVER/api/health" >/dev/null || { echo "server not healthy"; exit 1; }
 

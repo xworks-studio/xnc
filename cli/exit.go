@@ -9,7 +9,7 @@ const (
 	exitAuth     = 240 // UNAUTHORIZED, ENROLLMENT_TOKEN_INVALID
 	exitForbid   = 241 // FORBIDDEN
 	exitOffline  = 242 // NODE_OFFLINE
-	exitTimeout  = 243 // exec timed out or no exit code received
+	exitTimeout  = 243 // EXEC_RESULT received with timedOut/no exit code; resultless disconnects are 245
 	exitMissing  = 244 // CLUSTER_NOT_FOUND, NODE_NOT_FOUND, NODE_ALREADY_ENROLLED
 	exitNet      = 245 // NETWORK (client-side network failure)
 	exitQuota    = 246 // reserved: quota

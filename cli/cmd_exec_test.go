@@ -377,3 +377,29 @@ func TestRunMissingScriptArgUsage(t *testing.T) {
 		"run", "n1", "--json", "--server", "http://127.0.0.1:1", "--token", "tk"})
 	assert.Equal(t, 2, code) // --file or - required
 }
+
+// TestTimeoutFlagValidatedLocally: --timeout outside [1, 86400] is a usage
+// error (exit 2) on both exec and run, checked before any traffic — the dead
+// port would surface as NETWORK 245 if a request were attempted.
+func TestTimeoutFlagValidatedLocally(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"exec timeout 0", []string{"exec", "n1", "--timeout", "0", "--json",
+			"--server", "http://127.0.0.1:1", "--token", "tk", "--", "hostname"}},
+		{"exec timeout negative", []string{"exec", "n1", "--timeout", "-1", "--json",
+			"--server", "http://127.0.0.1:1", "--token", "tk", "--", "hostname"}},
+		{"exec timeout 86401", []string{"exec", "n1", "--timeout", "86401", "--json",
+			"--server", "http://127.0.0.1:1", "--token", "tk", "--", "hostname"}},
+		{"run timeout 0", []string{"run", "n1", "--timeout", "0", "--file", "-", "--json",
+			"--server", "http://127.0.0.1:1", "--token", "tk"}},
+		{"run timeout 86401", []string{"run", "n1", "--timeout", "86401", "--file", "-", "--json",
+			"--server", "http://127.0.0.1:1", "--token", "tk"}},
+	}
+	for _, c := range cases {
+		out, code := runCLIWithStdin(t, "", c.args)
+		assert.Equal(t, 2, code, c.name) // usage error before any network
+		assert.Contains(t, out, "timeout must be 1-86400 seconds", c.name)
+	}
+}

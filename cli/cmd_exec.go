@@ -23,6 +23,18 @@ const (
 
 const execTimeoutDefault = 300
 
+// execTimeoutMax 与服务端 [1, 86400] 上限一致；客户端先于任何网络请求本地校验。
+const execTimeoutMax = 86400
+
+// checkExecTimeout: --timeout 越界（<1 或 >86400）→ 用法错误（exit 2）。
+// 在 dial 之前调用：坏值绝不产生网络流量，也不进入服务端 400 路径。
+func checkExecTimeout(cmd *cobra.Command, timeout int) error {
+	if timeout < 1 || timeout > execTimeoutMax {
+		return failUsage(cmd, "timeout must be 1-86400 seconds")
+	}
+	return nil
+}
+
 // execScriptMax caps the inline script payload for `xnc run`: bigger scripts
 // wait for the upload+exec flow (Phase 4).
 const execScriptMax = 256 * 1024
@@ -74,8 +86,12 @@ func newRunCmd() *cobra.Command {
 	return cmd
 }
 
-// runExec: resolve node → hand the command body to the shared session loop.
+// runExec: validate --timeout → resolve node → hand the command body to the
+// shared session loop.
 func runExec(cmd *cobra.Command, args []string, timeout int, cwd string) error {
+	if e := checkExecTimeout(cmd, timeout); e != nil {
+		return e
+	}
 	cl, usage := dial(cmd, true)
 	if usage != "" {
 		return failUsage(cmd, usage)
@@ -99,6 +115,9 @@ func runExec(cmd *cobra.Command, args []string, timeout int, cwd string) error {
 // then rides the same exec session loop with body {script, timeoutSec}. Every
 // local failure is a usage error (exit 2) checked before any request is sent.
 func runRun(cmd *cobra.Command, args []string, timeout int, file string) error {
+	if e := checkExecTimeout(cmd, timeout); e != nil {
+		return e
+	}
 	src := file
 	if src == "" && len(args) > 1 {
 		src = args[1] // positional form: xnc run n1 -

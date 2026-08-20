@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -133,4 +134,29 @@ func TestExecValidation(t *testing.T) {
 		}
 		assert.Equal(t, c.code, resp.StatusCode, label)
 	}
+}
+
+// TestExecBodyLimit：512KB MaxBytesReader 在 JSON 解码前生效——1MB 请求体
+// 被拒为 400，而不是先被完整缓冲进内存（OOM/慢速消费挂起向量）。
+func TestExecBodyLimit(t *testing.T) {
+	env := NewTestEnv(t)
+	nodeID := env.EnrollNode(t, "WEB-E3", "mid-e3")
+	_ = dialControl(t, env, nodeID)
+
+	big := `{"command":"` + strings.Repeat("a", 1024*1024) + `"}`
+	resp := execPost(t, env, nodeID, big)
+	defer resp.Body.Close()
+	assert.Equal(t, 400, resp.StatusCode)
+
+	// 512KB 以内（但超过 256KB script 上限）的请求仍走正常校验路径，
+	// 证明上限是 512KB 而非更小。
+	overScript := `{"script":"` + strings.Repeat("a", 300*1024) + `"}`
+	resp2 := execPost(t, env, nodeID, overScript)
+	defer resp2.Body.Close()
+	assert.Equal(t, 400, resp2.StatusCode)
+	var e struct {
+		Error proto.APIError `json:"error"`
+	}
+	_ = decodeJSON(resp2.Body, &e)
+	assert.Equal(t, proto.CodeFileTooLarge, e.Error.Code, "script-size check, not body cap")
 }
