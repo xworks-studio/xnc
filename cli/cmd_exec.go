@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"os"
 	"strings"
@@ -27,6 +28,7 @@ type execOutcome struct {
 	exitCode  *int
 	timedOut  bool
 	duration  int64
+	gotResult bool // terminal EXEC_RESULT frame was received
 	stdout    strings.Builder
 	stderr    strings.Builder
 }
@@ -51,8 +53,9 @@ func newExecCmd() *cobra.Command {
 
 // runExec: resolve node → POST exec → dial session WS → stream binary frames
 // live while accumulating them → capture the EXEC_RESULT terminal frame →
-// print the envelope → map to the process exit code (passthrough, 243 when
-// timed out or no exit code was received).
+// print the envelope → map to the process exit code (passthrough; 243 only
+// when timed out per EXEC_RESULT; 245 NETWORK when the connection ended
+// without a result frame).
 //
 // With --json the live stream and the final envelope interleave on stdout by
 // design: the envelope is emitted after the stream, so line-based (jsonl)
@@ -118,8 +121,27 @@ func runExec(cmd *cobra.Command, args []string, timeout int, cwd string) error {
 			var r proto.ExecResult
 			if m.Decode(&r) == nil {
 				out.exitCode, out.timedOut, out.duration = r.ExitCode, r.TimedOut, r.DurationMs
+				out.gotResult = true
 			}
 		}
+	}
+
+	// Envelope separation: if the live stream left stdout mid-line, start the
+	// envelope on a fresh line so the trailing envelope line parses standalone.
+	if jsonOut(cmd) && out.stdout.Len() > 0 && !strings.HasSuffix(out.stdout.String(), "\n") {
+		os.Stdout.WriteString("\n")
+	}
+
+	// Disconnect before the terminal frame is a NETWORK failure (245), not a
+	// timeout: 243 is reserved for EXEC_RESULT.TimedOut (cli.md contract).
+	if !out.gotResult {
+		e := proto.Err(0, "NETWORK", "session ended without result")
+		if jsonOut(cmd) {
+			PrintJSON(false, nil, e)
+		} else {
+			fmt.Fprintln(os.Stderr, "xnc: session ended without result")
+		}
+		return &exitError{code: exitNet}
 	}
 
 	if jsonOut(cmd) {
@@ -134,7 +156,7 @@ func runExec(cmd *cobra.Command, args []string, timeout int, cwd string) error {
 	}
 	switch {
 	case out.exitCode == nil:
-		// timed out, killed, or the terminal frame never arrived
+		// timed out (or result with no exit code: killed / refused start)
 		return &exitError{code: exitTimeout}
 	case *out.exitCode == 0:
 		return nil

@@ -176,3 +176,94 @@ func TestExecNodeOfflineEnvelope(t *testing.T) {
 	require.NotNil(t, env.Error)
 	assert.Equal(t, proto.CodeNodeOffline, env.Error.Code)
 }
+
+// fakeExecDropServer streams one stdout frame then closes the session WS
+// WITHOUT a terminal EXEC_RESULT (agent crash / mid-session drop).
+func fakeExecDropServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/nodes" && r.Method == "GET":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[{"id":"` + execNodeUUID + `","name":"n1","cluster":"default",` +
+				`"hostname":"N1","os_version":"Windows","agent_version":"0.1.0",` +
+				`"shell_type":"pwsh","status":"online","last_seen_at":null}]`))
+		case r.URL.Path == "/api/nodes/"+execNodeUUID+"/exec" && r.Method == "POST":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(202)
+			_, _ = w.Write([]byte(`{"sessionId":"s1","token":"ct","expiresAt":"2026-01-01T00:00:00Z",` +
+				`"websocketUrl":"/api/session/s1?token=ct"}`))
+		case r.URL.Path == "/api/session/s1":
+			c, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				defer c.CloseNow()
+				_ = c.Write(ctx, websocket.MessageBinary, []byte{0x01, 'p', 'a', 'r', 't'})
+				// graceful close (frame delivery guaranteed), no EXEC_RESULT
+				_ = c.Close(websocket.StatusNormalClosure, "")
+			}()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	return srv
+}
+
+func TestExecResultlessDisconnectExits245(t *testing.T) {
+	srv := fakeExecDropServer(t)
+	defer srv.Close()
+
+	// JSON mode: error envelope NETWORK, exit 245 (NOT 243/timeout).
+	out, code := captureStdout(t, func() int {
+		return runCLI(t.Context(), []string{"exec", "n1", "--json",
+			"--server", srv.URL, "--token", "tk", "--", "hostname"})
+	})
+	require.Equal(t, 245, code)
+	assert.True(t, strings.HasPrefix(out, "part"), "streamed frame preserved: %q", out)
+	var env struct {
+		OK    bool            `json:"ok"`
+		Data  any             `json:"data"`
+		Error *proto.APIError `json:"error"`
+	}
+	require.NoError(t, jsonUnmarshalStr(lastJSONLine(t, out), &env))
+	assert.False(t, env.OK)
+	assert.Nil(t, env.Data)
+	require.NotNil(t, env.Error)
+	assert.Equal(t, "NETWORK", env.Error.Code)
+	assert.Equal(t, "session ended without result", env.Error.Message)
+
+	// Table mode: stderr line, exit 245.
+	stderr, code2 := captureStderr(t, func() int {
+		return runCLI(t.Context(), []string{"exec", "n1",
+			"--server", srv.URL, "--token", "tk", "--", "hostname"})
+	})
+	require.Equal(t, 245, code2)
+	assert.Contains(t, stderr, "xnc: session ended without result")
+}
+
+func TestExecEnvelopeNewlineSeparation(t *testing.T) {
+	zero := 0
+	// remote stdout without trailing newline must not glue onto the envelope
+	srv := fakeExecServer(t, &zero, "hostname", "out-no-newline", "")
+	defer srv.Close()
+
+	out, code := captureStdout(t, func() int {
+		return runCLI(t.Context(), []string{"exec", "n1", "--json",
+			"--server", srv.URL, "--token", "tk", "--", "hostname"})
+	})
+	require.Equal(t, 0, code)
+	assert.True(t, strings.HasPrefix(out, "out-no-newline\n"), "separator newline added: %q", out)
+	var env struct {
+		OK   bool `json:"ok"`
+		Data struct {
+			Stdout string `json:"stdout"`
+		} `json:"data"`
+	}
+	require.NoError(t, jsonUnmarshalStr(lastJSONLine(t, out), &env))
+	assert.True(t, env.OK)
+	assert.Equal(t, "out-no-newline", env.Data.Stdout)
+}
