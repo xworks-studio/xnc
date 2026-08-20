@@ -121,6 +121,8 @@ P8 Linux（依赖会话引擎稳定，随时可插）
 
 （各 Gate 的实测数据在对应 Phase 完成时追加到本节。）
 
+部署记录：2026-08-20 SRV 生产栈上线（Docker 29 + compose：caddy TLS + xnc-server + PostgreSQL，control.xnc.app 公网 HTTPS 验证通过）；NODE_MAIN（LABS-TB16G7）以 XNCAgent 服务形式注册并在线（真实 NAT 出站路径，Scenario A/B 真机成立）。
+
 ## 5. 跨 Phase 恒定轨道
 
 ```text

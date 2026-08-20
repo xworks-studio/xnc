@@ -2769,6 +2769,7 @@ MockAgent 不再是第三份协议实现——就是 agent 核心包 + 内存虚
 * NODE_MAIN 开发期经 WinRM PowerShell Remoting 自动化配置（部署测试构建、收集日志），仅为开发便利，与 XNC 协议无关。
 * 节点从办公/家庭网络连公网 SRV，天然覆盖 Scenario B（NAT），无需专门构造。
 * Scenario G（断连重连）：节点经手机热点联网即可模拟弱网。
+* WinRM/PS Remoting 会话内启动的进程属于 WSMan job object，会话结束即被终止——节点侧持久进程必须走 `xnc-agent install`（SCM 托管服务），不能 Start-Process。
 * NODE_MAIN 被 RDP 接管会锁定 console 会话——正好用于桌面预览"无扰动"对比验证（第 64 节）。
 * SRV 为阿里云国际区域（control.xnc.app → 47.243.209.52）：免 ICP 备案，.app 域名 + Let's Encrypt 直接可用。
 * 负载测试（1000 agents）用 MockAgent 跑在开发机/SRV，不占真机。
