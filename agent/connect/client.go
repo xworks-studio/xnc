@@ -38,6 +38,10 @@ type Client struct {
 	BackoffReset time.Duration
 	Log          *slog.Logger
 	Handler      Handler // nil 安全：会话消息分发；nil 时仅丢弃
+	// OnReady 每次连接就绪（HELLO_ACK 之后、读循环启动之前）各调用恰好一次，
+	// 交出该条连接的控制写闭包。重连后再次触发：旧闭包绑定已死连接，接收方
+	// （如会话引擎）必须在回调内整体重建自身，不得跨连接复用旧闭包。nil 跳过。
+	OnReady func(sendControl func(m proto.Message) error)
 }
 
 func NewClient(serverURL string, k *identity.Key, info machineinfo.Info) *Client {
@@ -133,13 +137,20 @@ func (c *Client) handshake(ctx context.Context) (*websocket.Conn, error) {
 }
 
 // once 完成一次完整连接生命周期：dial → CHALLENGE → CHALLENGE_RESPONSE → HELLO
-// → HELLO_ACK → 心跳循环，出错返回（由 Run 重连）。
+// → HELLO_ACK → OnReady → 心跳循环，出错返回（由 Run 重连）。
 func (c *Client) once(ctx context.Context) error {
 	ws, err := c.handshake(ctx)
 	if err != nil {
 		return err
 	}
 	defer ws.CloseNow()
+
+	// 连接就绪（HELLO_ACK 已收到、读循环未启动）：把本条连接的控制写闭包经
+	// OnReady 交出。每次连接各调用一次；闭包捕获外层 ctx（随 Run 取消，不随
+	// 连接拆除）与本条 ws——重连后旧闭包指向死连接，接收方须在回调内重建。
+	if c.OnReady != nil {
+		c.OnReady(func(m proto.Message) error { return writeControl(ctx, ws, m) })
+	}
 
 	// 泄读循环：消费 HEARTBEAT_ACK 等入站帧。不读的话 ACK 积压（~39B/30s）
 	// 会撑满接收窗口（~64KB ≈ 14h），服务器写超时掐线 → 节点周期性 offline
@@ -231,6 +242,14 @@ func writeMsg(ctx context.Context, ws *websocket.Conn, typ string, payload any) 
 	if err != nil {
 		return err
 	}
+	return writeControl(ctx, ws, m)
+}
+
+// writeControl 把已构造的完整控制帧写入控制连接。OnReady 交出的 sendControl
+// 闭包即绑定本函数（捕获 once 的外层 ctx 与本条 ws）：ctx 随 Run 取消而非
+// 随连接拆除，连接存续期内闭包始终有效；连接死亡后写入报错，由下一次
+// OnReady 重建依赖。coder/websocket 保证并发 Write 安全（与心跳写并存无竞态）。
+func writeControl(ctx context.Context, ws *websocket.Conn, m proto.Message) error {
 	b, err := json.Marshal(m)
 	if err != nil {
 		return err

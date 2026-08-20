@@ -17,6 +17,8 @@ import (
 	"xnc/agent/enroll"
 	"xnc/agent/identity"
 	"xnc/agent/machineinfo"
+	"xnc/agent/session"
+	"xnc/proto"
 )
 
 func main() {
@@ -90,6 +92,13 @@ func runOne(ctx context.Context, server, token, dir string, i int, beat, disc ti
 	c := connect.NewClient(server, k, mockInfo(i))
 	c.Beat = beat
 	c.Log = log
+	// 每次连接就绪（含重连）重建 engine：旧 engine 的 sendControl 绑定旧连接，
+	// 其 active 会话已随断连作废，重建即正确语义（与 agent.Run 相同装配）。
+	c.OnReady = func(sendControl func(m proto.Message) error) {
+		engine := session.NewEngine(log, sendControl)
+		engine.Register(proto.KindExec, session.NewExec(log))
+		c.Handler = engine
+	}
 
 	if once {
 		return c.RunOnce(ctx)

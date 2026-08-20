@@ -11,6 +11,8 @@ import (
 	"xnc/agent/enroll"
 	"xnc/agent/identity"
 	"xnc/agent/machineinfo"
+	"xnc/agent/session"
+	"xnc/proto"
 )
 
 type Agent struct {
@@ -47,5 +49,13 @@ func (a *Agent) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return connect.NewClient(a.ServerURL, k, info).Run(ctx)
+	c := connect.NewClient(a.ServerURL, k, info)
+	// 每次连接就绪（含重连）重建 engine：旧 engine 的 sendControl 绑定旧连接，
+	// 其 active 会话已随断连作废，重建即正确语义。
+	c.OnReady = func(sendControl func(m proto.Message) error) {
+		engine := session.NewEngine(slog.Default(), sendControl)
+		engine.Register(proto.KindExec, session.NewExec(slog.Default()))
+		c.Handler = engine
+	}
+	return c.Run(ctx)
 }

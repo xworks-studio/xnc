@@ -449,3 +449,90 @@ func TestDispatchDoesNotBlockReadLoop(t *testing.T) {
 		t.Fatal("read loop blocked by session dispatch: SESSION_CLOSE undelivered while open-handler parked")
 	}
 }
+
+// --- Task 8: OnReady 装配钩子 ---
+
+// TestOnReadyFiresAfterHelloAck（Task 8）：OnReady 必须在每次 HELLO_ACK 成功
+// 后（once 内 handshake 返回、drain 启动前）恰好触发一次，含重连。判别手段：
+// ① 计数器断言两次连接（首连被 server 强制掐断制造一次重连）各恰好一次，
+// 且二连存活期内不再触发；② 回调内经交出的 sendControl 发探测帧
+// （SESSION_REFUSED/onready-probe），server 只在读循环里收它——探测帧能回到
+// server 即证明闭包绑定的是 HELLO_ACK 之后的活连接（时机在握手完成之后）。
+func TestOnReadyFiresAfterHelloAck(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	var dials, fires atomic.Int32
+	probes := make(chan string, 4)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		write := challenge(t, c, pub) // CHALLENGE → 验签 → 写出 HELLO_ACK
+		if dials.Add(1) == 1 {
+			// 首连：停留 150ms（足够客户端读完 HELLO_ACK 并触发 OnReady）后
+			// 掐断，制造一次强制重连。
+			time.Sleep(150 * time.Millisecond)
+			return
+		}
+		for { // 后续连接：echo 心跳维持存活；记录 OnReady 探测帧
+			_, data, err := c.Read(context.Background())
+			if err != nil {
+				return
+			}
+			var hm proto.Message
+			require.NoError(t, json.Unmarshal(data, &hm))
+			switch hm.Type {
+			case proto.TypeSessionRefused:
+				var sr proto.SessionRefused
+				require.NoError(t, hm.Decode(&sr))
+				select {
+				case probes <- sr.SessionID:
+				default:
+				}
+			case proto.TypeHeartbeat:
+				write(proto.TypeHeartbeatAck, struct{}{})
+			}
+		}
+	}))
+	defer srv.Close()
+
+	k := &identity.Key{NodeID: "node-x", Priv: priv}
+	c := NewClient("ws"+srv.URL[4:], k, machineinfo.Info{})
+	c.Beat = 50 * time.Millisecond
+	c.OnReady = func(sendControl func(m proto.Message) error) {
+		fires.Add(1)
+		// HELLO_ACK 后连接必须已可写：交出的闭包即刻可用，探测帧直达 server。
+		msg, err := proto.NewMsg(proto.TypeSessionRefused,
+			proto.SessionRefused{SessionID: "onready-probe", Code: proto.CodeKindUnsupported})
+		require.NoError(t, err)
+		_ = sendControl(msg)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+
+	// 一次强制重连共两次连接：OnReady 每连接恰好一次（backoff[0]=1s，宽限 6s）。
+	require.Eventually(t, func() bool { return fires.Load() == 2 },
+		6*time.Second, 50*time.Millisecond, "OnReady must fire once per connection, including reconnect")
+	select {
+	case id := <-probes:
+		assert.Equal(t, "onready-probe", id,
+			"sendControl closure must deliver to the post-HELLO_ACK live connection")
+	case <-time.After(3 * time.Second):
+		t.Fatal("probe sent inside OnReady never reached server")
+	}
+	// 二连存活期内（多个心跳拍过去）不得再触发：恰好每连接一次，而非每拍/每帧。
+	time.Sleep(300 * time.Millisecond)
+	assert.Equal(t, int32(2), fires.Load(), "OnReady must fire exactly once per connection")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+}
