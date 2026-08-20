@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -196,16 +197,28 @@ func expectBinary(ctx context.Context, ws *websocket.Conn, want string) error {
 }
 
 // expectClose 断言 exit 后对端确实关线（agent shell 退出路径以 normal
-// closure 收线；读到任何终止即会话结束，超时则残留挂起）。
+// closure 收线）。读到关闭帧 / 连接终止 → PASS；读超时（每帧 15s 或
+// 会话总预算耗尽，均表现为 context.DeadlineExceeded）→ FAIL——exit
+// 不再关线（ConPTY 回显 exit 后静默挂住）正是本断言要拦的回归，不能
+// 借超时假绿。
 func expectClose(ctx context.Context, ws *websocket.Conn) error {
+	var tail []byte // 诊断尾巴：证明 exit 确已送达（被回显）而对端未关线
 	for {
 		fctx, cancel := context.WithTimeout(ctx, frameTimeout)
-		_, _, err := ws.Read(fctx)
+		_, data, err := ws.Read(fctx)
 		cancel()
-		if err != nil {
-			return nil // 对端关线 / 关闭帧：会话已按预期结束
+		if err == nil { // exit 后的残余输出帧继续吞掉，直到读到终止
+			tail = append(tail, data...)
+			if len(tail) > 200 {
+				tail = tail[len(tail)-200:]
+			}
+			continue
 		}
-		// exit 后的残余输出帧继续吞掉，直到读到终止。
+		if errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("session still open %s after exit (tail %q): exit did not close the session",
+				frameTimeout, clip(tail))
+		}
+		return nil // 关闭帧 / 连接终止：会话已按预期结束
 	}
 }
 
