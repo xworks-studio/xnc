@@ -64,6 +64,8 @@ func NewRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		nr.Use(auth.Middleware(cfg.JWTSecret, st))
 		nr.Get("/", h.listNodes)
 		nr.Get("/{id}", h.getNode)
+		// exec：鉴权 + membership 通过后创建会话并下发 SESSION_OPEN，202 异步语义
+		nr.Post("/{id}/exec", h.execStart)
 	})
 	return r
 }

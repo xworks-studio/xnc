@@ -90,3 +90,19 @@ func mustUUID(s string) uuid.UUID {
 	}
 	return id
 }
+
+// readRaw 读一帧返回 ("text"|"binary", data)，不断言帧型（exec 终态帧是 text）。
+func readRaw(t *testing.T, ws *websocket.Conn) (string, []byte) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	typ, data, err := ws.Read(ctx)
+	require.NoError(t, err)
+	if typ == websocket.MessageText {
+		return "text", data
+	}
+	return "binary", data
+}
+
+// jsonUnmarshal 是 json.Unmarshal 的别名（测试正文用它保持简洁）。
+func jsonUnmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }
