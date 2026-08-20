@@ -17,16 +17,27 @@ try {
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
     } -ArgumentList $RemoteDir
 
-    Copy-Item -Path $LocalExe -Destination "$RemoteDir\xnc-agent.exe" -ToSession $session -Force
-
     # NOTE: processes started inside a PS-Remoting session die with the session
     # (WSMan job object). The durable path is the XNCAgent windows service.
+    # Stop the service BEFORE copying (the running exe locks the file).
+    Invoke-Command -Session $session -ScriptBlock {
+        param($dir)
+        $svc = Get-Service XNCAgent -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -ne 'Stopped') {
+            Stop-Service XNCAgent -Force
+            Start-Sleep -Seconds 2
+        }
+        Get-Process xnc-agent -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -like "$dir*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+    } -ArgumentList $RemoteDir
+
+    Copy-Item -Path $LocalExe -Destination "$RemoteDir\xnc-agent.exe" -ToSession $session -Force
+
     Invoke-Command -Session $session -ScriptBlock {
         param($dir, $server, $token)
         $svc = Get-Service XNCAgent -ErrorAction SilentlyContinue
         if ($svc) {
-            # refresh binary then restart service
-            Restart-Service XNCAgent -Force
+            Start-Service XNCAgent
             "service restarted"
         } else {
             $out = & "$dir\xnc-agent.exe" install "--server=$server" "--token=$token" "--state-dir=$dir" 2>&1
