@@ -66,6 +66,8 @@ func NewRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		nr.Get("/{id}", h.getNode)
 		// exec：鉴权 + membership 通过后创建会话并下发 SESSION_OPEN，202 异步语义
 		nr.Post("/{id}/exec", h.execStart)
+		// shell：同一会话创建路径（startSession），kind=shell，ConPTY 交互式终端
+		nr.Post("/{id}/shell", h.shellStart)
 	})
 	return r
 }

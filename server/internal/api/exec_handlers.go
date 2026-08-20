@@ -13,6 +13,7 @@ import (
 	"xnc/proto"
 	"xnc/server/internal/auth"
 	"xnc/server/internal/db/sqlc"
+	"xnc/server/internal/session"
 )
 
 const (
@@ -45,22 +46,10 @@ func mustJSON(v any) []byte {
 }
 
 // execStart 处理 POST /api/nodes/{id}/exec：鉴权（router 中间件）+ membership
-// → 校验 → Create（双侧 token）→ 装配 finish/notify 钩子 → 经控制连接下发
-// SESSION_OPEN → 审计 exec.start → 202 统一异步响应。
+// → 校验 → 委托 startSession（Create（双侧 token）→ 装配 finish/notify 钩子 →
+// 经控制连接下发 SESSION_OPEN → 审计 exec.start → 202 统一异步响应）。
 func (h *handlers) execStart(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, execBodyMaxBytes)
-	u := auth.UserFrom(r.Context())
-	nodeID, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		respondError(w, proto.Err(404, proto.CodeNodeNotFound, "node not found"))
-		return
-	}
-	if _, err := h.st.Q().GetNodeForUser(r.Context(), sqlc.GetNodeForUserParams{
-		UserID: u.ID, ID: nodeID,
-	}); err != nil {
-		respondError(w, proto.Err(404, proto.CodeNodeNotFound, "node not found"))
-		return
-	}
 
 	var req execReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -93,24 +82,46 @@ func (h *handlers) execStart(w http.ResponseWriter, r *http.Request) {
 		respondError(w, proto.Err(500, proto.CodeInternal, "encode params"))
 		return
 	}
+	h.startSession(w, r, proto.KindExec, params, "exec.start", "exec.finish")
+}
+
+// startSession 是 exec/shell 共享的会话创建路径：membership → Create（双侧
+// token）→ 装配 finish/notify 钩子 → 经控制连接下发 SESSION_OPEN → 审计
+// openAction → 202。返回 (result, true) 表示已写 202；false 表示已写错误响应。
+func (h *handlers) startSession(w http.ResponseWriter, r *http.Request,
+	kind string, params json.RawMessage, openAction, closeAction string,
+) (*session.CreateResult, bool) {
+	u := auth.UserFrom(r.Context())
+	nodeID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		respondError(w, proto.Err(404, proto.CodeNodeNotFound, "node not found"))
+		return nil, false
+	}
+	if _, err := h.st.Q().GetNodeForUser(r.Context(), sqlc.GetNodeForUserParams{
+		UserID: u.ID, ID: nodeID,
+	}); err != nil {
+		respondError(w, proto.Err(404, proto.CodeNodeNotFound, "node not found"))
+		return nil, false
+	}
+
 	// Create 内部检查 reg.Online：节点无控制连接 → 409 NODE_OFFLINE。
-	res, apiErr := h.sess.Create(nodeID, u.ID, proto.KindExec, params)
+	res, apiErr := h.sess.Create(nodeID, u.ID, kind, params)
 	if apiErr != nil {
 		respondError(w, apiErr)
-		return
+		return nil, false
 	}
 
 	// 钩子在 Create 后立即装配（早于任何可触发 NotifyClose 的路径）：
 	// Opening 超时（60s）、pump 断连、SESSION_REFUSED 都可能在 handler
 	// 返回后异步关闭会话，届时 finish/notify 必须已就位。
-	// finish 不含命令内容，仅 reason/kind/sessionId。
+	// finish 不含会话内容（命令/VT），仅 reason/kind/sessionId。
 	h.sess.SetFinishFn(res.Session, func(reason string) {
 		ctx, cancel := context.WithTimeout(context.Background(), auditInsertTimeout)
 		defer cancel()
 		_ = h.st.Q().InsertAuditLog(ctx, sqlc.InsertAuditLogParams{
-			UserID: pgUUID(u.ID), NodeID: pgUUID(nodeID), Action: "exec.finish",
+			UserID: pgUUID(u.ID), NodeID: pgUUID(nodeID), Action: closeAction,
 			Metadata: mustJSON(map[string]string{
-				"reason": reason, "kind": proto.KindExec, "sessionId": res.Session.ID,
+				"reason": reason, "kind": kind, "sessionId": res.Session.ID,
 			}),
 		})
 	})
@@ -132,10 +143,10 @@ func (h *handlers) execStart(w http.ResponseWriter, r *http.Request) {
 	if nodeConn == nil || nodeConn.Send == nil {
 		h.sess.NotifyClose(res.Session.ID, "node-offline")
 		respondError(w, proto.Err(409, proto.CodeNodeOffline, "node is offline"))
-		return
+		return nil, false
 	}
 	openMsg, err := proto.NewMsg(proto.TypeSessionOpen, proto.SessionOpen{
-		SessionID: res.Session.ID, Kind: proto.KindExec, Params: params,
+		SessionID: res.Session.ID, Kind: kind, Params: params,
 		AgentToken: res.AgentToken,
 		WsURL:      wsBaseURL(r) + "/api/agent/session?token=" + res.AgentToken,
 		ExpiresAt:  res.ExpiresAt,
@@ -143,21 +154,21 @@ func (h *handlers) execStart(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.sess.NotifyClose(res.Session.ID, "internal")
 		respondError(w, proto.Err(500, proto.CodeInternal, "encode session open"))
-		return
+		return nil, false
 	}
 	if err := nodeConn.Send(openMsg); err != nil {
 		h.sess.NotifyClose(res.Session.ID, "node-offline")
 		respondError(w, proto.Err(409, proto.CodeNodeOffline, "node is offline"))
-		return
+		return nil, false
 	}
 
 	// 独立 background ctx：此刻 SESSION_OPEN 已下发，客户端随时可能断连
-	// 取消 r.Context()，审计 start 行必须不受影响。
+	// 取消 r.Context()，审计 open 行必须不受影响。
 	actx, acancel := context.WithTimeout(context.Background(), auditInsertTimeout)
 	defer acancel()
 	_ = h.st.Q().InsertAuditLog(actx, sqlc.InsertAuditLogParams{
-		UserID: pgUUID(u.ID), NodeID: pgUUID(nodeID), Action: "exec.start",
-		Metadata: mustJSON(map[string]string{"kind": proto.KindExec, "sessionId": res.Session.ID}),
+		UserID: pgUUID(u.ID), NodeID: pgUUID(nodeID), Action: openAction,
+		Metadata: mustJSON(map[string]string{"kind": kind, "sessionId": res.Session.ID}),
 	})
 	// AgentToken 绝不进 REST 响应；client 拿到的 token 是一次性 ClientToken。
 	respondJSON(w, 202, map[string]any{
@@ -166,4 +177,5 @@ func (h *handlers) execStart(w http.ResponseWriter, r *http.Request) {
 		"expiresAt":    res.ExpiresAt,
 		"websocketUrl": "/api/session/" + res.Session.ID + "?token=" + res.ClientToken,
 	})
+	return res, true
 }

@@ -82,6 +82,28 @@ func readBin(t *testing.T, ws *websocket.Conn) []byte {
 	return data
 }
 
+// captureSessionOpen 在控制连接上后台读取一条 SESSION_OPEN，断言类型并解码后
+// 送入 channel（captureOnly 变体：不拨 agent 会话 WS，测试只关心下发的 params）。
+// goroutine 内用 Errorf 而非 require——FailNow 只能在测试主 goroutine 调用。
+func captureSessionOpen(t *testing.T, ctrlWS *websocket.Conn) chan proto.SessionOpen {
+	t.Helper()
+	ch := make(chan proto.SessionOpen, 1)
+	go func() {
+		m := readMsg(t, ctrlWS)
+		if m.Type != proto.TypeSessionOpen {
+			t.Errorf("expected %s on control conn, got %s", proto.TypeSessionOpen, m.Type)
+			return
+		}
+		var so proto.SessionOpen
+		if err := m.Decode(&so); err != nil {
+			t.Errorf("decode %s: %v", proto.TypeSessionOpen, err)
+			return
+		}
+		ch <- so
+	}()
+	return ch
+}
+
 // mustUUID 解析节点 UUID（EnrollNode 返回字符串形态）。
 func mustUUID(s string) uuid.UUID {
 	id, err := uuid.Parse(s)
