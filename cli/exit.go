@@ -12,7 +12,7 @@ const (
 	exitTimeout  = 243 // EXEC_RESULT received with timedOut/no exit code; resultless disconnects are 245
 	exitMissing  = 244 // CLUSTER_NOT_FOUND, NODE_NOT_FOUND, NODE_ALREADY_ENROLLED
 	exitNet      = 245 // NETWORK (client-side network failure)
-	exitQuota    = 246 // reserved: quota
+	exitQuota    = 246 // SESSION_LIMIT_EXCEEDED
 	exitInternal = 250 // everything else
 )
 
@@ -28,6 +28,8 @@ func ExitCode(e *proto.APIError) int {
 		return exitForbid
 	case proto.CodeNodeOffline:
 		return exitOffline
+	case proto.CodeSessionLimited:
+		return exitQuota
 	case proto.CodeClusterNotFound, proto.CodeNodeNotFound, proto.CodeNodeAlreadyEnrolled:
 		return exitMissing
 	case "NETWORK":
