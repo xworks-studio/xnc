@@ -68,10 +68,15 @@ func NewRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		nr.Use(auth.Middleware(cfg.JWTSecret, st))
 		nr.Get("/", h.listNodes)
 		nr.Get("/{id}", h.getNode)
-		// exec：鉴权 + membership 通过后创建会话并下发 SESSION_OPEN，202 异步语义
-		nr.Post("/{id}/exec", h.execStart)
-		// shell：同一会话创建路径（startSession），kind=shell，ConPTY 交互式终端
-		nr.Post("/{id}/shell", h.shellStart)
+			// exec：鉴权 + membership 通过后创建会话并下发 SESSION_OPEN，202 异步语义
+			nr.Post("/{id}/exec", h.execStart)
+			// shell：同一会话创建路径（startSession），kind=shell，ConPTY 交互式终端
+			nr.Post("/{id}/shell", h.shellStart)
+			// file：上传（path+size+sha256）/下载（path）会话，kind=file，startSession 路径
+			nr.Post("/{id}/files/upload", h.fileUpload)
+			nr.Post("/{id}/files/download", h.fileDownload)
+			// tunnel：RDP 等端口隧道，kind=tunnel，白名单 target 解析 host/port
+			nr.Post("/{id}/tunnel", h.tunnelStart)
 	})
 	return r
 }
