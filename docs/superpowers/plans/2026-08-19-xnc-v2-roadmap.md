@@ -116,7 +116,7 @@ P8 Linux（依赖会话引擎稳定，随时可插）
 | ---- | ---- | ---- | ---- |
 | Gate A | P1 出口 | mockagent × 1000 心跳：server CPU/内存基线、100 并发 exec 占位 | ✅ 2026-08-21 通过：1000/1000 在线稳定（10 波接入 0 失败）；心跳稳态 xnc-server CPU ≤2%、MEM ~75MiB，postgres ≤2.2%/52MiB；100 并发 exec 全部成功（exitCode 0），7s 完成，会话峰后 MEM 88MiB、无 panic。装置教训：Docker Desktop 端口代理经不起 1000 并发 SYN（需分波），dev 栈心跳超时已参数化（compose env XNC_HEARTBEAT_TIMEOUT），mockagent 增 --first 偏移支持多波共享身份目录 |
 | Gate B | P3 计划前 | Go ConPTY spike（两方案择一，均不可行则回炉） | ✅ 2026-08-20 双方案 6/6 PASS（pwsh 7.6 + PS 5.1）；**选定方案 B：x/sys 直接封装**（v0.47 原生导出 ConPTY API，91 行 in-repo wrapper，零三方依赖）；两个关键不变量已文档化（lpValue 传句柄值非指针；STARTF_USESTDHANDLES 必需）。详见 docs/superpowers/spikes/gateb-conpty/ |
-| Gate C | P4 内 | mstsc 实连 + websocket 粘合吞吐 | ◐ 2026-08-21 吞吐半项通过：docker loopback 下 10MB upload ~210-225ms、download ~155-190ms（计时含 CLI 启动），双边 sha256 一致，评审复核确认；mstsc 实连半项按刻意排除（合并后手工核验） |
+| Gate C | P4 内 | mstsc 实连 + websocket 粘合吞吐 | ✅ 2026-08-21 双项通过：吞吐（docker loopback 10MB upload 206-215ms / download 173-186ms，双边 sha256，评审复核）；生产真机（TB16G7 RDP 已启用 fDenyTS=0/3389 listener 通，文件 roundtrip 30B ok + diff identical；mstsc GUI 实连由用户手工确认——隧道路径已打通） |
 | 稳定性门 | P7 后 | 内部日常运行约 3 个月无事故 + 审计可回溯 → 商业化立项决策 | ⏳ |
 
 （各 Gate 的实测数据在对应 Phase 完成时追加到本节。）
