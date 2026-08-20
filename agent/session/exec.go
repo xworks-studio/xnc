@@ -192,7 +192,10 @@ func (ex *Exec) buildCommand(p proto.ExecParams, sessionID string) (*exec.Cmd, e
 			shell = "pwsh"
 		}
 		if p.Script != "" {
-			return exec.Command(shell, "-NoLogo", "-NonInteractive", "-File", ex.scriptPath(sessionID)), nil
+			// -ExecutionPolicy Bypass：默认 Restricted 策略会拒绝加载 .ps1 文件
+			// （agent 以 LocalSystem 运行，本就是管理通道，策略在此非安全边界）。
+			return exec.Command(shell, "-NoLogo", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+				"-File", ex.scriptPath(sessionID)), nil
 		}
 		return exec.Command(shell, "-NoLogo", "-NonInteractive", "-Command", p.Command), nil
 	}
