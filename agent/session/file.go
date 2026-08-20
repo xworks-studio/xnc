@@ -25,6 +25,11 @@ const (
 	typeFileError  = "FILE_ERROR"
 
 	fileChunkSize = 64 * 1024
+
+	// fileMaxBytes download 兜底上限 256MB，与 server 侧
+	// file_handlers.go 的上传上限同值对称：防篡改路径绕过服务端校验后
+	// 经 download 无界拉取超大文件。
+	fileMaxBytes = 256 * 1024 * 1024
 )
 
 // File 文件传输处理器。Log 为 nil 时用 slog.Default()。
@@ -130,7 +135,7 @@ func (f *File) handleUpload(ctx context.Context, ws *websocket.Conn, sessionID s
 
 // handleDownload download 方向：FILE_BEGIN（实测 size）→ binary 帧全量推送
 // （边送边算 hash）→ FILE_RESULT 携带实测 sha256；文件不可开/不可读回
-// FILE_ERROR 或静默终止（写失败=对端已断）。
+// FILE_ERROR，超 256MB 上限回 FILE_TOO_LARGE，或静默终止（写失败=对端已断）。
 func (f *File) handleDownload(ctx context.Context, ws *websocket.Conn, sessionID string, p proto.FileParams) {
 	fp, err := os.Open(p.Path)
 	if err != nil {
@@ -141,6 +146,11 @@ func (f *File) handleDownload(ctx context.Context, ws *websocket.Conn, sessionID
 	st, err := fp.Stat()
 	if err != nil {
 		f.fileError(ctx, ws, proto.CodeFileNotFound)
+		return
+	}
+	if st.Size() > fileMaxBytes {
+		fp.Close()
+		f.fileError(ctx, ws, proto.CodeFileTooLarge)
 		return
 	}
 
