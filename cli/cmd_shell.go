@@ -105,13 +105,23 @@ func runShell(cmd *cobra.Command, args []string, flagCols, flagRows int) error {
 	ctx := cmd.Context()
 	localClose := make(chan struct{}) // `~.` 或 stdin EOF 触发本地断开
 	stdinDone := make(chan struct{})
+	var debugDump *os.File // XNC_SHELL_DEBUG=<path> 时转储原始 stdin 字节（十六进制）
+	if p := os.Getenv("XNC_SHELL_DEBUG"); p != "" {
+		debugDump, _ = os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	}
 	go func() { // stdin → ws binary，行首 `~.` 本地断开
 		defer close(stdinDone)
+		if debugDump != nil {
+			defer debugDump.Close()
+		}
 		esc := newEscapeDetector()
 		buf := make([]byte, 4096)
 		for {
 			n, err := os.Stdin.Read(buf)
 			if n > 0 {
+				if debugDump != nil {
+					_, _ = debugDump.WriteString(fmt.Sprintf("% x\n", buf[:n]))
+				}
 				out, disconnect := esc.feed(buf[:n])
 				if len(out) > 0 {
 					wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -205,41 +215,89 @@ func runShell(cmd *cobra.Command, args []string, flagCols, flagRows int) error {
 	}
 }
 
-// escapeDetector 识别行首的 `~.`（ssh 风格本地断开）；其余字节原样转发。
-// 状态跨 chunk 保持（pending 记住悬而未决的 `~`）。
+// escapeDetector 识别行首的断开序列（ssh 风格）：`~.` 或裸 `~`+回车。
+// 同时接受全角变体（～ ． 。）——中文 IME 下用户极易打出全角字符。
+// 其余字节原样转发；状态跨 chunk 保持。
 type escapeDetector struct {
 	lineStart bool
-	pending   bool // 上一字节是行首的 `~`
+	held      []byte // 行首悬置的 tilde 字节（ASCII 或全角），待下一个字节裁决
 }
 
 func newEscapeDetector() *escapeDetector { return &escapeDetector{lineStart: true} }
 
+var (
+	tildeForms = [][]byte{
+		{'~'},                   // ASCII
+		{0xEF, 0xBD, 0x9E},      // ～ U+FF5E（全角波浪）
+	}
+	dotForms = [][]byte{
+		{0x2E},              // ASCII .
+		{0xEF, 0xBC, 0x8E},  // ． U+FF0E（全角句点）
+		{0xE3, 0x80, 0x82},  // 。 U+3002（CJK 句号）
+	}
+)
+
+func bytesHasPrefix(b, p []byte) bool {
+	if len(b) < len(p) {
+		return false
+	}
+	for i := range p {
+		if b[i] != p[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func matchForm(b []byte, forms [][]byte) int { // 返回匹配长度，0 = 无
+	for _, f := range forms {
+		if bytesHasPrefix(b, f) {
+			return len(f)
+		}
+	}
+	return 0
+}
+
 // feed 返回（应转发的字节, 是否触发本地断开）。
 func (d *escapeDetector) feed(in []byte) ([]byte, bool) {
 	var out []byte
-	for _, b := range in {
-		if d.pending {
-			d.pending = false
-			if b == '.' || b == '\r' || b == '\n' {
-				// `~.` 直连断开；行首裸 `~` + 回车也断开——用户本能会按
-				// 回车，且 bare `~` 在 PowerShell 里永远是无意义命令，劫持安全。
+	for len(in) > 0 {
+		if d.held != nil {
+			held := d.held
+			d.held = nil
+			switch {
+			case matchForm(in, dotForms) > 0:
 				return out, true
-			}
-			if b == '~' { // ssh 语义：行首 `~~` 输出单个字面 `~`
-				out = append(out, '~')
+			case in[0] == '\r' || in[0] == '\n':
+				return out, true // 裸 ~ + 回车
+			case matchForm(in, tildeForms) > 0:
+				out = append(out, '~') // `~~` 输出单个字面 ~
+				in = in[matchLen(in, tildeForms):]
 				d.lineStart = false
 				continue
+			default:
+				// 普通跟随字节：tilde 原样 + 该字节（UTF-8 后续字节由主循环透传）
+				out = append(out, held...)
+				b := in[0]
+				out = append(out, b)
+				d.lineStart = b == '\r' || b == '\n'
+				in = in[1:]
+				continue
 			}
-			out = append(out, '~', b)
-			d.lineStart = b == '\r' || b == '\n'
-			continue
 		}
-		if d.lineStart && b == '~' {
-			d.pending = true
-			continue
+		if d.lineStart {
+			if n := matchForm(in, tildeForms); n > 0 {
+				d.held = append([]byte(nil), in[:n]...)
+				in = in[n:]
+				continue
+			}
 		}
+		b := in[0]
 		out = append(out, b)
 		d.lineStart = b == '\r' || b == '\n'
+		in = in[1:]
 	}
 	return out, false
 }
+
+func matchLen(b []byte, forms [][]byte) int { return matchForm(b, forms) }

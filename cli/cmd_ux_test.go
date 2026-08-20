@@ -26,6 +26,13 @@ func TestEscapeDetector(t *testing.T) {
 		{"bare tilde + Enter disconnects", []byte("~\r"), "", true},
 		{"bare tilde + LF disconnects", []byte("~\n"), "", true},
 		{"tilde then path char passes both", []byte("~/dir\r"), "~/dir\r", false},
+		// 全角变体（中文 IME）：～ = EF BD 9E，． = EF BC 8E，。 = E3 80 82
+		{"fullwidth tilde + ascii dot", append([]byte{0xEF, 0xBD, 0x9E}, '.'), "", true},
+		{"fullwidth tilde + fullwidth dot", []byte{0xEF, 0xBD, 0x9E, 0xEF, 0xBC, 0x8E}, "", true},
+		{"fullwidth tilde + CJK dot", []byte{0xEF, 0xBD, 0x9E, 0xE3, 0x80, 0x82}, "", true},
+		{"ascii tilde + fullwidth dot", []byte{'~', 0xEF, 0xBC, 0x8E}, "", true},
+		{"fullwidth tilde + Enter disconnects", append([]byte{0xEF, 0xBD, 0x9E}, '\r'), "", true},
+		{"fullwidth tilde then text passes through", append(append([]byte{}, 0xEF, 0xBD, 0x9E), 'x'), string([]byte{0xEF, 0xBD, 0x9E, 'x'}), false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
