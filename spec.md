@@ -2053,7 +2053,7 @@ xnc rdp web-01
 
 # 53. 开发顺序
 
-推荐按以下顺序实现。各 Phase 所需测试设备见第 59 节测试设备矩阵，凭据读自 `config.env`。
+推荐按以下顺序实现。各 Phase 所需测试设备见第 59 节测试设备矩阵，凭据读自 `deploy/machines.env`。
 
 只重排不砍：v1 的全部功能能力保留，Web UI 独立成相（Phase 7），Linux 远期（Phase 8）。
 
@@ -2754,7 +2754,7 @@ MockAgent 不再是第三份协议实现——就是 agent 核心包 + 内存虚
 
 ## 测试设备矩阵
 
-开发/测试依赖以下设备。凭据统一存放仓库根目录 `config.env`（dotenv 格式、按设备前缀分节、已被 .gitignore 排除，当前已含 SRV 与 NODE_MAIN 真实凭据），开发脚本与 AI Agent 从中读取；未启用的设备栏位留空，脚本跳过对应测试。
+开发/测试依赖以下设备。凭据统一存放 `deploy/machines.env`（dotenv 格式、按设备前缀分节、已被 .gitignore 排除，当前已含 SRV 与 NODE_MAIN 真实凭据），开发脚本与 AI Agent 从中读取；未启用的设备栏位留空，脚本跳过对应测试。
 
 | 设备 | 系统 | 用途 | 阶段 |
 | ---- | ---- | ---- | ---- |
@@ -2860,7 +2860,7 @@ Linux 无 RDP 概念，Remote Desktop 仅作为 Windows 节点能力。
 | 痛点基线 | 无统一方案；合规禁穿透 / VPN / 开端口 | XNC 填补"合规 + 命令行"空档 |
 | 合规边界 | 仅出站长连接；中转 Shell/RDP 属允许范围，Server 可在公网 | 反向连接架构不变 |
 | 桌面预览 | 只读低频 JPEG（默认 1 fps），helper 进用户会话捕获 | RDP 会扰动会话状态，预览提供无扰动观察 |
-| 测试设备 | NODE_MAIN（开发机本体）+ SRV(Ubuntu 公网)；NODE2019 / NODELINUX 预留；凭据入 config.env | 真机覆盖版本线与 NAT 场景，负载用 MockAgent |
+| 测试设备 | NODE_MAIN（开发机本体）+ SRV(Ubuntu 公网)；NODE2019 / NODELINUX 预留；凭据入 deploy/machines.env | 真机覆盖版本线与 NAT 场景，负载用 MockAgent |
 | 协议模型（v2，2026-08） | 统一会话模型：控制连接纯 JSON；一切数据流（含 exec）走同一会话模式 | v1 五种通道三种帧规则并存、双实现漂移，不可维护 |
 | Agent 语言（v2，2026-08） | 换 Go，全栈单语言，proto/ 单一定义 | Go/Rust 双协议实现 + MockAgent 第三份镜像，1 人团队不可持续 |
 | Web UI（v2，2026-08） | 整体后置 Phase 7，CLI 先行 | 定位 Agent-First，第一版不应并行交付全套 React |

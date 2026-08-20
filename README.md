@@ -6,7 +6,7 @@ Windows 节点统一运维入口，出站 443 反向连接（agent 主动连 ser
 
 ## 测试设备凭据
 
-真机测试（SRV / NODE_MAIN / NODE2019 / NODELINUX，见 spec §59 矩阵）的访问凭据统一放根目录 `config.env`：`cp config.env.example config.env` 后填入。该文件已被 .gitignore 排除；未启用的设备栏位留空，脚本自动跳过对应测试。
+真机测试（SRV / NODE_MAIN / NODE2019 / NODELINUX，见 spec §59 矩阵）的访问凭据统一放 `deploy/machines.env`：`cd deploy && cp machines.env.example machines.env` 后填入。该文件已被 .gitignore 排除；未启用的设备栏位留空，脚本自动跳过对应测试。
 
 ## 负载 smoke
 
