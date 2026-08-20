@@ -401,3 +401,51 @@ func TestDispatchesSessionMessages(t *testing.T) {
 		t.Fatal("no SESSION_CLOSE dispatched")
 	}
 }
+
+// blockingOpenHandler 的 HandleSessionOpen 故意停车（阻塞至 ctx 取消），
+// SessionClose 照常送入 channel——用于构造能区分内联同步分发与 goroutine
+// 分发的场景：前者会卡死读循环，后者不受影响。
+type blockingOpenHandler struct {
+	close chan proto.SessionClose
+}
+
+func (b blockingOpenHandler) HandleSessionOpen(ctx context.Context, _ proto.SessionOpen) {
+	<-ctx.Done() // 模拟慢/卡死的会话处理；随 pctx 取消退出
+}
+
+func (b blockingOpenHandler) HandleSessionClose(_ context.Context, sc proto.SessionClose) {
+	b.close <- sc
+}
+
+// TestDispatchDoesNotBlockReadLoop（Fix 1，回归护栏）：HandleSessionOpen 永久
+// 阻塞时，读循环必须继续消费——server 在 SESSION_OPEN 200ms 后下发
+// SESSION_CLOSE；若分发是内联同步调用，读循环被卡死的 open 处理挂起，
+// SESSION_CLOSE 永远到不了（TestDispatchesSessionMessages 的 cap-1 缓冲
+// channel 区分不了这两种实现，本测试补上判别力）。
+func TestDispatchDoesNotBlockReadLoop(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	closeCh := make(chan proto.SessionClose, 1)
+
+	srv := fakeServerWithHooks(t, pub, func(write func(typ string, p any)) {
+		write(proto.TypeSessionOpen, proto.SessionOpen{SessionID: "s1", Kind: proto.KindExec})
+		time.Sleep(200 * time.Millisecond) // 给（假设的内联）分发一个卡死读循环的机会
+		write(proto.TypeSessionClose, proto.SessionClose{SessionID: "s1", Reason: "test"})
+	})
+	defer srv.Close()
+
+	k := &identity.Key{NodeID: "node-x", Priv: priv}
+	c := NewClient("ws"+srv.URL[4:], k, machineinfo.Info{})
+	c.Beat = 50 * time.Millisecond
+	c.Handler = blockingOpenHandler{close: closeCh}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // pctx 随连接拆除取消，卡住的 open 处理 goroutine 退出
+	go c.Run(ctx)
+
+	select {
+	case sc := <-closeCh:
+		assert.Equal(t, "s1", sc.SessionID)
+	case <-time.After(3 * time.Second):
+		t.Fatal("read loop blocked by session dispatch: SESSION_CLOSE undelivered while open-handler parked")
+	}
+}
