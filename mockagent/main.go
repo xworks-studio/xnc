@@ -97,6 +97,7 @@ func runOne(ctx context.Context, server, token, dir string, i int, beat, disc ti
 	c.OnReady = func(sendControl func(m proto.Message) error) {
 		engine := session.NewEngine(log, sendControl)
 		engine.Register(proto.KindExec, session.NewExec(log))
+		engine.Register(proto.KindShell, session.NewShell(log))
 		c.Handler = engine
 	}
 

@@ -55,6 +55,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	c.OnReady = func(sendControl func(m proto.Message) error) {
 		engine := session.NewEngine(slog.Default(), sendControl)
 		engine.Register(proto.KindExec, session.NewExec(slog.Default()))
+		engine.Register(proto.KindShell, session.NewShell(slog.Default()))
 		c.Handler = engine
 	}
 	return c.Run(ctx)
