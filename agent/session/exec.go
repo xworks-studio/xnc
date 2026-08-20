@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sync"
 	"time"
@@ -31,10 +32,20 @@ const (
 	typeExecResult = "EXEC_RESULT"
 
 	execDefaultTimeout = 300 * time.Second
+
+	// execMaxScriptBytes agent 侧脚本兜底上限。server 已拦 256KB；此值
+	// 只防绕过服务端校验的篡改路径直接在 agent 落盘超大文件（T7）。
+	execMaxScriptBytes = 1024 * 1024
 )
 
+// sessionIDRe 临时脚本文件名（xnc-<sessionId>.ps1）中 sessionID 的白名单：
+// UUID 形态（字母数字与连字符）。sessionID 来自服务端 SESSION_OPEN，凡带
+// 路径分隔符、点等其它字符一律拒绝整会话，杜绝临时文件路径穿越（T6 评审
+// 加固，T7 收口）。
+var sessionIDRe = regexp.MustCompile(`^[A-Za-z0-9-]+$`)
+
 // Exec 命令模式处理器。TmpDir 为空 = os.TempDir()（脚本模式临时文件目录，
-// 测试注入；脚本生命周期用例由 T7 覆盖）。
+// 测试注入点）。
 type Exec struct {
 	Log    *slog.Logger
 	TmpDir string
@@ -54,6 +65,18 @@ func (ex *Exec) logger() *slog.Logger {
 func (ex *Exec) Handle(ctx context.Context, ws *websocket.Conn, sessionID string, params json.RawMessage) {
 	var p proto.ExecParams
 	if err := json.Unmarshal(params, &p); err != nil {
+		ex.result(ctx, ws, nil, false, 0)
+		return
+	}
+	// sessionID 会进入临时脚本路径：非白名单形态（如 "../../evil"）即拒绝
+	// 整会话，路径穿越在落盘前终结。
+	if !sessionIDRe.MatchString(sessionID) {
+		ex.logger().Warn("exec refused malformed session id", "session", sessionID)
+		ex.result(ctx, ws, nil, false, 0)
+		return
+	}
+	if len(p.Script) > execMaxScriptBytes {
+		// server 已拦 256KB；agent 兜底，防篡改路径直接落盘超大文件
 		ex.result(ctx, ws, nil, false, 0)
 		return
 	}
