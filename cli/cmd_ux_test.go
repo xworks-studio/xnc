@@ -23,7 +23,9 @@ func TestEscapeDetector(t *testing.T) {
 		{"escape after newline", []byte("echo hi\r\n~."), "echo hi\r\n", true},
 		{"tilde then other char passes both", []byte("~x\r"), "~x\r", false},
 		{"double tilde emits one literal tilde", []byte("~~."), "~.", false},
-		{"tilde at start then newline resets", []byte("~\r~."), "~\r", true},
+		{"bare tilde + Enter disconnects", []byte("~\r"), "", true},
+		{"bare tilde + LF disconnects", []byte("~\n"), "", true},
+		{"tilde then path char passes both", []byte("~/dir\r"), "~/dir\r", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

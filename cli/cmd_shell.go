@@ -220,7 +220,9 @@ func (d *escapeDetector) feed(in []byte) ([]byte, bool) {
 	for _, b := range in {
 		if d.pending {
 			d.pending = false
-			if b == '.' {
+			if b == '.' || b == '\r' || b == '\n' {
+				// `~.` 直连断开；行首裸 `~` + 回车也断开——用户本能会按
+				// 回车，且 bare `~` 在 PowerShell 里永远是无意义命令，劫持安全。
 				return out, true
 			}
 			if b == '~' { // ssh 语义：行首 `~~` 输出单个字面 `~`
