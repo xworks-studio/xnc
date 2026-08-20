@@ -4,7 +4,7 @@
 
 | 命令 | 说明 |
 | ---- | ---- |
-| `xnc login [--server URL]` | 登录，凭证写入配置文件 |
+| `xnc login [--server URL] [--email E]` | 登录，凭证写入配置文件（TTY 交互提示/掩码密码/401 重试；非 TTY 读 stdin 密码） |
 | `xnc whoami` | 当前用户与 Server 信息 |
 | `xnc cluster list / show / create / delete` | Cluster 管理（owner） |
 | `xnc cluster member list / add / remove` | 成员与角色管理（owner） |
@@ -15,7 +15,7 @@
 | `xnc node disable / enable <node>` | 停用/启用节点 |
 | `xnc exec <node> [--timeout N] [--cwd PATH] -- <command...>` | 一次性命令 |
 | `xnc run <node> (--file x.ps1 \| -) [--timeout N]` | 脚本执行，`-` 表示 stdin |
-| `xnc shell <node> [--cols N] [--rows N]` | 交互式 PowerShell（需 TTY） |
+| `xnc shell <node> [--cols N] [--rows N]` | 交互式 PowerShell（需 TTY；行首 `~.` 断开；提示符带 `[机器名]` 前缀；显式 cols/rows 禁用自动 resize） |
 | `xnc rdp <node> [--local-port N]` | 反向隧道 + mstsc |
 | `xnc upload <node> <local> <remote>` | 上传（sha256 校验） |
 | `xnc download <node> <remote> <local>` | 下载（sha256 校验） |

@@ -77,6 +77,7 @@ Server 中转会话数据属于允许范围 → Control Server 可部署公网�
 * Windows 节点主动连接中心服务器。
 * 节点无需暴露 WinRM、SSH 或 RDP 公网端口。
 * 所有公网通信统一通过 HTTPS/WSS 443。
+* 会话建立后 agent 注入一次 `prompt` 函数重定义，交互提示符带 `[主机名]` 前缀（`[LABS-TB16G7] PS C:\>`），不解析/不改写 VT 流。
 * PowerShell 交互使用 ConPTY + `pwsh.exe`。
 * 一次性命令使用 PowerShell 子进程执行。
 * Remote Desktop 使用 Windows 原生 RDP。

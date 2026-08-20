@@ -60,7 +60,7 @@ xnc screen web-01 --snapshot desktop.jpg --json
 ## 交互式 Shell / 远程桌面（仅人类交互场景）
 
 ```bash
-xnc shell web-01      # 需要真 TTY；Agent 场景改用 exec
+xnc shell web-01      # 需要真 TTY；Agent 场景改用 exec；行首 ~. 断开；提示符带 [机器名] 前缀
 xnc rdp web-01        # 启动 mstsc 经反向隧道，交给人类操作
 ```
 
