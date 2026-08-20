@@ -59,10 +59,14 @@ echo "SMOKE: OK"
 
 echo "== CLI 非 TTY 拒绝 =="
 set +e
-OUT=$("$XNC" shell "$NODE" --json </dev/null 2>&1); CODE=$?
+# 不带 --json：shell 命令未注册该 flag（不同于 exec/run），带上会被 cobra 以
+# unknown flag 拒绝（恰好也是 exit 2），TTY 检查根本没走到——步骤只会"碰巧绿"。
+OUT=$("$XNC" shell "$NODE" </dev/null 2>&1); CODE=$?
 set -e
 [ $CODE -eq 2 ] || { echo "shell non-tty exit=$CODE: $OUT"; exit 1; }
-echo "NON-TTY: OK (exit 2)"
+# exit 2 必须来自 TTY 检查路径本身，而非任何其他 usage 错误。
+echo "$OUT" | grep -q "interactive terminal" || { echo "shell non-tty missing tty hint: $OUT"; exit 1; }
+echo "NON-TTY: OK (exit 2, tty check hit)"
 
 echo "== 限额说明 =="
 # 环境级限额验证（409 SESSION_LIMIT_EXCEEDED / CLI 246）由 server 单测覆盖

@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -114,4 +115,19 @@ func TestShellParamsDefaultsInSessionOpen(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("no SESSION_OPEN")
 	}
+}
+
+// TestShellBodyLimit：4KB MaxBytesReader 在 JSON 解码前生效——8KB 请求体被拒
+// 为 400，而不是先被完整缓冲进内存。4KB 以内的合法小 body 不被上限误伤的
+// 对照路径（202）已由 TestShellSessionEndToEnd / TestShellParamsDefaults-
+// InSessionOpen 覆盖，此处只做超限断言。
+func TestShellBodyLimit(t *testing.T) {
+	env := NewTestEnv(t)
+	nodeID := env.EnrollNode(t, "WEB-SH3", "mid-sh3")
+	_ = dialControl(t, env, nodeID)
+
+	big := `{"pad":"` + strings.Repeat("A", 8*1024) + `"}`
+	resp := shellPost(t, env, nodeID, big)
+	defer resp.Body.Close()
+	assert.Equal(t, 400, resp.StatusCode)
 }
