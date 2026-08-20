@@ -1,4 +1,4 @@
-MODULES := proto server agent cli mockagent
+MODULES := proto server agent cli mockagent shellsmoke
 
 .PHONY: build test fmt sqlc
 build:
@@ -23,6 +23,10 @@ e2e:
 .PHONY: e2e2
 e2e2:
 	bash scripts/e2e_phase2.sh
+
+.PHONY: e2e3
+e2e3:
+	bash scripts/e2e_phase3.sh
 
 EXE :=
 ifeq ($(OS),Windows_NT)
