@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"xnc/proto"
 )
 
 // NodeConn 记录一条活跃控制连接；Cancel 用于顶替同节点旧连接，Beats 统计心跳次数。
@@ -12,6 +14,9 @@ type NodeConn struct {
 	Cancel   context.CancelFunc
 	LastBeat time.Time
 	Beats    int64
+	// Send 控制连接的串行化发送器（agentws 装配）：心跳 ACK 与
+	// SESSION_OPEN/SESSION_CLOSE 共用的单一写路径，exec handler 经此下发会话消息。
+	Send func(m proto.Message) error
 }
 
 type Registry struct {
@@ -46,6 +51,14 @@ func (r *Registry) RemoveIf(nodeID string, c *NodeConn) bool {
 		return true
 	}
 	return false
+}
+
+// Get 返回节点当前连接（无则 nil）；exec handler 用以下发 SESSION_OPEN。
+// 调用方使用返回连接的 Send 前应判空。
+func (r *Registry) Get(nodeID string) *NodeConn {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.conns[nodeID]
 }
 
 func (r *Registry) Online(nodeID string) bool {

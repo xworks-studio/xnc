@@ -123,7 +123,28 @@ func (m *Manager) shortenOpeningTTL(s *Session, d time.Duration) {
 	(*session)(s).ttl.Reset(d)
 }
 
+// sessionByAgentToken 以 agent token 反查会话 ID。agent 侧 WS 的 URL（SESSION_OPEN
+// 的 WsURL）只携带 token——会话 ID 对 agent 透明；Opening 态会话数极少且 token
+// 为 256 位随机值，线性扫描无碰撞与枚举面。
+func (m *Manager) sessionByAgentToken(token string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, s := range m.sessions {
+		if s.agentToken != "" && token == s.agentToken {
+			return id
+		}
+	}
+	return ""
+}
+
 func (m *Manager) attach(side, sessionID, token string, ws *websocket.Conn) *proto.APIError {
+	if sessionID == "" {
+		// agent 侧端点（/api/agent/session?token=）无路径 ID：按 token 定位。
+		sessionID = m.sessionByAgentToken(token)
+		if sessionID == "" {
+			return proto.Err(404, proto.CodeSessionNotFound, "session not found")
+		}
+	}
 	m.mu.Lock()
 	s, ok := m.sessions[sessionID]
 	if !ok {
@@ -240,6 +261,3 @@ func (m *Manager) SetNotifyFn(s *Session, fn func(sc proto.SessionClose) error) 
 	(*session)(s).notifyAgent = fn
 }
 
-// pump 两侧 attach 齐备后的帧粘合入口。
-// T3 实现帧粘合
-func (m *Manager) pump(s *session) {}

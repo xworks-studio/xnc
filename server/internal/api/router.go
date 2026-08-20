@@ -1,6 +1,7 @@
 package api
 
 import (
+	"log/slog"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -9,16 +10,27 @@ import (
 	"xnc/server/internal/config"
 	"xnc/server/internal/db"
 	"xnc/server/internal/registry"
+	"xnc/server/internal/session"
 )
 
 type handlers struct {
-	st  *db.Store
-	cfg config.Config
-	reg *registry.Registry
+	st   *db.Store
+	cfg  config.Config
+	reg  *registry.Registry
+	sess *session.Manager
 }
 
 func NewRouter(st *db.Store, cfg config.Config, reg *registry.Registry) http.Handler {
-	h := &handlers{st: st, cfg: cfg, reg: reg}
+	return NewRouterWithSession(st, cfg, reg, nil)
+}
+
+// NewRouterWithSession 允许注入共享的 session manager（测试经 TestEnv.Sess 直接
+// 驱动会话生命周期）；sess 为 nil 时自建，NewRouter 即此路径。
+func NewRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registry, sess *session.Manager) http.Handler {
+	if sess == nil {
+		sess = session.New(reg, slog.Default())
+	}
+	h := &handlers{st: st, cfg: cfg, reg: reg, sess: sess}
 	r := chi.NewRouter()
 
 	r.Get("/api/health", func(w http.ResponseWriter, _ *http.Request) {
@@ -45,6 +57,9 @@ func NewRouter(st *db.Store, cfg config.Config, reg *registry.Registry) http.Han
 	})
 	r.Post("/api/agent/enroll", h.agentEnroll)
 	r.Get("/api/agent/connect", h.agentConnect)
+	// 会话 WS（两侧均 token 即凭证，不走 JWT）
+	r.Get("/api/session/{id}", h.clientSessionWS)
+	r.Get("/api/agent/session", h.agentSessionWS)
 	r.Route("/api/nodes", func(nr chi.Router) {
 		nr.Use(auth.Middleware(cfg.JWTSecret, st))
 		nr.Get("/", h.listNodes)

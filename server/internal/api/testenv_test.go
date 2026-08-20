@@ -7,12 +7,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
 	"xnc/server/internal/auth"
@@ -20,6 +23,7 @@ import (
 	"xnc/server/internal/config"
 	"xnc/server/internal/db"
 	"xnc/server/internal/registry"
+	"xnc/server/internal/session"
 )
 
 // TestEnv 起一个真实 PG 容器 + bootstrap admin + 完整 router，供 api 层集成测试复用。
@@ -29,6 +33,7 @@ type TestEnv struct {
 	Store  *db.Store
 	Cfg    config.Config
 	reg    *registry.Registry
+	Sess   *session.Manager
 	nodes  map[string]ed25519.PrivateKey
 }
 
@@ -45,13 +50,32 @@ func NewTestEnv(t *testing.T) *TestEnv {
 	}
 	require.NoError(t, bootstrap.EnsureAdmin(context.Background(), st, cfg))
 	reg := registry.New()
-	h := NewRouter(st, cfg, reg)
+	// 测试注入共享 manager（NewRouterWithSession），env.Sess 供测试直接驱动会话生命周期。
+	sess := session.New(reg, slog.Default())
+	h := NewRouterWithSession(st, cfg, reg, sess)
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	return &TestEnv{
-		Router: h, srv: srv, Store: st, Cfg: cfg, reg: reg,
+		Router: h, srv: srv, Store: st, Cfg: cfg, reg: reg, Sess: sess,
 		nodes: map[string]ed25519.PrivateKey{},
 	}
+}
+
+// AdminUUID 返回 bootstrap admin 的 UUID 形态（Create 入参用）。
+func (e *TestEnv) AdminUUID(t *testing.T) uuid.UUID {
+	t.Helper()
+	id, err := uuid.Parse(e.adminID(t))
+	require.NoError(t, err)
+	return id
+}
+
+// dialControl 走真实 WS 完成挑战→验签→HELLO 全流程，返回保持打开的控制连接
+// （复用 agentws_test.go 的 dialAgentWS/agentHandshake 助手）。
+func dialControl(t *testing.T, env *TestEnv, nodeID string) *websocket.Conn {
+	t.Helper()
+	c := dialAgentWS(t, "ws"+env.srv.URL[4:]+"/api/agent/connect")
+	agentHandshake(t, env, c, nodeID)
+	return c
 }
 
 func (e *TestEnv) AdminToken(t *testing.T) string {

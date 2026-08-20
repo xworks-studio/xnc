@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -87,6 +88,22 @@ func (h *handlers) agentConnect(w http.ResponseWriter, r *http.Request) {
 	_ = h.st.Q().TouchNode(ctx, node.ID)
 
 	conn := &registry.NodeConn{NodeID: node.ID.String(), Cancel: cancel, LastBeat: time.Now()}
+	// 控制连接写串行化：心跳 ACK 与 SESSION_OPEN/SESSION_CLOSE 共用此发送器，
+	// 互斥锁防止并发写交叉破坏帧边界（coder/websocket 不允许并发 Writer）。
+	// T4 的 exec handler 经 conn.Send 下发会话消息。
+	var wmu sync.Mutex
+	sendControl := func(m proto.Message) error {
+		b, err := json.Marshal(m)
+		if err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		wmu.Lock()
+		defer wmu.Unlock()
+		return c.Write(ctx, websocket.MessageText, b)
+	}
+	conn.Send = sendControl
 	h.reg.Add(conn)
 	defer func() {
 		// identity-aware 清理：仅当本连接仍是该节点的当前连接时才落 offline/last_seen。
@@ -115,7 +132,16 @@ func (h *handlers) agentConnect(w http.ResponseWriter, r *http.Request) {
 				_ = h.st.Q().TouchNode(ctx, node.ID)
 			}
 			conn.Beats++
-			h.writeJSON(ctx, c, proto.TypeHeartbeatAck, struct{}{})
+			// ACK 经串行化发送器（与 SESSION_OPEN/CLOSE 单一写路径）
+			ack, _ := proto.NewMsg(proto.TypeHeartbeatAck, struct{}{})
+			_ = sendControl(ack)
+		case proto.TypeSessionRefused:
+			// agent 能力协商失败（如 kind 不支持）：消费为会话关闭，
+			// reason 前缀 refused: 保留 agent 侧错误码。
+			var sr proto.SessionRefused
+			if err := m.Decode(&sr); err == nil && h.sess != nil {
+				h.sess.NotifyClose(sr.SessionID, "refused:"+sr.Code)
+			}
 		default:
 			h.writeJSON(ctx, c, proto.TypeError, proto.ErrorPayload{
 				Code: proto.CodeInternal, Message: "unexpected message"})

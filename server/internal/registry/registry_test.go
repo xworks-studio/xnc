@@ -8,6 +8,24 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// TestRegistryGet：Add 后 Get 返回同指针；不存在返回 nil（T4 exec handler 用以下发 SESSION_OPEN）。
+func TestRegistryGet(t *testing.T) {
+	r := New()
+	assert.Nil(t, r.Get("n1"))
+
+	c1 := &NodeConn{NodeID: "n1", LastBeat: time.Now()}
+	r.Add(c1)
+	assert.Same(t, c1, r.Get("n1"))
+
+	// 顶替后 Get 返回新连接
+	c2 := &NodeConn{NodeID: "n1", LastBeat: time.Now()}
+	r.Add(c2)
+	assert.Same(t, c2, r.Get("n1"))
+
+	r.Remove("n1")
+	assert.Nil(t, r.Get("n1"))
+}
+
 func TestRegistryNilCancel(t *testing.T) {
 	// Add 必须容忍 nil Cancel（session 包测试以此注入在线节点）
 	r := New()
