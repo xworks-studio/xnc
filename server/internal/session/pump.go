@@ -8,7 +8,23 @@ import (
 	"github.com/coder/websocket"
 )
 
-const pumpWriteTimeout = 60 * time.Second
+// pumpWriteTimeout 写侧每帧超时：仅约束写方向，防慢消费者（对端停止读取）
+// 把转发 goroutine 永久挂死。包级 var 供测试注入。
+var pumpWriteTimeout = 60 * time.Second
+
+// pumpReadTimeout 读侧每帧超时，默认 0 = 禁用（background ctx，读侧永不超时）。
+// 读写超时必须分离：单向静默（exec 运行 ≥60s 且 client 零输入）是正常流量
+// 形态，会话级超时的所有权在 agent（EXEC_RESULT.TimedOut）——server 不得因
+// 方向静默代拆健康会话。非 0 值供测试/特殊部署注入读侧兜底。
+var pumpReadTimeout time.Duration = 0
+
+// readCtx 构造读侧 ctx：pumpReadTimeout<=0 → background（默认禁用）。
+func readCtx() (context.Context, context.CancelFunc) {
+	if pumpReadTimeout <= 0 {
+		return context.Background(), func() {}
+	}
+	return context.WithTimeout(context.Background(), pumpReadTimeout)
+}
 
 // pump 两侧 attach 齐备后的帧粘合：双 goroutine 双向转发 text+binary 帧
 // （server 不解析会话帧）；任一方向出错（对端断开/写失败/超时）→
@@ -25,33 +41,38 @@ func (m *Manager) pump(s *session) {
 }
 
 // relay 流式转发 from → to（Reader/Writer 级流式，避免整帧缓冲）。
-// 每帧的读+写共用一个 60s 超时 ctx；任何错误即返回。
+// 读侧用 readCtx（默认无超时），写侧独立 60s 超时；任何错误即返回。
 func (m *Manager) relay(from, to *websocket.Conn) {
 	if from == nil || to == nil {
 		return
 	}
 	buf := make([]byte, 32*1024)
 	for {
-		ctx, cancel := context.WithTimeout(context.Background(), pumpWriteTimeout)
-		typ, r, err := from.Reader(ctx)
+		rctx, cancelRead := readCtx()
+		typ, r, err := from.Reader(rctx)
 		if err != nil {
-			cancel()
+			cancelRead()
 			return
 		}
-		w, err := to.Writer(ctx, typ)
+		wctx, cancelWrite := context.WithTimeout(context.Background(), pumpWriteTimeout)
+		w, err := to.Writer(wctx, typ)
 		if err != nil {
-			cancel()
+			cancelRead()
+			cancelWrite()
 			return
 		}
 		if _, err = copyBuf(w, r, buf); err != nil {
-			cancel()
+			cancelRead()
+			cancelWrite()
 			return
 		}
 		if err = w.Close(); err != nil {
-			cancel()
+			cancelRead()
+			cancelWrite()
 			return
 		}
-		cancel()
+		cancelWrite()
+		cancelRead()
 	}
 }
 

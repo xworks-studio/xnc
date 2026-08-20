@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"net/http/httptest"
+	"runtime"
 	"testing"
 	"time"
 
@@ -137,4 +138,98 @@ func TestWsBaseURL(t *testing.T) {
 	r = httptest.NewRequest("GET", "https://xnc.local/api/session/x", nil)
 	require.NotNil(t, r.TLS)
 	assert.Equal(t, "wss://xnc.local", wsBaseURL(r))
+}
+
+// readSessionOpen 读控制连接直到 SESSION_OPEN（跳过测试自身心跳的 ACK）。
+// 用于 goroutine 泄漏回归的循环驱动。
+func readSessionOpen(t *testing.T, ctrl *websocket.Conn) proto.SessionOpen {
+	t.Helper()
+	for {
+		m := readMsg(t, ctrl)
+		if m.Type == proto.TypeHeartbeatAck {
+			continue
+		}
+		require.Equal(t, proto.TypeSessionOpen, m.Type)
+		var so proto.SessionOpen
+		require.NoError(t, m.Decode(&so))
+		return so
+	}
+}
+
+// TestSessionHandlersDoNotLeakGoroutines（回归：sessionWS handler 泄漏）：
+// websocket.Accept hijack 连接后 net/http 永不 cancel 请求 ctx，旧实现的
+// <-r.Context().Done() 挂起永不返回——每个会话泄漏 2 个永久驻留的 handler
+// goroutine。修复后 attach 成功即 return。N=30 个完整会话（创建→agent
+// attach→client attach→帧到达→双侧关闭）走真实端点，全部拆解后
+// runtime.NumGoroutine() 必须回到基线（±10 容差吸收运行时噪声）。
+func TestSessionHandlersDoNotLeakGoroutines(t *testing.T) {
+	env := NewTestEnv(t)
+	nodeID := env.EnrollNode(t, "WEB-GL", "mid-goroutine-leak")
+	ctrl := dialControl(t, env, nodeID)
+
+	// 基线在环境/控制连接 goroutine 全部就位后采样
+	runtime.GC()
+	time.Sleep(100 * time.Millisecond)
+	runtime.GC()
+	baseline := runtime.NumGoroutine()
+
+	const n = 30
+	frame := append([]byte{0x01}, []byte("leak-check")...)
+	for i := 0; i < n; i++ {
+		// 心跳防 ctrl 读超时（HeartbeatTimeout 5s）判节点 offline；
+		// 其 ACK 由下一轮 readSessionOpen 跳过。
+		if i > 0 {
+			hb, err := proto.NewMsg(proto.TypeHeartbeat, struct{}{})
+			require.NoError(t, err)
+			writeMsg(t, ctrl, hb)
+		}
+
+		res, apiErr := env.Sess.Create(mustUUID(nodeID), env.AdminUUID(t), proto.KindExec, []byte(`{}`))
+		require.Nil(t, apiErr, "iteration %d", i)
+
+		agentDone := make(chan struct{})
+		go func() {
+			defer close(agentDone)
+			so := readSessionOpen(t, ctrl)
+			dctx, dcancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer dcancel()
+			aws, _, err := websocket.Dial(dctx, so.WsURL, nil)
+			if err != nil {
+				t.Errorf("iter %d: agent dial: %v", i, err)
+				return
+			}
+			defer func() { _ = aws.CloseNow() }()
+
+			wctx, wcancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer wcancel()
+			if err := aws.Write(wctx, websocket.MessageBinary, frame); err != nil {
+				t.Errorf("iter %d: agent write: %v", i, err)
+				return
+			}
+			// 等 client 断开经 pump 传导为读错误
+			_, _, err = aws.Read(wctx)
+			if err == nil {
+				t.Errorf("iter %d: expected agent read error after client close", i)
+			}
+		}()
+		sendSessionOpen(t, env, nodeID, res)
+
+		cl := dialClientSession(t, env.srv.URL, res.ClientPath, res.ClientToken)
+		require.Equal(t, frame, readBin(t, cl), "iteration %d", i)
+		_ = cl.CloseNow()
+
+		select {
+		case <-agentDone:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("iteration %d: agent side never observed teardown", i)
+		}
+	}
+
+	// 全部会话拆解后，驻留 goroutine 应回到基线（修复前每会话泄漏 2 个
+	// 挂起的 sessionWS handler，30 轮即 +60）。
+	require.Eventually(t, func() bool {
+		runtime.GC()
+		return runtime.NumGoroutine() <= baseline+10
+	}, 15*time.Second, 200*time.Millisecond,
+		"goroutines leaked: baseline %d, now %d", baseline, runtime.NumGoroutine())
 }
