@@ -24,8 +24,8 @@ xnc exec web-01 -- hostname
 xnc exec web-01 --timeout 60 -- Get-Service WinRM
 ```
 
-- stdout/stderr 流式返回；`--json` 时 data 含 exitCode / stdout / stderr / durationMs
-- CLI 退出码 = 远程退出码透传；240+ 表示命令未执行（242 离线 / 243 超时 / 240 认证失效）
+- stdout/stderr 流式返回；`--json` 时 data 含 exitCode / stdout / stderr / durationMs / timedOut（envelope 固定在流之后最后一行）
+- CLI 退出码 = 远程退出码透传；240+ 表示命令未执行（242 离线 / 243 超时或未执行完 / 245 会话在收到结果前断开 / 240 认证失效）
 - 超时会 kill 远端进程树，使用前提醒用户
 
 ## 执行脚本
@@ -35,7 +35,7 @@ xnc run web-01 --file ./fix.ps1
 cat fix.ps1 | xnc run web-01 -
 ```
 
-Agent 端落地临时文件执行后自动删除（失败路径同样清理）；脚本大于 256 KB 时先 upload 再 exec 路径。
+Agent 端落地临时文件执行后自动删除（失败路径同样清理）；脚本上限 256 KB，超出 CLI 预检拒绝（退出码 2），upload+exec 大脚本路径后续版本提供。
 
 ## 文件传输
 

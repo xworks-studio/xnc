@@ -32,10 +32,18 @@
 ```text
 --server   默认 $XNC_SERVER
 --token    默认 $XNC_TOKEN，其次配置文件
---output   json | table（默认 table）
---timeout  请求超时（默认 30s；exec/run 默认 300s）
+--output   json | table（默认 table）；数据命令另有 --json 简写，等价于 --output json
+--timeout  exec/run 的命令/脚本超时（默认 300s，范围 1-86400），仅这两条命令有
 --yes      破坏性命令确认
 ```
+
+## exec / run 细节
+
+- `--timeout N`：命令/脚本超时秒数，默认 300，范围 1-86400；到点 agent kill 远端整个进程树并返回 `timedOut:true`（CLI 退出码 243）
+- `exec` 独有 `--cwd PATH`：远端工作目录
+- `--` 之后的所有 token 都是远端命令参数（含 `-Verbose` 等 flag），不再被 CLI 解析；命令带参数时必须用 `--`，否则被 CLI 当作自己的 flag 报用法错误（退出码 2）
+- `run` 的脚本来源：`--file <path>` 或 `-`（读 stdin；位置参数形式 `xnc run n1 -` 等价）；脚本 ≤ 256 KB，超出 CLI 预检直接拒绝（退出码 2），upload+exec 大脚本路径后续版本提供
+- `--json` 时 stdout/stderr 实时流先输出，envelope 固定为最后一行——按行（jsonl）解析时取尾行即可
 
 ## JSON envelope
 
@@ -44,8 +52,9 @@
 {"ok": false, "data": null, "error": {"code": "NODE_OFFLINE", "message": "..."}}
 ```
 
-exec / run 的 data 字段：`node`、`exitCode`、`stdout`、`stderr`、`durationMs`。
+exec / run 的 data 字段：`node`、`exitCode`、`stdout`、`stderr`、`durationMs`、`timedOut`。
 超时被 kill 时 `exitCode: null` 且 `timedOut: true`。
+`--json` 下 stdout/stderr 实时流先于 envelope 输出，envelope 是最后一行。
 
 ## 退出码
 
@@ -56,9 +65,9 @@ exec / run 的 data 字段：`node`、`exitCode`、`stdout`、`stderr`、`durati
 | 240 | 认证失败（重新 login） |
 | 241 | 权限不足 |
 | 242 | 节点离线 |
-| 243 | 超时 |
+| 243 | exec/run 超时或未执行完（`timedOut:true`） |
 | 244 | 资源不存在 |
-| 245 | 网络错误 |
+| 245 | 网络错误（含 exec/run 会话在收到 EXEC_RESULT 前断开：`NETWORK`, "session ended without result"） |
 | 246 | 会话/配额超限 |
 | 250 | 内部错误 |
 

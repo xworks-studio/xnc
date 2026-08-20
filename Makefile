@@ -20,6 +20,10 @@ dev-down:
 e2e:
 	bash scripts/e2e_phase1.sh
 
+.PHONY: e2e2
+e2e2:
+	bash scripts/e2e_phase2.sh
+
 EXE :=
 ifeq ($(OS),Windows_NT)
 EXE := .exe
