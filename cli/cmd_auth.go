@@ -2,11 +2,13 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 
 	"xnc/proto"
 )
@@ -21,45 +23,88 @@ func newLoginCmd() *cobra.Command {
 	var email string
 	cmd := &cobra.Command{
 		Use:   "login",
-		Short: "Log in to an XNC server (reads password from stdin)",
+		Short: "Log in to an XNC server (interactive on a TTY; password on stdin otherwise)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, _ := LoadConfig()
 			server := resolveServer(cmd, cfg)
-			if server == "" {
-				return failUsage(cmd, "--server, XNC_SERVER, or config file required")
+
+			var token string
+			var user userDTO
+
+			if term.IsTerminal(int(os.Stdin.Fd())) {
+				// 交互模式：缺省提示 + 掩码密码 + 401 重试。
+				deps := loginDeps{
+					promptServer: func() string {
+						return promptLine("Server URL", cfg.Server)
+					},
+					promptEmail: func() string {
+						return promptLine("Email", cfg.RememberedEmail)
+					},
+					promptPassword: promptPassword,
+					doLogin:        doLogin,
+				}
+				s, t, u, err := runLoginFlow(deps, server, email)
+				if err != nil {
+					if errors.Is(err, errLoginRetries) {
+						return failAPI(cmd, proto.Err(240, proto.CodeUnauthorized, "too many failed attempts"))
+					}
+					var apiErr *proto.APIError
+					if errors.As(err, &apiErr) {
+						return failAPI(cmd, apiErr)
+					}
+					return failAPI(cmd, proto.Err(250, proto.CodeInternal, err.Error()))
+				}
+				server, token, user = s, t, u
+			} else {
+				// 非交互（Agent/脚本）：严格 flag + stdin 一行密码。
+				if server == "" {
+					return failUsage(cmd, "--server, XNC_SERVER, or config file required")
+				}
+				if email == "" {
+					return failUsage(cmd, "--email required in non-interactive mode")
+				}
+				password, _ := readLine(os.Stdin)
+				if password == "" {
+					return failUsage(cmd, "password expected on stdin")
+				}
+				t, u, apiErr := doLogin(server, email, password)
+				if apiErr != nil {
+					return failAPI(cmd, apiErr)
+				}
+				token, user = t, u
 			}
-			password, _ := readLine(os.Stdin)
-			if password == "" {
-				return failUsage(cmd, "password expected on stdin")
-			}
-			cl := NewClient(server, "")
-			var resp struct {
-				Token string  `json:"token"`
-				User  userDTO `json:"user"`
-			}
-			e := cl.Do("POST", "/api/auth/login",
-				map[string]string{"email": email, "password": password}, &resp)
-			if e != nil {
-				return failAPI(cmd, e)
-			}
-			if err := SaveConfig(Config{Server: server, Token: resp.Token}); err != nil {
+
+			if err := SaveConfig(Config{Server: server, Token: token, RememberedEmail: user.Email}); err != nil {
 				return failAPI(cmd, proto.Err(0, proto.CodeInternal, "save config: "+err.Error()))
 			}
 			if jsonOut(cmd) {
-				PrintJSON(true, map[string]any{"user": resp.User, "server": server,
-					"token": resp.Token}, nil)
+				PrintJSON(true, map[string]any{"user": user, "server": server,
+					"token": token}, nil)
 				return nil
 			}
-			fmt.Printf("logged in as %s (%s)\nserver %s\nconfig saved to %s\n",
-				resp.User.Email, resp.User.DisplayName, server, configPath())
+			fmt.Printf("Logged in to %s as %s (%s)\ntoken saved to %s\n",
+				server, user.Email, user.DisplayName, configPath())
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&email, "email", "", "account email")
-	cmd.MarkFlagRequired("email")
 	addJSONFlag(cmd)
 	return cmd
+}
+
+// doLogin 执行一次登录请求。
+func doLogin(server, email, password string) (string, userDTO, *proto.APIError) {
+	cl := NewClient(server, "")
+	var resp struct {
+		Token string  `json:"token"`
+		User  userDTO `json:"user"`
+	}
+	if e := cl.Do("POST", "/api/auth/login",
+		map[string]string{"email": email, "password": password}, &resp); e != nil {
+		return "", userDTO{}, e
+	}
+	return resp.Token, resp.User, nil
 }
 
 // readLine reads one line from r without printing any prompt (Agent-First:

@@ -4,6 +4,7 @@ package session
 
 import (
 	"context"
+	"os"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -190,4 +191,21 @@ func TestShellCloseKillsProcess(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return !processAlive(t, pid)
 	}, 10*time.Second, 300*time.Millisecond, "shell process must die after disconnect")
+}
+
+// TestShellPromptPrefix：会话输出应出现 [HOSTNAME] PS 前缀提示符
+// （prompt 函数注入后的下一次渲染）。
+func TestShellPromptPrefix(t *testing.T) {
+	host, _ := os.Hostname()
+	want := "[" + host + "] PS "
+	ws, done := runShell(t, proto.ShellParams{Cols: 80, Rows: 25})
+	defer func() { _ = ws.CloseNow() }()
+	_ = done
+
+	// 触发一次新的提示符渲染
+	writeBin(t, ws, []byte("\r"))
+	collectUntil(t, ws, func(k string, d []byte) bool {
+		return k == "binary" && strings.Contains(string(d), want)
+	}, 15*time.Second)
+	writeBin(t, ws, []byte("exit\r"))
 }

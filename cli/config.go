@@ -8,8 +8,9 @@ import (
 
 // Config is the CLI credential file at ~/.xnc/config.json.
 type Config struct {
-	Server string `json:"server"`
-	Token  string `json:"token"`
+	Server          string `json:"server"`
+	Token           string `json:"token"`
+	RememberedEmail string `json:"remembered_email,omitempty"` // login 交互提示的默认邮箱
 }
 
 func configPath() string {

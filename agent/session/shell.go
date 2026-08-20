@@ -89,6 +89,13 @@ func (sh *Shell) Handle(ctx context.Context, ws *websocket.Conn, sessionID strin
 		}
 	}
 
+	// 提示符前缀：注入一次 prompt 函数重定义，让每行提示符带上机器名
+	// （[HOSTNAME] PS C:\>）。走 shell 自身机制，不解析/不改写 VT 流；
+	// 注入行会像用户输入一样被回显一次，属预期。仅 PowerShell 系。
+	if exe == "pwsh" || exe == "powershell" {
+		_, _ = pty.inW.Write([]byte("function global:prompt { '[' + $env:COMPUTERNAME + '] PS ' + \"\" + $executionContext.SessionState.Path.CurrentLocation + '> ' }\r"))
+	}
+
 	done := make(chan struct{})
 	go func() { // pty 输出 → ws binary
 		defer close(done)
