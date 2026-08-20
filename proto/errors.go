@@ -12,6 +12,7 @@ const (
 	CodeNodeAlreadyEnrolled     = "NODE_ALREADY_ENROLLED"
 	CodeSessionNotFound         = "SESSION_NOT_FOUND"
 	CodeSessionExpired          = "SESSION_EXPIRED"
+	CodeSessionLimited          = "SESSION_LIMIT_EXCEEDED"
 	CodeShellStartFailed        = "SHELL_START_FAILED"
 	CodeKindUnsupported         = "KIND_UNSUPPORTED"
 	CodeRdpNotAvailable         = "RDP_NOT_AVAILABLE"

@@ -54,3 +54,38 @@ func TestSessionCloseRefused(t *testing.T) {
 	b2, _ := json.Marshal(m2)
 	assert.Contains(t, string(b2), `"SESSION_REFUSED"`)
 }
+
+func TestShellVocabulary(t *testing.T) {
+	m, err := NewMsg(TypeSessionOpen, SessionOpen{
+		SessionID: "s1", Kind: KindShell,
+		Params: mustRaw(t, ShellParams{Cols: 120, Rows: 30}),
+	})
+	require.NoError(t, err)
+	b, err := json.Marshal(m)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"type":"SESSION_OPEN","payload":{"sessionId":"s1","kind":"shell",
+		"params":{"cols":120,"rows":30},"agentToken":"","wsUrl":"",
+		"expiresAt":"0001-01-01T00:00:00Z"}}`, string(b))
+
+	bb, _ := json.Marshal(ShellBegin{Shell: "pwsh"})
+	assert.JSONEq(t, `{"shell":"pwsh"}`, string(bb))
+
+	rb, _ := NewMsg("SHELL_RESIZE", ShellResize{Cols: 100, Rows: 40})
+	// SHELL_RESIZE 是会话内 text 帧，type 字面量属 kind 私有词汇：
+	// 不进 proto 常量（与 EXEC_RESULT 同策略），测试用字面量验证 payload。
+	mr, err := NewMsg("SHELL_RESIZE", ShellResize{Cols: 100, Rows: 40})
+	require.NoError(t, err)
+	br, _ := json.Marshal(mr)
+	assert.Contains(t, string(br), `"cols":100`)
+	assert.Contains(t, string(br), `"rows":40`)
+
+	assert.Equal(t, "SESSION_LIMIT_EXCEEDED", CodeSessionLimited)
+	_ = rb
+}
+
+func mustRaw(t *testing.T, v any) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(v)
+	require.NoError(t, err)
+	return b
+}

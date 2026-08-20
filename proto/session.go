@@ -5,8 +5,11 @@ import (
 	"time"
 )
 
-// 会话 kind。Phase 2 仅 exec；shell/file/screen/tunnel 由后续 Phase 注册。
+// 会话 kind。Phase 2 exec；shell Phase 3 注册；file/screen/tunnel 由后续 Phase 注册。
 const KindExec = "exec"
+
+// KindShell 交互式终端会话（ConPTY，Phase 3）。
+const KindShell = "shell"
 
 // SessionOpen 经控制连接下发：agent 按 WsURL（含 token 的绝对 URL）拨号。
 type SessionOpen struct {
@@ -44,4 +47,23 @@ type ExecResult struct {
 	ExitCode   *int   `json:"exitCode"`
 	TimedOut   bool   `json:"timedOut"`
 	DurationMs int64  `json:"durationMs"`
+}
+
+// ShellParams 会话 Params 的 shell 形态；Cols/Rows 为 0 时用默认 120x30，
+// Shell 为空时由 agent 按探测结果决定。
+type ShellParams struct {
+	Cols  int    `json:"cols,omitempty"`
+	Rows  int    `json:"rows,omitempty"`
+	Shell string `json:"shell,omitempty"`
+}
+
+// ShellBegin agent → client：实际使用的 shell（SHELL_BEGIN text 帧）。
+type ShellBegin struct {
+	Shell string `json:"shell"`
+}
+
+// ShellResize client → agent：终端尺寸变化（SHELL_RESIZE text 帧）。
+type ShellResize struct {
+	Cols int `json:"cols"`
+	Rows int `json:"rows"`
 }
