@@ -193,8 +193,8 @@ func TestShellCloseKillsProcess(t *testing.T) {
 	}, 10*time.Second, 300*time.Millisecond, "shell process must die after disconnect")
 }
 
-// TestShellPromptPrefix：会话输出应出现 [HOSTNAME] PS 前缀提示符
-// （prompt 函数注入后的下一次渲染）。
+// TestShellPromptPrefix：会话输出应出现 [HOSTNAME] PS 前缀提示符，
+// 且启动命令注入无回显（-NoExit -Command 不经交互行编辑器）。
 func TestShellPromptPrefix(t *testing.T) {
 	host, _ := os.Hostname()
 	want := "[" + host + "] PS "
@@ -202,10 +202,32 @@ func TestShellPromptPrefix(t *testing.T) {
 	defer func() { _ = ws.CloseNow() }()
 	_ = done
 
-	// 触发一次新的提示符渲染
+	// 单读循环：触发提示符渲染并累积全部输出（同时供回显断言）。
 	writeBin(t, ws, []byte("\r"))
-	collectUntil(t, ws, func(k string, d []byte) bool {
-		return k == "binary" && strings.Contains(string(d), want)
-	}, 15*time.Second)
+	var all []byte
+	deadline := time.After(15 * time.Second)
+	found := false
+	for !found {
+		select {
+		case <-deadline:
+			t.Fatalf("prompt prefix %q not seen; output so far: %q", want, all)
+		default:
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		typ, data, err := ws.Read(ctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("read: %v (output: %q)", err, all)
+		}
+		if typ == websocket.MessageBinary {
+			all = append(all, data...)
+			if strings.Contains(string(all), want) {
+				found = true
+			}
+		}
+	}
 	writeBin(t, ws, []byte("exit\r"))
+
+	assert.NotContains(t, string(all), "function global:prompt",
+		"startup command must not be echoed")
 }

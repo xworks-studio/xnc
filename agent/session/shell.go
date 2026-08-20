@@ -72,7 +72,15 @@ func (sh *Shell) Handle(ctx context.Context, ws *websocket.Conn, sessionID strin
 		return
 	}
 
-	pty, err := startConPTY(cols, rows, exe, "-NoLogo")
+	// 提示符前缀：让每行提示符带上机器名（[HOSTNAME] PS C:\>）。
+	// 经 -NoExit -Command 作为启动命令注入：不经过交互行编辑器，无回显
+	// （比写入 pty 输入干净）；-Command 在 profile 之后执行，覆盖其 prompt。
+	args := []string{"-NoLogo"}
+	if exe == "pwsh" || exe == "powershell" {
+		args = append(args, "-NoExit", "-Command",
+			"function global:prompt { '[' + $env:COMPUTERNAME + '] PS ' + $executionContext.SessionState.Path.CurrentLocation + '> ' }")
+	}
+	pty, err := startConPTY(cols, rows, exe, args...)
 	if err != nil {
 		sh.logger().Warn("conpty start failed", "session", sessionID, "err", err)
 		sh.failStart(ctx, ws, "conpty start failed")
@@ -87,13 +95,6 @@ func (sh *Shell) Handle(ctx context.Context, ws *websocket.Conn, sessionID strin
 			_ = ws.Write(wctx, websocket.MessageText, jb)
 			cancel()
 		}
-	}
-
-	// 提示符前缀：注入一次 prompt 函数重定义，让每行提示符带上机器名
-	// （[HOSTNAME] PS C:\>）。走 shell 自身机制，不解析/不改写 VT 流；
-	// 注入行会像用户输入一样被回显一次，属预期。仅 PowerShell 系。
-	if exe == "pwsh" || exe == "powershell" {
-		_, _ = pty.inW.Write([]byte("function global:prompt { '[' + $env:COMPUTERNAME + '] PS ' + \"\" + $executionContext.SessionState.Path.CurrentLocation + '> ' }\r"))
 	}
 
 	done := make(chan struct{})
