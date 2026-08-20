@@ -8,6 +8,20 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestRegistryNilCancel(t *testing.T) {
+	// Add 必须容忍 nil Cancel（session 包测试以此注入在线节点）
+	r := New()
+	c1 := &NodeConn{NodeID: "n1", LastBeat: time.Now()}
+	r.Add(c1)
+	assert.True(t, r.Online("n1"))
+
+	// 顶替 nil Cancel 的旧连接同样不得 panic
+	c2 := &NodeConn{NodeID: "n1", LastBeat: time.Now()}
+	r.Add(c2)
+	assert.Equal(t, 1, r.Count())
+	assert.Equal(t, c2, r.conns["n1"])
+}
+
 func TestRegistryReplace(t *testing.T) {
 	r := New()
 	c1ctx, c1cancel := context.WithCancel(context.Background())
