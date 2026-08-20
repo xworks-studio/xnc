@@ -27,22 +27,23 @@ func readCtx() (context.Context, context.CancelFunc) {
 }
 
 // pump 两侧 attach 齐备后的帧粘合：双 goroutine 双向转发 text+binary 帧
-// （server 不解析会话帧）；任一方向出错（对端断开/写失败/超时）→
+// （server 不解析会话帧）；每帧转发成功即刷新 s.lastActivity（shell idle
+// 计时的活跃信号）；任一方向出错（对端断开/写失败/超时）→
 // NotifyClose("peer-disconnect")，由 close 幂等收敛（双侧 CloseNow + 通知）。
 func (m *Manager) pump(s *session) {
 	go func() {
-		m.relay(s.clientWS, s.agentWS)
+		m.relay(s, s.clientWS, s.agentWS)
 		m.NotifyClose(s.ID, "peer-disconnect")
 	}()
 	go func() {
-		m.relay(s.agentWS, s.clientWS)
+		m.relay(s, s.agentWS, s.clientWS)
 		m.NotifyClose(s.ID, "peer-disconnect")
 	}()
 }
 
 // relay 流式转发 from → to（Reader/Writer 级流式，避免整帧缓冲）。
 // 读侧用 readCtx（默认无超时），写侧独立 60s 超时；任何错误即返回。
-func (m *Manager) relay(from, to *websocket.Conn) {
+func (m *Manager) relay(s *session, from, to *websocket.Conn) {
 	if from == nil || to == nil {
 		return
 	}
@@ -71,6 +72,7 @@ func (m *Manager) relay(from, to *websocket.Conn) {
 			cancelWrite()
 			return
 		}
+		s.lastActivity.Store(time.Now().UnixNano()) // 每帧免锁刷新活跃时间
 		cancelWrite()
 		cancelRead()
 	}

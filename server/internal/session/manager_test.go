@@ -85,8 +85,104 @@ func TestCloseIdempotent(t *testing.T) {
 func TestOfflineNodeRefused(t *testing.T) {
 	// registry 无此节点连接 → Create 拒绝 NODE_OFFLINE（409）
 	m := newMgr(t)
+	defer m.Close()
 	_, apiErr := m.Create(uuid.New(), uuid.New(), proto.KindExec, []byte(`{}`))
 	require.NotNil(t, apiErr)
 	assert.Equal(t, 409, apiErr.Status)
 	assert.Equal(t, proto.CodeNodeOffline, apiErr.Code)
+}
+
+// —— Phase 3 shell 会话治理：每节点限额 + idle/max-lifetime janitor ——
+
+func TestShellPerNodeLimit(t *testing.T) {
+	id, m := onlineMgr(t)
+	defer m.Close()
+	m.ShellPerNode = 2
+	for i := 0; i < 2; i++ {
+		res, apiErr := m.Create(id, uuid.New(), proto.KindShell, []byte(`{}`))
+		require.Nil(t, apiErr)
+		_ = res
+	}
+	_, apiErr := m.Create(id, uuid.New(), proto.KindShell, []byte(`{}`))
+	require.NotNil(t, apiErr)
+	assert.Equal(t, 409, apiErr.Status)
+	assert.Equal(t, proto.CodeSessionLimited, apiErr.Code)
+	// exec 不受限
+	_, apiErr = m.Create(id, uuid.New(), proto.KindExec, []byte(`{}`))
+	assert.Nil(t, apiErr)
+	// 关掉一个 shell 后可再建
+	m.NotifyClose(firstShellID(t, m, id), "test")
+	res, apiErr := m.Create(id, uuid.New(), proto.KindShell, []byte(`{}`))
+	assert.Nil(t, apiErr)
+	_ = res
+}
+
+func firstShellID(t *testing.T, m *Manager, nodeID uuid.UUID) string {
+	t.Helper()
+	sess := m.SessionsOf(nodeID, proto.KindShell)
+	require.NotEmpty(t, sess)
+	return sess[0].ID
+}
+
+func TestIdleTimeoutClosesShell(t *testing.T) {
+	id, m := onlineMgr(t)
+	defer m.Close()
+	m.ShellIdleTimeout = 100 * time.Millisecond
+	m.setJanitorInterval(30 * time.Millisecond)
+
+	var reasons []string
+	res, _ := m.Create(id, uuid.New(), proto.KindShell, []byte(`{}`))
+	m.SetFinishFn(res.Session, func(r string) { reasons = append(reasons, r) })
+
+	require.Eventually(t, func() bool { return len(reasons) > 0 }, 3*time.Second, 50*time.Millisecond)
+	assert.Equal(t, "idle-timeout", reasons[0])
+}
+
+func TestActivityPreventsIdleTimeout(t *testing.T) {
+	id, m := onlineMgr(t)
+	defer m.Close()
+	m.ShellIdleTimeout = 250 * time.Millisecond
+	m.setJanitorInterval(50 * time.Millisecond)
+
+	res, _ := m.Create(id, uuid.New(), proto.KindShell, []byte(`{}`))
+	closed := make(chan string, 1)
+	m.SetFinishFn(res.Session, func(r string) { closed <- r })
+
+	// 每 100ms 活动一次，持续 600ms（跨越 2 个 idle 窗口）
+	deadline := time.Now().Add(600 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		m.touch(res.Session, time.Now())
+		time.Sleep(100 * time.Millisecond)
+	}
+	select {
+	case r := <-closed:
+		t.Fatalf("closed early: %s", r)
+	default:
+	}
+	// 停止活动 → 应在 idle+janitor 内关闭
+	select {
+	case r := <-closed:
+		assert.Equal(t, "idle-timeout", r)
+	case <-time.After(3 * time.Second):
+		t.Fatal("no idle close after activity stopped")
+	}
+}
+
+func TestMaxLifetimeClosesShell(t *testing.T) {
+	id, m := onlineMgr(t)
+	defer m.Close()
+	m.ShellMaxLifetime = 120 * time.Millisecond
+	m.setJanitorInterval(30 * time.Millisecond)
+
+	res, _ := m.Create(id, uuid.New(), proto.KindShell, []byte(`{}`))
+	closed := make(chan string, 1)
+	m.SetFinishFn(res.Session, func(r string) { closed <- r })
+	m.touch(res.Session, time.Now().Add(time.Hour)) // 活动再频繁也逃不过寿命
+
+	select {
+	case r := <-closed:
+		assert.Equal(t, "max-lifetime", r)
+	case <-time.After(3 * time.Second):
+		t.Fatal("no max-lifetime close")
+	}
 }

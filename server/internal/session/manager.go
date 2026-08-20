@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -22,6 +23,9 @@ const (
 	// expiredRetention：Opening 超时的会话保留一段时间再从表中回收，
 	// 让迟到的 attach 得到 410（SESSION_EXPIRED）而非 404。
 	expiredRetention = 5 * time.Minute
+
+	// janitorDefaultInterval janitor 默认扫表周期（测试经 setJanitorInterval 缩短）。
+	janitorDefaultInterval = 30 * time.Second
 )
 
 type Manager struct {
@@ -30,6 +34,17 @@ type Manager struct {
 
 	mu       sync.Mutex
 	sessions map[string]*session
+
+	// —— shell 会话治理（Phase 3）。New 设默认值，router 构造后按 config 覆写；
+	// 0 值 = 不限。会话创建时快照到 session（janitor 只读会话内副本）。
+	ShellPerNode     int
+	ShellIdleTimeout time.Duration
+	ShellMaxLifetime time.Duration
+
+	janitorInterval time.Duration // mu 保护；janitorLoop 每轮重读
+	stopJanitor     chan struct{}
+	kickJanitor     chan struct{} // interval 变更后立即重臂定时器
+	stopOnce        sync.Once
 }
 
 // session 内部完整状态。ID/Kind/NodeID/UserID/Params 与只读视图 Session
@@ -56,6 +71,12 @@ type session struct {
 	finish      func(reason string)
 	notifyAgent func(sc proto.SessionClose) error
 	closeOnce   sync.Once
+
+	// —— shell 治理（Phase 3）：创建时快照 manager 配置，janitor 只读此处。
+	startedAt    time.Time
+	lastActivity atomic.Int64 // unixnano；pump 每帧与 touch 更新（免锁）
+	idleTimeout  time.Duration
+	maxLifetime  time.Duration
 }
 
 // Session 是对外只读视图（ID/Kind/NodeID/UserID/Params）。
@@ -70,7 +91,20 @@ type CreateResult struct {
 }
 
 func New(reg *registry.Registry, log *slog.Logger) *Manager {
-	return &Manager{reg: reg, log: log, sessions: map[string]*session{}}
+	m := &Manager{
+		reg: reg, log: log, sessions: map[string]*session{},
+		ShellPerNode: 10, ShellIdleTimeout: 30 * time.Minute, ShellMaxLifetime: 8 * time.Hour,
+		janitorInterval: janitorDefaultInterval,
+		stopJanitor:     make(chan struct{}),
+		kickJanitor:     make(chan struct{}, 1),
+	}
+	go m.janitorLoop()
+	return m
+}
+
+// Close 幂等停止 janitor（测试用；生产随进程退出）。
+func (m *Manager) Close() {
+	m.stopOnce.Do(func() { close(m.stopJanitor) })
 }
 
 func newToken() string {
@@ -88,7 +122,22 @@ func (m *Manager) Create(nodeID, userID uuid.UUID, kind string, params json.RawM
 		Params: params, agentToken: newToken(), clientToken: newToken(),
 		expiresAt: time.Now().Add(openingTTL),
 	}
+	if kind == proto.KindShell {
+		// 治理参数创建时快照：janitor 只读会话内副本，免与配置覆写竞争。
+		now := time.Now()
+		s.startedAt = now
+		s.lastActivity.Store(now.UnixNano())
+		s.idleTimeout = m.ShellIdleTimeout
+		s.maxLifetime = m.ShellMaxLifetime
+	}
 	m.mu.Lock()
+	if kind == proto.KindShell {
+		// 限额判定与表插入同锁：并发抢最后一个名额时不超发。
+		if m.ShellPerNode > 0 && countByNodeLocked(m.sessions, nodeID, proto.KindShell) >= m.ShellPerNode {
+			m.mu.Unlock()
+			return nil, proto.Err(409, proto.CodeSessionLimited, "shell session limit reached")
+		}
+	}
 	m.sessions[s.ID] = s
 	m.mu.Unlock()
 	s.ttl = time.AfterFunc(openingTTL, func() { m.expire(s) })
@@ -259,5 +308,104 @@ func (m *Manager) SetNotifyFn(s *Session, fn func(sc proto.SessionClose) error) 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	(*session)(s).notifyAgent = fn
+}
+
+// —— shell 会话治理：janitor 与查询助手 ——
+
+// setJanitorInterval 仅供测试缩短扫表周期（构造后调用即生效：kick 通道让
+// janitor 立即按新周期重臂定时器，不必等旧周期走完）。
+func (m *Manager) setJanitorInterval(d time.Duration) {
+	m.mu.Lock()
+	m.janitorInterval = d
+	m.mu.Unlock()
+	select {
+	case m.kickJanitor <- struct{}{}:
+	default: // 已有 pending kick
+	}
+}
+
+// janitorLoop 周期扫表回收 idle/超寿 shell 会话。每轮从 mu 下重读周期再重臂
+// 定时器（支持运行中调整）；stopJanitor 关闭即退出。
+func (m *Manager) janitorLoop() {
+	for {
+		m.mu.Lock()
+		d := m.janitorInterval
+		m.mu.Unlock()
+		if d <= 0 {
+			d = janitorDefaultInterval
+		}
+		t := time.NewTimer(d)
+		select {
+		case <-m.stopJanitor:
+			t.Stop()
+			return
+		case <-m.kickJanitor:
+			t.Stop()
+		case now := <-t.C:
+			m.sweep(now)
+		}
+	}
+}
+
+// sweep 单轮回收：锁内判定到期（idle 优先级低于寿命），锁外 NotifyClose
+// （幂等；避免持锁回调）。
+func (m *Manager) sweep(now time.Time) {
+	type expiration struct {
+		id     string
+		reason string
+	}
+	var expire []expiration
+	m.mu.Lock()
+	for id, s := range m.sessions {
+		if s.Kind != proto.KindShell {
+			continue
+		}
+		if s.maxLifetime > 0 && now.Sub(s.startedAt) > s.maxLifetime {
+			expire = append(expire, expiration{id, "max-lifetime"})
+			continue
+		}
+		if s.idleTimeout > 0 && now.Sub(time.Unix(0, s.lastActivity.Load())) > s.idleTimeout {
+			expire = append(expire, expiration{id, "idle-timeout"})
+		}
+	}
+	m.mu.Unlock()
+	for _, e := range expire {
+		m.NotifyClose(e.id, e.reason)
+	}
+}
+
+func countByNodeLocked(sessions map[string]*session, nodeID uuid.UUID, kind string) int {
+	n := 0
+	for _, s := range sessions {
+		if s.NodeID == nodeID && s.Kind == kind {
+			n++
+		}
+	}
+	return n
+}
+
+// CountByNode 返回某节点指定 kind 的活跃会话数（含 Opening 态）。
+func (m *Manager) CountByNode(nodeID uuid.UUID, kind string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return countByNodeLocked(m.sessions, nodeID, kind)
+}
+
+// SessionsOf 返回某节点指定 kind 的会话只读视图快照。
+func (m *Manager) SessionsOf(nodeID uuid.UUID, kind string) []*Session {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []*Session
+	for _, s := range m.sessions {
+		if s.NodeID == nodeID && s.Kind == kind {
+			out = append(out, (*Session)(s))
+		}
+	}
+	return out
+}
+
+// touch 更新会话活跃时间（测试/内部助手；pump 的每帧更新走同一 atomic 字段）。
+func (m *Manager) touch(s *Session, at time.Time) {
+	(*session)(s).lastActivity.Store(at.UnixNano())
 }
 

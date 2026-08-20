@@ -124,3 +124,24 @@ func TestPumpWriteTimeoutDoesNotBindReadSide(t *testing.T) {
 	require.Equal(t, websocket.MessageBinary, typ)
 	assert.Equal(t, "immune", string(data))
 }
+
+// TestPumpRelayUpdatesActivity（机制验证）：粘合会话每成功转发一帧即刷新
+// session.lastActivity（atomic）——idle 计时被真实流量重置。
+func TestPumpRelayUpdatesActivity(t *testing.T) {
+	res, agent, client := gluedSession(t, nil)
+	s := (*session)(res.Session)
+
+	wctx, wcancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer wcancel()
+	before := s.lastActivity.Load()
+	time.Sleep(20 * time.Millisecond) // 保证时间戳区分度
+	require.NoError(t, agent.Write(wctx, websocket.MessageBinary, []byte("ping")))
+
+	// client 收到帧 ⇒ agent→client 方向完成了一次转发
+	typ, data, err := client.Read(wctx)
+	require.NoError(t, err)
+	require.Equal(t, websocket.MessageBinary, typ)
+	assert.Equal(t, "ping", string(data))
+
+	assert.Greater(t, s.lastActivity.Load(), before, "relay must bump lastActivity per frame")
+}

@@ -25,10 +25,14 @@ func NewRouter(st *db.Store, cfg config.Config, reg *registry.Registry) http.Han
 }
 
 // NewRouterWithSession 允许注入共享的 session manager（测试经 TestEnv.Sess 直接
-// 驱动会话生命周期）；sess 为 nil 时自建，NewRouter 即此路径。
+// 驱动会话生命周期）；sess 为 nil 时自建并按 config 覆写 shell 治理参数
+// （NewRouter 即此生产路径；Manager.New 的默认值仅零值兜底）。
 func NewRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registry, sess *session.Manager) http.Handler {
 	if sess == nil {
 		sess = session.New(reg, slog.Default())
+		sess.ShellPerNode = cfg.ShellPerNode
+		sess.ShellIdleTimeout = cfg.ShellIdleTimeout
+		sess.ShellMaxLifetime = cfg.ShellMaxLifetime
 	}
 	h := &handlers{st: st, cfg: cfg, reg: reg, sess: sess}
 	r := chi.NewRouter()
