@@ -66,13 +66,10 @@ func TestExecSessionEndToEnd(t *testing.T) {
 	assert.False(t, created.ExpiresAt.IsZero())
 	assert.Contains(t, created.WebsocketURL, "/api/session/"+created.SessionID)
 
-	// agent 侧收到 SESSION_OPEN：kind/AgentToken 与 agent 会话 WS URL 齐备
-	so := <-agentDone
-	assert.Equal(t, proto.KindExec, so.Kind)
-	assert.Equal(t, created.SessionID, so.SessionID)
-	assert.NotEmpty(t, so.AgentToken)
-	assert.Contains(t, so.WsURL, "/api/agent/session?token=")
-
+	// client 立即拨号（sessionId/token 已随 202 到手）：与 agent goroutine 并发
+	// attach，pump 双侧齐备即启动转发。绝不在此处等待 agentDone——agent 的
+	// aws.Close 关闭握手要等 server 侧读到 close 帧（即 pump 已在跑），先等后拨
+	// 会把握手卡满 coder/websocket 硬编码的 5s waitCloseHandshake。
 	cl := dialClientSession(t, env.srv.URL, "/api/session/"+created.SessionID, created.Token)
 	// 两条 binary 帧按序到达（stdout 前缀 0x01 / stderr 前缀 0x02）
 	d1 := readBin(t, cl)
@@ -89,6 +86,14 @@ func TestExecSessionEndToEnd(t *testing.T) {
 	require.NoError(t, m.Decode(&res))
 	require.NotNil(t, res.ExitCode)
 	assert.Equal(t, 7, *res.ExitCode)
+
+	// agent 侧完成屏障：act（含优雅关闭握手）全部落地后才继续，并顺带校验
+	// SESSION_OPEN 的 kind/AgentToken 与 agent 会话 WS URL 齐备。
+	so := <-agentDone
+	assert.Equal(t, proto.KindExec, so.Kind)
+	assert.Equal(t, created.SessionID, so.SessionID)
+	assert.NotEmpty(t, so.AgentToken)
+	assert.Contains(t, so.WsURL, "/api/agent/session?token=")
 
 	// 审计：exec.start 存在；等待 finish（会话关闭路径）
 	require.Eventually(t, func() bool {
