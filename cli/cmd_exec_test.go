@@ -3,8 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -266,4 +269,111 @@ func TestExecEnvelopeNewlineSeparation(t *testing.T) {
 	require.NoError(t, jsonUnmarshalStr(lastJSONLine(t, out), &env))
 	assert.True(t, env.OK)
 	assert.Equal(t, "out-no-newline", env.Data.Stdout)
+}
+
+// execNodesJSON: the one-online-node list the run fakes serve for resolution.
+const execNodesJSON = `[{"id":"` + execNodeUUID + `","name":"n1","cluster":"default",` +
+	`"hostname":"N1","os_version":"Windows","agent_version":"0.1.0",` +
+	`"shell_type":"pwsh","status":"online","last_seen_at":null}]`
+
+// fakeRunServer mirrors fakeExecServer for `xnc run`: node resolution, POST
+// /exec capturing the raw request body (to assert the script payload), and a
+// session WS streaming one stdout frame then EXEC_RESULT.
+func fakeRunServer(t *testing.T, exitCode *int, stdout string) (*httptest.Server, *[]byte) {
+	t.Helper()
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/nodes" && r.Method == "GET":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(execNodesJSON))
+		case r.URL.Path == "/api/nodes/"+execNodeUUID+"/exec" && r.Method == "POST":
+			gotBody, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(202)
+			_, _ = w.Write([]byte(`{"sessionId":"s1","token":"ct","expiresAt":"2026-01-01T00:00:00Z",` +
+				`"websocketUrl":"/api/session/s1?token=ct"}`))
+		case r.URL.Path == "/api/session/s1":
+			c, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				defer c.CloseNow()
+				_ = c.Write(ctx, websocket.MessageBinary, append([]byte{0x01}, stdout...))
+				_ = c.Write(ctx, websocket.MessageText,
+					[]byte(`{"type":"EXEC_RESULT","payload":`+mustJSONStr(proto.ExecResult{
+						ExitCode: exitCode, TimedOut: exitCode == nil, DurationMs: 3,
+					})+`}`))
+				_ = c.Close(websocket.StatusNormalClosure, "")
+			}()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	return srv, &gotBody
+}
+
+func TestRunScriptFromStdin(t *testing.T) {
+	zero := 0
+	srv, gotBody := fakeRunServer(t, &zero, "done")
+	defer srv.Close()
+
+	out, code := runCLIWithStdin(t, "Write-Output ok\n", []string{
+		"run", "n1", "-", "--json", "--server", srv.URL, "--token", "tk"})
+	require.Equal(t, 0, code)
+	// POST body carries the stdin script (not a command) plus the timeout.
+	assert.Contains(t, string(*gotBody), `"script":"Write-Output ok`)
+	assert.NotContains(t, string(*gotBody), `"command"`)
+	assert.Contains(t, string(*gotBody), `"timeoutSec":300`)
+	// Streamed stdout lands in the envelope.
+	assert.Contains(t, out, `"stdout":"done"`)
+}
+
+func TestRunScriptFromFileExitsPassthrough(t *testing.T) {
+	seven := 7
+	srv, gotBody := fakeRunServer(t, &seven, "ran\n")
+	defer srv.Close()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "x.ps1")
+	require.NoError(t, os.WriteFile(path, []byte("Write-Output hi\n"), 0o600))
+
+	out, code := runCLIWithStdin(t, "", []string{
+		"run", "n1", "--file", path, "--json", "--server", srv.URL, "--token", "tk"})
+	require.Equal(t, 7, code) // exit-code passthrough
+	assert.Contains(t, string(*gotBody), `"script":"Write-Output hi\n"`)
+	var env struct {
+		Data struct {
+			Node     string `json:"node"`
+			ExitCode int    `json:"exitCode"`
+			Stdout   string `json:"stdout"`
+		} `json:"data"`
+	}
+	require.NoError(t, jsonUnmarshalStr(lastJSONLine(t, out), &env))
+	assert.Equal(t, "n1", env.Data.Node)
+	assert.Equal(t, 7, env.Data.ExitCode)
+	assert.Equal(t, "ran\n", env.Data.Stdout)
+}
+
+func TestRunOversizeScriptRejectedLocally(t *testing.T) {
+	dir := t.TempDir()
+	big := strings.Repeat("a", 256*1024+1)
+	path := filepath.Join(dir, "big.ps1")
+	require.NoError(t, os.WriteFile(path, []byte(big), 0o600))
+	// Dead-port server: any request would surface as NETWORK 245, so exit 2
+	// proves the local precheck fired before any traffic was sent.
+	out, code := runCLIWithStdin(t, "", []string{
+		"run", "n1", "--file", path, "--json", "--server", "http://127.0.0.1:1", "--token", "tk"})
+	assert.Equal(t, 2, code) // usage error (local precheck, no request sent)
+	assert.Contains(t, out, "256KB")
+	assert.Contains(t, out, "Phase 4")
+}
+
+func TestRunMissingScriptArgUsage(t *testing.T) {
+	_, code := runCLIWithStdin(t, "", []string{
+		"run", "n1", "--json", "--server", "http://127.0.0.1:1", "--token", "tk"})
+	assert.Equal(t, 2, code) // --file or - required
 }

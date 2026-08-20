@@ -1,10 +1,34 @@
 package main
 
 import (
+	"context"
 	"io"
 	"os"
 	"testing"
 )
+
+// runCLIWithStdin pipes input into os.Stdin before running the CLI (used by
+// `xnc run <node> -`) and captures stdout like captureStdout. The write end
+// closes first so io.ReadAll(os.Stdin) inside the command sees EOF.
+func runCLIWithStdin(t *testing.T, input string, args []string) (string, int) {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(w, input); err != nil {
+		t.Fatal(err)
+	}
+	_ = w.Close()
+	old := os.Stdin
+	os.Stdin = r
+	out, code := captureStdout(t, func() int {
+		return runCLI(context.Background(), args)
+	})
+	os.Stdin = old
+	_ = r.Close()
+	return out, code
+}
 
 // captureStdout redirects os.Stdout while f runs and returns the captured
 // output plus f's exit code. runCLI itself lives in main.go.

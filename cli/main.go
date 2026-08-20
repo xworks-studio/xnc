@@ -1,6 +1,7 @@
 // Command xnc is the XNC v2 CLI: login/whoami/status/version, cluster list,
-// token create, node list/show, exec. Agent-First contract: --json envelope
-// {"ok",data,"error"} on stdout plus stable exit codes; no interactive prompts.
+// token create, node list/show, exec, run. Agent-First contract: --json
+// envelope {"ok",data,"error"} on stdout plus stable exit codes; no
+// interactive prompts.
 package main
 
 import (
@@ -59,7 +60,7 @@ func newRootCmd() *cobra.Command {
 	root.PersistentFlags().String("output", "table", "output format: table or json")
 	root.AddCommand(
 		newLoginCmd(), newWhoamiCmd(), newStatusCmd(), newVersionCmd(),
-		newClusterCmd(), newTokenCmd(), newNodeCmd(), newExecCmd(),
+		newClusterCmd(), newTokenCmd(), newNodeCmd(), newExecCmd(), newRunCmd(),
 	)
 	return root
 }

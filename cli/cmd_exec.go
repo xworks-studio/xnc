@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"strings"
@@ -21,6 +22,10 @@ const (
 )
 
 const execTimeoutDefault = 300
+
+// execScriptMax caps the inline script payload for `xnc run`: bigger scripts
+// wait for the upload+exec flow (Phase 4).
+const execScriptMax = 256 * 1024
 
 // execOutcome accumulates a finished exec run for the --json envelope.
 type execOutcome struct {
@@ -51,15 +56,25 @@ func newExecCmd() *cobra.Command {
 	return cmd
 }
 
-// runExec: resolve node → POST exec → dial session WS → stream binary frames
-// live while accumulating them → capture the EXEC_RESULT terminal frame →
-// print the envelope → map to the process exit code (passthrough; 243 only
-// when timed out per EXEC_RESULT; 245 NETWORK when the connection ended
-// without a result frame).
-//
-// With --json the live stream and the final envelope interleave on stdout by
-// design: the envelope is emitted after the stream, so line-based (jsonl)
-// consumers are unaffected.
+func newRunCmd() *cobra.Command {
+	var timeout int
+	var file string
+	cmd := &cobra.Command{
+		Use:   "run <node> (--file x.ps1 | -) [--timeout N]",
+		Short: "Run a PowerShell script from a file or stdin on a node",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runRun(cmd, args, timeout, file)
+		},
+	}
+	cmd.Flags().IntVar(&timeout, "timeout", execTimeoutDefault,
+		"script timeout in seconds (1-86400)")
+	cmd.Flags().StringVar(&file, "file", "", "script file path, or - to read stdin")
+	addJSONFlag(cmd)
+	return cmd
+}
+
+// runExec: resolve node → hand the command body to the shared session loop.
 func runExec(cmd *cobra.Command, args []string, timeout int, cwd string) error {
 	cl, usage := dial(cmd, true)
 	if usage != "" {
@@ -75,6 +90,59 @@ func runExec(cmd *cobra.Command, args []string, timeout int, cwd string) error {
 	if cwd != "" {
 		body["cwd"] = cwd
 	}
+	return runSession(cl, ref, body, cmd)
+}
+
+// runRun: `xnc run <node> (--file <path> | -) [--timeout N]`. The script
+// payload is read locally (--file PATH, or "-" for stdin; the positional form
+// `run n1 -` is accepted too), prechecked against the 256KB inline cap, and
+// then rides the same exec session loop with body {script, timeoutSec}. Every
+// local failure is a usage error (exit 2) checked before any request is sent.
+func runRun(cmd *cobra.Command, args []string, timeout int, file string) error {
+	src := file
+	if src == "" && len(args) > 1 {
+		src = args[1] // positional form: xnc run n1 -
+	}
+	var script []byte
+	var err error
+	switch {
+	case src == "-":
+		script, err = io.ReadAll(os.Stdin)
+	case src != "":
+		script, err = os.ReadFile(src)
+	default:
+		err = fmt.Errorf("--file or - required")
+	}
+	if err != nil {
+		return failUsage(cmd, err.Error())
+	}
+	if len(script) > execScriptMax {
+		return failUsage(cmd, "script exceeds 256KB; upload+exec arrives in Phase 4")
+	}
+
+	cl, usage := dial(cmd, true)
+	if usage != "" {
+		return failUsage(cmd, usage)
+	}
+	ref, e := resolveNode(cl, args[0])
+	if e != nil {
+		return failAPI(cmd, e)
+	}
+	return runSession(cl, ref, map[string]any{
+		"script": string(script), "timeoutSec": timeout}, cmd)
+}
+
+// runSession drives the shared kind=exec flow behind `xnc exec` and `xnc run`:
+// POST body to /api/nodes/{id}/exec → dial the session WS → stream binary
+// frames live while accumulating them → capture the EXEC_RESULT terminal
+// frame → print the envelope → map to the process exit code (passthrough; 243
+// only when timed out per EXEC_RESULT; 245 NETWORK when the connection ended
+// without a result frame).
+//
+// With --json the live stream and the final envelope interleave on stdout by
+// design: the envelope is emitted after the stream, so line-based (jsonl)
+// consumers are unaffected.
+func runSession(cl *Client, ref nodeRef, body map[string]any, cmd *cobra.Command) error {
 	var created struct {
 		SessionID    string `json:"sessionId"`
 		Token        string `json:"token"`
