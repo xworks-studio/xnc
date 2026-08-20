@@ -1180,13 +1180,15 @@ func runFileTransfer(cmd *cobra.Command, node, direction, local, remote string) 
 		}()
 	}
 
-	// 主循环：收帧
+	// 主循环：收帧（labeled break 避免 goto 跳变量声明）
 	var downloaded []byte
-	var h sha256igest // 见注记——用 sha256.New()
+	var result *proto.FileResult
+	var fileErr *proto.FileError
+loop:
 	for {
 		kind, data, err := readWS(ctx, ws)
 		if err != nil {
-			break
+			break loop
 		}
 		switch kind {
 		case "binary":
@@ -1205,19 +1207,17 @@ func runFileTransfer(cmd *cobra.Command, node, direction, local, remote string) 
 				var fr proto.FileResult
 				if m.Decode(&fr) == nil {
 					result = &fr
+					break loop
 				}
 			case "FILE_ERROR":
 				var fe proto.FileError
 				if m.Decode(&fe) == nil {
 					fileErr = &fe
+					break loop
 				}
-			}
-			if result != nil || fileErr != nil {
-				goto done
 			}
 		}
 	}
-done:
 	if fileErr != nil {
 		return fileErrExit(cmd, fileErr)
 	}
@@ -1225,8 +1225,8 @@ done:
 		return failAPI(cmd, proto.Err(245, "NETWORK", "session ended without result"))
 	}
 	if direction == "download" && result.Ok {
-		if dir := filepath(filepath); dir != "" { // 确保父目录存在
-			_ = os.MkdirAll(fileParent(local), 0o755)
+		if err := os.MkdirAll(filepath.Dir(local), 0o755); err != nil {
+			return failAPI(cmd, proto.Err(250, proto.CodeInternal, err.Error()))
 		}
 		if err := os.WriteFile(local, downloaded, 0o600); err != nil {
 			return failAPI(cmd, proto.Err(250, proto.CodeInternal, err.Error()))
@@ -1245,7 +1245,7 @@ done:
 		}, nil)
 		return nil
 	}
-	fmt.Printf("%s %s: %d bytes, sha256 %s (ok=%v)\n", direction, ref.Name, result.Bytes, result.Sha256[:12]+"…", result.Ok)
+	fmt.Printf("%s %s: %d bytes, sha256 %s (ok=%v)\n", direction, ref.Name, result.Bytes, result.Sha256, result.Ok)
 	return nil
 }
 
@@ -1261,7 +1261,7 @@ func fileErrExit(cmd *cobra.Command, fe *proto.FileError) error {
 }
 ```
 
-（实现注记：上面有几处笔误需清理——`sha256igest`/`filepath(filepath)`/`fileParent` 等占位：删掉未用变量 h；download 写文件前 `os.MkdirAll(filepath.Dir(local), 0o755)`；`result.Sha256[:12]` 需 len 检查（sha256 恒 64 hex，安全）；`goto done` 从 switch 内跳出——Go 不允许 goto 跳过变量声明，改用 labeled break 或提取函数。以编译通过的最终版落地。）
+（`filepath` 需加入 import 列表。mstsc 多连接重连属于打磨项，MVP 单连接。）
 
 `cmd_rdp.go`：
 
