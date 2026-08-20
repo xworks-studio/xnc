@@ -62,7 +62,7 @@ Phase 1 实现计划    ✅ docs/superpowers/plans/2026-08-19-xnc-v2-phase1.md�
 
 **验收**：Scenario D（$x=42 状态保持、Ctrl+C 后会话存活、resize）；断连后 pwsh 进程无残留。
 
-**风险门 Gate B**：Phase 3 计划前先做 2-3 天 spike——`x/sys/windows` 手封 CreatePseudoConsole 与 `UserExistsError/conpty` 二选一产出可用原型；若两者均不可行，**停下重新决策**（升级回 brainstorming，这是设计 §10 的显式假设）。
+**Gate B 已通过（2026-08-20）**：采用 x/sys/windows 直接封装（勿引入第三方 conpty 库）；两个已验证不变量必须带入实现——lpValue 传 HPCON 句柄值（非指针），子进程 STARTUPINFO 必须置 STARTF_USESTDHANDLES。原风险门描述：Phase 3 计划前先做 2-3 天 spike——`x/sys/windows` 手封 CreatePseudoConsole 与 `UserExistsError/conpty` 二选一产出可用原型；若两者均不可行，**停下重新决策**（升级回 brainstorming，这是设计 §10 的显式假设）。
 
 ### Phase 4 — 数据通道（file + tunnel + RDP）
 
@@ -115,7 +115,7 @@ P8 Linux（依赖会话引擎稳定，随时可插）
 | 门 | 时点 | 内容 | 状态 |
 | ---- | ---- | ---- | ---- |
 | Gate A | P1 出口 | mockagent × 1000 心跳：server CPU/内存基线、100 并发 exec 占位 | ⏳ 待 P1 |
-| Gate B | P3 计划前 | Go ConPTY spike（两方案择一，均不可行则回炉） | ⏳ |
+| Gate B | P3 计划前 | Go ConPTY spike（两方案择一，均不可行则回炉） | ✅ 2026-08-20 双方案 6/6 PASS（pwsh 7.6 + PS 5.1）；**选定方案 B：x/sys 直接封装**（v0.47 原生导出 ConPTY API，91 行 in-repo wrapper，零三方依赖）；两个关键不变量已文档化（lpValue 传句柄值非指针；STARTF_USESTDHANDLES 必需）。详见 docs/superpowers/spikes/gateb-conpty/ |
 | Gate C | P4 内 | mstsc 实连 + websocket 粘合吞吐 | ⏳ |
 | 稳定性门 | P7 后 | 内部日常运行约 3 个月无事故 + 审计可回溯 → 商业化立项决策 | ⏳ |
 
