@@ -15,7 +15,7 @@
 | `xnc node disable / enable <node>` | 停用/启用节点 |
 | `xnc exec <node> [--timeout N] [--cwd PATH] -- <command...>` | 一次性命令 |
 | `xnc run <node> (--file x.ps1 \| -) [--timeout N]` | 脚本执行，`-` 表示 stdin |
-| `xnc shell <node> [--cols N] [--rows N]` | 交互式 PowerShell（需 TTY；行首 `~.` 断开；提示符带 `[机器名]` 前缀；显式 cols/rows 禁用自动 resize） |
+| `xnc shell <node> [--cols N] [--rows N]` | 交互式 PowerShell（需 TTY；行首 `~.` 断开（全角 `～．` 同样识别；裸 `~`+回车亦可）；提示符带 `[机器名]` 前缀；显式 cols/rows 禁用自动 resize） |
 | `xnc rdp <node> [--local-port N]` | 反向隧道 + mstsc |
 | `xnc upload <node> <local> <remote>` | 上传（sha256 校验） |
 | `xnc download <node> <remote> <local>` | 下载（sha256 校验） |
