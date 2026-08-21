@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"time"
 	"unsafe"
@@ -45,6 +46,7 @@ var (
 	iidIDXGIFactory1 = guid{0x770aae78, 0xf26f, 0x4dba, [8]byte{0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87}}
 	iidIDXGIOutput1  = guid{0x00cddea8, 0x939b, 0x4b83, [8]byte{0xa3, 0x40, 0xa6, 0x85, 0x22, 0x66, 0x66, 0xcc}}
 	iidIDXGIOutput5  = guid{0x80a07424, 0xab52, 0x42eb, [8]byte{0x83, 0x3c, 0x0c, 0x42, 0xfd, 0x28, 0x2d, 0x98}}
+	iidIDXGIDevice   = guid{0x54ec77fa, 0x1377, 0x44e6, [8]byte{0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c}}
 )
 
 type comPtr struct{ p unsafe.Pointer }
@@ -878,7 +880,7 @@ func scanDupMethods() {
 	}
 
 	try := func(name string, fn func(device comPtr) (comPtr, uintptr)) {
-		for _, flags := range []uintptr{uintptr(d3d11CreateDeviceBgraSupport), 0} {
+		for _, flags := range []uintptr{uintptr(d3d11CreateDeviceBgraSupport), 0, 0x800, 0x820} {
 			var device, context comPtr
 			var fl uint32
 			r, _, _ := procD3D11CreateDevice.Call(adapter.u(), uintptr(d3dDriverTypeUnknown), 0,
@@ -1061,6 +1063,82 @@ func newCapturerBare(opts bareOpts) (*capturer, error) {
 	return c, nil
 }
 
+// scan4 复刻 ffmpeg vf_ddagrab 的对象链：NULL 适配器硬件设备 →
+// QI(IDXGIDevice) → GetAdapter → EnumOutputs → QI(IDXGIOutput1) →
+// DuplicateOutput。与 factory 枚举路径对照，定位我们与 ffmpeg 的差异。
+func scan4() {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	r, _, e := procCoInitEx.Call(0, coinitMode)
+	coInit := r == 0
+	if r != 0 && uint32(r) != rpcEChangedMode {
+		fmt.Fprintf(os.Stderr, "dxgiprobe: CoInitializeEx: %v\n", e)
+		return
+	}
+	if coInit {
+		defer procCoUninit.Call()
+	}
+
+	// 1. NULL 适配器 + HARDWARE 设备（ffmpeg hwcontext 默认 + VIDEO_SUPPORT）。
+	var device, context comPtr
+	var fl uint32
+	r, _, _ = procD3D11CreateDevice.Call(
+		0, uintptr(d3dDriverTypeHardware), 0,
+		uintptr(0x800|uintptr(d3d11CreateDeviceBgraSupport)), 0, 0, uintptr(d3d11SdkVersion),
+		uintptr(unsafe.Pointer(&device.p)), uintptr(unsafe.Pointer(&fl)), uintptr(unsafe.Pointer(&context.p)))
+	if r != 0 {
+		fmt.Fprintf(os.Stderr, "dxgiprobe: [scan4] device hr=0x%08X\n", uint32(r))
+		return
+	}
+	defer device.release()
+	defer context.release()
+	fmt.Fprintf(os.Stderr, "dxgiprobe: [scan4] device ok fl=0x%X\n", fl)
+
+	// 2. device → IDXGIDevice → GetAdapter（槽 7）。
+	dxgiDev, err := device.queryInterface(&iidIDXGIDevice)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "dxgiprobe: [scan4] QI IDXGIDevice: %v\n", err)
+		return
+	}
+	defer dxgiDev.release()
+	var adapter comPtr
+	if _, err := dxgiDev.call(7 /*GetAdapter*/, uintptr(unsafe.Pointer(&adapter.p))); err != nil {
+		fmt.Fprintf(os.Stderr, "dxgiprobe: [scan4] GetAdapter: %v\n", err)
+		return
+	}
+	defer adapter.release()
+	var adesc dxgiAdapterDesc
+	adapter.call(vtAdapterGetDesc, uintptr(unsafe.Pointer(&adesc)))
+	fmt.Fprintf(os.Stderr, "dxgiprobe: [scan4] adapter: %s\n", windows.UTF16ToString(adesc.Description[:]))
+
+	// 3. EnumOutputs(0) → QI(IDXGIOutput1) → DuplicateOutput(19)。
+	var output comPtr
+	if _, err := adapter.call(vtAdapterEnumOutputs, 0, uintptr(unsafe.Pointer(&output.p))); err != nil {
+		fmt.Fprintf(os.Stderr, "dxgiprobe: [scan4] EnumOutputs: %v\n", err)
+		return
+	}
+	defer output.release()
+	var od dxgiOutputDesc
+	output.call(vtOutputGetDesc, uintptr(unsafe.Pointer(&od)))
+	fmt.Fprintf(os.Stderr, "dxgiprobe: [scan4] output %s %dx%d attached=%v\n",
+		windows.UTF16ToString(od.DeviceName[:]), od.DesktopCoordinates.width(), od.DesktopCoordinates.height(), od.AttachedToDesktop != 0)
+	out1, err := output.queryInterface(&iidIDXGIOutput1)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "dxgiprobe: [scan4] QI out1: %v\n", err)
+		return
+	}
+	defer out1.release()
+	var dup comPtr
+	r1, err := out1.call(vtOutput1DuplicateOutput, device.u(), uintptr(unsafe.Pointer(&dup.p)))
+	fmt.Fprintf(os.Stderr, "dxgiprobe: [scan4] DuplicateOutput hr=0x%08X dup=%v err=%v\n", uint32(r1), dup.valid(), err)
+	if dup.valid() {
+		if w, h := duplDims(dup); w > 0 {
+			fmt.Fprintf(os.Stderr, "dxgiprobe: [scan4] dup dims %dx%d\n", w, h)
+		}
+		dup.release()
+	}
+}
+
 // ---- 主流程 ----
 
 func main() {
@@ -1072,6 +1150,7 @@ func main() {
 	scan := flag.Bool("scan", false, "scan DuplicateOutput vtable slots 16..22 then exit")
 	scan2 := flag.Bool("scan2", false, "variant matrix: DuplicateOutput/DuplicateOutput1 x device flags")
 	scan3Flag := flag.Bool("scan3", false, "incremental bisect: add suspect steps to known-good skeleton")
+	scan4Flag := flag.Bool("scan4", false, "replicate ffmpeg ddagrab object chain (device->GetAdapter->output)")
 	mta := flag.Bool("mta", false, "use COINIT_MULTITHREADED instead of STA")
 	dpiAware := flag.Bool("dpi", false, "SetProcessDpiAwarenessContext(PMv2) before init")
 	flag.Parse()
@@ -1089,6 +1168,10 @@ func main() {
 	}
 	if *scan3Flag {
 		scan3()
+		return
+	}
+	if *scan4Flag {
+		scan4()
 		return
 	}
 

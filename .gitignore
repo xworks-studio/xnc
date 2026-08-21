@@ -40,3 +40,4 @@ agent/screen-helper/dda/*.exe
 agent/screen-helper/dda/*.obj
 agent/screen-helper/dda/*.lib
 agent/screen-helper/dda/*.exp
+*.obj

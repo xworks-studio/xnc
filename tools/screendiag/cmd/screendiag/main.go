@@ -114,6 +114,11 @@ func main() {
 			continue
 		}
 		binCount++
+		// 子头协议（agent screen.go）：第 1 字节 0x01 key / 0x02 delta /
+		// 0x03 jpeg——帧类型显式随帧走，NAL 解析前剥离。
+		if len(data) > 0 && (data[0] == 0x01 || data[0] == 0x02 || data[0] == 0x03) {
+			data = data[1:]
+		}
 		nalus := splitAnnexB(data)
 		descs := make([]string, 0, len(nalus))
 		isKey := false
