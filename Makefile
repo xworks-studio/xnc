@@ -32,6 +32,10 @@ e2e3:
 e2e4:
 	bash scripts/e2e_phase4.sh
 
+.PHONY: e2e5
+e2e5:
+	bash scripts/e2e_phase5.sh
+
 EXE :=
 ifeq ($(OS),Windows_NT)
 EXE := .exe
