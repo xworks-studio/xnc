@@ -142,6 +142,16 @@ xnc audit list [--node n] [--user u] [--action a] [--since 7d]
 
 **遗留**：TB16G7 上 DXGI DuplicateOutput 全适配器失败（0x887A0001 INVALID_CALL，见 screen-helper.log），流走 GDI 路径（正确但 CPU 较高、上限 15fps）。后续可试 IDXGIOutput5::DuplicateOutput1 / 检查 CreateProcessAsUser 的 STARTUPINFO lpDesktop。诊断工具在 `tools/screendiag/`（screendiag=抓流+SPS 解析，correlate=几何判定，checkcorners=编码回归配套）。
 
+### WGC 迁移（2026-08-21 深夜，commit `1a9eb68`）
+
+捕获层全面切换 Windows.Graphics.Capture（无 DXGI/GDI 回退）。ABI 经 SDK 26100 头文件+运行时反射双重验证；入口走 IGraphicsCaptureItemInterop（经典 COM）。
+
+**服务→用户启动器重写**（裸 CreateProcessAsUserW），修复连环 bug：err 遮蔽（CreateProcessAsUser 失败被吞成幽灵成功）、stderr 管道死锁、管道路径掉反斜杠、活动会话枚举（RDP 机器 WTSGetActiveConsoleSessionId 取不到令牌→WGC 0x80070424）、服务 slog 接入 agent-service.log（原写入无效句柄全丢）。
+
+**验证状态**：LABS-DEV（生产服务路径，RDP 会话）快照+流式全通（1920x809）。TB16G7：快照✓；流式 init-ok-但-零帧（计划任务直跑可捕获→怀疑 captureLoop 的 LockOSThread 或 listenPipe 交互，机器现休眠待唤醒后测）。诊断工具：tools/screendiag（抓流）、tools/screendiag/cmd/pipeclient（本地管道冒烟）、C: ncscreen-helper.log + agent-service.log。
+
+**待办**：TB16G7 零帧排查（去 LockOSThread 试、计划任务 pipe 探针 xgc4 未取回）；清理 TB16G7 上的计划任务 xgc2/xgc3/xgc4 与探针文件；WebRTC Phase 计划（pion 上行+SFU+浏览器端）。
+
 ### 稳定期
 
 Phase 8（Linux agent，远期）或 3 个月稳定运行 → 商业化决策。
