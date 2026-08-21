@@ -10,6 +10,7 @@ import Nodes from "./pages/Nodes";
 import NodeDetail from "./pages/NodeDetail";
 import Terminal from "./pages/Terminal";
 import Users from "./pages/Users";
+import ScreenPreview from "./pages/ScreenPreview";
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
@@ -30,6 +31,7 @@ createRoot(document.getElementById("root")!).render(
             <Route path="/nodes" element={<Nodes />} />
             <Route path="/nodes/:id" element={<NodeDetail />} />
             <Route path="/terminal/:id" element={<Terminal />} />
+            <Route path="/screen/:id" element={<ScreenPreview />} />
             <Route path="/users" element={<Users />} />
           </Route>
         </Routes>
