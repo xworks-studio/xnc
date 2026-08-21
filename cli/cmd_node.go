@@ -66,9 +66,13 @@ func newNodeListCmd() *cobra.Command {
 			}
 			rows := make([][]string, 0, len(nodes))
 			for _, n := range nodes {
-				rows = append(rows, []string{n.Name, n.Cluster, n.Status})
+				ls := ""
+				if n.LastSeenAt != nil {
+					ls = *n.LastSeenAt
+				}
+				rows = append(rows, []string{n.Name, n.Cluster, n.Status, relTime(parseTimeOrZero(ls))})
 			}
-			printTable([]string{"NAME", "CLUSTER", "STATUS"}, rows)
+			printTable([]string{"NAME", "CLUSTER", "STATUS", "LAST SEEN"}, rows)
 			return nil
 		},
 	}

@@ -14,8 +14,10 @@ import (
 type auditDTO struct {
 	ID        int64           `json:"id"`
 	UserID    *string         `json:"user_id"`
+	UserEmail *string         `json:"user_email"`
 	ClusterID *string         `json:"cluster_id"`
 	NodeID    *string         `json:"node_id"`
+	NodeName  *string         `json:"node_name"`
 	Action    string          `json:"action"`
 	SessionID string          `json:"session_id"`
 	Metadata  json.RawMessage `json:"metadata"`
@@ -88,13 +90,21 @@ func newAuditListCmd() *cobra.Command {
 			}
 			out := make([][]string, 0, len(rows))
 			for _, a := range rows {
+				user := orDash(a.UserEmail)
+				if user == "-" {
+					user = orDash(a.UserID) // fallback to UUID if no email
+				}
+				node := orDash(a.NodeName)
+				if node == "-" {
+					node = orDash(a.NodeID)
+				}
 				out = append(out, []string{
 					strconv.FormatInt(a.ID, 10), a.Action,
-					orDash(a.UserID), orDash(a.NodeID),
-					a.CreatedAt.Format(time.RFC3339),
+					user, node,
+					relTime(a.CreatedAt),
 				})
 			}
-			printTable([]string{"ID", "ACTION", "USER", "NODE", "CREATED"}, out)
+			printTable([]string{"ID", "ACTION", "USER", "NODE", "WHEN"}, out)
 			return nil
 		},
 	}

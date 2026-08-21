@@ -61,6 +61,7 @@ export default function TerminalPage() {
   const [shell, setShell] = useState<string | null>(null);
   const [nodeName, setNodeName] = useState<string | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
+  const [reconnectKey, setReconnectKey] = useState(0);
 
   // Node name for the status bar (best-effort — viewers can read nodes too;
   // on failure the bar falls back to the node id).
@@ -203,7 +204,7 @@ export default function TerminalPage() {
       ws?.close();
       term?.dispose();
     };
-  }, [id]);
+  }, [id, reconnectKey]);
 
   return (
     <div className="term-page">
@@ -212,10 +213,18 @@ export default function TerminalPage() {
         <span className={`term-conn term-conn-${status}`}>
           {status === "connected" && shell ? `${status} · ${shell}` : status}
         </span>
+        {status === "disconnected" && !startError && (
+          <button className="btn btn-sm" onClick={() => setReconnectKey(k => k + 1)}>
+            Reconnect
+          </button>
+        )}
       </div>
       {startError ? (
         <div className="term-error form-error" role="alert">
           {startError}
+          <button className="btn btn-sm" style={{ marginLeft: 12 }} onClick={() => setReconnectKey(k => k + 1)}>
+            Retry
+          </button>
         </div>
       ) : (
         <div className="term-container" ref={containerRef} />

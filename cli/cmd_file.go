@@ -104,12 +104,13 @@ func runFileTransfer(cmd *cobra.Command, node, direction, local, remote string) 
 	start := time.Now()
 
 	if direction == "upload" {
-		go func() { // send the local file as 64KB binary chunks
+		go func() { // send the local file as 64KB binary chunks with progress
 			data, _ := os.ReadFile(local)
-			for off := 0; off < len(data); off += 64 * 1024 {
-				end := off + 64*1024
-				if end > len(data) {
-					end = len(data)
+			total := len(data)
+			for off := 0; off < total; off += 64 * 1024 {
+				end := off + 64 * 1024
+				if end > total {
+					end = total
 				}
 				wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 				if err := ws.Write(wctx, websocket.MessageBinary, data[off:end]); err != nil {
@@ -117,6 +118,13 @@ func runFileTransfer(cmd *cobra.Command, node, direction, local, remote string) 
 					return
 				}
 				cancel()
+				if !jsonOut(cmd) { // progress indicator (non-JSON mode only)
+					fmt.Fprintf(os.Stderr, "\ruploading: %d/%d KB (%d%%)",
+						end/1024, total/1024, end*100/total)
+				}
+			}
+			if !jsonOut(cmd) {
+				fmt.Fprintf(os.Stderr, "\r%42s\r", "") // clear progress line
 			}
 		}()
 	}
@@ -136,6 +144,9 @@ loop:
 		case "binary":
 			if direction == "download" {
 				downloaded = append(downloaded, data...)
+				if !jsonOut(cmd) {
+					fmt.Fprintf(os.Stderr, "\rdownloading: %d KB", len(downloaded)/1024)
+				}
 			}
 		case "text":
 			var m proto.Message
@@ -165,6 +176,9 @@ loop:
 	}
 	if result == nil {
 		return failAPI(cmd, proto.Err(0, "NETWORK", "session ended without result"))
+	}
+	if !jsonOut(cmd) && direction == "download" {
+		fmt.Fprintf(os.Stderr, "\r%42s\r", "") // clear progress line
 	}
 	if !result.Ok { // the writing side already failed its own verify
 		return failAPI(cmd, proto.Err(246, proto.CodeHashMismatch, "sha256 mismatch"))

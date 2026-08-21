@@ -107,8 +107,7 @@ func TestExecStreamsAndPassthroughExit(t *testing.T) {
 			"--server", srv.URL, "--token", "tk", "--", "hostname"})
 	})
 	require.Equal(t, 7, code) // exit-code passthrough
-	// Live stream lands on stdout before the envelope.
-	assert.True(t, strings.HasPrefix(out, "out-line\n"), "stream first, got %q", out)
+	// --json silent mode: only the envelope is on stdout (no live stream).
 	var env struct {
 		OK   bool `json:"ok"`
 		Data struct {
@@ -120,7 +119,7 @@ func TestExecStreamsAndPassthroughExit(t *testing.T) {
 			TimedOut  bool   `json:"timedOut"`
 		} `json:"data"`
 	}
-	require.NoError(t, jsonUnmarshalStr(lastJSONLine(t, out), &env))
+	require.NoError(t, jsonUnmarshalStr(out, &env))
 	assert.True(t, env.OK)
 	assert.Equal(t, "n1", env.Data.Node) // resolved name, not the raw arg
 	assert.Equal(t, 7, env.Data.ExitCode)
@@ -221,18 +220,19 @@ func TestExecResultlessDisconnectExits245(t *testing.T) {
 	defer srv.Close()
 
 	// JSON mode: error envelope NETWORK, exit 245 (NOT 243/timeout).
+	// Silent mode: no streamed frame on stdout, only the error envelope.
 	out, code := captureStdout(t, func() int {
 		return runCLI(t.Context(), []string{"exec", "n1", "--json",
 			"--server", srv.URL, "--token", "tk", "--", "hostname"})
 	})
 	require.Equal(t, 245, code)
-	assert.True(t, strings.HasPrefix(out, "part"), "streamed frame preserved: %q", out)
+	assert.NotContains(t, out, "part", "no streamed frame in --json mode: %q", out)
 	var env struct {
 		OK    bool            `json:"ok"`
 		Data  any             `json:"data"`
 		Error *proto.APIError `json:"error"`
 	}
-	require.NoError(t, jsonUnmarshalStr(lastJSONLine(t, out), &env))
+	require.NoError(t, jsonUnmarshalStr(out, &env))
 	assert.False(t, env.OK)
 	assert.Nil(t, env.Data)
 	require.NotNil(t, env.Error)
@@ -259,14 +259,16 @@ func TestExecEnvelopeNewlineSeparation(t *testing.T) {
 			"--server", srv.URL, "--token", "tk", "--", "hostname"})
 	})
 	require.Equal(t, 0, code)
-	assert.True(t, strings.HasPrefix(out, "out-no-newline\n"), "separator newline added: %q", out)
+	// --json silent mode: stdout only contains the envelope (no stream, no separator needed)
+	assert.NotContains(t, out, "out-no-newline\n", "no streamed output in --json mode: %q", out)
+	assert.True(t, strings.HasPrefix(out, "{"), "envelope only: %q", out)
 	var env struct {
 		OK   bool `json:"ok"`
 		Data struct {
 			Stdout string `json:"stdout"`
 		} `json:"data"`
 	}
-	require.NoError(t, jsonUnmarshalStr(lastJSONLine(t, out), &env))
+	require.NoError(t, jsonUnmarshalStr(out, &env))
 	assert.True(t, env.OK)
 	assert.Equal(t, "out-no-newline", env.Data.Stdout)
 }

@@ -23,11 +23,14 @@ const (
 )
 
 // auditDTO：审计行对外形态。可空维度（user/cluster/node）NULL 序列化为 null。
+// UserEmail/NodeName 为 JOIN 出的人类可读名称（LEFT JOIN，无匹配时 null）。
 type auditDTO struct {
 	ID        int64           `json:"id"`
 	UserID    *string         `json:"user_id"`
+	UserEmail *string         `json:"user_email"`
 	ClusterID *string         `json:"cluster_id"`
 	NodeID    *string         `json:"node_id"`
+	NodeName  *string         `json:"node_name"`
 	Action    string          `json:"action"`
 	SessionID string          `json:"session_id"`
 	Metadata  json.RawMessage `json:"metadata"`
@@ -104,13 +107,24 @@ func (h *handlers) listAudit(w http.ResponseWriter, r *http.Request) {
 	out := make([]auditDTO, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, auditDTO{
-			ID: row.ID, UserID: uuidPtr(row.UserID), ClusterID: uuidPtr(row.ClusterID),
-			NodeID: uuidPtr(row.NodeID), Action: row.Action,
+			ID: row.ID, UserID: uuidPtr(row.UserID), UserEmail: textPtr(row.UserEmail),
+			ClusterID: uuidPtr(row.ClusterID),
+			NodeID:    uuidPtr(row.NodeID), NodeName: textPtr(row.NodeName),
+			Action: row.Action,
 			SessionID: row.SessionID, Metadata: json.RawMessage(row.Metadata),
 			CreatedAt: row.CreatedAt,
 		})
 	}
 	respondJSON(w, http.StatusOK, out)
+}
+
+// textPtr：pgtype.Text → *string（NULL 序列化为 JSON null）。
+func textPtr(v pgtype.Text) *string {
+	if !v.Valid {
+		return nil
+	}
+	s := v.String
+	return &s
 }
 
 // parseAuditSince 支持 (1) Go 时长（24h/30m/10s）；(2) Nd 天数简写（7d——

@@ -7,19 +7,24 @@ package sqlc
 
 import (
 	"context"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const queryAuditLog = `-- name: QueryAuditLog :many
 
-SELECT id, user_id, cluster_id, node_id, action, session_id, metadata, created_at
-FROM audit_logs
-WHERE ($1::uuid IS NULL OR node_id = $1)
-  AND ($2::uuid IS NULL OR user_id = $2)
-  AND ($3::text IS NULL OR action = $3)
-  AND ($4::timestamptz IS NULL OR created_at >= $4)
-ORDER BY created_at DESC
+SELECT a.id, a.user_id, a.cluster_id, a.node_id, a.action, a.session_id, a.metadata, a.created_at,
+       u.email AS user_email,
+       n.name AS node_name
+FROM audit_logs a
+LEFT JOIN users u ON u.id = a.user_id
+LEFT JOIN nodes n ON n.id = a.node_id
+WHERE ($1::uuid IS NULL OR a.node_id = $1)
+  AND ($2::uuid IS NULL OR a.user_id = $2)
+  AND ($3::text IS NULL OR a.action = $3)
+  AND ($4::timestamptz IS NULL OR a.created_at >= $4)
+ORDER BY a.created_at DESC
 LIMIT $6 OFFSET $5
 `
 
@@ -32,10 +37,23 @@ type QueryAuditLogParams struct {
 	Limit  int32              `json:"limit"`
 }
 
-// 审计查询（GET /api/audit）：动态 WHERE + 分页。
+type QueryAuditLogRow struct {
+	ID        int64       `json:"id"`
+	UserID    pgtype.UUID `json:"user_id"`
+	ClusterID pgtype.UUID `json:"cluster_id"`
+	NodeID    pgtype.UUID `json:"node_id"`
+	Action    string      `json:"action"`
+	SessionID string      `json:"session_id"`
+	Metadata  []byte      `json:"metadata"`
+	CreatedAt time.Time   `json:"created_at"`
+	UserEmail pgtype.Text `json:"user_email"`
+	NodeName  pgtype.Text `json:"node_name"`
+}
+
+// 审计查询（GET /api/audit）：动态 WHERE + 分页 + 人类可读名称。
 // sqlc.narg 生成可空参数（pgtype.*）——零值（Valid=false）即 NULL，
 // 对应过滤跳过；action/userId/nodeId/since 全部可选组合。
-func (q *Queries) QueryAuditLog(ctx context.Context, arg QueryAuditLogParams) ([]AuditLog, error) {
+func (q *Queries) QueryAuditLog(ctx context.Context, arg QueryAuditLogParams) ([]QueryAuditLogRow, error) {
 	rows, err := q.db.Query(ctx, queryAuditLog,
 		arg.NodeID,
 		arg.UserID,
@@ -48,9 +66,9 @@ func (q *Queries) QueryAuditLog(ctx context.Context, arg QueryAuditLogParams) ([
 		return nil, err
 	}
 	defer rows.Close()
-	var items []AuditLog
+	var items []QueryAuditLogRow
 	for rows.Next() {
-		var i AuditLog
+		var i QueryAuditLogRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.UserID,
@@ -60,6 +78,8 @@ func (q *Queries) QueryAuditLog(ctx context.Context, arg QueryAuditLogParams) ([
 			&i.SessionID,
 			&i.Metadata,
 			&i.CreatedAt,
+			&i.UserEmail,
+			&i.NodeName,
 		); err != nil {
 			return nil, err
 		}

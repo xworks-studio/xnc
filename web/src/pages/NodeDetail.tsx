@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import { api, APIError } from "../api";
 import type { NodeDTO } from "../types";
 import StatusBadge from "../components/StatusBadge";
+import { formatRelativeTime } from "../reltime";
 
 /**
  * Node detail: info card + actions.
@@ -35,6 +36,9 @@ export default function NodeDetail() {
   }, [load]);
 
   async function toggleDisabled(enable: boolean) {
+    if (!enable && !window.confirm(`Disable ${node?.name ?? "this node"}? All sessions will be blocked.`)) {
+      return;
+    }
     setBusy(true);
     setActionError(null);
     try {
@@ -71,7 +75,7 @@ export default function NodeDetail() {
     ["OS", node.os_version],
     ["Agent", node.agent_version],
     ["Shell", node.shell_type],
-    ["Last seen", node.last_seen_at ? new Date(node.last_seen_at).toLocaleString() : "never"],
+    ["Last seen", node.last_seen_at ? formatRelativeTime(node.last_seen_at) : "never"],
     ["ID", <span key="id" className="mono">{node.id}</span>],
   ];
 

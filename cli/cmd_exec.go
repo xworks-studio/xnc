@@ -194,10 +194,14 @@ func runSession(cl *Client, ref nodeRef, body map[string]any, cmd *cobra.Command
 				continue
 			}
 			if data[0] == frameStdout {
-				os.Stdout.Write(data[1:])
+				if !jsonOut(cmd) { // --json：静默积累，不实时打印（管道消费友好）
+					os.Stdout.Write(data[1:])
+				}
 				out.stdout.Write(data[1:])
 			} else {
-				os.Stderr.Write(data[1:])
+				if !jsonOut(cmd) {
+					os.Stderr.Write(data[1:])
+				}
 				out.stderr.Write(data[1:])
 			}
 		case "text":
@@ -213,11 +217,8 @@ func runSession(cl *Client, ref nodeRef, body map[string]any, cmd *cobra.Command
 		}
 	}
 
-	// Envelope separation: if the live stream left stdout mid-line, start the
-	// envelope on a fresh line so the trailing envelope line parses standalone.
-	if jsonOut(cmd) && out.stdout.Len() > 0 && !strings.HasSuffix(out.stdout.String(), "\n") {
-		os.Stdout.WriteString("\n")
-	}
+	// --json mode is now silent (no streaming output on stdout), so the
+	// envelope separator is no longer needed — stdout contains only the envelope.
 
 	// Disconnect before the terminal frame is a NETWORK failure (245), not a
 	// timeout: 243 is reserved for EXEC_RESULT.TimedOut (cli.md contract).

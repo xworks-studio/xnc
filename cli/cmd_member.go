@@ -49,9 +49,9 @@ func newMemberListCmd() *cobra.Command {
 			}
 			rows := make([][]string, 0, len(members))
 			for _, m := range members {
-				rows = append(rows, []string{m.Email, m.Role})
+				rows = append(rows, []string{m.Email, m.Role, m.UserID})
 			}
-			printTable([]string{"EMAIL", "ROLE"}, rows)
+			printTable([]string{"EMAIL", "ROLE", "USER_ID"}, rows)
 			return nil
 		},
 	}

@@ -47,6 +47,7 @@ func newRootCmd() *cobra.Command {
 		Short:         "XNC control plane CLI",
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		Version:       cliVersion, // enables --version flag
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			out, _ := cmd.Flags().GetString("output")
 			if out != "json" && out != "table" {

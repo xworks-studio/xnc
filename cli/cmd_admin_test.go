@@ -214,8 +214,8 @@ func TestAuditListFiltersAndGolden(t *testing.T) {
 	want.Set("limit", "50")
 	want.Set("offset", "1")
 	assert.Equal(t, want.Encode(), gotQuery.Encode())
-	assert.JSONEq(t, `{"ok":true,"data":[{"id":7,"user_id":"`+adminUserID+`","cluster_id":null,
-		"node_id":"`+nodeUUID+`","action":"node.disable","session_id":"",
+	assert.JSONEq(t, `{"ok":true,"data":[{"id":7,"user_id":"`+adminUserID+`","user_email":null,"cluster_id":null,
+		"node_id":"`+nodeUUID+`","node_name":null,"action":"node.disable","session_id":"",
 		"metadata":{"name":"web-01"},"created_at":"2026-08-19T10:00:00Z"}],"error":null}`, out)
 
 	tbl, code2 := captureStdout(t, func() int {
