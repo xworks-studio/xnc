@@ -228,11 +228,27 @@ ws.onmessage = (ev) => {
     return;
   }
   const data = new Uint8Array(ev.data);
-  // start code (00 00 01) 后第一字节低 5 位 = NALU 类型。
-  const nalType = data.length > 4 ? data[4] & 0x1F : 0;
+  // NALU type: handle both 3-byte (00 00 01) and 4-byte (00 00 00 01) start codes.
+  let nalType = -1;
+  if (data.length >= 4) {
+    if (data[0] === 0 && data[1] === 0 && data[2] === 1) {
+      nalType = data[3] & 0x1F; // 3-byte start code
+    } else if (data[0] === 0 && data[1] === 0 && data[2] === 0 && data[3] === 1 && data.length >= 5) {
+      nalType = data[4] & 0x1F; // 4-byte start code
+    } else {
+      nalType = data[0] & 0x1F; // raw NALU
+    }
+  }
   const isKey = nalType === 5 || nalType === 7 || nalType === 8;
   if (!decoder) {
-    if (nalType !== 7) return; // 等 SPS 才能配置解码器
+    if (nalType !== 7 && nalType !== 5) return; // 等 SPS/IDR 才能配置
+    // 从 SPS 中提取实际 profile/level 构造 codec 字符串
+    let codec = "avc1.4D4028"; // default: Main profile
+    if (nalType === 7 && data.length > 7) {
+      const off = data[0] === 0 && data[1] === 0 && data[2] === 1 ? 4 : 5;
+      const p = data[off]; const c = data[off+1]; const l = data[off+2];
+      if (p > 0) codec = "avc1." + p.toString(16).padStart(2,"0") + c.toString(16).padStart(2,"0") + l.toString(16).padStart(2,"0");
+    }
     decoder = new VideoDecoder({
       output: (frame) => {
         ctx.drawImage(frame, 0, 0, canvas.width || frame.displayWidth,
@@ -241,7 +257,7 @@ ws.onmessage = (ev) => {
       },
       error: (e) => { st.textContent = "decoder error: " + e.message; },
     });
-    decoder.configure({ codec: "avc1.42E01E", optimizeForLatency: true });
+    decoder.configure({ codec: codec, optimizeForLatency: true });
   }
   decoder.decode(new EncodedVideoChunk({
     type: isKey ? "key" : "delta",
