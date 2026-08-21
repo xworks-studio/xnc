@@ -18,6 +18,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"sync"
@@ -57,15 +58,18 @@ type ScreenFrame struct {
 // ScreenStreamManager 管理共享捕获管线。单例——无论观众数，仅一个 helper
 // 进程：首个 Subscribe 启动，最后一个 Unsubscribe 停止。
 type ScreenStreamManager struct {
-	mu           sync.Mutex
-	helperCmd    *exec.Cmd
-	pipeConn     net.Conn
-	subscribers  map[string]chan ScreenFrame // sessionID → 帧 channel
-	lastKeyFrame []byte                      // 最新 I 帧缓存（新观众立即推送）
-	lastSPSPPS   []byte                      // SPS/PPS 缓存（解码器初始化）
+	mu            sync.Mutex
+	helperCmd     *exec.Cmd
+	pipeConn      net.Conn
+	subscribers   map[string]chan ScreenFrame // sessionID → 帧 channel
+	lastKeyFrame  []byte                      // 最新 I 帧缓存（新观众立即推送）
+	lastSPSPPS    []byte                      // SPS/PPS 缓存（解码器初始化）
 	width, height int
-	state        string // capturing / locked / no_session
-	helperPath   string
+	state         string // capturing / locked / no_session
+	helperPath    string
+	// viewerParams 首个订阅者的捕获参数（helper 启动参数 --fps/--quality/
+	// --max-width 的来源）；管线已运行时后续订阅者的参数不生效（共享管线）。
+	viewerParams proto.ScreenParams
 	log          *slog.Logger
 	stopCh       chan struct{}
 	running      bool
@@ -107,24 +111,27 @@ func newScreenStreamManager(agentExe string, log *slog.Logger) *ScreenStreamMana
 	}
 }
 
-// helperPathFromExe 返回与 agent 同目录的 helper 路径（跨平台文件名一致，
-// Windows 上为 xnc-screen-helper.exe）。
+// helperPathFromExe 返回与 agent 同目录的 xnc-screen-helper 路径（Windows
+// 上带 .exe 后缀；跨平台文件名一致，部署脚本与 bin/ 产物同名）。
 func helperPathFromExe(agentExe string) string {
 	if agentExe == "" {
 		return "xnc-screen-helper"
 	}
+	name := "xnc-screen-helper"
 	if runtime.GOOS == "windows" {
-		return agentExe[:len(agentExe)-len(".exe")] + "-screen-helper.exe"
+		name += ".exe"
 	}
-	return agentExe + "-screen-helper"
+	return filepath.Join(filepath.Dir(agentExe), name)
 }
 
-// Subscribe 添加一个观众；helper 未运行则启动。返回帧广播 channel
-// （manager 停止时关闭）。
-func (m *ScreenStreamManager) Subscribe(sessionID string) <-chan ScreenFrame {
+// Subscribe 添加一个观众；helper 未运行则以该观众的捕获参数启动（fps/
+// quality/maxWidth 一次定终身——共享管线，后续观众参数不生效）。返回帧
+// 广播 channel（manager 停止时关闭）。
+func (m *ScreenStreamManager) Subscribe(sessionID string, p proto.ScreenParams) <-chan ScreenFrame {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.running {
+		m.viewerParams = p
 		if err := m.startPipelineLocked(); err != nil {
 			m.log.Warn("screen helper start failed", "err", err)
 			m.state = "no_session"
@@ -198,10 +205,11 @@ func (m *ScreenStreamManager) CachedKeyFrame() (spspps, key []byte) {
 }
 
 // Snapshot 运行 helper 的 --jpeg-single 模式：单帧 GDI 截屏 → JPEG 文件 →
-// 读回字节。不触碰流式管线（helper 截完即退出，无 named pipe）。
+// 读回字节。不触碰流式管线（helper 截完即退出，无 named pipe）。helper 同样
+// 经 launchHelperAsUser 桥接进用户会话（Session 0 服务的 GDI 截屏同样需要）。
 func (m *ScreenStreamManager) Snapshot(quality int) ([]byte, error) {
 	m.mu.Lock()
-	helperPath := m.helperPath
+	helperPath, log := m.helperPath, m.log
 	m.mu.Unlock()
 	if quality <= 0 {
 		quality = screenDefaultQuality
@@ -214,10 +222,14 @@ func (m *ScreenStreamManager) Snapshot(quality int) ([]byte, error) {
 	tmp.Close()
 	defer os.Remove(tmpPath)
 
-	cmd := exec.Command(helperPath, "--jpeg-single", tmpPath,
-		"--quality", strconv.Itoa(quality))
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("screen helper: %v: %s", err, bytes.TrimSpace(out))
+	var out bytes.Buffer
+	cmd, err := launchHelperAsUser(log, helperPath, &out,
+		"--jpeg-single", tmpPath, "--quality", strconv.Itoa(quality))
+	if err != nil {
+		return nil, err
+	}
+	if err := cmd.Wait(); err != nil {
+		return nil, fmt.Errorf("screen helper: %v: %s", err, bytes.TrimSpace(out.Bytes()))
 	}
 	return os.ReadFile(tmpPath)
 }
@@ -248,11 +260,13 @@ func (m *ScreenStreamManager) startPipelineLocked() error {
 }
 
 // launchHelperLocked 拉起 helper 进程并连接其 named pipe（pipe 名按 agent
-// PID 确定性生成，同一 agent 运行期内不变）。
+// PID 确定性生成，同一 agent 运行期内不变）。启动经 launchHelperAsUser
+// （Session 0 桥接，平台实现见 screen_windows.go / screen_other.go），并按
+// 首个订阅者的参数转发 --fps/--quality/--max-width。
 func (m *ScreenStreamManager) launchHelperLocked() (net.Conn, *exec.Cmd, error) {
 	pipeName := screenPipeName()
-	cmd := exec.Command(m.helperPath, "--pipe", pipeName)
-	if err := cmd.Start(); err != nil {
+	cmd, err := launchHelperAsUser(m.log, m.helperPath, nil, helperArgs(pipeName, m.viewerParams)...)
+	if err != nil {
 		return nil, nil, err
 	}
 	conn, err := dialPipe(pipeName)
@@ -262,6 +276,22 @@ func (m *ScreenStreamManager) launchHelperLocked() (net.Conn, *exec.Cmd, error) 
 		return nil, nil, err
 	}
 	return conn, cmd, nil
+}
+
+// helperArgs 组装 helper 启动参数：pipe 名 + 首个订阅者的捕获参数（0 值省
+// 略——helper 侧 flag 自带默认值）。
+func helperArgs(pipeName string, p proto.ScreenParams) []string {
+	args := []string{"--pipe", pipeName}
+	if p.Fps > 0 {
+		args = append(args, "--fps", strconv.Itoa(p.Fps))
+	}
+	if p.Quality > 0 {
+		args = append(args, "--quality", strconv.Itoa(p.Quality))
+	}
+	if p.MaxWidth > 0 {
+		args = append(args, "--max-width", strconv.Itoa(p.MaxWidth))
+	}
+	return args
 }
 
 // screenPipeName 返回确定性 pipe 名（同一 agent 运行期内一致）。
@@ -411,7 +441,7 @@ func (h *ScreenHandler) Handle(ctx context.Context, ws *websocket.Conn, sessionI
 		return
 	}
 
-	ch := h.Manager.Subscribe(sessionID)
+	ch := h.Manager.Subscribe(sessionID, p)
 	defer h.Manager.Unsubscribe(sessionID)
 
 	w, ht, state := h.Manager.State()

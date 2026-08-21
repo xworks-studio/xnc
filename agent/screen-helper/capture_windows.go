@@ -443,7 +443,8 @@ func bitrateFor(quality int) int {
 // 回退）→ 发分辨率 + capturing → 捕获-编码-推送循环。
 //
 //	静止：AcquireFrame 超时/无变化 → 不编码不出帧（自适应 0fps）
-//	锁屏：ErrAccessLost → 状态 0x03 locked + 重建 duplication
+//	锁屏：ErrAccessLost → 状态 0x03 locked + 重建 duplication；重建后
+//	      首次成功取帧再发 0x03 capturing（观众得以感知恢复）
 //	关键帧：首帧 + 每 gop 帧（新观众可立即入流）
 func captureLoop(ctx context.Context, conn net.Conn, opts captureOpts) error {
 	frameInterval := time.Second / time.Duration(opts.fps)
@@ -509,6 +510,9 @@ func captureLoop(ctx context.Context, conn net.Conn, opts captureOpts) error {
 	framesSinceKey := 0
 	sentKey := false
 	var lastFrame []byte
+	// locked：处于锁屏 / 访问丢失状态（去重 0x03 locked 通告；重建并成功
+	// 取到下一帧后通告 capturing 复位）。
+	locked := false
 	// 静止桌面自愈：MFT 有 ~gop 帧启动延迟，若期间桌面转静止，首帧可能
 	// 被编码器内部吞掉而始终无输出。静止超时 ~1s 后强制重编码缓存帧。
 	// 首关键帧出帧前按节拍持续驱动编码器；出帧后静止即完全静默。
@@ -534,8 +538,11 @@ func captureLoop(ctx context.Context, conn net.Conn, opts captureOpts) error {
 		}
 		if err != nil {
 			if errors.Is(err, ErrAccessLost) {
-				if werr := writeFrame(conn, pipeFrameState, []byte("locked")); werr != nil {
-					return werr
+				if !locked {
+					if werr := writeFrame(conn, pipeFrameState, []byte("locked")); werr != nil {
+						return werr
+					}
+					locked = true
 				}
 				// 重建 duplication 后继续；连续失败则按秒退避重试。
 				if rerr := dxgi.recreate(); rerr != nil {
@@ -558,6 +565,13 @@ func captureLoop(ctx context.Context, conn net.Conn, opts captureOpts) error {
 			return fmt.Errorf("acquire: %w", err)
 		}
 		idleTicks = 0
+		// 锁屏恢复：重建后首次成功取帧 → 通告 capturing，观众状态条复位。
+		if locked {
+			if werr := writeFrame(conn, pipeFrameState, []byte("capturing")); werr != nil {
+				return werr
+			}
+			locked = false
+		}
 		if len(frame) < srcW*srcH*4 {
 			continue
 		}

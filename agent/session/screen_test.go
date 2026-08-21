@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -236,7 +238,7 @@ func TestScreenStateChangeTextFrame(t *testing.T) {
 // TestScreenUnsubscribeStopsPipeline 退订归零 → 管线停止（stopCh 关闭）。
 func TestScreenUnsubscribeStopsPipeline(t *testing.T) {
 	m, _ := newMockScreenManager(t)
-	ch := m.Subscribe("solo")
+	ch := m.Subscribe("solo", proto.ScreenParams{})
 	require.True(t, m.Running())
 	m.Unsubscribe("solo")
 	require.False(t, m.Running())
@@ -252,11 +254,11 @@ func TestScreenUnsubscribeStopsPipeline(t *testing.T) {
 // TestScreenResubscribeRestartsPipeline 停止后再次订阅能重新启动。
 func TestScreenResubscribeRestartsPipeline(t *testing.T) {
 	m, mock := newMockScreenManager(t)
-	_ = m.Subscribe("a")
+	_ = m.Subscribe("a", proto.ScreenParams{})
 	m.Unsubscribe("a")
 	require.False(t, m.Running())
 
-	_ = m.Subscribe("b")
+	_ = m.Subscribe("b", proto.ScreenParams{})
 	require.True(t, m.Running())
 	mock.write(0x03, []byte("capturing"))
 	require.Eventually(t, func() bool {
@@ -306,8 +308,30 @@ func TestScreenSplitSPSPPS(t *testing.T) {
 // TestScreenPipeDeathStopsPipeline helper（pipe）死亡 → 管线自动停止。
 func TestScreenPipeDeathStopsPipeline(t *testing.T) {
 	m, mock := newMockScreenManager(t)
-	_ = m.Subscribe("s1")
+	_ = m.Subscribe("s1", proto.ScreenParams{})
 	require.True(t, m.Running())
 	_ = mock.c.Close() // 模拟 helper 退出
 	require.Eventually(t, func() bool { return !m.Running() }, 2*time.Second, 20*time.Millisecond)
+}
+
+// TestScreenHelperPathFromExe helper 与 agent 同目录、固定名
+// xnc-screen-helper(.exe)——与 bin/ 产物及 deploy 脚本的拷贝目标一致。
+func TestScreenHelperPathFromExe(t *testing.T) {
+	assert.Equal(t, "xnc-screen-helper", helperPathFromExe(""))
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "xnc-agent.exe")
+	name := "xnc-screen-helper"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	assert.Equal(t, filepath.Join(dir, name), helperPathFromExe(exe))
+}
+
+// TestScreenHelperArgs M1：首个订阅者的捕获参数转发为 helper 命令行（0 值
+// 省略，helper 侧 flag 自带默认值）。
+func TestScreenHelperArgs(t *testing.T) {
+	assert.Equal(t, []string{"--pipe", "p"}, helperArgs("p", proto.ScreenParams{}))
+	assert.Equal(t,
+		[]string{"--pipe", "p", "--fps", "10", "--quality", "80", "--max-width", "1280"},
+		helperArgs("p", proto.ScreenParams{Fps: 10, Quality: 80, MaxWidth: 1280}))
 }

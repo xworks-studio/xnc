@@ -32,6 +32,9 @@ try {
     } -ArgumentList $RemoteDir
 
     Copy-Item -Path $LocalExe -Destination "$RemoteDir\xnc-agent.exe" -ToSession $session -Force
+    # Screen helper lives next to the agent exe (agent/session/screen.go
+    # derives the path from its own executable directory).
+    Copy-Item -Path "$PSScriptRoot\..\bin\xnc-screen-helper.exe" -Destination "$RemoteDir\xnc-screen-helper.exe" -ToSession $session -Force
 
     Invoke-Command -Session $session -ScriptBlock {
         param($dir, $server, $token)

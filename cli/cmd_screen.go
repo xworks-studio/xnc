@@ -52,6 +52,7 @@ func newScreenCmd() *cobra.Command {
 		"capture a single frame and write it to this JPEG file")
 	cmd.Flags().BoolVar(&openBrowser, "open", false,
 		"open a live screen preview in the default browser")
+	addJSONFlag(cmd)
 	return cmd
 }
 
