@@ -29,3 +29,6 @@ server/web/dist/*
 /bin/
 *.exe
 __pycache__/
+
+# 误提交的 ELF 构建产物
+agent/screen-helper/screen-helper

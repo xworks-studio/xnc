@@ -136,18 +136,18 @@ const (
 
 	vtAdapterEnumOutputs = 7 // IDXGIAdapter1: ...+GetDesc8,EnumOutputs9,Check...
 
-	vtOutputGetDesc = 9 // IDXGIOutput: ...+GetDisplayModeList7,FindClosest8,GetDesc9,...
+	vtOutputGetDesc = 7 // IDXGIOutput: IUnknown3+IDXGIObject4+GetDesc7,GetDisplayModeList8,...
 
-	vtOutput1DuplicateOutput = 15 // IDXGIOutput1: ...+GetDisplayModeList1_12,Find1_13,GetSurface1_14,DuplicateOutput
+	vtOutput1DuplicateOutput = 20 // IDXGIOutput1: IDXGIOutput17+GetDisplaySurfaceData18,ReleaseFrameOwnership19,DuplicateOutput20
 
-	vtDupAcquireNextFrame = 4  // IDXGIOutputDuplication: GetDesc3,AcquireNextFrame4,...
-	vtDupReleaseFrame     = 10 // ...,ReleaseFrame10
+	vtDupAcquireNextFrame = 8  // IDXGIOutputDuplication: IUnknown0-2,GetDesc3,...,AcquireNextFrame8
+	vtDupReleaseFrame     = 12 // GetFrameDirtyRects9,GetFrameMoveRects10,GetFramePointerShape11,ReleaseFrame12
 
-	vtDeviceCreateTexture2D = 7 // ID3D11Device: GetImmediateContext3,CreateDeferredContext4,CreateBuffer5,CreateTexture1D6,CreateTexture2D7
+	vtDeviceCreateTexture2D = 5 // ID3D11Device: IUnknown0-2,CreateBuffer3,CreateTexture1D4,CreateTexture2D5
 
-	vtContextCopyResource = 9  // ID3D11DeviceContext: devicechild6,UpdateSubresource7,CopySubresourceRegion8,CopyResource9
-	vtContextMap          = 34 // ...,Map34,Unmap35
-	vtContextUnmap        = 35
+	vtContextCopyResource = 47 // ID3D11DeviceContext: IUnknown0-2+ID3D11DeviceChild3-4,...,Map14,Unmap15,...,CopyResource47
+	vtContextMap          = 14 // ...,Map14,Unmap15
+	vtContextUnmap        = 15
 )
 
 // ---- DXGI/D3D11 常量 ----
@@ -374,6 +374,23 @@ func (c *DXGICapturer) ReleaseFrame() {
 	}
 }
 
+// recreate 销毁并重建 duplication（ErrAccessLost 后恢复：锁屏返回 /
+// 桌面切换 / 显示模式变化）。设备等长生命周期接口保持不动。
+func (c *DXGICapturer) recreate() error {
+	// 若仍持有帧，先归还（access lost 后通常已失效，忽略错误）。
+	c.ReleaseFrame()
+	if c.duplication.valid() {
+		c.duplication.release()
+		c.duplication = nilPtr
+	}
+	var dup comPtr
+	if _, err := c.output1.call(vtOutput1DuplicateOutput, c.device.u(), uintptr(unsafe.Pointer(&dup.p))); err != nil {
+		return fmt.Errorf("DuplicateOutput(recreate): %w", err)
+	}
+	c.duplication = dup
+	return nil
+}
+
 // Close 释放全部 COM 资源。
 func (c *DXGICapturer) Close() {
 	for _, p := range []comPtr{c.duplication, c.staging, c.context, c.device, c.output1, c.output, c.adapter, c.factory} {
@@ -442,7 +459,11 @@ func captureLoop(ctx context.Context, conn net.Conn, frameInterval time.Duration
 				if werr := writeFrame(conn, pipeFrameState, []byte("locked")); werr != nil {
 					return werr
 				}
-				time.Sleep(time.Second)
+				// 重建 duplication 后继续；连续失败则按秒退避重试。
+				if rerr := cap.recreate(); rerr != nil {
+					_, _ = fmt.Fprintf(os.Stderr, "xnc-screen-helper: recreate duplication: %v\n", rerr)
+					time.Sleep(time.Second)
+				}
 				continue
 			}
 			if errors.Is(err, ErrTimeout) {
