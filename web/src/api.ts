@@ -50,5 +50,8 @@ export async function api<T>(path: string, opts?: RequestInit): Promise<T> {
     throw new APIError(code, message);
   }
 
+  // 204 No Content (node disable/enable, member remove) — no JSON body to parse.
+  if (res.status === 204) return undefined as T;
+
   return (await res.json()) as T;
 }
