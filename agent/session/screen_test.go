@@ -154,12 +154,12 @@ func TestScreenViewerReceivesBeginKeyAndDelta(t *testing.T) {
 	// I 帧 binary：SPS/PPS/IDR 原序。
 	kind, data := readFrame(t, ws)
 	require.Equal(t, "binary", kind)
-	assert.Equal(t, iframe, data)
+	assert.Equal(t, append([]byte{proto.ScreenBinKey}, iframe...), data)
 
 	// P 帧 binary。
 	kind, data = readFrame(t, ws)
 	require.Equal(t, "binary", kind)
-	assert.Equal(t, mockP, data)
+	assert.Equal(t, append([]byte{proto.ScreenBinDelta}, mockP...), data)
 
 	w, h, state := m.State()
 	assert.Equal(t, 1920, w)
@@ -195,7 +195,7 @@ func TestScreenSecondViewerGetsCachedKeyFrame(t *testing.T) {
 
 	kind, data = readFrame(t, ws2)
 	require.Equal(t, "binary", kind)
-	assert.Equal(t, iframe, data) // 缓存立即推送
+	assert.Equal(t, append([]byte{proto.ScreenBinKey}, iframe...), data) // 缓存立即推送
 }
 
 // TestScreenBroadcastTwoViewers 两个观众收到相同帧。
@@ -212,7 +212,7 @@ func TestScreenBroadcastTwoViewers(t *testing.T) {
 		require.Equal(t, typeScreenBegin, msg.Type)
 		kind, data := readFrame(t, ws)
 		require.Equal(t, "binary", kind)
-		assert.Equal(t, mockP, data)
+		assert.Equal(t, append([]byte{proto.ScreenBinDelta}, mockP...), data)
 	}
 }
 

@@ -14,9 +14,9 @@ import (
 	"xnc/proto"
 )
 
-// wsReadLimit 会话 WS 单帧读上限：file kind 以 64KiB chunk 收发，需高于
-// coder/websocket 默认 32768（详见 HandleSessionOpen 内注释）。
-const wsReadLimit = 1 << 20
+// wsReadLimit 会话 WS 单帧读上限：统一取 proto.MaxSessionFrameBytes
+// （file 64KiB chunk 与 screen 大 I 帧共用此限；详见 HandleSessionOpen 内注释）。
+const wsReadLimit = proto.MaxSessionFrameBytes
 
 // Handler 会话 kind 处理器（与会话 WS 一一对应）。ctx 由 Engine 持有：
 // SESSION_CLOSE 到来即取消；ws 归 Engine 关闭（处理器返回后 CloseNow）。

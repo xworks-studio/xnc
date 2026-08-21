@@ -4,14 +4,14 @@ import (
 	"context"
 	"strings"
 	"time"
+	"xnc/proto"
 
 	"github.com/coder/websocket"
 )
 
 // wsReadLimit 会话 WS 单帧读上限：download 收 agent 推来的 64KiB binary
-// chunk，coder/websocket 默认 32768 会首帧即断（"session ended without
-// result"）。1MiB 留 chunk 余量且仍防滥用。
-const wsReadLimit = 1 << 20
+// chunk，screen 大 I 帧需 MiB 级余量；统一取 proto.MaxSessionFrameBytes。
+const wsReadLimit = proto.MaxSessionFrameBytes
 
 // dialSession connects to a session WS. wsPath is the relative websocketUrl
 // from the exec 202 response (includes ?token=); https servers need wss.

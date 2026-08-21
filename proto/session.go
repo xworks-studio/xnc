@@ -131,3 +131,17 @@ type ScreenBegin struct {
 type ScreenState struct {
 	State string `json:"state"` // capturing / locked / no_session
 }
+
+// Screen 会话 WS 二进制帧子头：帧类型显式随帧走（第 1 字节），消费端免
+// NALU 嗅探判定 key/delta——历史上三处独立嗅探实现各自漂移，是 WebCodecs
+// 拒帧类问题的温床。
+const (
+	ScreenBinKey   byte = 0x01 // H.264 关键帧（Annex-B AU，首 NALU 必为 SPS）
+	ScreenBinDelta byte = 0x02 // H.264 增量帧（Annex-B AU）
+	ScreenBinJPEG  byte = 0x03 // JPEG 单帧（快照模式）
+)
+
+// MaxSessionFrameBytes 会话 WS 单帧上限（server/agent/CLI 三处共用同一
+// 常量）。8MiB：H.264 大 I 帧实测 <1MB，JPEG 快照 <2MB，留足余量；此前
+// server 1MiB / agent 32MiB 不一致会在高码率 I 帧上断流。
+const MaxSessionFrameBytes = 8 << 20

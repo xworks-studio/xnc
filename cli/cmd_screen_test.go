@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+	"xnc/proto"
 
 	"github.com/coder/websocket"
 	"github.com/stretchr/testify/assert"
@@ -31,7 +32,8 @@ func TestScreenPreviewHTML(t *testing.T) {
 	assert.Contains(t, h, "XNC Screen — node-7")
 	assert.Contains(t, h, `new WebSocket("wss://srv/api/session/abc?token=tk")`)
 	assert.Contains(t, h, "VideoDecoder")
-	assert.Contains(t, h, "avc1.42E01E")
+	assert.Contains(t, h, "avc1.4D4028") // 默认 codec 串兜底
+	assert.Contains(t, h, "sub === 1")   // 子头协议：0x01 key
 	assert.Contains(t, h, "SCREEN_BEGIN")
 }
 
@@ -79,7 +81,8 @@ func fakeScreenServer(t *testing.T, gotSnapshot *bool, jpeg []byte) *httptest.Se
 func TestRunScreenSnapshot(t *testing.T) {
 	gotSnapshot := false
 	jpeg := append([]byte{0xFF, 0xD8, 0xFF, 0xE0}, []byte("...jpeg bytes...")...)
-	srv := fakeScreenServer(t, &gotSnapshot, jpeg)
+	frame := append([]byte{proto.ScreenBinJPEG}, jpeg...)
+	srv := fakeScreenServer(t, &gotSnapshot, frame)
 
 	out := t.TempDir() + "/snap.jpg"
 	cmd := newRootCmd()

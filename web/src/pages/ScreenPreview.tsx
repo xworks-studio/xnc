@@ -9,9 +9,10 @@ import type { NodeDTO } from "../types";
  * 1. POST /api/nodes/{id}/screen {} → 202 {websocketUrl}
  * 2. WS to that URL (relative → same-origin ws/wss). binaryType = arraybuffer.
  * 3. Text frames: SCREEN_BEGIN {width,height,state,codec} / SCREEN_STATE
- *    {state}. Binary frames: H.264 NALUs — the decoder is configured on the
- *    first SPS (NALU type 7) and fed key/delta chunks; decoded frames are
- *    drawn to the canvas.
+ *    {state}. Binary frames carry a 1-byte subheader (protocol-owned frame
+ *    type — no NALU sniffing): 0x01 H.264 key / 0x02 H.264 delta / 0x03
+ *    JPEG single. The decoder is configured from the SPS of the first key
+ *    frame (key frames always start with SPS per the helper contract).
  */
 interface ScreenStartResponse {
   sessionId: string;
@@ -76,15 +77,8 @@ export default function ScreenPreview() {
     let ws: WebSocket | null = null;
     let decoder: VideoDecoder | null = null;
 
-    // Annex-B chunk 的首个 NALU 类型（3/4 字节起始码兼容）。
-    const firstNalType = (data: Uint8Array): number => {
-      if (data.length >= 4 && data[0] === 0 && data[1] === 0 && data[2] === 1) return data[3] & 0x1f;
-      if (data.length >= 5 && data[0] === 0 && data[1] === 0 && data[2] === 0 && data[3] === 1) return data[4] & 0x1f;
-      if (data.length >= 1) return data[0] & 0x1f;
-      return -1;
-    };
-
-    // SPS NALU（含起始码）中提取 codec string：avc1.<profile><compat><level>。
+    // 关键帧首 SPS（含起始码）提取 codec string：avc1.<profile><compat><level>。
+    // 关键帧契约：首 NALU 必为 SPS（helper 保证 IDR 前带 SPS/PPS）。
     const codecFromSPS = (data: Uint8Array): string | null => {
       let hdr = -1;
       if (data[0] === 0 && data[1] === 0 && data[2] === 1) hdr = 3;
@@ -161,10 +155,29 @@ export default function ScreenPreview() {
             return;
           }
           const data = new Uint8Array(ev.data);
-          const nalType = firstNalType(data);
-          const isKey = nalType === 5 || nalType === 7 || nalType === 8;
-          // 等携带 SPS 的关键帧再配置解码器（codec string 取自实际 SPS 字节）。
-          const codec = codecFromSPS(data);
+          if (data.length < 1) return;
+          const sub = data[0];
+          if (sub === 3) {
+            // JPEG 单帧（快照模式经同一页面查看）。
+            createImageBitmap(new Blob([data.subarray(1)]))
+              .then((bmp) => {
+                if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
+                  canvas.width = bmp.width;
+                  canvas.height = bmp.height;
+                  setDims(`${bmp.width}x${bmp.height}`);
+                }
+                ctx.drawImage(bmp, 0, 0);
+                bmp.close();
+              })
+              .catch(() => {
+                /* malformed jpeg — dropped */
+              });
+            return;
+          }
+          const isKey = sub === 1;
+          const au = data.subarray(1); // Annex-B access unit
+          // codec string 取自关键帧首 SPS（仅在关键帧上做，帧类型本身来自子头）。
+          const codec = isKey ? codecFromSPS(au) : null;
           const dec = codec ? ensureDecoder(codec) : decoder;
           if (!dec) return;
           try {
@@ -172,7 +185,7 @@ export default function ScreenPreview() {
               new EncodedVideoChunk({
                 type: isKey ? "key" : "delta",
                 timestamp: performance.now(),
-                data,
+                data: au,
               }),
             );
           } catch {

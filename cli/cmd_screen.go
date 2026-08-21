@@ -26,7 +26,7 @@ import (
 
 // screenWSReadLimit：快照 JPEG 单帧可达数 MB，流式 I 帧亦超 1MiB——放大
 // 会话读上限（dialSession 的默认 1MiB 不够）。
-const screenWSReadLimit = 32 << 20
+const screenWSReadLimit = proto.MaxSessionFrameBytes
 
 func newScreenCmd() *cobra.Command {
 	var snapshotPath string
@@ -100,9 +100,11 @@ func runScreenSnapshot(cmd *cobra.Command, nodeRef, outPath string) error {
 		}
 		switch typ {
 		case "binary":
-			if len(data) == 0 || data[0] != 0xFF || data[1] != 0xD8 {
+			// 子头 0x03 = JPEG 单帧（帧类型随帧走，免魔数嗅探）。
+			if len(data) < 3 || data[0] != proto.ScreenBinJPEG || data[1] != 0xFF || data[2] != 0xD8 {
 				return failAPI(cmd, proto.Err(0, proto.CodeInternal, "received frame is not a JPEG"))
 			}
+			data = data[1:]
 			if err := os.WriteFile(outPath, data, 0o644); err != nil {
 				return failUsage(cmd, "write "+outPath+": "+err.Error())
 			}
@@ -228,25 +230,26 @@ ws.onmessage = (ev) => {
     return;
   }
   const data = new Uint8Array(ev.data);
-  // NALU type: handle both 3-byte (00 00 01) and 4-byte (00 00 00 01) start codes.
-  let nalType = -1;
-  if (data.length >= 4) {
-    if (data[0] === 0 && data[1] === 0 && data[2] === 1) {
-      nalType = data[3] & 0x1F; // 3-byte start code
-    } else if (data[0] === 0 && data[1] === 0 && data[2] === 0 && data[3] === 1 && data.length >= 5) {
-      nalType = data[4] & 0x1F; // 4-byte start code
-    } else {
-      nalType = data[0] & 0x1F; // raw NALU
-    }
+  // 子头（第 1 字节）显式帧类型：0x01 key / 0x02 delta / 0x03 jpeg——
+  // 免 NALU 嗅探（与 web ScreenPreview.tsx 同一协议）。
+  if (data.length < 1) return;
+  const sub = data[0];
+  if (sub === 3) { // jpeg 单帧（快照模式经同一页面查看）
+    createImageBitmap(new Blob([data.subarray(1)])).then((bmp) => {
+      canvas.width = bmp.width; canvas.height = bmp.height;
+      ctx.drawImage(bmp, 0, 0); bmp.close();
+    });
+    return;
   }
-  const isKey = nalType === 5 || nalType === 7 || nalType === 8;
+  const isKey = sub === 1;
+  const au = data.subarray(1); // Annex-B access unit
   if (!decoder) {
-    if (nalType !== 7 && nalType !== 5) return; // 等 SPS/IDR 才能配置
-    // 从 SPS 中提取实际 profile/level 构造 codec 字符串
-    let codec = "avc1.4D4028"; // default: Main profile
-    if (nalType === 7 && data.length > 7) {
-      const off = data[0] === 0 && data[1] === 0 && data[2] === 1 ? 4 : 5;
-      const p = data[off]; const c = data[off+1]; const l = data[off+2];
+    if (!isKey) return; // 等关键帧（首 NALU 必为 SPS）
+    // codec 字符串取自关键帧首 SPS 的 profile/compat/level 字节。
+    let codec = "avc1.4D4028";
+    const off = au.length > 4 && au[0] === 0 && au[1] === 0 && au[2] === 1 ? 4 : 5;
+    if (au[off-1] === 1 && au.length > off + 2) {
+      const p = au[off]; const c = au[off+1]; const l = au[off+2];
       if (p > 0) codec = "avc1." + p.toString(16).padStart(2,"0") + c.toString(16).padStart(2,"0") + l.toString(16).padStart(2,"0");
     }
     decoder = new VideoDecoder({
@@ -266,7 +269,7 @@ ws.onmessage = (ev) => {
   decoder.decode(new EncodedVideoChunk({
     type: isKey ? "key" : "delta",
     timestamp: performance.now(),
-    data: data,
+    data: au,
   }));
 };
 ws.onclose = () => { st.textContent = "disconnected"; };

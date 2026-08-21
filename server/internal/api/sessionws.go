@@ -24,8 +24,9 @@ func wsBaseURL(r *http.Request) string {
 
 // wsReadLimit 会话 WS 单帧读上限：file kind 以 64KiB chunk 收发（cli 上传/
 // agent 下载），coder/websocket 默认 32768 会在首帧即杀会话（pump 的 Reader
-// 按 conn 读限执行）。1MiB 留 chunk 余量且仍防滥用；控制连接帧小，不受影响。
-const wsReadLimit = 1 << 20
+// 按 conn 读限执行）；screen kind 的 H.264 大 I 帧需要 MiB 级余量。上限统
+// 一取 proto.MaxSessionFrameBytes（agent/CLI 同一常量，防各处漂移断流）。
+const wsReadLimit = proto.MaxSessionFrameBytes
 
 // clientSessionWS 处理 GET /api/session/{id}?token=（client 侧）。
 // token 即凭证，不走 JWT：会话 token 单用途且 60s TTL，比长期 JWT 更收紧。

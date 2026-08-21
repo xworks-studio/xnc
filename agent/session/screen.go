@@ -463,7 +463,7 @@ func (h *ScreenHandler) Handle(ctx context.Context, ws *websocket.Conn, sessionI
 		writeScreenText(ctx, ws, typeScreenBegin, proto.ScreenBegin{
 			State: "capturing", Codec: "jpeg",
 		})
-		writeScreenBinary(ctx, ws, jpeg)
+		writeScreenBinary(ctx, ws, append([]byte{proto.ScreenBinJPEG}, jpeg...))
 		_ = ws.Close(websocket.StatusNormalClosure, "snapshot done")
 		return
 	}
@@ -482,7 +482,8 @@ func (h *ScreenHandler) Handle(ctx context.Context, ws *websocket.Conn, sessionI
 	// 新观众立即出画面：缓存 SPS/PPS + 最新 I 帧。
 	spspps, key := h.Manager.CachedKeyFrame()
 	if state == "capturing" && len(spspps)+len(key) > 0 {
-		frame := make([]byte, 0, len(spspps)+len(key))
+		frame := make([]byte, 0, 1+len(spspps)+len(key))
+		frame = append(frame, proto.ScreenBinKey)
 		frame = append(frame, spspps...)
 		frame = append(frame, key...)
 		writeScreenBinary(ctx, ws, frame)
@@ -502,7 +503,12 @@ func (h *ScreenHandler) Handle(ctx context.Context, ws *websocket.Conn, sessionI
 			case screenFrameDims:
 				// 分辨率已编入二进制流（0x04 广播仅驱动 manager 状态），无 WS 帧。
 			default:
-				writeScreenBinary(ctx, ws, f.Data)
+				// 帧类型随帧走（消费端免嗅探）：0x01 key / 0x02 delta。
+				sub := proto.ScreenBinDelta
+				if f.Type == screenFrameKey {
+					sub = proto.ScreenBinKey
+				}
+				writeScreenBinary(ctx, ws, append([]byte{sub}, f.Data...))
 			}
 		}
 	}
