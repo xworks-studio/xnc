@@ -4,6 +4,7 @@ const (
 	CodeUnauthorized            = "UNAUTHORIZED"
 	CodeForbidden               = "FORBIDDEN"
 	CodeClusterNotFound         = "CLUSTER_NOT_FOUND"
+	CodeClusterNotEmpty         = "CLUSTER_NOT_EMPTY"
 	CodeNodeNotFound            = "NODE_NOT_FOUND"
 	CodeNodeOffline             = "NODE_OFFLINE"
 	CodeNodeDisabled            = "NODE_DISABLED"

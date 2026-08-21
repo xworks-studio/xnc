@@ -53,6 +53,8 @@ func NewRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		cr.Use(auth.Middleware(cfg.JWTSecret, st))
 		cr.Get("/", h.listClusters)
 		cr.Post("/", h.createCluster)
+		// 软删除：owner-only，有节点 409（handler 内判定）
+		cr.Delete("/{id}", h.deleteCluster)
 	})
 
 	// 用户管理：无自注册，仅 admin（任一 cluster owner）可创建/列出。
@@ -91,6 +93,9 @@ func NewRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		nr.Post("/{id}/files/download", h.fileDownload)
 		// tunnel：RDP 等端口隧道，kind=tunnel，白名单 target 解析 host/port
 		nr.Post("/{id}/tunnel", h.tunnelStart)
+		// 管理动作：owner-only（handler 内经 requireMinRoleIgnoreDisabled 判定）
+		nr.Post("/{id}/disable", h.nodeDisable)
+		nr.Post("/{id}/enable", h.nodeEnable)
 	})
 	return r
 }

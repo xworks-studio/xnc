@@ -32,6 +32,22 @@ var roleRank = map[string]int{"viewer": 0, "operator": 1, "owner": 2}
 func (h *handlers) requireMinRole(w http.ResponseWriter, r *http.Request,
 	nodeID uuid.UUID, minRole string,
 ) (*sqlc.Node, bool) {
+	return h.authorizeNodeRole(w, r, nodeID, minRole, false)
+}
+
+// requireMinRoleIgnoreDisabled：requireMinRole 的管理端点变体——跳过 disabled
+// 检查。node disable/enable 的 owner 必须能作用于已 disabled 的节点（否则
+// enable 永远 403 NODE_DISABLED，disable 也无法幂等）；disabled 拒绝的语义
+// 只针对会话创建（exec/shell/file/tunnel），管理面不适用。
+func (h *handlers) requireMinRoleIgnoreDisabled(w http.ResponseWriter, r *http.Request,
+	nodeID uuid.UUID, minRole string,
+) (*sqlc.Node, bool) {
+	return h.authorizeNodeRole(w, r, nodeID, minRole, true)
+}
+
+func (h *handlers) authorizeNodeRole(w http.ResponseWriter, r *http.Request,
+	nodeID uuid.UUID, minRole string, ignoreDisabled bool,
+) (*sqlc.Node, bool) {
 	// 任意节点（不限成员可见）：存在性在角色判定前，非成员统一 404。
 	node, err := h.st.Q().GetNodeByID(r.Context(), nodeID)
 	if err != nil {
@@ -51,7 +67,7 @@ func (h *handlers) requireMinRole(w http.ResponseWriter, r *http.Request,
 		respondError(w, proto.Err(403, proto.CodeForbidden, "insufficient role"))
 		return nil, false
 	}
-	if node.Status == "disabled" {
+	if !ignoreDisabled && node.Status == "disabled" {
 		respondError(w, proto.Err(403, proto.CodeNodeDisabled, "node is disabled"))
 		return nil, false
 	}
