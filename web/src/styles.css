@@ -423,3 +423,66 @@ h2 {
   color: var(--ok);
   font-size: 13px;
 }
+
+/* Terminal page: status bar + xterm pane filling the remaining height.
+   FitAddon measures this container's computed box, so it needs a definite
+   flex height (min-height: 0 lets it shrink inside the .content column). */
+
+.term-page {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.term-statusbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
+  padding: 6px 12px;
+  font-size: 12px;
+}
+
+.term-statusbar .term-node {
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.term-conn {
+  flex-shrink: 0;
+  text-transform: uppercase;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+.term-conn-connecting {
+  color: var(--warn);
+}
+
+.term-conn-connected {
+  color: var(--ok);
+}
+
+.term-conn-disconnected {
+  color: var(--danger);
+}
+
+.term-container {
+  flex: 1;
+  min-height: 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 0 0 6px 6px;
+  padding: 6px 2px 6px 10px;
+}
+
+.term-error {
+  padding: 24px 4px;
+}
