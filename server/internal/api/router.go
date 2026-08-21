@@ -100,6 +100,8 @@ func NewRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		nr.Post("/{id}/files/download", h.fileDownload)
 		// tunnel：RDP 等端口隧道，kind=tunnel，白名单 target 解析 host/port
 		nr.Post("/{id}/tunnel", h.tunnelStart)
+		// screen：桌面流会话，kind=screen（Phase 6，DXGI+H.264），startSession 路径
+		nr.Post("/{id}/screen", h.screenStart)
 		// 管理动作：owner-only（handler 内经 requireMinRoleIgnoreDisabled 判定）
 		nr.Post("/{id}/disable", h.nodeDisable)
 		nr.Post("/{id}/enable", h.nodeEnable)
