@@ -214,7 +214,10 @@ func (m *ScreenStreamManager) Snapshot(quality int) ([]byte, error) {
 	if quality <= 0 {
 		quality = screenDefaultQuality
 	}
-	tmp, err := os.CreateTemp("", "xnc-snapshot-*.jpg")
+	// 在 helper 同目录（agent 部署目录，两进程均可读写）创建快照临时文件，
+	// 而非 os.CreateTemp（SYSTEM 服务的 %TEMP% 对 console 用户不可写）。
+	snapDir := filepath.Dir(helperPath)
+	tmp, err := os.CreateTemp(snapDir, "xnc-snapshot-*.jpg")
 	if err != nil {
 		return nil, err
 	}
