@@ -94,8 +94,13 @@ func (c *DDACapturer) AcquireFrame(timeoutMs uint) ([]byte, error) {
 		case ddaFrameTimeout:
 			return nil, ErrTimeout
 		case ddaFrameAccessLost:
-			// DLL 内已重建 duplication；尺寸可能已变。
+			// DLL 内已重建 duplication；尺寸可能已变。重建被拒期间若
+			// 安全桌面（UAC）激活，显式报告——观众看到 locked 暂停态
+			// 而非冻结的旧帧。
 			c.refreshDims()
+			if secureDesktopActive() {
+				return nil, ErrSecureDesktop
+			}
 			return nil, ErrTimeout
 		default:
 			return nil, errors.New("dda: " + c.dll.lastErrorStr())
