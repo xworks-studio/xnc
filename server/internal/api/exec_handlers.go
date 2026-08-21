@@ -45,9 +45,10 @@ func mustJSON(v any) []byte {
 	return b
 }
 
-// execStart 处理 POST /api/nodes/{id}/exec：鉴权（router 中间件）+ membership
-// → 校验 → 委托 startSession（Create（双侧 token）→ 装配 finish/notify 钩子 →
-// 经控制连接下发 SESSION_OPEN → 审计 exec.start → 202 统一异步响应）。
+// execStart 处理 POST /api/nodes/{id}/exec：鉴权（router 中间件）+ RBAC
+// （operator 及以上）→ 校验 → 委托 startSession（Create（双侧 token）→ 装配
+// finish/notify 钩子 → 经控制连接下发 SESSION_OPEN → 审计 exec.start → 202
+// 统一异步响应）。
 func (h *handlers) execStart(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, execBodyMaxBytes)
 
@@ -85,9 +86,10 @@ func (h *handlers) execStart(w http.ResponseWriter, r *http.Request) {
 	h.startSession(w, r, proto.KindExec, params, "exec.start", "exec.finish")
 }
 
-// startSession 是 exec/shell 共享的会话创建路径：membership → Create（双侧
-// token）→ 装配 finish/notify 钩子 → 经控制连接下发 SESSION_OPEN → 审计
-// openAction → 202。返回 (result, true) 表示已写 202；false 表示已写错误响应。
+// startSession 是 exec/shell/file/tunnel 共享的会话创建路径：RBAC
+// （requireMinRole "operator"）→ Create（双侧 token）→ 装配 finish/notify 钩子
+// → 经控制连接下发 SESSION_OPEN → 审计 openAction → 202。
+// 返回 (result, true) 表示已写 202；false 表示已写错误响应。
 func (h *handlers) startSession(w http.ResponseWriter, r *http.Request,
 	kind string, params json.RawMessage, openAction, closeAction string,
 ) (*session.CreateResult, bool) {
@@ -97,10 +99,9 @@ func (h *handlers) startSession(w http.ResponseWriter, r *http.Request,
 		respondError(w, proto.Err(404, proto.CodeNodeNotFound, "node not found"))
 		return nil, false
 	}
-	if _, err := h.st.Q().GetNodeForUser(r.Context(), sqlc.GetNodeForUserParams{
-		UserID: u.ID, ID: nodeID,
-	}); err != nil {
-		respondError(w, proto.Err(404, proto.CodeNodeNotFound, "node not found"))
+	// RBAC：operator 及以上方可开会话（exec/shell/file/tunnel 全经此路径）；
+	// 非成员 404、viewer 403 由 requireMinRole 统一写出。
+	if _, ok := h.requireMinRole(w, r, nodeID, "operator"); !ok {
 		return nil, false
 	}
 
