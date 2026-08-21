@@ -34,6 +34,11 @@ const (
 	typeScreenBegin = "SCREEN_BEGIN"
 	typeScreenState = "SCREEN_STATE"
 
+	// typeScreenFeedback 观众 → agent 的回传（浏览器解码器错误等）：
+	// 此前解码错误死在浏览器 console，是纯黑洞——现在 surfaced 到 agent
+	// 日志，编码侧问题第一时间可见。
+	typeScreenFeedback = "SCREEN_FEEDBACK"
+
 	// pipe 帧类型。
 	screenFrameKey     byte = 0x01
 	screenFrameDelta   byte = 0x02
@@ -470,6 +475,28 @@ func (h *ScreenHandler) Handle(ctx context.Context, ws *websocket.Conn, sessionI
 
 	ch := h.Manager.Subscribe(sessionID, p)
 	defer h.Manager.Unsubscribe(sessionID)
+
+	// 观众回传：消费客户端 → agent 方向的帧（SCREEN_FEEDBACK 等）并落日
+	// 志。必须持续读取——server pump 双向转发，不读会反压观众的发送。
+	// 生命周期：随 ctx 取消 / 连接关闭（Reader 出错）自然退出；不 join——
+	// 引擎在 Handle 返回后才关闭连接，join 会死锁。
+	go func() {
+		for {
+			_, r, err := ws.Reader(ctx)
+			if err != nil {
+				return
+			}
+			b, err := io.ReadAll(io.LimitReader(r, 4096))
+			if err != nil {
+				return
+			}
+			var m proto.Message
+			if json.Unmarshal(b, &m) != nil || m.Type != typeScreenFeedback {
+				continue
+			}
+			h.Manager.log.Warn("screen viewer feedback", "session", sessionID, "payload", string(m.Payload))
+		}
+	}()
 
 	w, ht, state := h.Manager.State()
 	writeScreenText(ctx, ws, typeScreenBegin, proto.ScreenBegin{

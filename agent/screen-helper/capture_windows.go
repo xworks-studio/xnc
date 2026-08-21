@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"syscall"
@@ -220,13 +221,56 @@ func captureLoopWith(ctx context.Context, conn net.Conn, opts captureOpts, cap s
 
 	// 编码器在首帧之后创建：部分机器上 MFT 编码器初始化（COM 单元/MTA 交
 	// 互）会阻断 WGC 帧池交付——首帧由调用方（listenPipe 之前）预取。
-	gop := opts.fps * 2 // 关键帧间隔 ≈ 2s
-	encoder, eerr := newH264Encoder(outW, outH, bitrateFor(opts.quality), gop)
+	encoder, eerr := newH264Encoder(outW, outH, bitrateFor(opts.quality), opts.fps*2)
 	if eerr != nil {
 		fmt.Fprintf(os.Stderr, "xnc-screen-helper: h264 mft unavailable (%v), jpeg fallback\n", eerr)
 		encoder = newJPEGStreamEncoder(outW, outH, opts.quality)
 	}
 	defer encoder.Close()
+
+	// fps 节流 + 时间基 GOP：光标-only 合成帧可按输入设备频率（~125Hz）
+	// 到达，编码按帧间隔限速；静止自适应（0fps）与突发帧共存时按帧数
+	// 计 GOP 会时间扭曲，改为距上一关键帧 ≥2s 强制 IDR。
+	gop := &gopState{}
+	var lastEncodeAt time.Time
+
+	// 可观测性：XNC_DUMP_H264=path 把最终 Annex-B 码流（整形后、即管道
+	// 实发字节）落盘——ffplay 直接可播，30 秒内二分定位"采集/编码侧还是
+	// 下游"的现场分界线工具。周期计数器（10s）走 stderr 进 agent 日志。
+	if p := os.Getenv("XNC_DUMP_H264"); p != "" {
+		if f, err := os.Create(p); err == nil {
+			dumpFile = f
+			defer func() { _ = f.Close(); dumpFile = nil }()
+			fmt.Fprintf(os.Stderr, "xnc-screen-helper: h264 dump -> %s\n", p)
+		} else {
+			fmt.Fprintf(os.Stderr, "xnc-screen-helper: dump open failed: %v\n", err)
+		}
+	}
+	statTick := time.NewTicker(10 * time.Second)
+	defer statTick.Stop()
+	go func() {
+		for range statTick.C {
+			fmt.Fprintf(os.Stderr, "xnc-screen-helper: stats sent=%d key=%d delta=%d encErr=%d bytes=%d\n",
+				statFrames, statKeys, statDeltas, statEncErrs, statBytes)
+		}
+	}()
+
+	pacedSend := func(frame []byte) error {
+		if !lastEncodeAt.IsZero() {
+			if wait := frameInterval - time.Since(lastEncodeAt); wait > 0 {
+				time.Sleep(wait)
+			}
+		}
+		err := sendEncoded(conn, encoder, frame, gop)
+		lastEncodeAt = time.Now()
+		return err
+	}
+	go func() {
+		for range statTick.C {
+			fmt.Fprintf(os.Stderr, "xnc-screen-helper: stats sent=%d key=%d delta=%d encErr=%d bytes=%d\n",
+				statFrames, statKeys, statDeltas, statEncErrs, statBytes)
+		}
+	}()
 
 	if err := writeFrame(conn, pipeFrameDims, packDims(outW, outH)); err != nil {
 		return err
@@ -242,8 +286,6 @@ func captureLoopWith(ctx context.Context, conn net.Conn, opts captureOpts, cap s
 		acquireTimeout = 100
 	}
 
-	framesSinceKey := 0
-	sentKey := false
 	var lastFrame []byte
 	if ferr == nil {
 		w, h := cap.Dims()
@@ -252,7 +294,7 @@ func captureLoopWith(ctx context.Context, conn net.Conn, opts captureOpts, cap s
 				firstFrame = scaleBGRA(firstFrame, w, h, outW, outH)
 			}
 			lastFrame = firstFrame
-			if err := sendEncoded(conn, encoder, firstFrame, gop, &framesSinceKey, &sentKey, false); err != nil {
+			if err := pacedSend(firstFrame); err != nil {
 				return err
 			}
 		}
@@ -282,8 +324,8 @@ func captureLoopWith(ctx context.Context, conn net.Conn, opts captureOpts, cap s
 			if errors.Is(aerr, ErrTimeout) {
 				// 后续静止帧：MFT 启动缓冲自愈逻辑
 				idleTicks++
-				if !sentKey && lastFrame != nil && idleTicks >= idleLimit {
-					if err := sendEncoded(conn, encoder, lastFrame, gop, &framesSinceKey, &sentKey, false); err != nil {
+				if !gop.sentKey && lastFrame != nil && idleTicks >= idleLimit {
+					if err := pacedSend(lastFrame); err != nil {
 						return err
 					}
 				}
@@ -306,17 +348,31 @@ func captureLoopWith(ctx context.Context, conn net.Conn, opts captureOpts, cap s
 		}
 		lastFrame = frame
 
-		if err := sendEncoded(conn, encoder, frame, gop, &framesSinceKey, &sentKey, false); err != nil {
+		if err := pacedSend(frame); err != nil {
 			return err
 		}
 	}
 }
 
+// gopState 时间基关键帧记账：变帧率（静止自适应 0fps + 光标突发）下按
+// 帧数计 GOP 会时间扭曲，改为距上一关键帧 ≥2s 强制 IDR（新观众可立即
+// 入流的语义不变——agent 缓存最新 I 帧）。
+type gopState struct {
+	sentKey   bool
+	lastKeyAt time.Time
+}
+
+func (g *gopState) keyDue() bool {
+	return !g.sentKey || time.Since(g.lastKeyAt) >= 2*time.Second
+}
+
 // sendEncoded 编码一帧并按关键帧/增量帧类型写 pipe。编码器无输出（MFT
-// 启动缓冲）时静默跳过。flipY 传递给编码器（BGRA 行序翻转）。
-func sendEncoded(conn net.Conn, encoder frameEncoder, frame []byte, gop int, framesSinceKey *int, sentKey *bool, flipY bool) error {
-	forceKey := !*sentKey || *framesSinceKey >= gop // 首输出前始终请求关键帧
-	data, encErr := encoder.Encode(frame, forceKey, flipY)
+// 启动缓冲）时静默跳过。码流契约（唯一整形规则，其余 NALU 直通）：IDR
+// 前必有缓存的 SPS/PPS，统一 4 字节起始码——消费端（WebCodecs Annex-B
+// 模式）按此契约配置解码器。
+func sendEncoded(conn net.Conn, encoder frameEncoder, frame []byte, gop *gopState) error {
+	forceKey := gop.keyDue() // 首输出前始终请求关键帧
+	data, encErr := encoder.Encode(frame, forceKey, false)
 	if encErr != nil {
 		fmt.Fprintf(os.Stderr, "xnc-screen-helper: encode: %v\n", encErr)
 		return nil
@@ -334,17 +390,33 @@ func sendEncoded(conn net.Conn, encoder frameEncoder, frame []byte, gop int, fra
 			// 部分浏览器 WebCodecs 解码器 "key frame required" 拒帧。
 			data = append(append([]byte{}, spspps...), vclNALUs(data)...)
 		}
-		*framesSinceKey = 0
-		*sentKey = true
+		gop.sentKey = true
+		gop.lastKeyAt = time.Now()
 	} else {
 		frameType = pipeFrameDelta
 		if len(encoder.SPSPPS()) > 0 { // H.264 模式统一 4 字节起始码
 			data = vclNALUs(data)
 		}
-		(*framesSinceKey)++
+	}
+	if dumpFile != nil {
+		_, _ = dumpFile.Write(data) // 整形后码流（= 管道实发字节）
+	}
+	statFrames++
+	statBytes += int64(len(data))
+	if frameType == pipeFrameKey {
+		statKeys++
+	} else {
+		statDeltas++
 	}
 	return writeFrame(conn, frameType, data)
 }
+
+// 单管线诊断状态：helper 每进程恰好一条采集管线，进程级即可。
+var (
+	dumpFile                                      io.Writer // XNC_DUMP_H264 落盘目标（整形后码流）
+	statFrames, statKeys, statDeltas, statEncErrs int
+	statBytes                                     int64
+)
 
 // vclNALUs 重排 Annex-B 码流：丢弃参数集与 AUD（type 7/8/9），其余 NALU
 // 统一以 4 字节起始码输出。JPEG 回退模式（无参数集）不应调用。

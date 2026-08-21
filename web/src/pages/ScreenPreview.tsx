@@ -114,6 +114,18 @@ export default function ScreenPreview() {
         error: (e) => {
           setState("error");
           setStartError(`decoder error: ${e.message}`);
+          // 回传 agent（SCREEN_FEEDBACK）：解码错误此前死在浏览器 console，
+          // 现在第一时间 surfaced 到 agent 日志。
+          try {
+            ws?.send(
+              JSON.stringify({
+                type: "SCREEN_FEEDBACK",
+                payload: { message: e.message },
+              }),
+            );
+          } catch {
+            /* session already dead */
+          }
         },
       });
       decoder.configure({ codec, optimizeForLatency: true });

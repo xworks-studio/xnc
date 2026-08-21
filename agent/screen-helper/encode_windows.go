@@ -26,6 +26,7 @@ package main
 
 import (
 	"fmt"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -150,12 +151,13 @@ type H264Encoder struct {
 	bitrate       uint32
 	gopSize       uint32
 
-	nv12               []byte // 复用的转换缓冲（w*h*3/2）
-	spsPPS             []byte // 首个 IDR 帧后提取
-	lastKey            bool   // 最近一次 Encode 输出是否关键帧
-	rtStart            int64  // 合成时间戳（100ns 单位）
-	mftProvidesSamples bool   // 输出 sample 由 MFT 分配
-	outBufSize         int    // 客户端输出缓冲大小
+	nv12               []byte    // 复用的转换缓冲（w*h*3/2）
+	spsPPS             []byte    // 首个 IDR 帧后提取
+	lastKey            bool      // 最近一次 Encode 输出是否关键帧
+	t0                 time.Time // 编码器起点（墙钟 PTS 基准）
+	rtLast             int64     // 上一帧时间戳（100ns 单位，算 duration 用）
+	mftProvidesSamples bool      // 输出 sample 由 MFT 分配
+	outBufSize         int       // 客户端输出缓冲大小
 	coInit             bool
 }
 
@@ -187,6 +189,7 @@ func NewH264Encoder(width, height, bitrate, gopSize int) (*H264Encoder, error) {
 		width: width, height: height,
 		bitrate: uint32(bitrate), gopSize: uint32(gopSize),
 		nv12:   make([]byte, width*height*3/2),
+		t0:     time.Now(),
 		coInit: err == nil,
 	}
 
@@ -360,9 +363,19 @@ func (e *H264Encoder) Encode(frame []byte, forceKey bool, flipY bool) ([]byte, e
 	if _, err := sample.call(vtSampleAddBuffer, buffer.u()); err != nil {
 		return nil, fmt.Errorf("AddBuffer: %w", err)
 	}
-	_, _ = sample.call(vtSampleSetSampleTime, uintptr(e.rtStart))
-	_, _ = sample.call(vtSampleSetSampleDuration, uintptr(10_000_000/encAssumedFps))
-	e.rtStart += 10_000_000 / encAssumedFps
+	// PTS=编码墙钟（100ns 单位）：固定 30fps 推进在变帧率下产生时间戳漂移
+	// （画面节奏异常的隐形来源）；MFT 帧率属性仅作码控参考。
+	now := int64(time.Since(e.t0)) * 100 // ns → 100ns
+	if now <= e.rtLast {
+		now = e.rtLast + 1 // 单调防回退
+	}
+	dur := now - e.rtLast
+	if dur <= 0 {
+		dur = 1
+	}
+	_, _ = sample.call(vtSampleSetSampleTime, uintptr(now))
+	_, _ = sample.call(vtSampleSetSampleDuration, uintptr(dur))
+	e.rtLast = now
 
 	if _, err := e.mft.call(vtMFTProcessInput, 0, sample.u(), 0); err != nil {
 		return nil, fmt.Errorf("ProcessInput: %w", err)
