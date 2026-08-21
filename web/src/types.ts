@@ -23,6 +23,14 @@ export interface ClusterDTO {
   name: string;
 }
 
+/** GET /api/clusters/{id}/members rows. */
+export interface MemberDTO {
+  user_id: string;
+  email: string;
+  display_name: string;
+  role: "owner" | "operator" | "viewer";
+}
+
 /** POST /api/auth/login response. */
 export interface LoginResponse {
   token: string;
