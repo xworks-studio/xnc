@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"syscall"
 	"time"
 	"unsafe"
@@ -218,6 +219,10 @@ func newScreenCapturer() (screenCapturer, string, error) {
 //	      设备移除等场景
 //	关键帧：首帧 + 每 gop 帧（新观众可立即入流）
 func captureLoopWith(ctx context.Context, conn net.Conn, opts captureOpts, cap screenCapturer, firstFrame []byte, ferr error) error {
+	// 线程钉扎：安全桌面路径的 SetThreadDesktop/GDI 句柄是线程状态，
+	// goroutine 迁移会使其失效（UAC 期间帧流冻结事故）。
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	frameInterval := time.Second / time.Duration(opts.fps)
 
 	srcW, srcH := cap.Dims()

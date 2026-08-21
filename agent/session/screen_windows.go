@@ -225,3 +225,171 @@ const screenPipeDialTimeout = 5 * time.Second
 
 // procCreateProcessAsUserW — kernel32 直连（绕开 advapi32 转发）。
 var procCreateProcessAsUserW = windows.NewLazySystemDLL("kernel32.dll").NewProc("CreateProcessAsUserW")
+
+// ---- SYSTEM-in-session 启动（安全桌面/UAC 捕获的必要形态）----
+//
+// RustDesk 同款机制：winlogon（安全）桌面仅对 SYSTEM 开放——helper 以
+// SYSTEM 令牌 + TokenSessionId 重写（psexec -s -i 原理）进入用户会话后，
+// DLL 侧可在 UAC 激活时 SetThreadDesktop(Winlogon) + GDI BitBlt 捕获弹窗
+// （gditest.c 于 LABS-XIAOXIN 实证）。WGC 在 SYSTEM 下不可用（0x80070424），
+// 故此形态仅服务 DDA 路径；启动失败或 helper 自退（exit 3 = SYSTEM 下采集
+// 不可用）时回退用户令牌启动（WGC 路径，无安全桌面能力）。
+
+var (
+	advapi32DLL            = windows.NewLazySystemDLL("advapi32.dll")
+	procOpenProcessToken   = advapi32DLL.NewProc("OpenProcessToken")
+	procDupTokenEx         = advapi32DLL.NewProc("DuplicateTokenEx")
+	procSetTokenInfo       = advapi32DLL.NewProc("SetTokenInformation")
+	procLookupPrivValue    = advapi32DLL.NewProc("LookupPrivilegeValueW")
+	procAdjustPrivs        = advapi32DLL.NewProc("AdjustTokenPrivileges")
+	kernel32DLL2           = windows.NewLazySystemDLL("kernel32.dll")
+	procWaitForSingleObj   = kernel32DLL2.NewProc("WaitForSingleObject")
+	procGetExitCodeProcess = kernel32DLL2.NewProc("GetExitCodeProcess")
+	procGetCurrentProcess  = kernel32DLL2.NewProc("GetCurrentProcess")
+)
+
+const (
+	tokenSessionIDClass = 12 // TOKEN_INFORMATION_CLASS::TokenSessionId
+	sePrivilegeEnabled  = 0x2
+)
+
+type luid struct{ LowPart, HighPart int32 }
+
+type tokenPrivileges1 struct {
+	PrivilegeCount uint32
+	Luid           luid
+	Attributes     uint32
+}
+
+// helperExitCode waits up to timeout for the helper to exit and returns
+// (code, true), or (0, false) if still running.
+func (p *helperProc) helperExitCode(timeout time.Duration) (uint32, bool) {
+	if p.handle == 0 {
+		return 0, false
+	}
+	r, _, _ := procWaitForSingleObj.Call(uintptr(p.handle), uintptr(timeout.Milliseconds()))
+	if r != 0 { // WAIT_OBJECT_0
+		return 0, false // 仍在运行
+	}
+	var code uint32
+	procGetExitCodeProcess.Call(uintptr(p.handle), uintptr(unsafe.Pointer(&code)))
+	return code, true
+}
+
+// launchHelperSystem duplicates the agent's SYSTEM token, rewrites its
+// session id into the active user session, and starts the helper there.
+func launchHelperSystem(log *slog.Logger, helperPath string, stderr io.Writer, args ...string) (*helperProc, error) {
+	cmdline := `"` + helperPath + `"`
+	for _, a := range args {
+		cmdline += ` "` + a + `"`
+	}
+	cmd16, err := windows.UTF16PtrFromString(cmdline)
+	if err != nil {
+		return nil, err
+	}
+	app16, err := windows.UTF16PtrFromString(helperPath)
+	if err != nil {
+		return nil, err
+	}
+	dir16, err := windows.UTF16PtrFromString(filepathDir(helperPath))
+	if err != nil {
+		return nil, err
+	}
+	desktop16, err := windows.UTF16PtrFromString(`winsta0\default`)
+	if err != nil {
+		return nil, err
+	}
+
+	// 令牌舞：OpenProcessToken(self) → 启用 SeTcbPrivilege →
+	// DuplicateTokenEx(Primary) → SetTokenInformation(TokenSessionId)。
+	self, _, _ := procGetCurrentProcess.Call()
+	var hToken uintptr
+	if r, _, e := procOpenProcessToken.Call(self,
+		0x0002|0x0008|0x0100|0x0001, /*DUPLICATE|QUERY|ADJUST_SESSIONID|ASSIGN_PRIMARY*/
+		uintptr(unsafe.Pointer(&hToken))); r == 0 {
+		return nil, fmt.Errorf("OpenProcessToken: %v", e)
+	}
+	defer windows.Close(windows.Handle(hToken))
+
+	var tp tokenPrivileges1
+	if r, _, e := procLookupPrivValue.Call(0,
+		uintptr(unsafe.Pointer(windows.StringToUTF16Ptr("SeTcbPrivilege"))),
+		uintptr(unsafe.Pointer(&tp.Luid))); r == 0 {
+		return nil, fmt.Errorf("LookupPrivilegeValue(SeTcbPrivilege): %v", e)
+	}
+	tp.PrivilegeCount = 1
+	tp.Attributes = sePrivilegeEnabled
+	procAdjustPrivs.Call(hToken, uintptr(unsafe.Pointer(&tp)), uintptr(4+unsafe.Sizeof(tp)), 0, 0)
+
+	session := activeUserSession()
+	var hDup uintptr
+	if r, _, e := procDupTokenEx.Call(hToken, 0x0F01FF /*TOKEN_ALL_ACCESS*/, 0,
+		2 /*SecurityImpersonation*/, 1, /*TokenPrimary*/
+		uintptr(unsafe.Pointer(&hDup))); r == 0 {
+		return nil, fmt.Errorf("DuplicateTokenEx: %v", e)
+	}
+	defer windows.Close(windows.Handle(hDup))
+	if r, _, e := procSetTokenInfo.Call(hDup, uintptr(tokenSessionIDClass),
+		uintptr(unsafe.Pointer(&session)), 4); r == 0 {
+		return nil, fmt.Errorf("SetTokenInformation(TokenSessionId=%d): %v", session, e)
+	}
+
+	// 进程脚手架与 launchHelperAsUser 一致（stderr 管道/继承）。
+	p := &helperProc{}
+	var stdH windows.Handle
+	if f, ok := stderr.(*os.File); ok {
+		stdH = windows.Handle(f.Fd())
+		if err := windows.SetHandleInformation(stdH, windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT); err != nil {
+			return nil, fmt.Errorf("make stderr inheritable: %w", err)
+		}
+	} else if stderr != nil {
+		var w windows.Handle
+		if err := windows.CreatePipe(&p.pipeR, &w, &windows.SecurityAttributes{InheritHandle: 1}, 0); err != nil {
+			return nil, fmt.Errorf("stderr pipe: %w", err)
+		}
+		stdH = w
+		done := make(chan struct{})
+		p.copyDone = done
+		p.pipeW = w
+		r := os.NewFile(uintptr(p.pipeR), "helper-stderr")
+		go func() {
+			io.Copy(stderr, r)
+			r.Close()
+			close(done)
+		}()
+	}
+
+	si := &windows.StartupInfo{
+		Desktop:   desktop16,
+		Flags:     windows.STARTF_USESTDHANDLES,
+		StdOutput: stdH,
+		StdErr:    stdH,
+	}
+	var pi windows.ProcessInformation
+	r1, _, e1 := procCreateProcessAsUserW.Call(
+		uintptr(hDup),
+		uintptr(unsafe.Pointer(app16)), uintptr(unsafe.Pointer(cmd16)),
+		0, 0, 1, uintptr(windows.CREATE_NO_WINDOW),
+		0, uintptr(unsafe.Pointer(dir16)),
+		uintptr(unsafe.Pointer(si)), uintptr(unsafe.Pointer(&pi)))
+	if stdH != 0 && p.pipeR == 0 {
+		windows.SetHandleInformation(stdH, windows.HANDLE_FLAG_INHERIT, 0)
+	}
+	if r1 == 0 {
+		if p.pipeR != 0 {
+			windows.CloseHandle(p.pipeW)
+			<-p.copyDone
+		}
+		return nil, fmt.Errorf("CreateProcessAsUserW(system): %v", e1)
+	}
+	if p.pipeW != 0 {
+		windows.CloseHandle(p.pipeW)
+		p.pipeW = 0
+	}
+	windows.CloseHandle(pi.Thread)
+	p.pid, p.handle = pi.ProcessId, pi.Process
+	if log != nil {
+		log.Info("screen helper launched (SYSTEM-in-session)", "pid", p.pid, "session", session)
+	}
+	return p, nil
+}

@@ -28,6 +28,14 @@ typedef struct dda_ctx {
     ID3D11Texture2D        *staging;
     int32_t w, h;
 
+    // 安全桌面 GDI 模式状态（RustDesk 机制，SYSTEM 令牌专属）。
+    int secure_mode;
+    HDESK hDefault, hSecure;
+    HDC hdcScreen, hdcMem;
+    HBITMAP hbmp;
+    void *dib_bits;
+    int32_t gw, gh;
+
     uint8_t *shape;
     DWORD    shape_cap;
     DXGI_OUTDUPL_POINTER_SHAPE_INFO shape_info;
@@ -222,22 +230,99 @@ static void fetch_cursor(dda_ctx *c, const DXGI_OUTDUPL_FRAME_INFO *info) {
     // 失败（含形状未变化的语义路径）：沿用上次的 shape/cursor 字段。
 }
 
-int32_t dda_acquire(void *dda, uint8_t *bgra, int32_t timeout_ms, dda_frame *out) {
+// ---- 安全桌面（UAC）GDI 路径（RustDesk 同款机制）----
+// 依据：DXGI 对安全桌面封闭（重建 E_ACCESSDENIDEN，实测 SYSTEM 亦然）；
+// SYSTEM 令牌 + SetThreadDesktop(Winlogon) + BitBlt(CAPTUREBLT) 可捕获
+// （gditest.c 于 LABS-XIAOXIN 实证：UAC 弹窗像素完整入帧）。
+// helper 需以 SYSTEM-in-session 运行（agent TokenSessionId 启动器）。
+
+// Forward declarations (used early by dda_destroy)
+static void secure_gdi_teardown(dda_ctx *c);
+static int enter_secure_mode_with(dda_ctx *c, HDESK hIn);
+static void enter_secure_mode(dda_ctx *c);
+static void leave_secure_mode(dda_ctx *c);
+static int32_t secure_gdi_acquire(dda_ctx *c, uint8_t *bgra, int32_t cap, int32_t timeout_ms, dda_frame *out);
+
+static BOOL input_desktop_name(char *name, DWORD cap, HDESK *hOut) {
+    HDESK h = OpenInputDesktop(0, FALSE, GENERIC_READ | DESKTOP_READOBJECTS);
+    if (!h) return FALSE;
+    if (hOut) *hOut = h; else CloseDesktop(h);
+    if (name) {
+        DWORD need = 0;
+        if (!GetUserObjectInformationA(h, UOI_NAME, name, cap, &need)) name[0] = 0;
+    }
+    return TRUE;
+}
+
+int32_t dda_acquire(void *dda, uint8_t *bgra, int32_t cap, int32_t timeout_ms, dda_frame *out) {
     dda_ctx *c = (dda_ctx *)dda;
-    if (!c || !c->dupl) return DDA_ERR;
+
+    // 安全桌面 GDI 模式：ACCESS_LOST 后若输入桌面已切走（UAC），以
+    // SYSTEM + SetThreadDesktop + BitBlt 捕获安全桌面帧（RustDesk 机制，
+    // gditest.c 实证）；桌面切回 Default 后恢复 DXGI。
+    if (c->secure_mode) {
+        return secure_gdi_acquire(c, bgra, cap, timeout_ms, out);
+    }
+
+    // 无 duplication（变暗期 ACCESS_LOST→重建被拒留下的状态）：先探测
+    // 桌面——已切到 winlogon 则进 GDI 模式；仍在 Default 则重建重试
+    // （返回 TIMEOUT 而非 DDA_ERR——桌面切换期是暂态，致命错会触发调用
+    // 方整体重建，在安全桌面期间重建必败并绕远路）。
+    if (!c->dupl) {
+        char name[64];
+        HDESK hIn = NULL;
+        if (input_desktop_name(name, sizeof(name), &hIn)) {
+            if (strcmp(name, "Default") != 0) {
+                if (enter_secure_mode_with(c, hIn)) {
+                    if (out) { ZeroMemory(out, sizeof(*out)); out->kind = DDA_FRAME_TIMEOUT; }
+                    return DDA_FRAME_TIMEOUT;
+                }
+                // 进入失败（SetThreadDesktop 拒绝）：显式致命错暴露原因，
+                // 调用方日志可见——不再静默无限重试（stats 冻结事故）。
+                return DDA_ERR;
+            }
+            if (hIn) CloseDesktop(hIn);
+        }
+        if (FAILED(do_duplicate(c))) {
+            if (out) { ZeroMemory(out, sizeof(*out)); out->kind = DDA_FRAME_TIMEOUT; }
+            return DDA_FRAME_TIMEOUT;
+        }
+    }
 
     DXGI_OUTDUPL_FRAME_INFO info;
     ZeroMemory(&info, sizeof(info));
     IDXGIResource *res = NULL;
+
     HRESULT hr = c->dupl->lpVtbl->AcquireNextFrame(c->dupl, (UINT)timeout_ms, &info, &res);
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+        // 空闲期顺带探测桌面切换（ACCESS_LOST 有时滞后/不触发）。
+        char name[64];
+        HDESK hIn = NULL;
+        if (input_desktop_name(name, sizeof(name), &hIn) && strcmp(name, "Default") != 0) {
+            CloseDesktop(hIn);
+            enter_secure_mode(c);
+            if (out) { ZeroMemory(out, sizeof(*out)); out->kind = DDA_FRAME_TIMEOUT; }
+            return DDA_FRAME_TIMEOUT;
+        }
+        if (hIn) CloseDesktop(hIn);
         if (out) { ZeroMemory(out, sizeof(*out)); out->kind = DDA_FRAME_TIMEOUT; }
         return DDA_FRAME_TIMEOUT;
     }
     if (hr == DXGI_ERROR_ACCESS_LOST) {
-        // 重建失败不升级为致命错误：安全桌面（UAC）活跃期间重建会被拒
-        // （E_ACCESSDENIED，实测 SYSTEM 亦然）——返回 ACCESS_LOST 让调用
-        // 方按自身节拍继续重试，桌面切回后自然恢复。
+        // 重建失败不升级为致命错误；安全桌面（UAC）活跃期间重建必被拒
+        // （E_ACCESSDENIDEN，实测 SYSTEM 亦然）——切 GDI 安全模式（捕获
+        // UAC 弹窗）或普通重试。
+        char name[64];
+        HDESK hIn = NULL;
+        if (input_desktop_name(name, sizeof(name), &hIn)) {
+            if (strcmp(name, "Default") != 0) {
+                if (enter_secure_mode_with(c, hIn)) {
+                    if (out) { ZeroMemory(out, sizeof(*out)); out->kind = DDA_FRAME_TIMEOUT; }
+                    return DDA_FRAME_TIMEOUT;
+                }
+            }
+            if (hIn) CloseDesktop(hIn);
+        }
         hr = do_duplicate(c);
         if (out) { ZeroMemory(out, sizeof(*out)); out->kind = DDA_FRAME_ACCESS_LOST; }
         return DDA_FRAME_ACCESS_LOST;
@@ -332,6 +417,13 @@ int32_t dda_format(const void *dda) {
 }
 
 void dda_destroy(void *dda) {
+    dda_ctx *dc = (dda_ctx *)dda;
+    if (dc && dc->secure_mode) {
+        secure_gdi_teardown(dc);
+        if (dc->hSecure) { CloseDesktop(dc->hSecure); dc->hSecure = NULL; }
+        if (dc->hDefault) SetThreadDesktop(dc->hDefault);
+        dc->secure_mode = 0;
+    }
     dda_ctx *c = (dda_ctx *)dda;
     if (!c) return;
     if (c->dupl) c->dupl->lpVtbl->Release(c->dupl);
@@ -342,4 +434,114 @@ void dda_destroy(void *dda) {
     free(c->shape);
     free(c);
     if (dda_ctx_global == c) dda_ctx_global = NULL;
+}
+
+// ---- 安全桌面 GDI 模式实现 ----
+
+static void secure_gdi_teardown(dda_ctx *c) {
+    if (c->hbmp) { DeleteObject(c->hbmp); c->hbmp = NULL; }
+    if (c->hdcMem) { DeleteDC(c->hdcMem); c->hdcMem = NULL; }
+    if (c->hdcScreen) { ReleaseDC(NULL, c->hdcScreen); c->hdcScreen = NULL; }
+    c->dib_bits = NULL;
+}
+
+// enter_secure_mode_with 切线程到安全桌面并建 GDI 资源。非 SYSTEM 令牌
+// SetThreadDesktop 会失败 → 返回 0（调用方走旧回退路径）。
+static int enter_secure_mode_with(dda_ctx *c, HDESK hIn) {
+    if (!c->hDefault) c->hDefault = GetThreadDesktop(GetCurrentThreadId());
+    if (!SetThreadDesktop(hIn)) { set_err(c, "SetThreadDesktop", (HRESULT)0x80070000 | (HRESULT)GetLastError()); return 0; }
+    c->hSecure = hIn; // 所有权归 ctx
+    c->secure_mode = 1;
+    c->gw = GetSystemMetrics(SM_CXSCREEN);
+    c->gh = GetSystemMetrics(SM_CYSCREEN);
+    return 1;
+}
+
+static void enter_secure_mode(dda_ctx *c) {
+    char name[64];
+    HDESK hIn = NULL;
+    if (input_desktop_name(name, sizeof(name), &hIn) && strcmp(name, "Default") != 0) {
+        if (!enter_secure_mode_with(c, hIn)) {
+            CloseDesktop(hIn);
+        }
+    } else if (hIn) {
+        CloseDesktop(hIn);
+    }
+}
+
+// leave_secure_mode 桌面切回 Default：恢复线程桌面、释放 GDI、重建 DXGI。
+static void leave_secure_mode(dda_ctx *c) {
+    secure_gdi_teardown(c);
+    if (c->hSecure) { CloseDesktop(c->hSecure); c->hSecure = NULL; }
+    if (c->hDefault) SetThreadDesktop(c->hDefault);
+    c->secure_mode = 0;
+    do_duplicate(c);
+}
+
+// secure_gdi_acquire 安全桌面帧：BitBlt(CAPTUREBLT) → DIB → bgra。
+// UAC 对话框多为静止，按 timeout 节流轮询。缓冲不足（dims 变化）时只
+// 更新尺寸并返回 TIMEOUT，调用方（Go）重分配后下一帧生效。
+static int32_t secure_gdi_acquire(dda_ctx *c, uint8_t *bgra, int32_t cap, int32_t timeout_ms, dda_frame *out) {
+    char name[64];
+    HDESK hIn = NULL;
+    if (input_desktop_name(name, sizeof(name), &hIn)) {
+        if (strcmp(name, "Default") == 0) {
+            CloseDesktop(hIn);
+            leave_secure_mode(c);
+            if (out) { ZeroMemory(out, sizeof(*out)); out->kind = DDA_FRAME_TIMEOUT; }
+            return DDA_FRAME_TIMEOUT;
+        }
+        CloseDesktop(hIn);
+    }
+    int32_t wait = timeout_ms;
+    if (wait < 16) wait = 16;
+    if (wait > 100) wait = 100;
+    Sleep((DWORD)wait);
+
+    if (!c->hdcScreen) {
+        c->gw = GetSystemMetrics(SM_CXSCREEN);
+        c->gh = GetSystemMetrics(SM_CYSCREEN);
+        c->hdcScreen = GetDC(NULL);
+        c->hdcMem = CreateCompatibleDC(c->hdcScreen);
+    }
+    if (c->gw != GetSystemMetrics(SM_CXSCREEN) || c->gh != GetSystemMetrics(SM_CYSCREEN)) {
+        secure_gdi_teardown(c);
+        c->gw = GetSystemMetrics(SM_CXSCREEN);
+        c->gh = GetSystemMetrics(SM_CYSCREEN);
+        c->hdcScreen = GetDC(NULL);
+        c->hdcMem = CreateCompatibleDC(c->hdcScreen);
+    }
+    if (!c->hbmp) {
+        BITMAPINFO bi;
+        ZeroMemory(&bi, sizeof(bi));
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = c->gw;
+        bi.bmiHeader.biHeight = -c->gh; // top-down
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        c->hbmp = CreateDIBSection(c->hdcScreen, &bi, DIB_RGB_COLORS, &c->dib_bits, NULL, 0);
+        if (c->hbmp) SelectObject(c->hdcMem, c->hbmp);
+    }
+    if (c->gw != c->w || c->gh != c->h) {
+        c->w = c->gw; // 通知调用方新尺寸（Dims 读这里）
+        c->h = c->gh;
+    }
+    if (!c->hbmp || !c->dib_bits) {
+        if (out) { ZeroMemory(out, sizeof(*out)); out->kind = DDA_FRAME_TIMEOUT; }
+        return DDA_FRAME_TIMEOUT;
+    }
+    if ((int32_t)(c->gw) * c->gh * 4 > cap) {
+        if (out) { ZeroMemory(out, sizeof(*out)); out->kind = DDA_FRAME_TIMEOUT; }
+        return DDA_FRAME_TIMEOUT; // 缓冲不足：调用方按 Dims 重分配
+    }
+    BitBlt(c->hdcMem, 0, 0, c->gw, c->gh, c->hdcScreen, 0, 0, SRCCOPY | CAPTUREBLT);
+    GdiFlush();
+    memcpy(bgra, c->dib_bits, (size_t)c->gw * c->gh * 4);
+    if (out) {
+        ZeroMemory(out, sizeof(*out));
+        out->kind = DDA_FRAME_CONTENT;
+        out->present_time = 0;
+    }
+    return DDA_FRAME_CONTENT;
 }

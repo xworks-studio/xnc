@@ -22,6 +22,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/coder/websocket"
 
@@ -289,7 +290,26 @@ func (m *ScreenStreamManager) launchHelperLocked() (net.Conn, *helperProc, error
 	if logFile != nil {
 		stderr = logFile
 	}
-	cmd, err := launchHelperAsUser(m.log, m.helperPath, stderr, helperArgs(pipeName, m.viewerParams)...)
+	// 启动梯子：SYSTEM-in-session（DDA + 安全桌面/UAC 捕获）→ 用户令牌
+	// （WGC 回退路径）。helper 在 SYSTEM 下采集不可用时以 exit 3 自退，
+	// 此处短暂等待该信号后回退；XNC_USER_HELPER=1 可强制用户模式。
+	var cmd *helperProc
+	var err error
+	if os.Getenv("XNC_USER_HELPER") == "" {
+		cmd, err = launchHelperSystem(m.log, m.helperPath, stderr, helperArgs(pipeName, m.viewerParams)...)
+		if err == nil {
+			if code, exited := cmd.helperExitCode(2500 * time.Millisecond); exited {
+				m.log.Warn("screen helper exited early under SYSTEM token, falling back to user token",
+					"code", code)
+				cmd = nil
+			}
+		} else {
+			m.log.Warn("screen helper SYSTEM launch failed, falling back to user token", "err", err)
+		}
+	}
+	if cmd == nil {
+		cmd, err = launchHelperAsUser(m.log, m.helperPath, stderr, helperArgs(pipeName, m.viewerParams)...)
+	}
 	if err != nil {
 		if logFile != nil {
 			logFile.Close()

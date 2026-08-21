@@ -64,7 +64,7 @@ int main(int argc, char **argv) {
 
     while (now_ms() - start < (ULONGLONG)seconds * 1000) {
         dda_frame f;
-        int32_t k = dda_acquire(dda, bgra, 100, &f);
+        int32_t k = dda_acquire(dda, bgra, (int32_t)((size_t)w*h*4), 100, &f);
         ULONGLONG t = now_ms() - start;
         const char *ks = "?";
         switch (k) {

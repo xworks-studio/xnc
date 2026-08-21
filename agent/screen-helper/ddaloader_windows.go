@@ -111,8 +111,8 @@ func loadDDA() (*ddaDLL, error) {
 		if ddaErr != nil {
 			return
 		}
-		if v, _, _ := d.abiVersion.Call(); uint32(v) != 1 {
-			ddaErr = fmt.Errorf("xnc-dda.dll abi version %d != 1 (helper/DLL 部署偏斜)", uint32(v))
+		if v, _, _ := d.abiVersion.Call(); uint32(v) != 2 {
+			ddaErr = fmt.Errorf("xnc-dda.dll abi version %d != 2 (helper/DLL 部署偏斜)", uint32(v))
 			return
 		}
 		ddaLoaded = d
