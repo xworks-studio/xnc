@@ -83,6 +83,10 @@ def cmd_push():
         for name in ("proto", "server", "deploy"):
             tf.add(ROOT / name, arcname=name,
                    filter=lambda ti: None if ti.name.endswith((".env", "machines.env")) else ti)
+        # Web UI source（Docker 内构建）；排除 node_modules 与 dist
+        tf.add(ROOT / "web", arcname="web",
+               filter=lambda ti: None if "node_modules" in ti.name or "/dist" in ti.name
+                   or ti.name.endswith((".env", "machines.env")) else ti)
     buf.seek(0)
     sh(f"mkdir -p {REMOTE_ROOT}")
     sftp = client.open_sftp()
