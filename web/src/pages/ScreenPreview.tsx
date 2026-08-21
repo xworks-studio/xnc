@@ -97,7 +97,7 @@ export default function ScreenPreview() {
           setStartError(`decoder error: ${e.message}`);
         },
       });
-      decoder.configure({ codec: "avc1.42E01E", optimizeForLatency: true });
+      decoder.configure({ codec: "avc1.4D4028", optimizeForLatency: true });
       return decoder;
     };
 
@@ -136,15 +136,26 @@ export default function ScreenPreview() {
             return;
           }
           const data = new Uint8Array(ev.data);
-          // NALU type: first byte after the 3-byte start code (00 00 01).
-          const nalType = data.length > 4 ? data[4] & 0x1f : 0;
+          // NALU type detection: handle both 3-byte (00 00 01) and
+          // 4-byte (00 00 00 01) Annex B start codes.
+          let nalHdr = -1;
+          if (data.length >= 4) {
+            if (data[0] === 0 && data[1] === 0 && data[2] === 1) {
+              nalHdr = data[3] & 0x1f; // 3-byte start code
+            } else if (data[0] === 0 && data[1] === 0 && data[2] === 0 && data[3] === 1 && data.length >= 5) {
+              nalHdr = data[4] & 0x1f; // 4-byte start code
+            } else {
+              // raw NALU (no start code) — first byte is the header
+              nalHdr = data[0] & 0x1f;
+            }
+          }
+          const isKey = nalHdr === 5 || nalHdr === 7 || nalHdr === 8;
           const dec = ensureDecoder();
           if (!dec) return;
-          if (!dec && nalType !== 7) return;
           try {
             dec.decode(
               new EncodedVideoChunk({
-                type: nalType === 5 || nalType === 7 || nalType === 8 ? "key" : "delta",
+                type: isKey ? "key" : "delta",
                 timestamp: performance.now(),
                 data,
               }),
