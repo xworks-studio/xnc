@@ -105,6 +105,35 @@ func TestFileVocabulary(t *testing.T) {
 	assert.JSONEq(t, `{"target":"rdp"}`, string(tp))
 }
 
+// TestScreenVocabulary：ScreenParams 全零值 omitempty（server 端补默认）+
+// 非零值字段写出；ScreenBegin/ScreenState 无 omitempty，字段全量序列化，
+// 并做 Marshal→Unmarshal 往返断言（Phase 6 SCREEN_BEGIN/SCREEN_STATE 帧）。
+func TestScreenVocabulary(t *testing.T) {
+	empty, _ := json.Marshal(ScreenParams{})
+	assert.JSONEq(t, `{}`, string(empty))
+
+	sp := ScreenParams{Fps: 30, Quality: 80, MaxWidth: 1280}
+	b, _ := json.Marshal(sp)
+	assert.JSONEq(t, `{"fps":30,"quality":80,"maxWidth":1280}`, string(b))
+	var back ScreenParams
+	require.NoError(t, json.Unmarshal(b, &back))
+	assert.Equal(t, sp, back)
+
+	sb := ScreenBegin{Width: 1920, Height: 1080, State: "capturing", Codec: "h264"}
+	bb, _ := json.Marshal(sb)
+	assert.JSONEq(t, `{"width":1920,"height":1080,"state":"capturing","codec":"h264"}`, string(bb))
+	var backB ScreenBegin
+	require.NoError(t, json.Unmarshal(bb, &backB))
+	assert.Equal(t, sb, backB)
+
+	st := ScreenState{State: "locked"}
+	bs, _ := json.Marshal(st)
+	assert.JSONEq(t, `{"state":"locked"}`, string(bs))
+	var backS ScreenState
+	require.NoError(t, json.Unmarshal(bs, &backS))
+	assert.Equal(t, st, backS)
+}
+
 func mustRaw(t *testing.T, v any) json.RawMessage {
 	t.Helper()
 	b, err := json.Marshal(v)

@@ -17,6 +17,9 @@ const KindFile = "file"
 // KindTunnel 端口隧道会话（RDP 等，Phase 4）。
 const KindTunnel = "tunnel"
 
+// KindScreen 桌面流会话（DXGI 捕获 + H.264，Phase 6）。
+const KindScreen = "screen"
+
 // SessionOpen 经控制连接下发：agent 按 WsURL（含 token 的绝对 URL）拨号。
 type SessionOpen struct {
 	SessionID  string          `json:"sessionId"`
@@ -105,4 +108,25 @@ type FileError struct {
 // TunnelParams SESSION_OPEN params：target 枚举（server 白名单解析为 host/port）。
 type TunnelParams struct {
 	Target string `json:"target"` // "rdp"
+}
+
+// ScreenParams SESSION_OPEN params：fps 默认 15（上限 30），quality 默认 60，
+// maxWidth 默认 1920；0 值由 server 端补默认后再下发。
+type ScreenParams struct {
+	Fps      int `json:"fps,omitempty"`      // 默认 15，上限 30
+	Quality  int `json:"quality,omitempty"`  // JPEG/H.264 质量，默认 60
+	MaxWidth int `json:"maxWidth,omitempty"` // 默认 1920
+}
+
+// ScreenBegin agent → client：流开始（SCREEN_BEGIN text 帧）。
+type ScreenBegin struct {
+	Width  int    `json:"width"`
+	Height int    `json:"height"`
+	State  string `json:"state"` // capturing / locked / no_session
+	Codec  string `json:"codec"` // "h264"
+}
+
+// ScreenState agent → client：捕获状态变化（SCREEN_STATE text 帧）。
+type ScreenState struct {
+	State string `json:"state"` // capturing / locked / no_session
 }
