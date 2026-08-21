@@ -76,7 +76,30 @@ export default function ScreenPreview() {
     let ws: WebSocket | null = null;
     let decoder: VideoDecoder | null = null;
 
-    const ensureDecoder = (): VideoDecoder | null => {
+    // Annex-B chunk 的首个 NALU 类型（3/4 字节起始码兼容）。
+    const firstNalType = (data: Uint8Array): number => {
+      if (data.length >= 4 && data[0] === 0 && data[1] === 0 && data[2] === 1) return data[3] & 0x1f;
+      if (data.length >= 5 && data[0] === 0 && data[1] === 0 && data[2] === 0 && data[3] === 1) return data[4] & 0x1f;
+      if (data.length >= 1) return data[0] & 0x1f;
+      return -1;
+    };
+
+    // SPS NALU（含起始码）中提取 codec string：avc1.<profile><compat><level>。
+    const codecFromSPS = (data: Uint8Array): string | null => {
+      let hdr = -1;
+      if (data[0] === 0 && data[1] === 0 && data[2] === 1) hdr = 3;
+      else if (data[0] === 0 && data[1] === 0 && data[2] === 0 && data[3] === 1) hdr = 4;
+      if (hdr < 0 || data.length < hdr + 4) return null;
+      return (
+        "avc1." +
+        [data[hdr + 1], data[hdr + 2], data[hdr + 3]]
+          .map((b) => b.toString(16).padStart(2, "0"))
+          .join("")
+          .toUpperCase()
+      );
+    };
+
+    const ensureDecoder = (codec: string): VideoDecoder | null => {
       if (decoder) return decoder;
       if (typeof VideoDecoder === "undefined") {
         setState("error");
@@ -85,11 +108,13 @@ export default function ScreenPreview() {
       }
       decoder = new VideoDecoder({
         output: (frame) => {
-          if (canvas.width === 0 || canvas.height === 0) {
+          // 画布尺寸以解码帧为准（SPS 裁剪后可能与 SCREEN_BEGIN 声明差几像素）。
+          if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
             canvas.width = frame.displayWidth;
             canvas.height = frame.displayHeight;
+            setDims(`${frame.displayWidth}x${frame.displayHeight}`);
           }
-          ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+          ctx.drawImage(frame, 0, 0);
           frame.close();
         },
         error: (e) => {
@@ -97,7 +122,7 @@ export default function ScreenPreview() {
           setStartError(`decoder error: ${e.message}`);
         },
       });
-      decoder.configure({ codec: "avc1.4D4028", optimizeForLatency: true });
+      decoder.configure({ codec, optimizeForLatency: true });
       return decoder;
     };
 
@@ -136,21 +161,11 @@ export default function ScreenPreview() {
             return;
           }
           const data = new Uint8Array(ev.data);
-          // NALU type detection: handle both 3-byte (00 00 01) and
-          // 4-byte (00 00 00 01) Annex B start codes.
-          let nalHdr = -1;
-          if (data.length >= 4) {
-            if (data[0] === 0 && data[1] === 0 && data[2] === 1) {
-              nalHdr = data[3] & 0x1f; // 3-byte start code
-            } else if (data[0] === 0 && data[1] === 0 && data[2] === 0 && data[3] === 1 && data.length >= 5) {
-              nalHdr = data[4] & 0x1f; // 4-byte start code
-            } else {
-              // raw NALU (no start code) — first byte is the header
-              nalHdr = data[0] & 0x1f;
-            }
-          }
-          const isKey = nalHdr === 5 || nalHdr === 7 || nalHdr === 8;
-          const dec = ensureDecoder();
+          const nalType = firstNalType(data);
+          const isKey = nalType === 5 || nalType === 7 || nalType === 8;
+          // 等携带 SPS 的关键帧再配置解码器（codec string 取自实际 SPS 字节）。
+          const codec = codecFromSPS(data);
+          const dec = codec ? ensureDecoder(codec) : decoder;
           if (!dec) return;
           try {
             dec.decode(

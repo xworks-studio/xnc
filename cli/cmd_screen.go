@@ -251,8 +251,12 @@ ws.onmessage = (ev) => {
     }
     decoder = new VideoDecoder({
       output: (frame) => {
-        ctx.drawImage(frame, 0, 0, canvas.width || frame.displayWidth,
-                      canvas.height || frame.displayHeight);
+        // 画布尺寸以解码帧为准（SPS 裁剪后可能与 SCREEN_BEGIN 声明差几像素）。
+        if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+          canvas.width = frame.displayWidth;
+          canvas.height = frame.displayHeight;
+        }
+        ctx.drawImage(frame, 0, 0);
         frame.close();
       },
       error: (e) => { st.textContent = "decoder error: " + e.message; },

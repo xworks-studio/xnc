@@ -61,6 +61,7 @@ type ScreenStreamManager struct {
 	mu            sync.Mutex
 	helperCmd     *exec.Cmd
 	pipeConn      net.Conn
+	helperLog     *os.File // helper stderr 日志文件（句柄继承给子进程）
 	subscribers   map[string]chan ScreenFrame // sessionID → 帧 channel
 	lastKeyFrame  []byte                      // 最新 I 帧缓存（新观众立即推送）
 	lastSPSPPS    []byte                      // SPS/PPS 缓存（解码器初始化）
@@ -177,6 +178,10 @@ func (m *ScreenStreamManager) stopLocked() {
 		_ = m.pipeConn.Close()
 		m.pipeConn = nil
 	}
+	if m.helperLog != nil {
+		_ = m.helperLog.Close()
+		m.helperLog = nil
+	}
 	for id, ch := range m.subscribers {
 		close(ch)
 		delete(m.subscribers, id)
@@ -265,17 +270,36 @@ func (m *ScreenStreamManager) startPipelineLocked() error {
 // launchHelperLocked 拉起 helper 进程并连接其 named pipe（pipe 名按 agent
 // PID 确定性生成，同一 agent 运行期内不变）。启动经 launchHelperAsUser
 // （Session 0 桥接，平台实现见 screen_windows.go / screen_other.go），并按
-// 首个订阅者的参数转发 --fps/--quality/--max-width。
+// 首个订阅者的参数转发 --fps/--quality/--max-width。stderr 落盘到 helper
+// 同目录 screen-helper.log（agent/SYSTEM 打开、句柄继承给子进程——子进程
+// 无需目录写权限），stopLocked 时关闭。
 func (m *ScreenStreamManager) launchHelperLocked() (net.Conn, *exec.Cmd, error) {
 	pipeName := screenPipeName()
-	cmd, err := launchHelperAsUser(m.log, m.helperPath, nil, helperArgs(pipeName, m.viewerParams)...)
+	logFile, lerr := os.OpenFile(filepath.Join(filepath.Dir(m.helperPath), "screen-helper.log"),
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if lerr != nil {
+		m.log.Warn("screen helper log file unavailable, stderr discarded", "err", lerr)
+	}
+	var stderr io.Writer
+	if logFile != nil {
+		stderr = logFile
+	}
+	cmd, err := launchHelperAsUser(m.log, m.helperPath, stderr, helperArgs(pipeName, m.viewerParams)...)
 	if err != nil {
+		if logFile != nil {
+			logFile.Close()
+		}
 		return nil, nil, err
 	}
+	m.helperLog = logFile
 	conn, err := dialPipe(pipeName)
 	if err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
+		if logFile != nil {
+			logFile.Close()
+			m.helperLog = nil
+		}
 		return nil, nil, err
 	}
 	return conn, cmd, nil

@@ -44,6 +44,8 @@ func main() {
 	)
 	flag.Parse()
 
+	setDPIAware()
+
 	if *jpegSingle != "" {
 		if err := runJpegSingle(*jpegSingle, *quality); err != nil {
 			fmt.Fprintf(os.Stderr, "xnc-screen-helper: %v\n", err)

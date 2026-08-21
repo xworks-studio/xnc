@@ -70,12 +70,14 @@ func captureGDIFrame() ([]byte, int, int, error) {
 	// 选回默认位图（读取类 API 要求 bitmap 未被选入 DC）。
 	procSelectObject.Call(memDC, oldBmp)
 
-	// 优先 GetDIBits（top-down，负 biHeight）；失败回退 GetBitmapBits（bottom-up
-	// + 手动翻行——部分环境 GetDIBits 始终失败）。
+	// 请求 bottom-up（正 biHeight——所有驱动普遍支持的经典布局；负 biHeight
+	// 的 top-down 请求在部分驱动/环境下被忽略仍返回 bottom-up，导致画面上下
+	// 翻转），取出后统一翻转为 top-down。GetDIBits 失败回退 GetBitmapBits
+	// （同样按 bottom-up 处理——DDB 内存扫描行惯例）。
 	var bi [40]byte
 	le32(bi[0:4], 40)
 	le32(bi[4:8], w)
-	le32(bi[8:12], -h)
+	le32(bi[8:12], h)
 	le32(bi[12:16], 1)  // planes
 	le32(bi[16:20], 32) // bpp
 	// 其余 0（BI_RGB）
@@ -86,8 +88,8 @@ func captureGDIFrame() ([]byte, int, int, error) {
 		if n, _, _ := procGetBitmapBits.Call(bmp, uintptr(len(buf)), uintptr(unsafe.Pointer(&buf[0]))); n == 0 {
 			return nil, 0, 0, fmt.Errorf("GetDIBits/GetBitmapBits failed")
 		}
-		flipRows(buf, w*4)
 	}
+	flipRows(buf, w*4)
 	return buf, w, h, nil
 }
 

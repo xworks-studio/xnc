@@ -233,7 +233,10 @@ type DXGICapturer struct {
 	coInit bool
 }
 
-// NewDXGICapturer 初始化 Desktop Duplication（主适配器 + 主输出）。
+// NewDXGICapturer 初始化 Desktop Duplication。遍历所有适配器/输出，
+// 取第一个连桌面且 DuplicateOutput 成功的组合（混合显卡设备上 adapter 0
+// 未必持有桌面输出——单设备创建在 dGPU 上会 INVALID_CALL）。全部失败返回
+// 最后一个错误，调用方回退 GDI。
 func NewDXGICapturer() (*DXGICapturer, error) {
 	hr, err := coInitializeEx()
 	if err != nil && hr != rpcEChangedMode {
@@ -241,7 +244,6 @@ func NewDXGICapturer() (*DXGICapturer, error) {
 	}
 	c := &DXGICapturer{coInit: err == nil}
 
-	// CreateDXGIFactory1
 	var factory comPtr
 	r, _, e := procCreateDXGIFactory1.Call(uintptr(unsafe.Pointer(&iidIDXGIFactory1)), uintptr(unsafe.Pointer(&factory.p)))
 	if r != 0 {
@@ -249,82 +251,109 @@ func NewDXGICapturer() (*DXGICapturer, error) {
 	}
 	c.factory = factory
 
-	// EnumAdapters1(0)
-	var adapter comPtr
-	if _, err := factory.call(vtFactoryEnumAdapters1, 0, uintptr(unsafe.Pointer(&adapter.p))); err != nil {
-		c.Close()
-		return nil, fmt.Errorf("EnumAdapters1: %w", err)
+	var lastErr error
+	for ai := 0; ai < 4; ai++ {
+		var adapter comPtr
+		if _, err := factory.call(vtFactoryEnumAdapters1, uintptr(ai), uintptr(unsafe.Pointer(&adapter.p))); err != nil {
+			break // 适配器列表耗尽
+		}
+		matched := false
+		for oi := 0; oi < 4; oi++ {
+			var output comPtr
+			if _, err := adapter.call(vtAdapterEnumOutputs, uintptr(oi), uintptr(unsafe.Pointer(&output.p))); err != nil {
+				break // 该适配器输出耗尽
+			}
+			cc, err := c.tryDuplicate(adapter, output)
+			if err != nil {
+				lastErr = err
+				output.release()
+				continue
+			}
+			// 成功：接管资源所有权并返回。
+			c.adapter, c.output, c.output1 = adapter, output, cc.output1
+			c.device, c.context, c.duplication, c.staging = cc.device, cc.context, cc.duplication, cc.staging
+			c.width, c.height = cc.width, cc.height
+			matched = true
+			return c, nil
+		}
+		if !matched {
+			adapter.release()
+		}
 	}
-	c.adapter = adapter
-
-	// EnumOutputs(0)
-	var output comPtr
-	if _, err := adapter.call(vtAdapterEnumOutputs, 0, uintptr(unsafe.Pointer(&output.p))); err != nil {
-		c.Close()
-		return nil, fmt.Errorf("EnumOutputs: %w", err)
+	c.Close()
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no desktop-attached output")
 	}
-	c.output = output
+	return nil, lastErr
+}
 
-	// GetDesc → 分辨率
+// duplAttempt — tryDuplicate 成功结果的资源集合。
+type duplAttempt struct {
+	output1       comPtr // IDXGIOutput1
+	duplication   comPtr // IDXGIOutputDuplication
+	device        comPtr // ID3D11Device
+	context       comPtr // ID3D11DeviceContext
+	staging       comPtr // ID3D11Texture2D（CPU 可读）
+	width, height int
+}
+
+// tryDuplicate 在指定 adapter/output 上创建设备并尝试 DuplicateOutput。
+// 成功时返回全部资源（所有权归调用方）；失败时清理自身并返回错误。
+func (c *DXGICapturer) tryDuplicate(adapter, output comPtr) (*duplAttempt, error) {
 	var desc dxgiOutputDesc
 	if _, err := output.call(vtOutputGetDesc, uintptr(unsafe.Pointer(&desc))); err != nil {
-		c.Close()
 		return nil, fmt.Errorf("GetDesc: %w", err)
 	}
-	c.width, c.height = desc.DesktopCoordinates.width(), desc.DesktopCoordinates.height()
-	if c.width <= 0 || c.height <= 0 {
-		c.Close()
-		return nil, fmt.Errorf("invalid output desc %dx%d", c.width, c.height)
+	if desc.AttachedToDesktop == 0 {
+		return nil, fmt.Errorf("output not attached to desktop")
+	}
+	w, h := desc.DesktopCoordinates.width(), desc.DesktopCoordinates.height()
+	if w <= 0 || h <= 0 {
+		return nil, fmt.Errorf("invalid output desc %dx%d", w, h)
 	}
 
-	// QI IDXGIOutput1
 	out1, err := output.queryInterface(&iidIDXGIOutput1)
 	if err != nil {
-		c.Close()
 		return nil, fmt.Errorf("QI IDXGIOutput1: %w", err)
 	}
-	c.output1 = out1
+	a := &duplAttempt{output1: out1, width: w, height: h}
+	fail := func(err error) (*duplAttempt, error) {
+		a.staging.release()
+		a.context.release()
+		a.device.release()
+		out1.release()
+		return nil, err
+	}
 
-	// D3D11CreateDevice（adapter 非 NULL → DriverType 必须 UNKNOWN）
-	var device, context comPtr
+	// D3D11CreateDevice（adapter 非 NULL → DriverType 必须 UNKNOWN）。
 	var featureLevel uint32
-	r, _, e = procD3D11CreateDevice.Call(
+	r, _, e := procD3D11CreateDevice.Call(
 		adapter.u(), uintptr(d3dDriverTypeUnknown), 0,
 		uintptr(d3d11CreateDeviceBgraSupport),
 		0, 0, uintptr(d3d11SdkVersion),
-		uintptr(unsafe.Pointer(&device.p)), uintptr(unsafe.Pointer(&featureLevel)),
-		uintptr(unsafe.Pointer(&context.p)),
+		uintptr(unsafe.Pointer(&a.device.p)), uintptr(unsafe.Pointer(&featureLevel)),
+		uintptr(unsafe.Pointer(&a.context.p)),
 	)
 	if r != 0 {
-		c.Close()
-		return nil, fmt.Errorf("D3D11CreateDevice: %v", e)
+		return fail(fmt.Errorf("D3D11CreateDevice: %v", e))
 	}
-	c.device, c.context = device, context
 
-	// staging texture（CPU 读）
+	// staging texture（CPU 读）。
 	texDesc := d3d11Texture2DDesc{
-		Width: uint32(c.width), Height: uint32(c.height),
+		Width: uint32(w), Height: uint32(h),
 		MipLevels: 1, ArraySize: 1,
 		SampleCount:    1,
 		Format:         dxgiFormatB8G8R8A8UNorm,
 		Usage:          d3d11UsageStaging,
 		CPUAccessFlags: d3d11CpuAccessRead,
 	}
-	var staging comPtr
-	if _, err := device.call(vtDeviceCreateTexture2D, uintptr(unsafe.Pointer(&texDesc)), 0, uintptr(unsafe.Pointer(&staging.p))); err != nil {
-		c.Close()
-		return nil, fmt.Errorf("CreateTexture2D(staging): %w", err)
+	if _, err := a.device.call(vtDeviceCreateTexture2D, uintptr(unsafe.Pointer(&texDesc)), 0, uintptr(unsafe.Pointer(&a.staging.p))); err != nil {
+		return fail(fmt.Errorf("CreateTexture2D(staging): %w", err))
 	}
-	c.staging = staging
-
-	// DuplicateOutput
-	var dup comPtr
-	if _, err := out1.call(vtOutput1DuplicateOutput, device.u(), uintptr(unsafe.Pointer(&dup.p))); err != nil {
-		c.Close()
-		return nil, fmt.Errorf("DuplicateOutput: %w", err)
+	if _, err := out1.call(vtOutput1DuplicateOutput, a.device.u(), uintptr(unsafe.Pointer(&a.duplication.p))); err != nil {
+		return fail(fmt.Errorf("DuplicateOutput: %w", err))
 	}
-	c.duplication = dup
-	return c, nil
+	return a, nil
 }
 
 // AcquireFrame 阻塞等待下一帧（timeout 毫秒），返回全帧 BGRA（top-down）。
@@ -625,15 +654,62 @@ func sendEncoded(conn net.Conn, encoder frameEncoder, frame []byte, gop int, fra
 	if encoder.LastFrameKey() {
 		frameType = pipeFrameKey
 		if spspps := encoder.SPSPPS(); len(spspps) > 0 {
-			data = append(append([]byte{}, spspps...), data...)
+			// 关键帧 = 缓存参数集 + VCL NALU。丢弃编码器输出自带的
+			// SPS/PPS/AUD（type 7/8/9）——重复参数集与 AUD 前缀会触发
+			// 部分浏览器 WebCodecs 解码器 "key frame required" 拒帧。
+			data = append(append([]byte{}, spspps...), vclNALUs(data)...)
 		}
 		*framesSinceKey = 0
 		*sentKey = true
 	} else {
 		frameType = pipeFrameDelta
+		if len(encoder.SPSPPS()) > 0 { // H.264 模式统一 4 字节起始码
+			data = vclNALUs(data)
+		}
 		(*framesSinceKey)++
 	}
 	return writeFrame(conn, frameType, data)
+}
+
+// vclNALUs 重排 Annex-B 码流：丢弃参数集与 AUD（type 7/8/9），其余 NALU
+// 统一以 4 字节起始码输出。JPEG 回退模式（无参数集）不应调用。
+func vclNALUs(data []byte) []byte {
+	var out []byte
+	i := 0
+	for i < len(data) {
+		hdr := -1
+		for j := i; j+3 < len(data); j++ {
+			if data[j] == 0 && data[j+1] == 0 {
+				if data[j+2] == 1 {
+					hdr = j + 3
+					break
+				}
+				if data[j+2] == 0 && j+4 < len(data) && data[j+3] == 1 {
+					hdr = j + 4
+					break
+				}
+			}
+		}
+		if hdr < 0 || hdr >= len(data) {
+			break
+		}
+		end := len(data)
+		for j := hdr + 1; j+3 <= len(data); j++ {
+			if data[j] == 0 && data[j+1] == 0 && (data[j+2] == 1 || (j+4 <= len(data) && data[j+2] == 0 && data[j+3] == 1)) {
+				end = j
+				break
+			}
+		}
+		for end > hdr && data[end-1] == 0 { // 去起始码前导零
+			end--
+		}
+		if t := data[hdr] & 0x1F; t != 7 && t != 8 && t != 9 && end > hdr {
+			out = append(out, 0, 0, 0, 1)
+			out = append(out, data[hdr:end]...)
+		}
+		i = end
+	}
+	return out
 }
 
 // placeholderLoop DXGI 不可用时的占位循环（每秒状态帧，保持 pipe 活性）。
