@@ -182,8 +182,10 @@ func (r rect) height() int { return int(r.Bottom - r.Top) }
 // d3d11Texture2DDesc 对应 D3D11_TEXTURE2D_DESC。
 type d3d11Texture2DDesc struct {
 	Width, Height, MipLevels, ArraySize uint32
+	Format                              uint32
 	SampleCount, SampleQuality          uint32
-	Format, Usage, BindFlags            uint32
+	Usage                               uint32
+	BindFlags                           uint32
 	CPUAccessFlags, MiscFlags           uint32
 }
 
@@ -426,52 +428,176 @@ func coUninitialize() { procCoUninit.Call() }
 
 // ---- 主捕获循环 ----
 
-// captureLoop：初始化 DXGI → 发送分辨率 + capturing → 按帧率上限循环
-// AcquireFrame。像素帧的编码/推送由 T6（H.264 MFT）接入；当前阶段捕获后
-// 丢弃（维持协议与自适应帧率语义：静止即无动作）。DXGI 初始化失败时回退
-// 占位状态循环（T7 接入 GDI fallback）。
-func captureLoop(ctx context.Context, conn net.Conn, frameInterval time.Duration) error {
-	cap, err := NewDXGICapturer()
-	if err != nil {
-		return placeholderLoop(ctx, conn, err)
+// bitrateFor 将质量参数（1-100）映射到 H.264 平均码率。
+func bitrateFor(quality int) int {
+	if quality < 1 {
+		quality = 1
 	}
-	defer cap.Close()
+	if quality > 100 {
+		quality = 100
+	}
+	return 500_000 + quality*30_000 // q60 ≈ 2.3Mbps（1080p 30fps 预算内）
+}
 
-	if err := writeFrame(conn, pipeFrameDims, packDims(cap.width, cap.height)); err != nil {
+// captureLoop：DXGI 优先（GDI 回退）→ 编码器（H.264 MFT 优先，JPEG 流
+// 回退）→ 发分辨率 + capturing → 捕获-编码-推送循环。
+//
+//	静止：AcquireFrame 超时/无变化 → 不编码不出帧（自适应 0fps）
+//	锁屏：ErrAccessLost → 状态 0x03 locked + 重建 duplication
+//	关键帧：首帧 + 每 gop 帧（新观众可立即入流）
+func captureLoop(ctx context.Context, conn net.Conn, opts captureOpts) error {
+	frameInterval := time.Second / time.Duration(opts.fps)
+
+	// 捕获源：DXGI → GDI。
+	var dxgi *DXGICapturer
+	var gdi *gdiStreamCapturer
+	var srcW, srcH int
+	c, cerr := NewDXGICapturer()
+	if cerr == nil {
+		dxgi = c
+		srcW, srcH = dxgi.width, dxgi.height
+	} else {
+		g, gerr := newGDIStreamCapturer(opts.maxWidth)
+		if gerr != nil {
+			return placeholderLoop(ctx, conn, gerr)
+		}
+		gdi = g
+		// GDI 捕获器内部完成缩放——源分辨率即其输出分辨率，
+		// 避免 captureLoop 重复缩放。
+		srcW, srcH = gdi.outW, gdi.outH
+		fmt.Fprintf(os.Stderr, "xnc-screen-helper: dxgi unavailable (%v), gdi fallback\n", cerr)
+	}
+	defer func() {
+		if dxgi != nil {
+			dxgi.Close()
+		}
+		if gdi != nil {
+			gdi.Close()
+		}
+	}()
+
+	outW, outH := fitDims(srcW, srcH, opts.maxWidth)
+
+	// 编码器：H.264 MFT → JPEG 帧流。
+	gop := opts.fps * 2 // 关键帧间隔 ≈ 2s
+	encoder, eerr := newH264Encoder(outW, outH, bitrateFor(opts.quality), gop)
+	if eerr != nil {
+		fmt.Fprintf(os.Stderr, "xnc-screen-helper: h264 mft unavailable (%v), jpeg fallback\n", eerr)
+		encoder = newJPEGStreamEncoder(outW, outH, opts.quality)
+	}
+	defer encoder.Close()
+
+	if err := writeFrame(conn, pipeFrameDims, packDims(outW, outH)); err != nil {
 		return err
 	}
 	if err := writeFrame(conn, pipeFrameState, []byte("capturing")); err != nil {
 		return err
 	}
 
-	timeout := frameInterval.Milliseconds()
-	if timeout <= 0 || timeout > 100 {
-		timeout = 100
+	// DXGI：AcquireNextFrame 超时即节流（timeout ≤ 100ms）；GDI：ticker 节拍。
+	acquireTimeout := frameInterval.Milliseconds()
+	if acquireTimeout <= 0 || acquireTimeout > 100 {
+		acquireTimeout = 100
 	}
+	var tickC <-chan time.Time
+	if gdi != nil {
+		t := time.NewTicker(frameInterval)
+		defer t.Stop()
+		tickC = t.C
+	}
+
+	framesSinceKey := 0
+	sentKey := false
+	var lastFrame []byte
+	// 静止桌面自愈：MFT 有 ~gop 帧启动延迟，若期间桌面转静止，首帧可能
+	// 被编码器内部吞掉而始终无输出。静止超时 ~1s 后强制重编码缓存帧。
+	// 首关键帧出帧前按节拍持续驱动编码器；出帧后静止即完全静默。
+	idleTicks, idleLimit := 0, 1
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		data, _, err := cap.AcquireFrame(uint(timeout))
-		_ = data // T6：BGRA → YUV → H.264 → writeFrame(0x01/0x02)
+		if tickC != nil {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-tickC:
+			}
+		}
+
+		var frame []byte
+		var err error
+		if dxgi != nil {
+			frame, _, err = dxgi.AcquireFrame(uint(acquireTimeout))
+		} else {
+			frame, _, err = gdi.AcquireFrame(0)
+		}
 		if err != nil {
 			if errors.Is(err, ErrAccessLost) {
 				if werr := writeFrame(conn, pipeFrameState, []byte("locked")); werr != nil {
 					return werr
 				}
 				// 重建 duplication 后继续；连续失败则按秒退避重试。
-				if rerr := cap.recreate(); rerr != nil {
-					_, _ = fmt.Fprintf(os.Stderr, "xnc-screen-helper: recreate duplication: %v\n", rerr)
+				if rerr := dxgi.recreate(); rerr != nil {
+					fmt.Fprintf(os.Stderr, "xnc-screen-helper: recreate duplication: %v\n", rerr)
 					time.Sleep(time.Second)
 				}
 				continue
 			}
 			if errors.Is(err, ErrTimeout) {
-				continue // 桌面静止：自适应 0fps
+				// 桌面静止：自适应 0fps。但首个关键帧尚未输出（MFT 有 ~17 帧
+				// 启动缓冲）时，以缓存帧持续驱动编码器直至出帧。
+				idleTicks++
+				if !sentKey && lastFrame != nil && idleTicks >= idleLimit {
+					if err := sendEncoded(conn, encoder, lastFrame, gop, &framesSinceKey, &sentKey); err != nil {
+						return err
+					}
+				}
+				continue
 			}
 			return fmt.Errorf("acquire: %w", err)
 		}
+		idleTicks = 0
+		if len(frame) < srcW*srcH*4 {
+			continue
+		}
+		if outW != srcW {
+			frame = scaleBGRA(frame, srcW, srcH, outW, outH)
+		}
+		lastFrame = frame
+
+		if err := sendEncoded(conn, encoder, frame, gop, &framesSinceKey, &sentKey); err != nil {
+			return err
+		}
 	}
+}
+
+// sendEncoded 编码一帧并按关键帧/增量帧类型写 pipe。编码器无输出（MFT
+// 启动缓冲）时静默跳过。
+func sendEncoded(conn net.Conn, encoder frameEncoder, frame []byte, gop int, framesSinceKey *int, sentKey *bool) error {
+	forceKey := !*sentKey || *framesSinceKey >= gop // 首输出前始终请求关键帧
+	data, encErr := encoder.Encode(frame, forceKey)
+	if encErr != nil {
+		fmt.Fprintf(os.Stderr, "xnc-screen-helper: encode: %v\n", encErr)
+		return nil
+	}
+	if len(data) == 0 {
+		return nil // 编码器内部缓冲（MFT 启动延迟）
+	}
+
+	var frameType byte
+	if encoder.LastFrameKey() {
+		frameType = pipeFrameKey
+		if spspps := encoder.SPSPPS(); len(spspps) > 0 {
+			data = append(append([]byte{}, spspps...), data...)
+		}
+		*framesSinceKey = 0
+		*sentKey = true
+	} else {
+		frameType = pipeFrameDelta
+		(*framesSinceKey)++
+	}
+	return writeFrame(conn, frameType, data)
 }
 
 // placeholderLoop DXGI 不可用时的占位循环（每秒状态帧，保持 pipe 活性）。

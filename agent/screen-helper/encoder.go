@@ -58,7 +58,7 @@ func (j *jpegStreamEncoder) Encode(frame []byte, _ bool) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func (j *jpegStreamEncoder) SPSPPS() []byte    { return nil }
+func (j *jpegStreamEncoder) SPSPPS() []byte     { return nil }
 func (j *jpegStreamEncoder) LastFrameKey() bool { return true }
 func (j *jpegStreamEncoder) Close()             {}
 

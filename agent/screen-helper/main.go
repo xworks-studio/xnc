@@ -18,13 +18,21 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"time"
 )
 
 const (
+	pipeFrameKey   byte = 0x01 // 关键帧（H.264 I 帧 / JPEG 全帧）
+	pipeFrameDelta byte = 0x02 // 增量帧（H.264 P 帧）
 	pipeFrameState byte = 0x03
 	pipeFrameDims  byte = 0x04
 )
+
+// captureOpts — 管道模式捕获参数。
+type captureOpts struct {
+	fps      int // 帧率上限（1-30）
+	maxWidth int // 最大输出宽度（等比缩放）
+	quality  int // 质量（1-100），映射 H.264 码率或 JPEG 质量
+}
 
 func main() {
 	var (
@@ -35,7 +43,6 @@ func main() {
 		jpegSingle = flag.String("jpeg-single", "", "单帧 GDI 截屏输出 JPEG 路径（截完即退出）")
 	)
 	flag.Parse()
-	_ = maxWidth
 
 	if *jpegSingle != "" {
 		if err := runJpegSingle(*jpegSingle, *quality); err != nil {
@@ -49,7 +56,8 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: xnc-screen-helper.exe --pipe <name> --max-width 1920 --quality 60 [--fps 30] [--jpeg-single <path>]")
 		os.Exit(2)
 	}
-	if err := runPipe(*pipeName, *fps); err != nil {
+	opts := captureOpts{fps: *fps, maxWidth: *maxWidth, quality: *quality}
+	if err := runPipe(*pipeName, opts); err != nil {
 		log.Fatalf("xnc-screen-helper: %v", err)
 	}
 }
@@ -68,9 +76,12 @@ func runJpegSingle(path string, quality int) error {
 
 // runPipe 启动 named pipe 服务端并进入捕获主循环，直至 agent 断开或进程被
 // 终止（ctx 取消于 SIGINT/SIGTERM）。
-func runPipe(pipeName string, fps int) error {
-	if fps < 1 || fps > 30 {
-		fps = 15
+func runPipe(pipeName string, opts captureOpts) error {
+	if opts.fps < 1 || opts.fps > 30 {
+		opts.fps = 15
+	}
+	if opts.quality < 1 || opts.quality > 100 {
+		opts.quality = 60
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -81,6 +92,5 @@ func runPipe(pipeName string, fps int) error {
 	}
 	defer conn.Close()
 
-	frameInterval := time.Second / time.Duration(fps)
-	return captureLoop(ctx, conn, frameInterval)
+	return captureLoop(ctx, conn, opts)
 }

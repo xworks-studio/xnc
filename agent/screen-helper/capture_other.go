@@ -14,7 +14,7 @@ import (
 var errUnsupported = errors.New("screen capture not supported on this platform")
 
 // captureLoop 非 Windows 下仅发送状态帧后持续等待 ctx 取消（协议验证用）。
-func captureLoop(ctx context.Context, conn net.Conn, _ time.Duration) error {
+func captureLoop(ctx context.Context, conn net.Conn, _ captureOpts) error {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	for {
