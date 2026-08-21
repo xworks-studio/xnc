@@ -517,6 +517,9 @@ func captureLoop(ctx context.Context, conn net.Conn, opts captureOpts) error {
 	// 被编码器内部吞掉而始终无输出。静止超时 ~1s 后强制重编码缓存帧。
 	// 首关键帧出帧前按节拍持续驱动编码器；出帧后静止即完全静默。
 	idleTicks, idleLimit := 0, 1
+	// 首帧强制输出：即使桌面完全静止（DXGI 无脏区 / GDI 无差异），也必须
+	// 捕获并编码至少一个 I 帧——新观众需要立即看到画面而非空白。
+	firstFrame := true
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -552,8 +555,20 @@ func captureLoop(ctx context.Context, conn net.Conn, opts captureOpts) error {
 				continue
 			}
 			if errors.Is(err, ErrTimeout) {
-				// 桌面静止：自适应 0fps。但首个关键帧尚未输出（MFT 有 ~17 帧
-				// 启动缓冲）时，以缓存帧持续驱动编码器直至出帧。
+				// 首帧尚未输出且桌面静止：用 GDI 直接截一帧强制输出，
+				// 而非等待 DXGI 脏区（完全静止桌面 DXGI 永远不触发）。
+				if firstFrame {
+					if g, _, _, gerr := captureGDIFrame(); gerr == nil {
+						// GDI 帧是全分辨率 BGRA，需要缩放到编码器尺寸
+						scaled := scaleBGRA(g, srcW, srcH, outW, outH)
+						if serr := sendEncoded(conn, encoder, scaled, gop, &framesSinceKey, &sentKey); serr == nil {
+							firstFrame = false
+							lastFrame = scaled
+						}
+					}
+					continue
+				}
+				// 后续静止帧：MFT 启动缓冲自愈逻辑
 				idleTicks++
 				if !sentKey && lastFrame != nil && idleTicks >= idleLimit {
 					if err := sendEncoded(conn, encoder, lastFrame, gop, &framesSinceKey, &sentKey); err != nil {
