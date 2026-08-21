@@ -27,9 +27,10 @@ const (
 func (h *handlers) screenStart(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, screenBodyMaxBytes)
 	var req struct {
-		Fps      int `json:"fps"`
-		Quality  int `json:"quality"`
-		MaxWidth int `json:"maxWidth"`
+		Fps      int  `json:"fps"`
+		Quality  int  `json:"quality"`
+		MaxWidth int  `json:"maxWidth"`
+		Snapshot bool `json:"snapshot"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondError(w, proto.Err(400, proto.CodeInternal, "bad request"))
@@ -57,6 +58,7 @@ func (h *handlers) screenStart(w http.ResponseWriter, r *http.Request) {
 	}
 	params, err := json.Marshal(proto.ScreenParams{
 		Fps: req.Fps, Quality: req.Quality, MaxWidth: req.MaxWidth,
+		Snapshot: req.Snapshot,
 	})
 	if err != nil {
 		respondError(w, proto.Err(500, proto.CodeInternal, "encode params"))

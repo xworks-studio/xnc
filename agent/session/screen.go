@@ -8,9 +8,11 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -195,6 +197,31 @@ func (m *ScreenStreamManager) CachedKeyFrame() (spspps, key []byte) {
 	return m.lastSPSPPS, m.lastKeyFrame
 }
 
+// Snapshot 运行 helper 的 --jpeg-single 模式：单帧 GDI 截屏 → JPEG 文件 →
+// 读回字节。不触碰流式管线（helper 截完即退出，无 named pipe）。
+func (m *ScreenStreamManager) Snapshot(quality int) ([]byte, error) {
+	m.mu.Lock()
+	helperPath := m.helperPath
+	m.mu.Unlock()
+	if quality <= 0 {
+		quality = screenDefaultQuality
+	}
+	tmp, err := os.CreateTemp("", "xnc-snapshot-*.jpg")
+	if err != nil {
+		return nil, err
+	}
+	tmpPath := tmp.Name()
+	tmp.Close()
+	defer os.Remove(tmpPath)
+
+	cmd := exec.Command(helperPath, "--jpeg-single", tmpPath,
+		"--quality", strconv.Itoa(quality))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("screen helper: %v: %s", err, bytes.TrimSpace(out))
+	}
+	return os.ReadFile(tmpPath)
+}
+
 // startPipelineLocked 启动管线（注入或真实 helper），成功即置 running 并
 // 拉起读循环。
 func (m *ScreenStreamManager) startPipelineLocked() error {
@@ -364,7 +391,25 @@ func (h *ScreenHandler) Handle(ctx context.Context, ws *websocket.Conn, sessionI
 	var p proto.ScreenParams
 	_ = json.Unmarshal(params, &p)
 	normalizeScreenParams(&p)
-	_ = p // 参数由 server 端校验后下发；helper 启动参数归 Phase 6 后续任务
+
+	// 单帧快照模式：helper --jpeg-single 截屏后以单个 binary JPEG 帧回送，
+	// 随即收线——不进入流式管线（不启动共享 helper / named pipe）。
+	if p.Snapshot {
+		jpeg, err := h.Manager.Snapshot(p.Quality)
+		if err != nil {
+			h.Manager.log.Warn("screen snapshot failed", "err", err)
+			writeScreenText(ctx, ws, proto.TypeError, proto.ErrorPayload{
+				Code: "SNAPSHOT_FAILED", Message: err.Error(),
+			})
+			return
+		}
+		writeScreenText(ctx, ws, typeScreenBegin, proto.ScreenBegin{
+			State: "capturing", Codec: "jpeg",
+		})
+		writeScreenBinary(ctx, ws, jpeg)
+		_ = ws.Close(websocket.StatusNormalClosure, "snapshot done")
+		return
+	}
 
 	ch := h.Manager.Subscribe(sessionID)
 	defer h.Manager.Unsubscribe(sessionID)

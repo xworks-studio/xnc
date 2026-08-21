@@ -113,9 +113,10 @@ type TunnelParams struct {
 // ScreenParams SESSION_OPEN params：fps 默认 15（上限 30），quality 默认 60，
 // maxWidth 默认 1920；0 值由 server 端补默认后再下发。
 type ScreenParams struct {
-	Fps      int `json:"fps,omitempty"`      // 默认 15，上限 30
-	Quality  int `json:"quality,omitempty"`  // JPEG/H.264 质量，默认 60
-	MaxWidth int `json:"maxWidth,omitempty"` // 默认 1920
+	Fps      int  `json:"fps,omitempty"`      // 默认 15，上限 30
+	Quality  int  `json:"quality,omitempty"`  // JPEG/H.264 质量，默认 60
+	MaxWidth int  `json:"maxWidth,omitempty"` // 默认 1920
+	Snapshot bool `json:"snapshot,omitempty"` // 单帧 JPEG 模式（不走 H.264 流）
 }
 
 // ScreenBegin agent → client：流开始（SCREEN_BEGIN text 帧）。
