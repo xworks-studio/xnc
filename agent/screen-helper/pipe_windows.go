@@ -21,6 +21,10 @@ func listenPipe(ctx context.Context, name string) (net.Conn, error) {
 		MessageMode:      false, // 字节流——帧协议自带长度头
 		InputBufferSize:  0,
 		OutputBufferSize: 0,
+		// DACL：所有者 / SYSTEM / Administrators 完全控制。agent 以 Session 0
+		// 服务（SYSTEM）运行，需能连接用户会话 helper 创建的 pipe——默认 SD
+		// （仅创建者）会拒绝跨令牌连接。
+		SecurityDescriptor: "D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)",
 	})
 	if err != nil {
 		return nil, fmt.Errorf("ListenPipe: %w", err)
