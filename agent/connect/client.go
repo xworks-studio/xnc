@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"strings"
 	"sync"
 	"time"
@@ -58,9 +59,15 @@ func NewClient(serverURL string, k *identity.Key, info machineinfo.Info) *Client
 		Beat: 30 * time.Second, BackoffReset: time.Minute, Log: slog.Default()}
 }
 
-// Run 维持控制连接：断开后按 1,2,5,10,30s（上限 30s）退避重连；ctx 取消即返回。
+// Run 维持控制连接：指数退避 + 随机抖动重连。
+//
+// 退避公式：delay = min(2s × 2^n + rand(0, 2s), 5min)，n = 连续失败次数。
+// 连接存活 > BackoffReset（默认 1min）→ n 归零。
+// 抖动防止多节点同时断网后的雷群效应（同批机器不会同时重连）。
+// 长断网场景（笔记本合盖/网线断）5min 封顶比 30s 温和得多。
 func (c *Client) Run(ctx context.Context) error {
-	backoff := []time.Duration{time.Second, 2 * time.Second, 5 * time.Second, 10 * time.Second, 30 * time.Second}
+	const base = 2 * time.Second
+	const maxBackoff = 5 * time.Minute
 	reset := c.BackoffReset
 	if reset <= 0 {
 		reset = time.Minute
@@ -69,18 +76,35 @@ func (c *Client) Run(ctx context.Context) error {
 	for {
 		start := time.Now() // 拨号前记录连接起点
 		if err := c.once(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			c.Log.Warn("control connection lost", "err", err)
+			c.Log.Warn("control connection lost", "attempt", n, "err", err)
 		}
 		if time.Since(start) > reset {
 			n = 0 // 长连接证明健康，退避计数归零
 		}
+		// 指数退避 + 抖动：2s, 4s, 8s, 16s, 32s, 64s, ... → 5min 封顶
+		delay := base << uint(min(n, 18)) // 2^n × 2s，防位移溢出
+		if delay > maxBackoff {
+			delay = maxBackoff
+		}
+		jitter := time.Duration(rand.Int63n(int64(base)))
+		delay += jitter
+		if n > 0 {
+			c.Log.Info("reconnect backoff", "attempt", n, "delay", delay.String())
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(backoff[min(n, len(backoff)-1)]):
+		case <-time.After(delay):
 			n++
 		}
 	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // RunOnce 完成一次 dial → 认证 → HELLO_ACK，随即以正常关闭码收线并返回 nil。

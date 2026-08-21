@@ -144,7 +144,15 @@ func (h *handlers) adminUploadRelease(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	rel, err := h.st.Q().CreateRelease(ctx, sqlc.CreateReleaseParams{Version: version, Notes: notes})
+	channel := r.FormValue("channel")
+	if channel == "" {
+		channel = "stable"
+	}
+	if channel != "stable" && channel != "dev" {
+		respondError(w, proto.Err(400, proto.CodeInternal, "channel must be stable or dev"))
+		return
+	}
+	rel, err := h.st.Q().CreateRelease(ctx, sqlc.CreateReleaseParams{Version: version, Notes: notes, Channel: channel})
 	if err != nil {
 		respondError(w, proto.Err(500, proto.CodeInternal, "create release: "+err.Error()))
 		return
@@ -195,15 +203,17 @@ func (h *handlers) adminListReleases(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]any, 0, len(rels))
 	for _, rel := range rels {
 		out = append(out, map[string]any{
-			"id": rel.ID, "version": rel.Version, "notes": rel.Notes, "createdAt": rel.CreatedAt,
+			"id": rel.ID, "version": rel.Version, "notes": rel.Notes,
+			"channel": rel.Channel, "createdAt": rel.CreatedAt,
 		})
 	}
 	respondJSON(w, http.StatusOK, out)
 }
 
-// adminRollout — POST /api/admin/rollout {version, nodeId} | {unpin:true}。
-// 指定节点 = pin 该节点到版本并立即强制下发 OFFER（快速版本检查 ③）；
-// unpin = 清除所有节点 pin（跟随最新）。
+// adminRollout — POST /api/admin/rollout：
+//   {version, nodeId}                    pin 节点到版本 + 强制 OFFER
+//   {nodeId, channel: "dev"}             切节点频道 + 强制 OFFER（新频道的最新）
+//   {unpin: true}                        清除所有 pin（跟随频道最新）
 func (h *handlers) adminRollout(w http.ResponseWriter, r *http.Request) {
 	u := auth.UserFrom(r.Context())
 	if !isAdminUser(r.Context(), h.st, u.ID) {
@@ -213,6 +223,7 @@ func (h *handlers) adminRollout(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Version string `json:"version"`
 		NodeID  string `json:"nodeId"`
+		Channel string `json:"channel"`
 		Unpin   bool   `json:"unpin"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
@@ -222,7 +233,6 @@ func (h *handlers) adminRollout(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	if req.Unpin {
-		// v1 简化：unpin 通过 pin 到空 = 清 target_release（全部节点）。
 		if err := h.clearAllPins(ctx); err != nil {
 			respondError(w, proto.Err(500, proto.CodeInternal, err.Error()))
 			return
@@ -231,8 +241,8 @@ func (h *handlers) adminRollout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Version == "" || req.NodeID == "" {
-		respondError(w, proto.Err(400, proto.CodeInternal, "version and nodeId required"))
+	if req.NodeID == "" {
+		respondError(w, proto.Err(400, proto.CodeInternal, "nodeId required"))
 		return
 	}
 	nodeID, err := uuid.Parse(req.NodeID)
@@ -240,6 +250,35 @@ func (h *handlers) adminRollout(w http.ResponseWriter, r *http.Request) {
 		respondError(w, proto.Err(400, proto.CodeInternal, "invalid nodeId"))
 		return
 	}
+
+	// 频道切换（可选，与版本 pin 可同时使用）。
+	if req.Channel != "" {
+		if req.Channel != "stable" && req.Channel != "dev" {
+			respondError(w, proto.Err(400, proto.CodeInternal, "channel must be stable or dev"))
+			return
+		}
+		if err := h.st.Q().SetNodeChannel(ctx, sqlc.SetNodeChannelParams{
+			ID: nodeID, Channel: req.Channel,
+		}); err != nil {
+			respondError(w, proto.Err(500, proto.CodeInternal, err.Error()))
+			return
+		}
+	}
+
+	if req.Version == "" {
+		// 仅切频道：不 pin，让节点跟随新频道的最新。
+		offered := false
+		if nc := h.reg.Get(nodeID.String()); nc != nil {
+			node, err := h.st.Q().GetNodeByID(ctx, nodeID)
+			if err == nil {
+				h.maybeOfferUpdate(ctx, nodeID, node.AgentVersion, nc.Send)
+				offered = true
+			}
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"channel": req.Channel, "nodeId": req.NodeID, "offeredNow": offered})
+		return
+	}
+
 	if _, err := h.st.Q().GetReleaseByVersion(ctx, req.Version); err != nil {
 		respondError(w, proto.Err(404, "NOT_FOUND", "release not found"))
 		return
@@ -297,9 +336,13 @@ func (h *handlers) agentBundleDownload(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(art.Data)
 }
 
-// cliLatest — GET /api/cli/latest（用户 JWT）：CLI 自更新元信息。
+// cliLatest — GET /api/cli/latest?channel=（用户 JWT）：CLI 自更新元信息。
 func (h *handlers) cliLatest(w http.ResponseWriter, r *http.Request) {
-	rel, err := h.st.Q().GetLatestRelease(r.Context())
+	channel := r.URL.Query().Get("channel")
+	if channel == "" {
+		channel = "stable"
+	}
+	rel, err := h.st.Q().GetLatestReleaseByChannel(r.Context(), channel)
 	if err != nil {
 		respondError(w, proto.Err(404, "NOT_FOUND", "no releases"))
 		return
@@ -310,13 +353,17 @@ func (h *handlers) cliLatest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respondJSON(w, http.StatusOK, map[string]any{
-		"version": rel.Version, "sha256": art.Sha256, "size": art.Size,
+		"version": rel.Version, "sha256": art.Sha256, "size": art.Size, "channel": channel,
 	})
 }
 
-// cliDownload — GET /api/cli/download（用户 JWT）：CLI 二进制。
+// cliDownload — GET /api/cli/download?channel=（用户 JWT）：CLI 二进制。
 func (h *handlers) cliDownload(w http.ResponseWriter, r *http.Request) {
-	rel, err := h.st.Q().GetLatestRelease(r.Context())
+	channel := r.URL.Query().Get("channel")
+	if channel == "" {
+		channel = "stable"
+	}
+	rel, err := h.st.Q().GetLatestReleaseByChannel(r.Context(), channel)
 	if err != nil {
 		respondError(w, proto.Err(404, "NOT_FOUND", "no releases"))
 		return

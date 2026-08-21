@@ -65,17 +65,26 @@ func consumeDownloadToken(tok string, nodeID uuid.UUID) (uuid.UUID, bool) {
 	return v.ReleaseID, true
 }
 
-// targetReleaseFor — 节点的目标版本（pin 优先，否则最新 release）。
-// 无任何 release 时返回 false（不触发更新）。
+// targetReleaseFor — 节点的目标版本：pin 优先，否则节点所在频道的最新。
+// 无可用 release 时返回 false（不触发更新）。
 func (h *handlers) targetReleaseFor(ctx context.Context, nodeID uuid.UUID) (sqlc.Release, bool) {
 	q := h.st.Q()
-	if pin, err := q.GetNodeTargetRelease(ctx, nodeID); err == nil && pin.Valid {
-		if rel, err := q.GetReleaseByVersion(ctx, pin.String); err == nil {
+	info, err := q.GetNodeTargetRelease(ctx, nodeID)
+	if err != nil {
+		return sqlc.Release{}, false
+	}
+	// admin 显式 pin 最高优先。
+	if info.TargetRelease.Valid {
+		if rel, err := q.GetReleaseByVersion(ctx, info.TargetRelease.String); err == nil {
 			return rel, true
 		}
-		// pin 指向不存在的版本：按无 pin 处理（防御）。
 	}
-	rel, err := q.GetLatestRelease(ctx)
+	// 节点所在频道的最新 release。
+	channel := "stable"
+	if info.Channel != "" {
+		channel = info.Channel
+	}
+	rel, err := q.GetLatestReleaseByChannel(ctx, channel)
 	if err != nil {
 		return sqlc.Release{}, false
 	}

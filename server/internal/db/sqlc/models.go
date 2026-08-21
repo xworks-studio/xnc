@@ -61,6 +61,7 @@ type Node struct {
 	LastSeenAt    pgtype.Timestamptz `json:"last_seen_at"`
 	CreatedAt     time.Time          `json:"created_at"`
 	TargetRelease pgtype.Text        `json:"target_release"`
+	Channel       string             `json:"channel"`
 }
 
 type Release struct {
@@ -68,6 +69,7 @@ type Release struct {
 	Version   string    `json:"version"`
 	Notes     string    `json:"notes"`
 	CreatedAt time.Time `json:"created_at"`
+	Channel   string    `json:"channel"`
 }
 
 type ReleaseArtifact struct {

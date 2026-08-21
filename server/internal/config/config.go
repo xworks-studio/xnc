@@ -18,6 +18,7 @@ type Config struct {
 	ShellPerNode     int           // XNC_SHELL_PER_NODE，默认 10，0 = 不限
 	ShellIdleTimeout time.Duration // XNC_SHELL_IDLE，默认 30m，0 = 不限
 	ShellMaxLifetime time.Duration // XNC_SHELL_MAX，默认 8h，0 = 不限
+	PublicURL        string        // XNC_PUBLIC_URL，安装脚本/SHORT LINK 的基址
 }
 
 func Load() (Config, error) {
@@ -32,6 +33,7 @@ func Load() (Config, error) {
 		ShellPerNode:     envInt("XNC_SHELL_PER_NODE", 10),
 		ShellIdleTimeout: envDur("XNC_SHELL_IDLE", 30*time.Minute),
 		ShellMaxLifetime: envDur("XNC_SHELL_MAX", 8*time.Hour),
+		PublicURL:        env("XNC_PUBLIC_URL", "https://control.xnc.app"),
 	}
 	if c.DatabaseURL == "" {
 		return c, fmt.Errorf("XNC_DATABASE_URL is required")

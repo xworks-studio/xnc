@@ -3,3 +3,22 @@
 		flush_interval -1
 	}
 }
+
+# xnc.app — 快捷安装短域（安装端点直接响应；其余 301 到主域）
+{$XNC_SHORT_DOMAIN} {
+	# 安装端点直接转发（不跳转——curl -L 的管道语义需要直接响应）
+	handle /a/* {
+		reverse_proxy xnc-server:8080
+	}
+	handle /a-dev/* {
+		reverse_proxy xnc-server:8080
+	}
+	handle /c* {
+		reverse_proxy xnc-server:8080
+	}
+	handle /install/* {
+		reverse_proxy xnc-server:8080
+	}
+	# 其余路径 301 到主域名
+	redir https://{$XNC_DOMAIN}{uri} 301
+}

@@ -103,6 +103,18 @@ func NewRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		cr.Get("/latest", h.cliLatest)
 		cr.Get("/download", h.cliDownload)
 	})
+
+	// 快捷安装（无 JWT——token 是凭证；SPA 兜底之前注册）
+	// curl -sL xnc.app/a/<token> | cmd    → agent 安装
+	// curl -sL xnc.app/c | cmd           → CLI 安装
+	r.Get("/a/{token}", h.installAgentCmd)
+	r.Get("/a-dev/{token}", h.installAgentCmd)
+	r.Get("/c", h.installCliCmd)
+	r.Get("/c-dev", h.installCliCmd)
+	// 安装脚本本体（cmd 脚本内引用下载）
+	r.Get("/install/agent.ps1", h.serveAgentInstallPS)
+	r.Get("/install/cli.ps1", h.serveCliInstallPS)
+
 	r.Route("/api/nodes", func(nr chi.Router) {
 		nr.Use(auth.Middleware(cfg.JWTSecret, st))
 		nr.Get("/", h.listNodes)

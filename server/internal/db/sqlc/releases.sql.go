@@ -7,30 +7,33 @@ package sqlc
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const createRelease = `-- name: CreateRelease :one
-INSERT INTO releases (version, notes) VALUES ($1, $2)
-ON CONFLICT (version) DO UPDATE SET notes = EXCLUDED.notes
-RETURNING id, version, notes, created_at
+INSERT INTO releases (version, notes, channel) VALUES ($1, $2, $3)
+ON CONFLICT (version) DO UPDATE SET notes = EXCLUDED.notes, channel = EXCLUDED.channel
+RETURNING id, version, notes, created_at, channel
 `
 
 type CreateReleaseParams struct {
 	Version string `json:"version"`
 	Notes   string `json:"notes"`
+	Channel string `json:"channel"`
 }
 
 func (q *Queries) CreateRelease(ctx context.Context, arg CreateReleaseParams) (Release, error) {
-	row := q.db.QueryRow(ctx, createRelease, arg.Version, arg.Notes)
+	row := q.db.QueryRow(ctx, createRelease, arg.Version, arg.Notes, arg.Channel)
 	var i Release
 	err := row.Scan(
 		&i.ID,
 		&i.Version,
 		&i.Notes,
 		&i.CreatedAt,
+		&i.Channel,
 	)
 	return i, err
 }
@@ -59,35 +62,41 @@ func (q *Queries) GetArtifact(ctx context.Context, arg GetArtifactParams) (Relea
 	return i, err
 }
 
-const getLatestRelease = `-- name: GetLatestRelease :one
-SELECT id, version, notes, created_at FROM releases ORDER BY created_at DESC LIMIT 1
+const getLatestReleaseByChannel = `-- name: GetLatestReleaseByChannel :one
+SELECT id, version, notes, created_at, channel FROM releases WHERE channel = $1 ORDER BY created_at DESC LIMIT 1
 `
 
-func (q *Queries) GetLatestRelease(ctx context.Context) (Release, error) {
-	row := q.db.QueryRow(ctx, getLatestRelease)
+func (q *Queries) GetLatestReleaseByChannel(ctx context.Context, channel string) (Release, error) {
+	row := q.db.QueryRow(ctx, getLatestReleaseByChannel, channel)
 	var i Release
 	err := row.Scan(
 		&i.ID,
 		&i.Version,
 		&i.Notes,
 		&i.CreatedAt,
+		&i.Channel,
 	)
 	return i, err
 }
 
 const getNodeTargetRelease = `-- name: GetNodeTargetRelease :one
-SELECT target_release FROM nodes WHERE id = $1
+SELECT target_release, channel FROM nodes WHERE id = $1
 `
 
-func (q *Queries) GetNodeTargetRelease(ctx context.Context, id uuid.UUID) (pgtype.Text, error) {
+type GetNodeTargetReleaseRow struct {
+	TargetRelease pgtype.Text `json:"target_release"`
+	Channel       string      `json:"channel"`
+}
+
+func (q *Queries) GetNodeTargetRelease(ctx context.Context, id uuid.UUID) (GetNodeTargetReleaseRow, error) {
 	row := q.db.QueryRow(ctx, getNodeTargetRelease, id)
-	var target_release pgtype.Text
-	err := row.Scan(&target_release)
-	return target_release, err
+	var i GetNodeTargetReleaseRow
+	err := row.Scan(&i.TargetRelease, &i.Channel)
+	return i, err
 }
 
 const getReleaseByVersion = `-- name: GetReleaseByVersion :one
-SELECT id, version, notes, created_at FROM releases WHERE version = $1
+SELECT id, version, notes, created_at, channel FROM releases WHERE version = $1
 `
 
 func (q *Queries) GetReleaseByVersion(ctx context.Context, version string) (Release, error) {
@@ -98,27 +107,37 @@ func (q *Queries) GetReleaseByVersion(ctx context.Context, version string) (Rele
 		&i.Version,
 		&i.Notes,
 		&i.CreatedAt,
+		&i.Channel,
 	)
 	return i, err
 }
 
 const listReleases = `-- name: ListReleases :many
-SELECT id, version, notes, created_at FROM releases ORDER BY created_at DESC LIMIT 50
+SELECT id, version, notes, channel, created_at FROM releases ORDER BY created_at DESC LIMIT 50
 `
 
-func (q *Queries) ListReleases(ctx context.Context) ([]Release, error) {
+type ListReleasesRow struct {
+	ID        uuid.UUID `json:"id"`
+	Version   string    `json:"version"`
+	Notes     string    `json:"notes"`
+	Channel   string    `json:"channel"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func (q *Queries) ListReleases(ctx context.Context) ([]ListReleasesRow, error) {
 	rows, err := q.db.Query(ctx, listReleases)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []Release
+	var items []ListReleasesRow
 	for rows.Next() {
-		var i Release
+		var i ListReleasesRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.Version,
 			&i.Notes,
+			&i.Channel,
 			&i.CreatedAt,
 		); err != nil {
 			return nil, err
@@ -154,6 +173,20 @@ func (q *Queries) PutArtifact(ctx context.Context, arg PutArtifactParams) error 
 		arg.Size,
 		arg.Data,
 	)
+	return err
+}
+
+const setNodeChannel = `-- name: SetNodeChannel :exec
+UPDATE nodes SET channel = $2 WHERE id = $1
+`
+
+type SetNodeChannelParams struct {
+	ID      uuid.UUID `json:"id"`
+	Channel string    `json:"channel"`
+}
+
+func (q *Queries) SetNodeChannel(ctx context.Context, arg SetNodeChannelParams) error {
+	_, err := q.db.Exec(ctx, setNodeChannel, arg.ID, arg.Channel)
 	return err
 }
 

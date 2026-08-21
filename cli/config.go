@@ -11,6 +11,7 @@ type Config struct {
 	Server          string `json:"server"`
 	Token           string `json:"token"`
 	RememberedEmail string `json:"remembered_email,omitempty"` // login 交互提示的默认邮箱
+	Channel         string `json:"channel,omitempty"`          // update 频道偏好（stable|dev）
 }
 
 func configPath() string {

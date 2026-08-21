@@ -21,35 +21,55 @@ type cliLatestInfo struct {
 	Version string `json:"version"`
 	SHA256  string `json:"sha256"`
 	Size    int64  `json:"size"`
+	Channel string `json:"channel"`
 }
 
 func newUpdateCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "update",
+	var channel string
+	cmd := &cobra.Command{
+		Use:   "update [--channel stable|dev]",
 		Short: "Update the xnc CLI to the latest release",
-		RunE:  runUpdate,
+		RunE: func(c *cobra.Command, _ []string) error {
+			return runUpdate(c, channel)
+		},
 	}
+	cmd.Flags().StringVar(&channel, "channel", "",
+		"release channel (stable|dev; empty = saved preference or stable)")
+	return cmd
 }
 
-func runUpdate(cmd *cobra.Command, _ []string) error {
+func runUpdate(cmd *cobra.Command, channelFlag string) error {
 	cl, usage := dial(cmd, true)
 	if usage != "" {
 		return failUsage(cmd, usage)
 	}
 
 	// 1. 元信息。
+	// 频道解析：flag > 保存的偏好 > stable。非默认频道保存偏好。
+	if channelFlag == "" {
+		channelFlag = savedChannel()
+	}
+	if channelFlag == "" {
+		channelFlag = "stable"
+	}
+	if channelFlag != "stable" && channelFlag != "dev" {
+		return failUsage(cmd, "channel must be stable or dev")
+	}
+	saveChannel(channelFlag)
+
 	var latest cliLatestInfo
-	if err := cl.Do("GET", "/api/cli/latest", nil, &latest); err != nil {
+	path := "/api/cli/latest?channel=" + channelFlag
+	if err := cl.Do("GET", path, nil, &latest); err != nil {
 		return failAPI(cmd, err)
 	}
 	if latest.Version == cliVersion {
-		fmt.Fprintf(cmd.OutOrStdout(), "已是最新版本 (%s)\n", cliVersion)
+		fmt.Fprintf(cmd.OutOrStdout(), "已是最新版本 (%s, %s)\n", cliVersion, channelFlag)
 		return nil
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "当前 %s → 最新 %s\n", cliVersion, latest.Version)
+	fmt.Fprintf(cmd.OutOrStdout(), "当前 %s → 最新 %s [%s]\n", cliVersion, latest.Version, channelFlag)
 
 	// 2. 下载（Bearer 认证的裸 HTTP）。
-	body, err := downloadAuthenticated(cl, "/api/cli/download")
+	body, err := downloadAuthenticated(cl, "/api/cli/download?channel="+channelFlag)
 	if err != nil {
 		return failAPI(cmd, proto.Err(0, "NETWORK", err.Error()))
 	}
@@ -106,4 +126,20 @@ func cleanupOldCLI() {
 	if exe, err := os.Executable(); err == nil {
 		_ = os.Remove(exe + ".old")
 	}
+}
+
+// savedChannel 读取保存的频道偏好（config.json 的 channel 字段）。
+func savedChannel() string {
+	cfg, _ := LoadConfig()
+	return cfg.Channel
+}
+
+// saveChannel 持久化频道偏好（幂等——写入 config.json 但不覆盖 token）。
+func saveChannel(ch string) {
+	cfg, _ := LoadConfig()
+	if cfg.Channel == ch {
+		return
+	}
+	cfg.Channel = ch
+	_ = SaveConfig(cfg)
 }

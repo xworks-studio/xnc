@@ -14,7 +14,7 @@ import (
 const createNode = `-- name: CreateNode :one
 INSERT INTO nodes (id, cluster_id, name, machine_id, hostname, os_version,
                    agent_version, shell_type, public_key)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id, cluster_id, name, machine_id, hostname, os_version, agent_version, shell_type, public_key, status, last_seen_at, created_at, target_release
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id, cluster_id, name, machine_id, hostname, os_version, agent_version, shell_type, public_key, status, last_seen_at, created_at, target_release, channel
 `
 
 type CreateNodeParams struct {
@@ -56,12 +56,13 @@ func (q *Queries) CreateNode(ctx context.Context, arg CreateNodeParams) (Node, e
 		&i.LastSeenAt,
 		&i.CreatedAt,
 		&i.TargetRelease,
+		&i.Channel,
 	)
 	return i, err
 }
 
 const getNodeByID = `-- name: GetNodeByID :one
-SELECT id, cluster_id, name, machine_id, hostname, os_version, agent_version, shell_type, public_key, status, last_seen_at, created_at, target_release FROM nodes WHERE id = $1
+SELECT id, cluster_id, name, machine_id, hostname, os_version, agent_version, shell_type, public_key, status, last_seen_at, created_at, target_release, channel FROM nodes WHERE id = $1
 `
 
 func (q *Queries) GetNodeByID(ctx context.Context, id uuid.UUID) (Node, error) {
@@ -81,12 +82,13 @@ func (q *Queries) GetNodeByID(ctx context.Context, id uuid.UUID) (Node, error) {
 		&i.LastSeenAt,
 		&i.CreatedAt,
 		&i.TargetRelease,
+		&i.Channel,
 	)
 	return i, err
 }
 
 const getNodeByIdentity = `-- name: GetNodeByIdentity :one
-SELECT id, cluster_id, name, machine_id, hostname, os_version, agent_version, shell_type, public_key, status, last_seen_at, created_at, target_release FROM nodes WHERE cluster_id = $1 AND machine_id = $2
+SELECT id, cluster_id, name, machine_id, hostname, os_version, agent_version, shell_type, public_key, status, last_seen_at, created_at, target_release, channel FROM nodes WHERE cluster_id = $1 AND machine_id = $2
 `
 
 type GetNodeByIdentityParams struct {
@@ -111,12 +113,13 @@ func (q *Queries) GetNodeByIdentity(ctx context.Context, arg GetNodeByIdentityPa
 		&i.LastSeenAt,
 		&i.CreatedAt,
 		&i.TargetRelease,
+		&i.Channel,
 	)
 	return i, err
 }
 
 const getNodeByNameInCluster = `-- name: GetNodeByNameInCluster :one
-SELECT id, cluster_id, name, machine_id, hostname, os_version, agent_version, shell_type, public_key, status, last_seen_at, created_at, target_release FROM nodes WHERE cluster_id = $1 AND name = $2
+SELECT id, cluster_id, name, machine_id, hostname, os_version, agent_version, shell_type, public_key, status, last_seen_at, created_at, target_release, channel FROM nodes WHERE cluster_id = $1 AND name = $2
 `
 
 type GetNodeByNameInClusterParams struct {
@@ -141,6 +144,7 @@ func (q *Queries) GetNodeByNameInCluster(ctx context.Context, arg GetNodeByNameI
 		&i.LastSeenAt,
 		&i.CreatedAt,
 		&i.TargetRelease,
+		&i.Channel,
 	)
 	return i, err
 }

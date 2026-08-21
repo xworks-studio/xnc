@@ -19,6 +19,7 @@ services:
       dockerfile: deploy/Dockerfile
     environment:
       XNC_DATABASE_URL: postgres://xnc:${POSTGRES_PASSWORD}@postgres:5432/xnc
+      XNC_PUBLIC_URL: ${XNC_PUBLIC_URL:-https://control.xnc.app}
       XNC_JWT_SECRET: ${XNC_JWT_SECRET}
       XNC_ADMIN_EMAIL: ${XNC_ADMIN_EMAIL}
       XNC_ADMIN_PASSWORD: ${XNC_ADMIN_PASSWORD}
@@ -32,6 +33,7 @@ services:
     ports: ["80:80", "443:443"]
     environment:
       XNC_DOMAIN: ${XNC_DOMAIN}
+      XNC_SHORT_DOMAIN: ${XNC_SHORT_DOMAIN:-xnc.app}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
