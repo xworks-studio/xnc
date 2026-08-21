@@ -103,6 +103,7 @@ func runOne(ctx context.Context, server, token, dir string, i int, beat, disc ti
 		engine.Register(proto.KindShell, session.NewShell(log))
 		engine.Register(proto.KindFile, session.NewFile(log))
 		engine.Register(proto.KindTunnel, session.NewTunnel(log))
+		engine.Register(proto.KindScreen, session.NewScreenHandler())
 		c.Handler = engine
 	}
 

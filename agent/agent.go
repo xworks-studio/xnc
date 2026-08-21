@@ -58,6 +58,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		engine.Register(proto.KindShell, session.NewShell(slog.Default()))
 		engine.Register(proto.KindFile, session.NewFile(slog.Default()))
 		engine.Register(proto.KindTunnel, session.NewTunnel(slog.Default()))
+		engine.Register(proto.KindScreen, session.NewScreenHandler())
 		c.Handler = engine
 	}
 	return c.Run(ctx)
