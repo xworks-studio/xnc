@@ -55,6 +55,13 @@ func NewRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		cr.Post("/", h.createCluster)
 	})
 
+	// 用户管理：无自注册，仅 admin（任一 cluster owner）可创建/列出。
+	r.Route("/api/users", func(ur chi.Router) {
+		ur.Use(auth.Middleware(cfg.JWTSecret, st))
+		ur.Post("/", h.createUser)
+		ur.Get("/", h.listUsers)
+	})
+
 	r.Route("/api/clusters/{id}/enrollment-tokens", func(tr chi.Router) {
 		tr.Use(auth.Middleware(cfg.JWTSecret, st))
 		tr.Post("/", h.createEnrollToken)
