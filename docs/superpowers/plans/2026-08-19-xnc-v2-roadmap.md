@@ -142,7 +142,7 @@ skills/xnc 同步    CLI 每新增命令，核对 skills/xnc/references/cli.md �
 | 2 | `docs/superpowers/plans/2026-08-20-xnc-v2-phase2-exec.md` | ✅ 就绪待执行 |
 | 3 | `docs/superpowers/plans/2026-08-20-xnc-v2-phase3-shell.md`（Gate B 已通过） | ✅ 已完成并合并（2026-08-20，生产验收通过） |
 | 4 | `docs/superpowers/plans/2026-08-21-xnc-v2-phase4-files-tunnel.md` | ✅ 就绪待执行 |
-| 5 | `<date>-xnc-v2-phase5-multiuser.md` | ⏳ |
+| 5 | `docs/superpowers/plans/2026-08-21-xnc-v2-phase5-multiuser.md` | ✅ 就绪待执行 |
 | 6 | `<date>-xnc-v2-phase6-screen.md` | ⏳ |
 | 7 | `<date>-xnc-v2-phase7-webui.md` | ⏳ |
 | 8 | `<date>-xnc-v2-phase8-linux.md` | ⏳ 远期 |
