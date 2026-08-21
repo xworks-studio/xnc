@@ -30,7 +30,7 @@ func (n nodeDTO) lastSeen() string {
 
 func newNodeCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "node", Short: "Node operations"}
-	cmd.AddCommand(newNodeListCmd(), newNodeShowCmd())
+	cmd.AddCommand(newNodeListCmd(), newNodeShowCmd(), newNodeDisableCmd(), newNodeEnableCmd())
 	return cmd
 }
 

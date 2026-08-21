@@ -6,7 +6,7 @@ import (
 
 func newClusterCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "cluster", Short: "Cluster operations"}
-	cmd.AddCommand(newClusterListCmd())
+	cmd.AddCommand(newClusterListCmd(), newClusterMemberCmd(), newClusterDeleteCmd())
 	return cmd
 }
 
