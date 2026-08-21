@@ -1,0 +1,14 @@
+# 构建上下文瘦身（镜像只 COPY proto/server/web*）+ 秘密隔离。
+# 注意：server/web/dist 不在此列——go:embed 的仓库占位需随 COPY server 进
+# 上下文（随后被 Node 阶段产物覆盖）。
+.git
+.worktrees
+.superpowers
+docs
+bin
+**/node_modules
+web/dist
+deploy/.env
+deploy/machines.env
+*.log
+*.exe
