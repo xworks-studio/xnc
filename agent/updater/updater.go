@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"xnc/proto"
 )
@@ -124,7 +125,8 @@ func (u *Updater) download(ctx context.Context, offer proto.UpdateOffer) ([]byte
 	if err != nil {
 		return nil, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	hc := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, err
 	}

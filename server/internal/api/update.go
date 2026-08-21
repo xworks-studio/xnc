@@ -102,7 +102,7 @@ func (h *handlers) maybeOfferUpdate(ctx context.Context, nodeID uuid.UUID, curre
 	tok := mintDownloadToken(nodeID, rel.ID)
 	offer, _ := proto.NewMsg(proto.TypeUpdateOffer, proto.UpdateOffer{
 		Version: rel.Version,
-		URL:     "/api/agent/bundle?token=" + tok,
+		URL:     "/api/agent/bundle?token=" + tok + "&node=" + nodeID.String(),
 		SHA256:  art.Sha256,
 	})
 	if err := send(offer); err != nil {
