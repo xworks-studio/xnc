@@ -25,7 +25,7 @@
 - Node disable/enable：仅 owner；disabled 节点拒绝一切会话创建（403 NODE_DISABLED）。
 - Cluster delete：仅 owner；有节点时 409（先 disable+清理节点）；软删除（name 加后缀 `_deleted_<ts>` 保留审计链）。
 - 审计 action 新增：`user.create`、`cluster.delete`、`cluster.member.add`、`cluster.member.remove`、`node.disable`、`node.enable`。
-- CLI 契约（cli.md §57）：`xnc user create/list`、`xnc cluster member add/remove/list`、`xnc node disable/enable`、`xnc audit list`。
+- CLI 契约（cli.md §57）：`xnc cluster member add/remove/list`、`xnc node disable/enable`、`xnc audit list`。**用户创建不做 CLI**（REST 端点留给 Phase 7 Web UI）。
 - 退出码：FORBIDDEN→241、NODE_DISABLED→242（或 250——spec §51 无专用码，用 403 HTTP + FORBIDDEN 错误码→241）。
 - 每任务一 commit。
 
@@ -193,7 +193,7 @@ sqlc: QueryAuditLog（动态 WHERE + LIMIT/OFFSET）
 ### Task 6: CLI — 全部新命令
 
 **Files:**
-- Create: `cli/cmd_user.go`、`cli/cmd_member.go`、`cli/cmd_admin.go`、`cli/cmd_audit.go`
+- Create: `cli/cmd_member.go`、`cli/cmd_admin.go`、`cli/cmd_audit.go`
 - Modify: `cli/main.go`（注册）
 - Test: `cli/cmd_admin_test.go`
 
@@ -202,8 +202,6 @@ sqlc: QueryAuditLog（动态 WHERE + LIMIT/OFFSET）
 - Produces:
 
 ```text
-xnc user create <email> [--display-name N]     # 密码 stdin；--json envelope
-xnc user list                                  # table: EMAIL DISPLAY_NAME ID
 xnc cluster member list <cluster>              # table: EMAIL ROLE
 xnc cluster member add <cluster> <user-id> --role <r>
 xnc cluster member remove <cluster> <user-id>
@@ -212,7 +210,9 @@ xnc cluster delete <cluster>
 xnc audit list [--node n] [--user u] [--action a] [--since 7d] [--limit 50]
 ```
 
-- [ ] **Step 1-5:** TDD 循环（commit `feat(cli): user, member, admin, and audit commands`）。测试：envelope golden + 退出码（241 on 403）。
+**注意**：用户创建/列表**不做 CLI**——REST 端点（T1）保留给 Phase 7 Web UI 消费。admin 在 Web UI 上线前用 curl 或直接调 API 创建用户。
+
+- [ ] **Step 1-5:** TDD 循环（commit `feat(cli): member, admin, and audit commands`）。测试：envelope golden + 退出码（241 on 403）。
 
 ---
 
