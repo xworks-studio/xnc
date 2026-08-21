@@ -3,6 +3,7 @@
 package main
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -14,6 +15,12 @@ import (
 func runAgent(server, token, stateDir string) error {
 	a := &agent.Agent{ServerURL: server, Token: token, StateDir: stateDir}
 	if svcapp.IsService() {
+		// 服务上下文无有效 stdout/stderr——日志落盘 state 目录（否则
+		// slog 默认写入无效句柄，诊断全部丢失）。
+		if f, ferr := os.OpenFile(filepath.Join(stateDir, "agent-service.log"),
+			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); ferr == nil {
+			slog.SetDefault(slog.New(slog.NewTextHandler(f, nil)))
+		}
 		return svcapp.Run(a)
 	}
 	return a.Run(cmdContext())

@@ -1,15 +1,9 @@
 //go:build windows
 
-// capture_windows.go — DXGI Desktop Duplication GPU 捕获（纯 syscall COM，
-// CGO_ENABLED=0）。流程：
-//
-//	CoInitializeEx → CreateDXGIFactory1 → EnumAdapters1 → EnumOutputs →
-//	GetDesc（分辨率）→ QueryInterface(IDXGIOutput1) → D3D11CreateDevice →
-//	DuplicateOutput → 循环 AcquireNextFrame → CopyResource(staging) →
-//	Map → BGRA 字节 → ReleaseFrame。
-//
-// 所有 COM 调用走 vtable 槽位 syscall；GUID 从 Windows SDK 头文件复制。
-// DXGI 不可用（旧驱动 / 权限）时返回错误，调用方回退 GDI（T7）。
+// capture_windows.go — 捕获主循环与共享 COM syscall 基础设施。
+// 捕获源唯一：Windows.Graphics.Capture（capture_wgc_windows.go）——无
+// DXGI/GDI 回退。WGC 不可用（Win10 < 1903 等）时走 placeholderLoop 报告
+// 状态帧保活，不产出画面。
 package main
 
 import (
@@ -18,6 +12,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"syscall"
 	"time"
 	"unsafe"
@@ -27,20 +22,10 @@ import (
 
 // ---- 哨兵错误 ----
 
-var (
-	// ErrAccessLost — 锁屏 / 桌面切换 / 模式变化：需重建 duplication。
-	ErrAccessLost = errors.New("dxgi access lost")
-	// ErrTimeout — timeout 内无新帧（桌面静止）。
-	ErrTimeout = errors.New("dxgi acquire timeout")
-)
+// ErrTimeout — timeout 内无新帧（桌面静止：合成器无更新）。
+var ErrTimeout = errors.New("capture acquire timeout")
 
-const (
-	dxgiErrAccessLost = 0x887A0026
-	waitTimeout       = 0x80070102 // HRESULT_FROM_WIN32(WAIT_TIMEOUT)
-	rpcEChangedMode   = 0x80010106
-)
-
-// ---- GUID（复制自 SDK 头）----
+// ---- COM vtable 基础（共享：捕获 + 编码器）----
 
 type guid struct {
 	Data1 uint32
@@ -48,13 +33,6 @@ type guid struct {
 	Data3 uint16
 	Data4 [8]byte
 }
-
-var (
-	iidIDXGIFactory1 = guid{0x770aae78, 0xf26f, 0x4dba, [8]byte{0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87}}
-	iidIDXGIOutput1  = guid{0x00cddea8, 0x939b, 0x4b83, [8]byte{0xa3, 0x40, 0xa6, 0x85, 0x22, 0x66, 0x66, 0xcc}}
-)
-
-// ---- COM vtable 基础 ----
 
 // comPtr 包装裸 COM 接口指针。底层存 unsafe.Pointer（vtable 指针），
 // uintptr 转换仅出现在 syscall 实参位置（go vet 合规）。
@@ -126,34 +104,18 @@ func (p comPtr) release() {
 	}
 }
 
-// hrOf 从 call 的 r1 恢复 HRESULT 原值（错误分支也携带）。
-func hrOf(r1 uintptr) uint32 { return uint32(r1) }
-
-// ---- vtable 槽位（按 SDK 接口方法顺序）----
+// ---- vtable 槽位（D3D11，SDK 头顺序核实，勿改）----
 
 const (
-	vtFactoryEnumAdapters1 = 12 // IDXGIFactory1: IUnknown3+IDXGIObject4+IDXGIFactory5+EnumAdapters1
-
-	vtAdapterEnumOutputs = 7 // IDXGIAdapter1: ...+GetDesc8,EnumOutputs9,Check...
-
-	vtOutputGetDesc = 7 // IDXGIOutput: IUnknown3+IDXGIObject4+GetDesc7,GetDisplayModeList8,...
-
-	vtOutput1DuplicateOutput = 20 // IDXGIOutput1: IDXGIOutput17+GetDisplaySurfaceData18,ReleaseFrameOwnership19,DuplicateOutput20
-
-	vtDupAcquireNextFrame = 8  // IDXGIOutputDuplication: IUnknown0-2,GetDesc3,...,AcquireNextFrame8
-	vtDupReleaseFrame     = 12 // GetFrameDirtyRects9,GetFrameMoveRects10,GetFramePointerShape11,ReleaseFrame12
-
 	vtDeviceCreateTexture2D = 5 // ID3D11Device: IUnknown0-2,CreateBuffer3,CreateTexture1D4,CreateTexture2D5
-
-	vtContextCopyResource = 47 // ID3D11DeviceContext: IUnknown0-2+ID3D11DeviceChild3-4,...,Map14,Unmap15,...,CopyResource47
-	vtContextMap          = 14 // ...,Map14,Unmap15
-	vtContextUnmap        = 15
+	vtContextMap            = 14
+	vtContextUnmap          = 15
+	vtContextCopyResource   = 47
 )
 
-// ---- DXGI/D3D11 常量 ----
+// ---- D3D11 常量 ----
 
 const (
-	d3dDriverTypeUnknown         = 0
 	d3d11CreateDeviceBgraSupport = 0x20
 	d3d11SdkVersion              = 7
 	dxgiFormatB8G8R8A8UNorm      = 87
@@ -162,22 +124,6 @@ const (
 )
 
 // ---- 结构体（x64 布局）----
-
-// dxgiOutputDesc 对应 DXGI_OUTPUT_DESC（GetDesc 输出）。
-type dxgiOutputDesc struct {
-	DeviceName         [32]uint16 // 64B
-	DesktopCoordinates rect
-	AttachedToDesktop  uint32
-	Rotation           uint32
-	Monitor            uintptr
-}
-
-type rect struct {
-	Left, Top, Right, Bottom int32
-}
-
-func (r rect) width() int  { return int(r.Right - r.Left) }
-func (r rect) height() int { return int(r.Bottom - r.Top) }
 
 // d3d11Texture2DDesc 对应 D3D11_TEXTURE2D_DESC。
 type d3d11Texture2DDesc struct {
@@ -196,246 +142,21 @@ type d3d11MappedSubresource struct {
 	DepthPitch uint32
 }
 
-// dxgiOutduplFrameInfo 对应 DXGI_OUTDUPL_FRAME_INFO（仅用到头部字段）。
-type dxgiOutduplFrameInfo struct {
-	LastPresentTime           int64
-	LastPresentUpdateTime     int64
-	AccumulatedFrames         uint32
-	RectsCoalesced            uint32
-	ProtectedContentMaskedOut uint32
-	TotalMetadataSize         uint32
-}
-
 // ---- DLL ----
 
 var (
-	dxgiDLL  = windows.NewLazySystemDLL("dxgi.dll")
-	d3d11DLL = windows.NewLazySystemDLL("d3d11.dll")
+	user32DLL = windows.NewLazySystemDLL("user32.dll")
+	d3d11DLL  = windows.NewLazySystemDLL("d3d11.dll")
 
-	procCreateDXGIFactory1 = dxgiDLL.NewProc("CreateDXGIFactory1")
-	procD3D11CreateDevice  = d3d11DLL.NewProc("D3D11CreateDevice")
+	procD3D11CreateDevice = d3d11DLL.NewProc("D3D11CreateDevice")
 )
 
-// ---- DXGICapturer ----
+// hrOf 从 call 的 r1 恢复 HRESULT 原值（错误分支也携带）。
+func hrOf(r1 uintptr) uint32 { return uint32(r1) }
 
-// DXGICapturer 封装 Desktop Duplication 管线（主显示器）。
-type DXGICapturer struct {
-	factory       comPtr // IDXGIFactory1
-	adapter       comPtr // IDXGIAdapter1
-	output        comPtr // IDXGIOutput
-	output1       comPtr // IDXGIOutput1
-	duplication   comPtr // IDXGIOutputDuplication
-	device        comPtr // ID3D11Device
-	context       comPtr // ID3D11DeviceContext
-	staging       comPtr // ID3D11Texture2D（CPU 可读）
-	width, height int
+const rpcEChangedMode = 0x80010106
 
-	coInit bool
-}
-
-// NewDXGICapturer 初始化 Desktop Duplication。遍历所有适配器/输出，
-// 取第一个连桌面且 DuplicateOutput 成功的组合（混合显卡设备上 adapter 0
-// 未必持有桌面输出——单设备创建在 dGPU 上会 INVALID_CALL）。全部失败返回
-// 最后一个错误，调用方回退 GDI。
-func NewDXGICapturer() (*DXGICapturer, error) {
-	hr, err := coInitializeEx()
-	if err != nil && hr != rpcEChangedMode {
-		return nil, fmt.Errorf("CoInitializeEx: %w", err)
-	}
-	c := &DXGICapturer{coInit: err == nil}
-
-	var factory comPtr
-	r, _, e := procCreateDXGIFactory1.Call(uintptr(unsafe.Pointer(&iidIDXGIFactory1)), uintptr(unsafe.Pointer(&factory.p)))
-	if r != 0 {
-		return nil, fmt.Errorf("CreateDXGIFactory1: %v", e)
-	}
-	c.factory = factory
-
-	var lastErr error
-	for ai := 0; ai < 4; ai++ {
-		var adapter comPtr
-		if _, err := factory.call(vtFactoryEnumAdapters1, uintptr(ai), uintptr(unsafe.Pointer(&adapter.p))); err != nil {
-			break // 适配器列表耗尽
-		}
-		matched := false
-		for oi := 0; oi < 4; oi++ {
-			var output comPtr
-			if _, err := adapter.call(vtAdapterEnumOutputs, uintptr(oi), uintptr(unsafe.Pointer(&output.p))); err != nil {
-				break // 该适配器输出耗尽
-			}
-			cc, err := c.tryDuplicate(adapter, output)
-			if err != nil {
-				lastErr = err
-				output.release()
-				continue
-			}
-			// 成功：接管资源所有权并返回。
-			c.adapter, c.output, c.output1 = adapter, output, cc.output1
-			c.device, c.context, c.duplication, c.staging = cc.device, cc.context, cc.duplication, cc.staging
-			c.width, c.height = cc.width, cc.height
-			matched = true
-			return c, nil
-		}
-		if !matched {
-			adapter.release()
-		}
-	}
-	c.Close()
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no desktop-attached output")
-	}
-	return nil, lastErr
-}
-
-// duplAttempt — tryDuplicate 成功结果的资源集合。
-type duplAttempt struct {
-	output1       comPtr // IDXGIOutput1
-	duplication   comPtr // IDXGIOutputDuplication
-	device        comPtr // ID3D11Device
-	context       comPtr // ID3D11DeviceContext
-	staging       comPtr // ID3D11Texture2D（CPU 可读）
-	width, height int
-}
-
-// tryDuplicate 在指定 adapter/output 上创建设备并尝试 DuplicateOutput。
-// 成功时返回全部资源（所有权归调用方）；失败时清理自身并返回错误。
-func (c *DXGICapturer) tryDuplicate(adapter, output comPtr) (*duplAttempt, error) {
-	var desc dxgiOutputDesc
-	if _, err := output.call(vtOutputGetDesc, uintptr(unsafe.Pointer(&desc))); err != nil {
-		return nil, fmt.Errorf("GetDesc: %w", err)
-	}
-	if desc.AttachedToDesktop == 0 {
-		return nil, fmt.Errorf("output not attached to desktop")
-	}
-	w, h := desc.DesktopCoordinates.width(), desc.DesktopCoordinates.height()
-	if w <= 0 || h <= 0 {
-		return nil, fmt.Errorf("invalid output desc %dx%d", w, h)
-	}
-
-	out1, err := output.queryInterface(&iidIDXGIOutput1)
-	if err != nil {
-		return nil, fmt.Errorf("QI IDXGIOutput1: %w", err)
-	}
-	a := &duplAttempt{output1: out1, width: w, height: h}
-	fail := func(err error) (*duplAttempt, error) {
-		a.staging.release()
-		a.context.release()
-		a.device.release()
-		out1.release()
-		return nil, err
-	}
-
-	// D3D11CreateDevice（adapter 非 NULL → DriverType 必须 UNKNOWN）。
-	var featureLevel uint32
-	r, _, e := procD3D11CreateDevice.Call(
-		adapter.u(), uintptr(d3dDriverTypeUnknown), 0,
-		uintptr(d3d11CreateDeviceBgraSupport),
-		0, 0, uintptr(d3d11SdkVersion),
-		uintptr(unsafe.Pointer(&a.device.p)), uintptr(unsafe.Pointer(&featureLevel)),
-		uintptr(unsafe.Pointer(&a.context.p)),
-	)
-	if r != 0 {
-		return fail(fmt.Errorf("D3D11CreateDevice: %v", e))
-	}
-
-	// staging texture（CPU 读）。
-	texDesc := d3d11Texture2DDesc{
-		Width: uint32(w), Height: uint32(h),
-		MipLevels: 1, ArraySize: 1,
-		SampleCount:    1,
-		Format:         dxgiFormatB8G8R8A8UNorm,
-		Usage:          d3d11UsageStaging,
-		CPUAccessFlags: d3d11CpuAccessRead,
-	}
-	if _, err := a.device.call(vtDeviceCreateTexture2D, uintptr(unsafe.Pointer(&texDesc)), 0, uintptr(unsafe.Pointer(&a.staging.p))); err != nil {
-		return fail(fmt.Errorf("CreateTexture2D(staging): %w", err))
-	}
-	if _, err := out1.call(vtOutput1DuplicateOutput, a.device.u(), uintptr(unsafe.Pointer(&a.duplication.p))); err != nil {
-		return fail(fmt.Errorf("DuplicateOutput: %w", err))
-	}
-	return a, nil
-}
-
-// AcquireFrame 阻塞等待下一帧（timeout 毫秒），返回全帧 BGRA（top-down）。
-// 桌面静止超时返回 ErrTimeout；锁屏/访问丢失返回 ErrAccessLost。
-// 注：当前返回全帧像素；脏区子矩形优化待编码器接入（T6/T7）后启用。
-func (c *DXGICapturer) AcquireFrame(timeoutMs uint) ([]byte, []rect, error) {
-	var info dxgiOutduplFrameInfo
-	var texture comPtr
-	r1, err := c.duplication.call(vtDupAcquireNextFrame, uintptr(timeoutMs),
-		uintptr(unsafe.Pointer(&info)), uintptr(unsafe.Pointer(&texture.p)))
-	if err != nil {
-		hr := hrOf(r1)
-		if hr == dxgiErrAccessLost {
-			return nil, nil, ErrAccessLost
-		}
-		if hr == waitTimeout {
-			return nil, nil, ErrTimeout
-		}
-		return nil, nil, fmt.Errorf("AcquireNextFrame: %w", err)
-	}
-	defer c.ReleaseFrame()
-
-	// GPU 纹理 → staging → Map → 内存
-	if _, err := c.context.call(vtContextCopyResource, c.staging.u(), texture.u()); err != nil {
-		return nil, nil, fmt.Errorf("CopyResource: %w", err)
-	}
-	texture.release()
-
-	var mapped d3d11MappedSubresource
-	if _, err := c.context.call(vtContextMap, c.staging.u(), 0, 1 /*D3D11_MAP_READ*/, 0, uintptr(unsafe.Pointer(&mapped))); err != nil {
-		return nil, nil, fmt.Errorf("Map: %w", err)
-	}
-	defer c.context.call(vtContextUnmap, c.staging.u(), 0)
-
-	stride := c.width * 4
-	buf := make([]byte, c.height*stride)
-	src := unsafe.Slice((*byte)(mapped.pData), int(mapped.RowPitch)*c.height)
-	for row := 0; row < c.height; row++ {
-		copy(buf[row*stride:(row+1)*stride], src[row*int(mapped.RowPitch):row*int(mapped.RowPitch)+stride])
-	}
-	return buf, nil, nil
-}
-
-// ReleaseFrame 归还当前帧给 duplication（AcquireFrame 内部已 defer 调用；
-// 导出供异常路径手动归还）。
-func (c *DXGICapturer) ReleaseFrame() {
-	if c.duplication.valid() {
-		_, _ = c.duplication.call(vtDupReleaseFrame)
-	}
-}
-
-// recreate 销毁并重建 duplication（ErrAccessLost 后恢复：锁屏返回 /
-// 桌面切换 / 显示模式变化）。设备等长生命周期接口保持不动。
-func (c *DXGICapturer) recreate() error {
-	// 若仍持有帧，先归还（access lost 后通常已失效，忽略错误）。
-	c.ReleaseFrame()
-	if c.duplication.valid() {
-		c.duplication.release()
-		c.duplication = nilPtr
-	}
-	var dup comPtr
-	if _, err := c.output1.call(vtOutput1DuplicateOutput, c.device.u(), uintptr(unsafe.Pointer(&dup.p))); err != nil {
-		return fmt.Errorf("DuplicateOutput(recreate): %w", err)
-	}
-	c.duplication = dup
-	return nil
-}
-
-// Close 释放全部 COM 资源。
-func (c *DXGICapturer) Close() {
-	for _, p := range []comPtr{c.duplication, c.staging, c.context, c.device, c.output1, c.output, c.adapter, c.factory} {
-		p.release()
-	}
-	c.duplication, c.staging, c.context, c.device = nilPtr, nilPtr, nilPtr, nilPtr
-	c.output1, c.output, c.adapter, c.factory = nilPtr, nilPtr, nilPtr, nilPtr
-	if c.coInit {
-		coUninitialize()
-		c.coInit = false
-	}
-}
-
-// ---- ole32 ----
+// ---- ole32（编码器 MFT 路径使用）----
 
 var (
 	ole32        = windows.NewLazySystemDLL("ole32.dll")
@@ -468,44 +189,28 @@ func bitrateFor(quality int) int {
 	return 500_000 + quality*30_000 // q60 ≈ 2.3Mbps（1080p 30fps 预算内）
 }
 
-// captureLoop：DXGI 优先（GDI 回退）→ 编码器（H.264 MFT 优先，JPEG 流
-// 回退）→ 发分辨率 + capturing → 捕获-编码-推送循环。
+// captureLoop：WGC 捕获 → 编码器（H.264 MFT 优先，JPEG 帧流回退）→
+// 发分辨率 + capturing → 捕获-编码-推送循环。
 //
-//	静止：AcquireFrame 超时/无变化 → 不编码不出帧（自适应 0fps）
-//	锁屏：ErrAccessLost → 状态 0x03 locked + 重建 duplication；重建后
-//	      首次成功取帧再发 0x03 capturing（观众得以感知恢复）
+//	静止：合成器无更新 → AcquireFrame 超时 → 不编码不出帧（自适应 0fps）；
+//	      WGC 会话建立即推送首帧，静态桌面也有初始画面
+//	会话/设备失败：整体重建 capturer（秒级退避，有界）——分辨率切换 /
+//	      设备移除等场景
 //	关键帧：首帧 + 每 gop 帧（新观众可立即入流）
 func captureLoop(ctx context.Context, conn net.Conn, opts captureOpts) error {
+	// COM/WinRT 单元亲和：捕获全程固定线程。
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	frameInterval := time.Second / time.Duration(opts.fps)
 
-	// 捕获源：DXGI → GDI。
-	var dxgi *DXGICapturer
-	var gdi *gdiStreamCapturer
-	var srcW, srcH int
-	c, cerr := NewDXGICapturer()
-	if cerr == nil {
-		dxgi = c
-		srcW, srcH = dxgi.width, dxgi.height
-	} else {
-		g, gerr := newGDIStreamCapturer(opts.maxWidth)
-		if gerr != nil {
-			return placeholderLoop(ctx, conn, gerr)
-		}
-		gdi = g
-		// GDI 捕获器内部完成缩放——源分辨率即其输出分辨率，
-		// 避免 captureLoop 重复缩放。
-		srcW, srcH = gdi.outW, gdi.outH
-		fmt.Fprintf(os.Stderr, "xnc-screen-helper: dxgi unavailable (%v), gdi fallback\n", cerr)
+	cap, cerr := NewWGCCapturer()
+	if cerr != nil {
+		return placeholderLoop(ctx, conn, cerr)
 	}
-	defer func() {
-		if dxgi != nil {
-			dxgi.Close()
-		}
-		if gdi != nil {
-			gdi.Close()
-		}
-	}()
+	defer cap.Close()
 
+	srcW, srcH := cap.Dims()
 	outW, outH := fitDims(srcW, srcH, opts.maxWidth)
 
 	// 编码器：H.264 MFT → JPEG 帧流。
@@ -524,86 +229,33 @@ func captureLoop(ctx context.Context, conn net.Conn, opts captureOpts) error {
 		return err
 	}
 
-	// DXGI：AcquireNextFrame 超时即节流（timeout ≤ 100ms）；GDI：ticker 节拍。
-	// 首帧使用 2s 超时：静止桌面 DuplicateOutput 后仍需一次全屏脏区标记
-	// 才能产出首帧，100ms 不够。
+	// TryGetNextFrame 轮询节流（timeout ≤ 100ms）。首帧 2s 宽限
+	// （WGC 通常毫秒级送达，宽限无害）。
 	acquireTimeout := frameInterval.Milliseconds()
 	if acquireTimeout <= 0 || acquireTimeout > 100 {
 		acquireTimeout = 100
 	}
 	firstAcquireTimeout := uint(2000)
-	var tickC <-chan time.Time
-	if gdi != nil {
-		t := time.NewTicker(frameInterval)
-		defer t.Stop()
-		tickC = t.C
-	}
 
 	framesSinceKey := 0
 	sentKey := false
 	var lastFrame []byte
-	// locked：处于锁屏 / 访问丢失状态（去重 0x03 locked 通告；重建并成功
-	// 取到下一帧后通告 capturing 复位）。
-	locked := false
-	// 静止桌面自愈：MFT 有 ~gop 帧启动延迟，若期间桌面转静止，首帧可能
+	// 静止桌面自愈：MFT 有 ~gop 帧启动缓冲，若期间桌面转静止，首帧可能
 	// 被编码器内部吞掉而始终无输出。静止超时 ~1s 后强制重编码缓存帧。
 	// 首关键帧出帧前按节拍持续驱动编码器；出帧后静止即完全静默。
 	idleTicks, idleLimit := 0, 1
-	// 首帧强制输出：即使桌面完全静止（DXGI 无脏区 / GDI 无差异），也必须
-	// 捕获并编码至少一个 I 帧——新观众需要立即看到画面而非空白。
-	firstFrame := true
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if tickC != nil {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-tickC:
-			}
-		}
 
-		var frame []byte
-		var err error
-		if dxgi != nil {
-			t := uint(acquireTimeout)
-			if firstFrame {
-				t = firstAcquireTimeout
-			}
-			frame, _, err = dxgi.AcquireFrame(t)
-		} else {
-			frame, _, err = gdi.AcquireFrame(0)
+		t := uint(acquireTimeout)
+		if !sentKey {
+			t = firstAcquireTimeout
 		}
-		if err != nil {
-			if errors.Is(err, ErrAccessLost) {
-				if !locked {
-					if werr := writeFrame(conn, pipeFrameState, []byte("locked")); werr != nil {
-						return werr
-					}
-					locked = true
-				}
-				// 重建 duplication 后继续；连续失败则按秒退避重试。
-				if rerr := dxgi.recreate(); rerr != nil {
-					fmt.Fprintf(os.Stderr, "xnc-screen-helper: recreate duplication: %v\n", rerr)
-					time.Sleep(time.Second)
-				}
-				continue
-			}
-			if errors.Is(err, ErrTimeout) {
-				// 首帧尚未输出且桌面静止：用 GDI 直接截一帧强制输出，
-				// 而非等待 DXGI 脏区（完全静止桌面 DXGI 永远不触发）。
-				if firstFrame {
-					if g, _, _, gerr := captureGDIFrame(); gerr == nil {
-						// GDI 帧是全分辨率 BGRA，需要缩放到编码器尺寸
-						scaled := scaleBGRA(g, srcW, srcH, outW, outH)
-						if serr := sendEncoded(conn, encoder, scaled, gop, &framesSinceKey, &sentKey, false); serr == nil {
-							firstFrame = false
-							lastFrame = scaled
-						}
-					}
-					continue
-				}
+		frame, aerr := cap.AcquireFrame(t)
+		if aerr != nil {
+			if errors.Is(aerr, ErrTimeout) {
 				// 后续静止帧：MFT 启动缓冲自愈逻辑
 				idleTicks++
 				if !sentKey && lastFrame != nil && idleTicks >= idleLimit {
@@ -613,21 +265,27 @@ func captureLoop(ctx context.Context, conn net.Conn, opts captureOpts) error {
 				}
 				continue
 			}
-			return fmt.Errorf("acquire: %w", err)
-		}
-		idleTicks = 0
-		// 锁屏恢复：重建后首次成功取帧 → 通告 capturing，观众状态条复位。
-		if locked {
-			if werr := writeFrame(conn, pipeFrameState, []byte("capturing")); werr != nil {
-				return werr
+			// WGC 会话/设备级失败：整体重建（分辨率切换、设备移除等）。
+			fmt.Fprintf(os.Stderr, "xnc-screen-helper: wgc frame: %v, rebuilding\n", aerr)
+			cap.Close()
+			time.Sleep(time.Second)
+			nc, nerr := NewWGCCapturer()
+			if nerr != nil {
+				fmt.Fprintf(os.Stderr, "xnc-screen-helper: wgc rebuild failed: %v\n", nerr)
+				cap = nc // 置 nil：AcquireFrame 前重建重试
+				continue
 			}
-			locked = false
-		}
-		if len(frame) < srcW*srcH*4 {
+			cap = nc
 			continue
 		}
-		if outW != srcW {
-			frame = scaleBGRA(frame, srcW, srcH, outW, outH)
+		idleTicks = 0
+
+		w, h := cap.Dims()
+		if len(frame) < w*h*4 {
+			continue
+		}
+		if outW != w {
+			frame = scaleBGRA(frame, w, h, outW, outH)
 		}
 		lastFrame = frame
 
@@ -640,7 +298,7 @@ func captureLoop(ctx context.Context, conn net.Conn, opts captureOpts) error {
 // sendEncoded 编码一帧并按关键帧/增量帧类型写 pipe。编码器无输出（MFT
 // 启动缓冲）时静默跳过。flipY 传递给编码器（BGRA 行序翻转）。
 func sendEncoded(conn net.Conn, encoder frameEncoder, frame []byte, gop int, framesSinceKey *int, sentKey *bool, flipY bool) error {
-	forceKey := !*sentKey || *framesSinceKey >= gop
+	forceKey := !*sentKey || *framesSinceKey >= gop // 首输出前始终请求关键帧
 	data, encErr := encoder.Encode(frame, forceKey, flipY)
 	if encErr != nil {
 		fmt.Fprintf(os.Stderr, "xnc-screen-helper: encode: %v\n", encErr)
@@ -712,9 +370,9 @@ func vclNALUs(data []byte) []byte {
 	return out
 }
 
-// placeholderLoop DXGI 不可用时的占位循环（每秒状态帧，保持 pipe 活性）。
+// placeholderLoop WGC 不可用时的占位循环（每秒状态帧，保持 pipe 活性）。
 func placeholderLoop(ctx context.Context, conn net.Conn, cause error) error {
-	_, _ = fmt.Fprintf(os.Stderr, "xnc-screen-helper: dxgi unavailable: %v\n", cause)
+	_, _ = fmt.Fprintf(os.Stderr, "xnc-screen-helper: wgc unavailable: %v\n", cause)
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	for {
@@ -727,4 +385,39 @@ func placeholderLoop(ctx context.Context, conn net.Conn, cause error) error {
 			}
 		}
 	}
+}
+
+// fitDims 按 maxWidth 等比缩放并保证宽高为偶数（NV12/H.264 要求）。
+func fitDims(w, h, maxWidth int) (int, int) {
+	if maxWidth <= 0 || w <= maxWidth {
+		return even(w), even(h)
+	}
+	ow := even(maxWidth)
+	oh := even(h * ow / w)
+	if oh < 2 {
+		oh = 2
+	}
+	return ow, oh
+}
+
+func even(n int) int {
+	if n < 2 {
+		return 2
+	}
+	return n &^ 1
+}
+
+// scaleBGRA 最近邻缩放 BGRA 帧。
+func scaleBGRA(src []byte, sw, sh, dw, dh int) []byte {
+	dst := make([]byte, dw*dh*4)
+	for y := 0; y < dh; y++ {
+		sy := y * sh / dh
+		dRow := dst[y*dw*4 : (y+1)*dw*4]
+		sRow := src[sy*sw*4 : (sy+1)*sw*4]
+		for x := 0; x < dw; x++ {
+			sx := x * sw / dw
+			copy(dRow[x*4:(x+1)*4], sRow[sx*4:(sx+1)*4])
+		}
+	}
+	return dst
 }

@@ -44,7 +44,7 @@ func main() {
 	)
 	flag.Parse()
 
-	setDPIAware()
+	logLaunchContext()
 
 	if *jpegSingle != "" {
 		if err := runJpegSingle(*jpegSingle, *quality); err != nil {
@@ -69,9 +69,9 @@ func runJpegSingle(path string, quality int) error {
 	if quality < 1 || quality > 100 {
 		quality = 60
 	}
-	bgra, w, h, err := captureGDIFrame()
+	bgra, w, h, err := captureWGCSingle(2000)
 	if err != nil {
-		return fmt.Errorf("gdi capture: %w", err)
+		return fmt.Errorf("wgc capture: %w", err)
 	}
 	return writeJPEG(path, bgra, w, h, quality)
 }

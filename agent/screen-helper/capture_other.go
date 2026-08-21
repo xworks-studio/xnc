@@ -29,10 +29,12 @@ func captureLoop(ctx context.Context, conn net.Conn, _ captureOpts) error {
 	}
 }
 
-// captureGDIFrame 桩。
-func captureGDIFrame() ([]byte, int, int, error) { return nil, 0, 0, errUnsupported }
-
 // listenPipe 桩：非 Windows 无 named pipe 服务端。
 func listenPipe(ctx context.Context, name string) (net.Conn, error) {
 	return nil, errUnsupported
+}
+
+// captureWGCSingle 桩。
+func captureWGCSingle(timeoutMs uint) ([]byte, int, int, error) {
+	return nil, 0, 0, errUnsupported
 }

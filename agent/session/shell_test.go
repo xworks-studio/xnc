@@ -4,10 +4,10 @@ package session
 
 import (
 	"context"
-	"os"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"

@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -48,7 +47,7 @@ func newMockScreenManager(t *testing.T) (*ScreenStreamManager, *screenMockPipe) 
 	t.Helper()
 	mock := &screenMockPipe{t: t}
 	m := newScreenStreamManager("xnc-agent.exe", testLogger())
-	m.starter = func(*ScreenStreamManager) (net.Conn, *exec.Cmd, error) {
+	m.starter = func(*ScreenStreamManager) (net.Conn, *helperProc, error) {
 		client, server := net.Pipe()
 		t.Cleanup(func() { _ = server.Close() })
 		mock.c = server
@@ -272,7 +271,7 @@ func TestScreenResubscribeRestartsPipeline(t *testing.T) {
 // {no_session} 后会话即收线。
 func TestScreenHandlerHelperStartFailed(t *testing.T) {
 	m := newScreenStreamManager("xnc-agent.exe", testLogger())
-	m.starter = func(*ScreenStreamManager) (net.Conn, *exec.Cmd, error) {
+	m.starter = func(*ScreenStreamManager) (net.Conn, *helperProc, error) {
 		return nil, nil, errors.New("mock helper unavailable")
 	}
 	ws := runScreenSession(t, m, "s1", proto.ScreenParams{})

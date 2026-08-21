@@ -12,7 +12,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"os/exec"
 )
 
 // dialPipe 非 Windows 无实现。
@@ -21,6 +20,12 @@ func dialPipe(string) (net.Conn, error) {
 }
 
 // launchHelperAsUser 非 Windows 无 helper，直接报错（调用方回 no_session）。
-func launchHelperAsUser(*slog.Logger, string, io.Writer, ...string) (*exec.Cmd, error) {
+func launchHelperAsUser(*slog.Logger, string, io.Writer, ...string) (*helperProc, error) {
 	return nil, errors.New("screen helper requires a windows agent")
 }
+
+// helperProc 非 Windows 桩方法（类型由 windows 实现定义；这里给出空实现
+// 供链接）。实际不可达——launchHelperAsUser 恒定返回错误。
+func (p *helperProc) Kill() error { return nil }
+
+func (p *helperProc) Wait() error { return errors.New("not started") }

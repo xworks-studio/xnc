@@ -4,7 +4,8 @@
 // H.264 NALU 以 binary 帧转发，状态变化以 SCREEN_STATE text 帧通知）。
 //
 // pipe 帧协议（helper → agent）：[1B 类型][4B 长度 LE][payload]
-//   0x01 I 帧（含 SPS/PPS/IDR）/ 0x02 P 帧 / 0x03 状态 / 0x04 分辨率。
+//
+//	0x01 I 帧（含 SPS/PPS/IDR）/ 0x02 P 帧 / 0x03 状态 / 0x04 分辨率。
 package session
 
 import (
@@ -17,7 +18,6 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -51,7 +51,7 @@ const (
 
 // ScreenFrame 是 FrameHub 广播给订阅者的帧（pipe 帧去掉长度头）。
 type ScreenFrame struct {
-	Type byte   // 0x01 I 帧 / 0x02 P 帧 / 0x03 状态 / 0x04 分辨率
+	Type byte // 0x01 I 帧 / 0x02 P 帧 / 0x03 状态 / 0x04 分辨率
 	Data []byte
 }
 
@@ -59,9 +59,9 @@ type ScreenFrame struct {
 // 进程：首个 Subscribe 启动，最后一个 Unsubscribe 停止。
 type ScreenStreamManager struct {
 	mu            sync.Mutex
-	helperCmd     *exec.Cmd
+	helperCmd     *helperProc
 	pipeConn      net.Conn
-	helperLog     *os.File // helper stderr 日志文件（句柄继承给子进程）
+	helperLog     *os.File                    // helper stderr 日志文件（句柄继承给子进程）
 	subscribers   map[string]chan ScreenFrame // sessionID → 帧 channel
 	lastKeyFrame  []byte                      // 最新 I 帧缓存（新观众立即推送）
 	lastSPSPPS    []byte                      // SPS/PPS 缓存（解码器初始化）
@@ -77,7 +77,7 @@ type ScreenStreamManager struct {
 
 	// starter 可注入替换 helper 启动路径（测试用 net.Pipe 模拟）；nil 时
 	// 走 launchHelperLocked（真实 helper 进程 + named pipe）。
-	starter func(m *ScreenStreamManager) (net.Conn, *exec.Cmd, error)
+	starter func(m *ScreenStreamManager) (net.Conn, *helperProc, error)
 }
 
 var (
@@ -169,8 +169,8 @@ func (m *ScreenStreamManager) stopLocked() {
 	}
 	m.running = false
 	close(m.stopCh)
-	if m.helperCmd != nil && m.helperCmd.Process != nil {
-		_ = m.helperCmd.Process.Kill()
+	if m.helperCmd != nil {
+		_ = m.helperCmd.Kill()
 		_ = m.helperCmd.Wait()
 		m.helperCmd = nil
 	}
@@ -248,7 +248,7 @@ func (m *ScreenStreamManager) startPipelineLocked() error {
 	m.stopCh = make(chan struct{})
 	var (
 		conn net.Conn
-		cmd  *exec.Cmd
+		cmd  *helperProc
 		err  error
 	)
 	if m.starter != nil {
@@ -273,7 +273,7 @@ func (m *ScreenStreamManager) startPipelineLocked() error {
 // 首个订阅者的参数转发 --fps/--quality/--max-width。stderr 落盘到 helper
 // 同目录 screen-helper.log（agent/SYSTEM 打开、句柄继承给子进程——子进程
 // 无需目录写权限），stopLocked 时关闭。
-func (m *ScreenStreamManager) launchHelperLocked() (net.Conn, *exec.Cmd, error) {
+func (m *ScreenStreamManager) launchHelperLocked() (net.Conn, *helperProc, error) {
 	pipeName := screenPipeName()
 	logFile, lerr := os.OpenFile(filepath.Join(filepath.Dir(m.helperPath), "screen-helper.log"),
 		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
@@ -294,7 +294,7 @@ func (m *ScreenStreamManager) launchHelperLocked() (net.Conn, *exec.Cmd, error) 
 	m.helperLog = logFile
 	conn, err := dialPipe(pipeName)
 	if err != nil {
-		_ = cmd.Process.Kill()
+		_ = cmd.Kill()
 		_ = cmd.Wait()
 		if logFile != nil {
 			logFile.Close()
