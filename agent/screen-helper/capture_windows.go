@@ -2,7 +2,7 @@
 
 // capture_windows.go — 捕获主循环与共享 COM syscall 基础设施。
 // 捕获源唯一：Windows.Graphics.Capture（capture_wgc_windows.go）——无
-// DXGI/GDI 回退。WGC 不可用（Win10 < 1903 等）时走 placeholderLoop 报告
+// WGC 回退。采集源均不可用时走 placeholderLoop 报告
 // 状态帧保活，不产出画面。
 package main
 
@@ -13,168 +13,13 @@ import (
 	"io"
 	"net"
 	"os"
-	"syscall"
 	"time"
-	"unsafe"
-
-	"golang.org/x/sys/windows"
 )
 
 // ---- 哨兵错误 ----
 
 // ErrTimeout — timeout 内无新帧（桌面静止：合成器无更新）。
 var ErrTimeout = errors.New("capture acquire timeout")
-
-// ---- COM vtable 基础（共享：捕获 + 编码器）----
-
-type guid struct {
-	Data1 uint32
-	Data2 uint16
-	Data3 uint16
-	Data4 [8]byte
-}
-
-// comPtr 包装裸 COM 接口指针。底层存 unsafe.Pointer（vtable 指针），
-// uintptr 转换仅出现在 syscall 实参位置（go vet 合规）。
-type comPtr struct{ p unsafe.Pointer }
-
-// nilPtr 为零值接口。
-var nilPtr = comPtr{}
-
-// u 返回 uintptr 形式（仅用于 syscall 实参传递）。
-func (p comPtr) u() uintptr { return uintptr(p.p) }
-
-// valid 报告指针非空。
-func (p comPtr) valid() bool { return p.p != nil }
-
-// vtableSlot 返回接口 vtable 第 slot 项的函数指针。
-func (p comPtr) vtableSlot(slot int) uintptr {
-	vt := *(*unsafe.Pointer)(p.p) // 接口首字段 = vtable 指针
-	return *(*uintptr)(unsafe.Add(vt, uintptr(slot)*unsafe.Sizeof(uintptr(0))))
-}
-
-// call 按槽位调用接口方法（this 隐含在首参）。syscall.SyscallN 是编译器
-// intrinsic，不支持切片展开——按参数个数分派。
-func (p comPtr) call(slot int, a ...uintptr) (r1 uintptr, err error) {
-	if !p.valid() {
-		return 0, errors.New("nil COM interface")
-	}
-	fn := p.vtableSlot(slot)
-	var r2 uintptr
-	var l syscall.Errno
-	switch len(a) {
-	case 0:
-		r1, r2, l = syscall.SyscallN(fn, p.u())
-	case 1:
-		r1, r2, l = syscall.SyscallN(fn, p.u(), a[0])
-	case 2:
-		r1, r2, l = syscall.SyscallN(fn, p.u(), a[0], a[1])
-	case 3:
-		r1, r2, l = syscall.SyscallN(fn, p.u(), a[0], a[1], a[2])
-	case 4:
-		r1, r2, l = syscall.SyscallN(fn, p.u(), a[0], a[1], a[2], a[3])
-	case 5:
-		r1, r2, l = syscall.SyscallN(fn, p.u(), a[0], a[1], a[2], a[3], a[4])
-	case 6:
-		r1, r2, l = syscall.SyscallN(fn, p.u(), a[0], a[1], a[2], a[3], a[4], a[5])
-	default:
-		return 0, fmt.Errorf("unsupported arg count %d", len(a))
-	}
-	_, _ = r2, l
-	if int32(r1) < 0 {
-		return r1, fmt.Errorf("COM call slot %d: hr=0x%08X", slot, uint32(r1))
-	}
-	return r1, nil
-}
-
-// queryInterface 标准槽位 0 QI。
-func (p comPtr) queryInterface(iid *guid) (comPtr, error) {
-	var out comPtr
-	_, err := p.call(0, uintptr(unsafe.Pointer(iid)), uintptr(unsafe.Pointer(&out.p)))
-	if err != nil {
-		return nilPtr, err
-	}
-	return out, nil
-}
-
-// release 释放接口引用（槽位 2）。
-func (p comPtr) release() {
-	if p.valid() {
-		_, _, _ = syscall.SyscallN(p.vtableSlot(2), p.u())
-	}
-}
-
-// ---- vtable 槽位（D3D11，SDK 头顺序核实，勿改）----
-
-const (
-	vtDeviceCreateTexture2D = 5 // ID3D11Device: IUnknown0-2,CreateBuffer3,CreateTexture1D4,CreateTexture2D5
-	vtContextMap            = 14
-	vtContextUnmap          = 15
-	vtContextCopyResource   = 47
-)
-
-// ---- D3D11 常量 ----
-
-const (
-	d3d11CreateDeviceBgraSupport = 0x20
-	d3d11SdkVersion              = 7
-	dxgiFormatB8G8R8A8UNorm      = 87
-	d3d11UsageStaging            = 3
-	d3d11CpuAccessRead           = 0x20000
-)
-
-// ---- 结构体（x64 布局）----
-
-// d3d11Texture2DDesc 对应 D3D11_TEXTURE2D_DESC。
-type d3d11Texture2DDesc struct {
-	Width, Height, MipLevels, ArraySize uint32
-	Format                              uint32
-	SampleCount, SampleQuality          uint32
-	Usage                               uint32
-	BindFlags                           uint32
-	CPUAccessFlags, MiscFlags           uint32
-}
-
-// d3d11MappedSubresource 对应 D3D11_MAPPED_SUBRESOURCE（pData 为系统指针）。
-type d3d11MappedSubresource struct {
-	pData      unsafe.Pointer
-	RowPitch   uint32
-	DepthPitch uint32
-}
-
-// ---- DLL ----
-
-var (
-	user32DLL = windows.NewLazySystemDLL("user32.dll")
-	d3d11DLL  = windows.NewLazySystemDLL("d3d11.dll")
-
-	procD3D11CreateDevice = d3d11DLL.NewProc("D3D11CreateDevice")
-)
-
-// hrOf 从 call 的 r1 恢复 HRESULT 原值（错误分支也携带）。
-func hrOf(r1 uintptr) uint32 { return uint32(r1) }
-
-const rpcEChangedMode = 0x80010106
-
-// ---- ole32（编码器 MFT 路径使用）----
-
-var (
-	ole32        = windows.NewLazySystemDLL("ole32.dll")
-	procCoInitEx = ole32.NewProc("CoInitializeEx")
-	procCoUninit = ole32.NewProc("CoUninitialize")
-)
-
-const coinitApartmentThreaded = 0x2
-
-func coInitializeEx() (uintptr, error) {
-	r, _, e := procCoInitEx.Call(0, coinitApartmentThreaded)
-	if r != 0 {
-		return r, e
-	}
-	return 0, nil
-}
-
-func coUninitialize() { procCoUninit.Call() }
 
 // ---- 主捕获循环 ----
 
@@ -234,13 +79,11 @@ func captureLoopWith(ctx context.Context, conn net.Conn, opts captureOpts, cap s
 	gop := &gopState{}
 	var lastEncodeAt time.Time
 
-	// 可观测性：XNC_DUMP_H264=path 把最终 Annex-B 码流（整形后、即管道
-	// 实发字节）落盘——ffplay 直接可播，30 秒内二分定位"采集/编码侧还是
-	// 下游"的现场分界线工具。周期计数器（10s）走 stderr 进 agent 日志。
+	stats := &pipeStats{}
 	if p := os.Getenv("XNC_DUMP_H264"); p != "" {
 		if f, err := os.Create(p); err == nil {
-			dumpFile = f
-			defer func() { _ = f.Close(); dumpFile = nil }()
+			stats.dump = f
+			defer func() { _ = f.Close() }()
 			fmt.Fprintf(os.Stderr, "xnc-screen-helper: h264 dump -> %s\n", p)
 		} else {
 			fmt.Fprintf(os.Stderr, "xnc-screen-helper: dump open failed: %v\n", err)
@@ -251,7 +94,7 @@ func captureLoopWith(ctx context.Context, conn net.Conn, opts captureOpts, cap s
 	go func() {
 		for range statTick.C {
 			fmt.Fprintf(os.Stderr, "xnc-screen-helper: stats sent=%d key=%d delta=%d encErr=%d bytes=%d\n",
-				statFrames, statKeys, statDeltas, statEncErrs, statBytes)
+				stats.frames, stats.keys, stats.deltas, stats.encErrs, stats.bytes)
 		}
 	}()
 
@@ -261,16 +104,10 @@ func captureLoopWith(ctx context.Context, conn net.Conn, opts captureOpts, cap s
 				time.Sleep(wait)
 			}
 		}
-		err := sendEncoded(conn, encoder, frame, gop)
+		err := sendEncoded(conn, encoder, frame, gop, stats)
 		lastEncodeAt = time.Now()
 		return err
 	}
-	go func() {
-		for range statTick.C {
-			fmt.Fprintf(os.Stderr, "xnc-screen-helper: stats sent=%d key=%d delta=%d encErr=%d bytes=%d\n",
-				statFrames, statKeys, statDeltas, statEncErrs, statBytes)
-		}
-	}()
 
 	if err := writeFrame(conn, pipeFrameDims, packDims(outW, outH)); err != nil {
 		return err
@@ -366,11 +203,19 @@ func (g *gopState) keyDue() bool {
 	return !g.sentKey || time.Since(g.lastKeyAt) >= 2*time.Second
 }
 
+// pipeStats 单管线诊断状态（随 captureLoopWith 生命周期，替代包级全局）：
+// XNC_DUMP_H264 落盘目标 + 10s 周期计数器（stderr → agent 日志）。
+type pipeStats struct {
+	frames, keys, deltas, encErrs int
+	bytes                         int64
+	dump                          io.Writer
+}
+
 // sendEncoded 编码一帧并按关键帧/增量帧类型写 pipe。编码器无输出（MFT
 // 启动缓冲）时静默跳过。码流契约（唯一整形规则，其余 NALU 直通）：IDR
 // 前必有缓存的 SPS/PPS，统一 4 字节起始码——消费端（WebCodecs Annex-B
 // 模式）按此契约配置解码器。
-func sendEncoded(conn net.Conn, encoder frameEncoder, frame []byte, gop *gopState) error {
+func sendEncoded(conn net.Conn, encoder frameEncoder, frame []byte, gop *gopState, st *pipeStats) error {
 	forceKey := gop.keyDue() // 首输出前始终请求关键帧
 	data, encErr := encoder.Encode(frame, forceKey, false)
 	if encErr != nil {
@@ -398,25 +243,18 @@ func sendEncoded(conn net.Conn, encoder frameEncoder, frame []byte, gop *gopStat
 			data = vclNALUs(data)
 		}
 	}
-	if dumpFile != nil {
-		_, _ = dumpFile.Write(data) // 整形后码流（= 管道实发字节）
+	if st.dump != nil {
+		_, _ = st.dump.Write(data) // 整形后码流（= 管道实发字节）
 	}
-	statFrames++
-	statBytes += int64(len(data))
+	st.frames++
+	st.bytes += int64(len(data))
 	if frameType == pipeFrameKey {
-		statKeys++
+		st.keys++
 	} else {
-		statDeltas++
+		st.deltas++
 	}
 	return writeFrame(conn, frameType, data)
 }
-
-// 单管线诊断状态：helper 每进程恰好一条采集管线，进程级即可。
-var (
-	dumpFile                                      io.Writer // XNC_DUMP_H264 落盘目标（整形后码流）
-	statFrames, statKeys, statDeltas, statEncErrs int
-	statBytes                                     int64
-)
 
 // vclNALUs 重排 Annex-B 码流：丢弃参数集与 AUD（type 7/8/9），其余 NALU
 // 统一以 4 字节起始码输出。JPEG 回退模式（无参数集）不应调用。
@@ -459,7 +297,7 @@ func vclNALUs(data []byte) []byte {
 	return out
 }
 
-// placeholderLoop WGC 不可用时的占位循环（每秒状态帧，保持 pipe 活性）。
+// placeholderLoop 采集源不可用时的占位循环（每秒状态帧，保持 pipe 活性）。
 func placeholderLoop(ctx context.Context, conn net.Conn, cause error) error {
 	_, _ = fmt.Fprintf(os.Stderr, "xnc-screen-helper: wgc unavailable: %v\n", cause)
 	t := time.NewTicker(time.Second)
@@ -474,39 +312,4 @@ func placeholderLoop(ctx context.Context, conn net.Conn, cause error) error {
 			}
 		}
 	}
-}
-
-// fitDims 按 maxWidth 等比缩放并保证宽高为偶数（NV12/H.264 要求）。
-func fitDims(w, h, maxWidth int) (int, int) {
-	if maxWidth <= 0 || w <= maxWidth {
-		return even(w), even(h)
-	}
-	ow := even(maxWidth)
-	oh := even(h * ow / w)
-	if oh < 2 {
-		oh = 2
-	}
-	return ow, oh
-}
-
-func even(n int) int {
-	if n < 2 {
-		return 2
-	}
-	return n &^ 1
-}
-
-// scaleBGRA 最近邻缩放 BGRA 帧。
-func scaleBGRA(src []byte, sw, sh, dw, dh int) []byte {
-	dst := make([]byte, dw*dh*4)
-	for y := 0; y < dh; y++ {
-		sy := y * sh / dh
-		dRow := dst[y*dw*4 : (y+1)*dw*4]
-		sRow := src[sy*sw*4 : (sy+1)*sw*4]
-		for x := 0; x < dw; x++ {
-			sx := x * sw / dw
-			copy(dRow[x*4:(x+1)*4], sRow[sx*4:(sx+1)*4])
-		}
-	}
-	return dst
 }

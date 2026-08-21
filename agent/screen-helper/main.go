@@ -7,7 +7,7 @@
 //	xnc-screen-helper.exe --pipe <name> --max-width 1920 --quality 60 [--fps 30]
 //	xnc-screen-helper.exe --jpeg-single <path> [--quality 60]
 //
-// --jpeg-single：GDI 单帧截屏 → JPEG → 写文件 → 退出（CLI --snapshot 路径，
+// --jpeg-single：单帧截屏 → JPEG → 写文件 → 退出（CLI --snapshot 路径，
 // 不走 pipe 与 H.264）。
 package main
 
@@ -39,7 +39,7 @@ func main() {
 		maxWidth   = flag.Int("max-width", 1920, "最大输出宽度")
 		quality    = flag.Int("quality", 60, "JPEG/H.264 质量（1-100）")
 		fps        = flag.Int("fps", 15, "帧率上限（1-30）")
-		jpegSingle = flag.String("jpeg-single", "", "单帧 GDI 截屏输出 JPEG 路径（截完即退出）")
+		jpegSingle = flag.String("jpeg-single", "", "单帧截屏输出 JPEG 路径（截完即退出）")
 	)
 	flag.Parse()
 

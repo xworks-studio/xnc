@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"time"
 	"unsafe"
 
@@ -80,10 +81,7 @@ func launchHelperAsUser(log *slog.Logger, helperPath string, stderr io.Writer, a
 	if err != nil {
 		return nil, err
 	}
-	if err != nil {
-		return nil, err
-	}
-	dir, err := windows.UTF16PtrFromString(filepathDir(helperPath))
+	dir, err := windows.UTF16PtrFromString(filepath.Dir(helperPath))
 	if err != nil {
 		return nil, err
 	}
@@ -188,19 +186,6 @@ func activeUserSession() uint32 {
 		}
 	}
 	return windows.WTSGetActiveConsoleSessionId()
-}
-
-// filepathDir 取父目录。
-func filepathDir(p string) string {
-	for i := len(p) - 1; i >= 0; i-- {
-		if p[i] == '\\' || p[i] == '/' {
-			if i == 0 {
-				return string(p[0])
-			}
-			return p[:i]
-		}
-	}
-	return "."
 }
 
 // dialPipe 连接 helper 的 named pipe（helper 先监听，agent 拉起后回连，
