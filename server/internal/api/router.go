@@ -64,6 +64,12 @@ func NewRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		ur.Get("/", h.listUsers)
 	})
 
+	// 审计查询：admin-only，可选过滤 + 分页（handler 内判定）。
+	r.Route("/api/audit", func(ar chi.Router) {
+		ar.Use(auth.Middleware(cfg.JWTSecret, st))
+		ar.Get("/", h.listAudit)
+	})
+
 	r.Route("/api/clusters/{id}/enrollment-tokens", func(tr chi.Router) {
 		tr.Use(auth.Middleware(cfg.JWTSecret, st))
 		tr.Post("/", h.createEnrollToken)
