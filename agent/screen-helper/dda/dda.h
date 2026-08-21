@@ -19,7 +19,7 @@
 extern "C" {
 #endif
 
-#define DDA_ABI_VERSION 2
+#define DDA_ABI_VERSION 1
 
 // DLL 构建（/DXNC_DDA_BUILD）时导出符号；selftest 静态链接时无修饰。
 #ifdef XNC_DDA_BUILD
@@ -76,7 +76,7 @@ DDA_API void *dda_create(int32_t *w, int32_t *h);
 
 // dda_acquire 拉取一帧。bgra 容量须 ≥ w*h*4。返回 DDA_FRAME_* 之一；
 // ACCESS_LOST 已在内部重建（含 staging），调用方直接重试即可。
-DDA_API int32_t dda_acquire(void *dda, uint8_t *bgra, int32_t cap_bytes, int32_t timeout_ms, dda_frame *out);
+DDA_API int32_t dda_acquire(void *dda, uint8_t *bgra, int32_t timeout_ms, dda_frame *out);
 
 // dda_cursor_shape 返回当前指针形状缓冲（内部所有，随 acquire 更新）。
 DDA_API const uint8_t *dda_cursor_shape(const void *dda);

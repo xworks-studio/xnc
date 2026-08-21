@@ -57,22 +57,10 @@ func (c *DDACapturer) Close() {
 
 // AcquireFrame 拉取一帧（详见文件头语义说明）。
 func (c *DDACapturer) AcquireFrame(timeoutMs uint) ([]byte, error) {
-	// 尺寸守卫：安全桌面 GDI 模式的分辨率可能与 DXGI 不同（DPI 虚拟化/
-	// 模式切换），DLL 侧更新尺寸后按 Dims 重配缓冲再取帧。
-	var dw, dh int32
-	c.dll.dims.Call(c.inst, uintptr(unsafe.Pointer(&dw)), uintptr(unsafe.Pointer(&dh)))
-	if int(dw) != c.w || int(dh) != c.h {
-		c.w, c.h = int(dw), int(dh)
-		if c.w > 0 && c.h > 0 {
-			c.buf = make([]byte, c.w*c.h*4)
-			c.lastFrame = nil
-		}
-	}
-
 	var f ddaFrame
 	for attempt := 0; ; attempt++ {
 		f = ddaFrame{}
-		r1, _, _ := c.dll.acquire.Call(c.inst, uintptr(unsafe.Pointer(&c.buf[0])), uintptr(len(c.buf)), uintptr(timeoutMs), uintptr(unsafe.Pointer(&f)))
+		r1, _, _ := c.dll.acquire.Call(c.inst, uintptr(unsafe.Pointer(&c.buf[0])), uintptr(timeoutMs), uintptr(unsafe.Pointer(&f)))
 		switch int32(r1) {
 		case ddaFrameContent:
 			// DXGI 语义：LastPresentTime==0 的帧不含新桌面图像（常携带
@@ -106,13 +94,8 @@ func (c *DDACapturer) AcquireFrame(timeoutMs uint) ([]byte, error) {
 		case ddaFrameTimeout:
 			return nil, ErrTimeout
 		case ddaFrameAccessLost:
-			// DLL 内已重建 duplication；尺寸可能已变。重建被拒期间若
-			// 安全桌面（UAC）激活，显式报告——观众看到 locked 暂停态
-			// 而非冻结的旧帧。
+			// DLL 内已重建 duplication；尺寸可能已变。
 			c.refreshDims()
-			if secureDesktopActive() {
-				return nil, ErrSecureDesktop
-			}
 			return nil, ErrTimeout
 		default:
 			return nil, errors.New("dda: " + c.dll.lastErrorStr())

@@ -12,10 +12,10 @@ if errorlevel 1 (
 )
 cd /d "%~dp0"
 
-cl /nologo /utf-8 /O2 /W3 /MT /LD /DXNC_DDA_BUILD dda.c /Fe:xnc-dda.dll /link d3d11.lib dxgi.lib dxguid.lib user32.lib gdi32.lib
+cl /nologo /utf-8 /O2 /W3 /MT /LD /DXNC_DDA_BUILD dda.c /Fe:xnc-dda.dll /link d3d11.lib dxgi.lib dxguid.lib user32.lib
 if errorlevel 1 exit /b 1
 
-cl /nologo /utf-8 /O2 /W3 /MT selftest.c dda.c /Fe:dda-selftest.exe /link d3d11.lib dxgi.lib dxguid.lib user32.lib gdi32.lib
+cl /nologo /utf-8 /O2 /W3 /MT selftest.c dda.c /Fe:dda-selftest.exe /link d3d11.lib dxgi.lib dxguid.lib user32.lib
 if errorlevel 1 exit /b 1
 
 if not exist ..\embedded mkdir ..\embedded

@@ -94,13 +94,7 @@ func runPipe(pipeName string, opts captureOpts) error {
 
 	cap, backend, cerr := newScreenCapturer()
 	if cerr != nil {
-		// SYSTEM 上下文下采集不可用：exit 3 自退——agent 据此回退用户令牌
-		// 启动（WGC 路径）。SYSTEM 判据：机器账号环境（LABS-XX$）。
-		if isSystemContext() {
-			fmt.Fprintf(os.Stderr, "xnc-screen-helper: capture unavailable under SYSTEM (%v), exiting 3 for user-token relaunch\n", cerr)
-			os.Exit(3)
-		}
-		// 用户上下文：仍需 listen 报告状态（placeholderLoop）。
+		// 不可用：仍需 listen 报告状态（placeholderLoop）。
 		conn, err := listenPipe(ctx, pipeName)
 		if err != nil {
 			return fmt.Errorf("listen pipe: %w", err)
@@ -122,11 +116,4 @@ func runPipe(pipeName string, opts captureOpts) error {
 	defer conn.Close()
 
 	return captureLoopWith(ctx, conn, opts, cap, firstFrame, ferr)
-}
-
-// isSystemContext 报告当前是否运行在机器账号（SYSTEM）令牌下：环境
-// USERNAME 以 "$" 结尾（ctx 诊断日志同判据）。exit-3 回退契约依赖此判定。
-func isSystemContext() bool {
-	u := os.Getenv("USERNAME")
-	return len(u) > 0 && u[len(u)-1] == '$'
 }

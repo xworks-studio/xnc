@@ -13,7 +13,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"runtime"
 	"syscall"
 	"time"
 	"unsafe"
@@ -25,10 +24,6 @@ import (
 
 // ErrTimeout — timeout 内无新帧（桌面静止：合成器无更新）。
 var ErrTimeout = errors.New("capture acquire timeout")
-
-// ErrSecureDesktop 安全桌面（UAC/Ctrl+Alt+Del）激活：画面不可得。
-// 调用方应向观众发 locked 状态并按节拍重试，桌面切回后自然恢复。
-var ErrSecureDesktop = errors.New("secure desktop active")
 
 // ---- COM vtable 基础（共享：捕获 + 编码器）----
 
@@ -219,10 +214,6 @@ func newScreenCapturer() (screenCapturer, string, error) {
 //	      设备移除等场景
 //	关键帧：首帧 + 每 gop 帧（新观众可立即入流）
 func captureLoopWith(ctx context.Context, conn net.Conn, opts captureOpts, cap screenCapturer, firstFrame []byte, ferr error) error {
-	// 线程钉扎：安全桌面路径的 SetThreadDesktop/GDI 句柄是线程状态，
-	// goroutine 迁移会使其失效（UAC 期间帧流冻结事故）。
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
 	frameInterval := time.Second / time.Duration(opts.fps)
 
 	srcW, srcH := cap.Dims()
@@ -311,28 +302,13 @@ func captureLoopWith(ctx context.Context, conn net.Conn, opts captureOpts, cap s
 	// 静止桌面自愈：MFT 有 ~gop 帧启动缓冲，若期间桌面转静止，首帧可能
 	// 被编码器内部吞掉而始终无输出。静止超时 ~1s 后强制重编码缓存帧。
 	// 首关键帧出帧前按节拍持续驱动编码器；出帧后静止即完全静默。
-	// stateSent 状态机：安全桌面（UAC）期间发 locked，画面恢复发
-	// capturing——观众看到暂停态而非冻结的旧帧。
-	stateSent := "capturing"
 	idleTicks, idleLimit := 0, 1
-	setState := func(s string) {
-		if stateSent == s {
-			return
-		}
-		if err := writeFrame(conn, pipeFrameState, []byte(s)); err == nil {
-			stateSent = s
-		}
-	}
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		if cap == nil {
-			// 上轮重建失败后的重试节拍。安全桌面（UAC）期间 dda_create
-			// 也会被拒——此路径同样要发 locked，防静默冻结。
-			if secureDesktopActive() {
-				setState("locked")
-			}
+			// 上轮重建失败后的重试节拍。
 			time.Sleep(time.Second)
 			nc, _, nerr := newScreenCapturer()
 			if nerr != nil {
@@ -345,10 +321,6 @@ func captureLoopWith(ctx context.Context, conn net.Conn, opts captureOpts, cap s
 		t := uint(acquireTimeout)
 		frame, aerr := cap.AcquireFrame(t)
 		if aerr != nil {
-			if errors.Is(aerr, ErrSecureDesktop) {
-				setState("locked")
-				continue // 按节拍重试；桌面切回后自然恢复
-			}
 			if errors.Is(aerr, ErrTimeout) {
 				// 后续静止帧：MFT 启动缓冲自愈逻辑
 				idleTicks++
@@ -379,7 +351,6 @@ func captureLoopWith(ctx context.Context, conn net.Conn, opts captureOpts, cap s
 		if err := pacedSend(frame); err != nil {
 			return err
 		}
-		setState("capturing") // 安全桌面结束/画面恢复
 	}
 }
 
