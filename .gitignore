@@ -32,3 +32,11 @@ __pycache__/
 
 # 误提交的 ELF 构建产物
 agent/screen-helper/screen-helper
+
+# dda/build.bat 产出的嵌入用 DLL（embedded 目录只跟踪占位 README）
+agent/screen-helper/embedded/xnc-dda.dll
+agent/screen-helper/dda/*.dll
+agent/screen-helper/dda/*.exe
+agent/screen-helper/dda/*.obj
+agent/screen-helper/dda/*.lib
+agent/screen-helper/dda/*.exp

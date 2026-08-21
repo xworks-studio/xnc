@@ -63,22 +63,26 @@ func main() {
 	}
 }
 
-// runJpegSingle 捕获一帧并写 JPEG 后退出。
+// runJpegSingle 捕获一帧并写 JPEG 后退出。DDA 优先（单帧即建即取，
+// 静止桌面首帧也立即可得——DXGI 语义），WGC 回退。
 func runJpegSingle(path string, quality int) error {
 	if quality < 1 || quality > 100 {
 		quality = 60
 	}
-	bgra, w, h, err := captureWGCSingle(2000)
+	bgra, w, h, err := ddaSingleShot(2000)
 	if err != nil {
-		return fmt.Errorf("wgc capture: %w", err)
+		fmt.Fprintf(os.Stderr, "xnc-screen-helper: dda single: %v, trying wgc\n", err)
+		bgra, w, h, err = captureWGCSingle(2000)
+	}
+	if err != nil {
+		return fmt.Errorf("capture: %w", err)
 	}
 	return writeJPEG(path, bgra, w, h, quality)
 }
 
 // runPipe 启动 named pipe 服务端并进入捕获主循环，直至 agent 断开或进程被
-// 终止（agent 直接 Kill）。WGC 捕获器与首帧均在 listenPipe 之前获取：
-// listenPipe（winio）之后才建 WGC 会话的旧时序在 TB16G7 上零帧——预取
-// 首帧 + 提前建会话后流式正常（快照路径一直是该时序）。
+// 终止（agent 直接 Kill）。采集器与首帧均在 listenPipe 之前获取（TB16G7
+// 的 WGC 时序教训；DDA 无此约束但同序无害）。
 func runPipe(pipeName string, opts captureOpts) error {
 	if opts.fps < 1 || opts.fps > 30 {
 		opts.fps = 15
@@ -88,7 +92,7 @@ func runPipe(pipeName string, opts captureOpts) error {
 	}
 	ctx := context.Background()
 
-	cap, cerr := NewWGCCapturer()
+	cap, backend, cerr := newScreenCapturer()
 	if cerr != nil {
 		// 不可用：仍需 listen 报告状态（placeholderLoop）。
 		conn, err := listenPipe(ctx, pipeName)
@@ -99,6 +103,7 @@ func runPipe(pipeName string, opts captureOpts) error {
 		return placeholderLoop(ctx, conn, cerr)
 	}
 	defer cap.Close()
+	fmt.Fprintf(os.Stderr, "xnc-screen-helper: capture backend: %s\n", backend)
 
 	firstFrame, ferr := cap.AcquireFrame(2000)
 	fmt.Fprintf(os.Stderr, "xnc-screen-helper: pre-pipe first frame: err=%v len=%d\n",

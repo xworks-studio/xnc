@@ -38,3 +38,13 @@ func listenPipe(ctx context.Context, name string) (net.Conn, error) {
 func captureWGCSingle(timeoutMs uint) ([]byte, int, int, error) {
 	return nil, 0, 0, errUnsupported
 }
+
+// newScreenCapturer 桩。
+func newScreenCapturer() (screenCapturer, string, error) {
+	return nil, "", errUnsupported
+}
+
+// ddaSingleShot 桩。
+func ddaSingleShot(timeoutMs uint) ([]byte, int, int, error) {
+	return nil, 0, 0, errUnsupported
+}

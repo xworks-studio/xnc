@@ -188,15 +188,31 @@ func bitrateFor(quality int) int {
 	return 500_000 + quality*30_000 // q60 ≈ 2.3Mbps（1080p 30fps 预算内）
 }
 
-// captureLoop：WGC 捕获 → 编码器（H.264 MFT 优先，JPEG 帧流回退）→
-// 发分辨率 + capturing → 捕获-编码-推送循环。
+// newScreenCapturer 采集源梯子：DXGI（xnc-dda.dll，主路径）→ WGC（回退）。
+// XNC_NO_DDA=1 可禁用 DDA（诊断用）。返回 (capturer, backend名, error)。
+func newScreenCapturer() (screenCapturer, string, error) {
+	if os.Getenv("XNC_NO_DDA") == "" {
+		c, err := NewDDACapturer()
+		if err == nil {
+			return c, "dxgi", nil
+		}
+		fmt.Fprintf(os.Stderr, "xnc-screen-helper: dda unavailable (%v), trying wgc\n", err)
+	}
+	c, err := NewWGCCapturer()
+	if err != nil {
+		return nil, "", err
+	}
+	return c, "wgc", nil
+}
+
+// captureLoop：采集源（DDA 优先，WGC 回退）→ 编码器（H.264 MFT 优先，
+// JPEG 帧流回退）→ 发分辨率 + capturing → 捕获-编码-推送循环。
 //
-//	静止：合成器无更新 → AcquireFrame 超时 → 不编码不出帧（自适应 0fps）；
-//	      WGC 会话建立即推送首帧，静态桌面也有初始画面
+//	静止：合成器无更新 → AcquireFrame 超时 → 不编码不出帧（自适应 0fps）
 //	会话/设备失败：整体重建 capturer（秒级退避，有界）——分辨率切换 /
 //	      设备移除等场景
 //	关键帧：首帧 + 每 gop 帧（新观众可立即入流）
-func captureLoopWith(ctx context.Context, conn net.Conn, opts captureOpts, cap *WGCCapturer, firstFrame []byte, ferr error) error {
+func captureLoopWith(ctx context.Context, conn net.Conn, opts captureOpts, cap screenCapturer, firstFrame []byte, ferr error) error {
 	frameInterval := time.Second / time.Duration(opts.fps)
 
 	srcW, srcH := cap.Dims()
@@ -249,6 +265,16 @@ func captureLoopWith(ctx context.Context, conn net.Conn, opts captureOpts, cap *
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		if cap == nil {
+			// 上轮重建失败后的重试节拍。
+			time.Sleep(time.Second)
+			nc, _, nerr := newScreenCapturer()
+			if nerr != nil {
+				continue
+			}
+			cap = nc
+			continue
+		}
 
 		t := uint(acquireTimeout)
 		frame, aerr := cap.AcquireFrame(t)
@@ -263,17 +289,10 @@ func captureLoopWith(ctx context.Context, conn net.Conn, opts captureOpts, cap *
 				}
 				continue
 			}
-			// WGC 会话/设备级失败：整体重建（分辨率切换、设备移除等）。
-			fmt.Fprintf(os.Stderr, "xnc-screen-helper: wgc frame: %v, rebuilding\n", aerr)
+			// 会话/设备级失败：整体重建（分辨率切换、设备移除等）。
+			fmt.Fprintf(os.Stderr, "xnc-screen-helper: capture frame: %v, rebuilding\n", aerr)
 			cap.Close()
-			time.Sleep(time.Second)
-			nc, nerr := NewWGCCapturer()
-			if nerr != nil {
-				fmt.Fprintf(os.Stderr, "xnc-screen-helper: wgc rebuild failed: %v\n", nerr)
-				cap = nc // 置 nil：AcquireFrame 前重建重试
-				continue
-			}
-			cap = nc
+			cap = nil
 			continue
 		}
 		idleTicks = 0
