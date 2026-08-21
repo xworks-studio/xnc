@@ -66,6 +66,13 @@ func NewRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		tr.Use(auth.Middleware(cfg.JWTSecret, st))
 		tr.Post("/", h.createEnrollToken)
 	})
+	// membership 管理：列表任一成员可用；增删仅 owner（handler 内判定）。
+	r.Route("/api/clusters/{id}/members", func(mr chi.Router) {
+		mr.Use(auth.Middleware(cfg.JWTSecret, st))
+		mr.Get("/", h.listMembers)
+		mr.Post("/", h.addMember)
+		mr.Delete("/{userId}", h.removeMember)
+	})
 	r.Post("/api/agent/enroll", h.agentEnroll)
 	r.Get("/api/agent/connect", h.agentConnect)
 	// 会话 WS（两侧均 token 即凭证，不走 JWT）
