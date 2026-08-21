@@ -50,3 +50,7 @@ load:
 	cd cli && go build -o ../bin/xnc$(EXE) .
 	cd mockagent && go build -o ../bin/mockagent$(EXE) .
 	bin/mockagent$(EXE) --server http://127.0.0.1:8080 --token $$(bin/xnc$(EXE) token create default --max-uses 1000 --json | sed -n 's/.*"token":"\([^"]*\)".*/\1/p') --count $(N)
+
+.PHONY: e2e6
+e2e6:
+	bash scripts/e2e_phase6.sh
