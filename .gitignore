@@ -12,6 +12,13 @@ dist/
 target/
 node_modules/
 
+# go:embed 编译期占位：server/web/dist 需入库（web_embed.go 引用），
+# 但只跟踪占位文件；真实 Vite 产物（assets/* 等）仍忽略。
+!server/web/dist/
+server/web/dist/*
+!server/web/dist/index.html
+!server/web/dist/.gitkeep
+
 # IDE / 系统
 .idea/
 .vscode/

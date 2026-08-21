@@ -6,6 +6,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"xnc/server"
 	"xnc/server/internal/auth"
 	"xnc/server/internal/config"
 	"xnc/server/internal/db"
@@ -103,5 +104,11 @@ func NewRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		nr.Post("/{id}/disable", h.nodeDisable)
 		nr.Post("/{id}/enable", h.nodeEnable)
 	})
+
+	// 内嵌 Web UI 兜底（Phase 7）：作为最后一条注册，chi 静态路由
+	// （/api/*）优先命中，其余路径走 SPA——静态文件直出，未命中回落
+	// index.html（react-router 客户端路由）；/api/* 前缀在 handler 内
+	// 保持 404，不被 SPA 吞掉。
+	r.Mount("/", server.SPAHandler())
 	return r
 }
