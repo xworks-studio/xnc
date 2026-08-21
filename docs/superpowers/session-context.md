@@ -1,7 +1,7 @@
 # XNC v2 — 会话上下文快照（Session Context Snapshot）
 
 > 本文档保存了跨会话的项目全貌，供新会话或 fork 后快速恢复上下文。
-> 最后更新：2026-08-21（Phase 6 执行中途更新）
+> 最后更新：2026-08-21（Phase 6 画面质量修复完成）
 
 ---
 
@@ -38,7 +38,7 @@ Windows 节点 ──出站 WSS───────┘（XNCAgent Windows 服�
 | 3 | shell 会话（ConPTY、xnc shell、win32 键盘协议转义） | ✅ 合并+生产 |
 | 4 | 数据通道（file upload/download、tunnel、RDP/mstsc） | ✅ 合并+生产 |
 | 5 | 多用户（RBAC、Membership、审计查询、Node disable） | ✅ 合并+生产 |
-| 6 | 桌面预览（screen 会话 + GDI helper） | 计划就绪 `2026-08-21-xnc-v2-phase6-screen.md` |
+| 6 | 桌面预览（screen 会话 + DXGI/GDI helper + H.264 MFT） | ✅ 合并+生产（`484e38d` 画面质量修复） |
 | 7 | Web UI（React SPA、xterm.js Terminal、用户管理） | ✅ 合并+生产 |
 | 8 | Linux agent | 远期 |
 
@@ -130,29 +130,18 @@ xnc audit list [--node n] [--user u] [--action a] [--since 7d]
 
 ## 下一步
 
-### Phase 6（桌面流）执行中 — T11 待完成
+### Phase 6 画面质量修复完成（2026-08-21，commit `484e38d`）
 
-**当前状态**：T1-T10 已完成并提交到分支 `xnc-v2-phase6`（worktree `.worktrees/xnc-v2-phase6`）。
+用户反馈"首帧黑屏/镜像/模糊/只有 1/4"，经像素级诊断（tools/screendiag 抓流 → ffmpeg 解码 → 与 GDI 快照做 4 变换相关性对比）定位三个根因并全部修复：
 
-**已提交**（base 33bb515 → HEAD 1a43916，共 11 commits）：
-- T1+T2: proto screen 词汇 + server POST /screen（`6de6da0` + `d4c1f86`）
-- T3: ScreenStreamManager 单例 + FrameHub 多观众广播（`bb10cd7`）
-- T4+T5: helper 入口 + DXGI 捕获（`ce25a87` + `e157d42` + 修复 `a87cc3f`）
-- T6+T7+T8: H.264 MFT 编码器 + GDI fallback + 注册（`36f4ff1` + `e6df8a9` + `d708c57`）
-- T9+T10: CLI xnc screen + Web UI ScreenPreview（`e3b3769` + `1a43916`）
+1. **GDI 行序翻转（"镜像"）**：TB16G7 驱动对负 biHeight 的 top-down 请求仍返回 bottom-up。改为正 biHeight（bottom-up 经典路径）+ 统一 flipRows。
+2. **DPI 虚拟化（"模糊"）**：TB16G7 屏 3200×2000 @200%，helper DPI-unaware → GDI 只拿到 1600×1000 降采样帧。helper 启动即 SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)，现在 1920×1200 全清晰。
+3. **浏览器拒帧（"首帧黑屏"）**：原关键帧含重复 SPS/PPS + AUD 前缀，Chromium VideoDecoder 直接抛 "key frame is required...description"，被 Web UI 静默吞掉。helper 侧 vclNALUs 规范化为 `[SPS PPS SEI IDR]` 4 字节起始码；Web UI/CLI codec string 从实际 SPS 解析，canvas 尺寸取解码帧 displayWidth/Height。
 
-**T11 待做**：
-1. E2E 脚本 `scripts/e2e_phase6.sh`（dev 栈 + mockagent + --snapshot + 无残留断言）
-2. Final whole-branch review
-3. 合并回 main + 生产部署
-4. 真机 TB16G7 验收（DXGI 捕获 + Web UI 预览 + 三态）
+**验证**：快照方向/清晰正常；流帧 vs 快照 identity 相关性 0.303→0.999；headless Edge 渲染生产流 E2E 通过。helper stderr 现落盘 `C:\xnc\screen-helper.log`。
 
-**关键实现细节**（供新会话参考）：
-- DXGI COM 纯 syscall（CGO_ENABLED=0）— vtable 偏移已修正（GetDesc=7, DuplicateOutput=20, AcquireNextFrame=8 等）
-- H.264 MFT 编码器 — IMFTransform vtable: ProcessInput=24, ProcessOutput=25, CLSID 6CA50344
-- ScreenStreamManager 用 `Microsoft/go-winio` 做 named pipe net.Conn
-- helper 独立模块 `xnc/screen-helper`，构建产物 `bin/xnc-screen-helper.exe`
-- Web UI 用 WebCodecs VideoDecoder + canvas 渲染
-- pipe 协议：[1B type][4B length LE][payload]，5 种类型
+**遗留**：TB16G7 上 DXGI DuplicateOutput 全适配器失败（0x887A0001 INVALID_CALL，见 screen-helper.log），流走 GDI 路径（正确但 CPU 较高、上限 15fps）。后续可试 IDXGIOutput5::DuplicateOutput1 / 检查 CreateProcessAsUser 的 STARTUPINFO lpDesktop。诊断工具在 `tools/screendiag/`（screendiag=抓流+SPS 解析，correlate=几何判定，checkcorners=编码回归配套）。
 
-Phase 6 完成后：Phase 8（Linux，远期）或稳定运行期。
+### 稳定期
+
+Phase 8（Linux agent，远期）或 3 个月稳定运行 → 商业化决策。
