@@ -21,14 +21,14 @@ func TestH264EncoderSmoke(t *testing.T) {
 	for i := 0; i < len(frame); i += 4 {
 		frame[i], frame[i+2] = 0x80, 0xA0 // 均匀 BGR
 	}
-	if _, err := enc.Encode(frame, true); err != nil {
+	if _, err := enc.Encode(frame, true, false); err != nil {
 		t.Fatalf("first encode: %v", err)
 	}
 	// MFT 内部有 ~17 帧启动延迟——继续喂帧直到出关键帧。
 	var keyData []byte
 	for i := 0; i < 40 && keyData == nil; i++ {
 		frame[16] ^= 0xFF // 每帧微变，驱动编码器
-		data, err := enc.Encode(frame, i == 20)
+		data, err := enc.Encode(frame, i == 20, false)
 		if err != nil {
 			t.Fatalf("encode %d: %v", i, err)
 		}
@@ -55,7 +55,7 @@ func TestBGRAToNV12(t *testing.T) {
 		bgra[i+2] = 0xFF
 	}
 	nv12 := make([]byte, w*h*3/2)
-	bgraToNV12(bgra, nv12, w, h)
+	bgraToNV12(bgra, nv12, w, h, false)
 	// 红：Y ≈ 82，U ≈ 90，V ≈ 240（BT.601 有限范围）
 	y, u, v := nv12[0], nv12[w*h], nv12[w*h+1]
 	if y < 75 || y > 90 {

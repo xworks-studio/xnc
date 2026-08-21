@@ -90,6 +90,7 @@ var (
 	attrMFMTFrameSize     = guid{0x1652c33d, 0xd6b2, 0x4012, [8]byte{0xb8, 0x34, 0x72, 0x03, 0x08, 0x49, 0xa3, 0x7d}}
 	attrMFMTFrameRate     = guid{0xc459a2e8, 0x3d2c, 0x4e44, [8]byte{0xb1, 0x32, 0xfe, 0xe5, 0x15, 0x6c, 0x7b, 0xb0}}
 	attrMFMTInterlace     = guid{0xe2724bb8, 0xe676, 0x4806, [8]byte{0xb4, 0xb2, 0xa8, 0xd6, 0xef, 0xb4, 0x4c, 0xcd}}
+	attrMFMTDefaultStride = guid{0x82e1bf1f, 0x83b1, 0x4b81, [8]byte{0x9a, 0x4b, 0xdc, 0xf5, 0xd6, 0xc3, 0x35, 0x22}}
 	attrMFMTAvgBitrate    = guid{0x20332624, 0xfb0d, 0x4d9e, [8]byte{0xbd, 0x0d, 0xcb, 0xf6, 0x78, 0x6c, 0x10, 0x2e}}
 	guidMFMediaTypeVideo  = guid{0x73646976, 0x0000, 0x0010, [8]byte{0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}}
 	guidMFVideoFormatH264 = guid{0x34363248, 0x0000, 0x0010, [8]byte{0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}} // 'H264'
@@ -242,6 +243,10 @@ func NewH264Encoder(width, height, bitrate, gopSize int) (*H264Encoder, error) {
 		if _, err := mt.call(vtAttrSetGUID, ptrGUID(&attrMFMTSubtype), ptrGUID(&guidMFVideoFormatNV12)); err != nil {
 			return err
 		}
+		// 显式声明 NV12 紧凑 stride = width（默认 MFT 可能用对齐 stride）
+		if _, err := mt.call(vtAttrSetUINT32, ptrGUID(&attrMFMTDefaultStride), uintptr(width)); err != nil {
+			return err
+		}
 		if _, err := mt.call(vtAttrSetUINT64, ptrGUID(&attrMFMTFrameSize), uintptr(frameSize)); err != nil {
 			return err
 		}
@@ -318,13 +323,13 @@ func (e *H264Encoder) codecAPISetUint(api *guid, v uint32) error {
 	return err
 }
 
-// Encode 编码一帧 BGRA（top-down，w*h*4 字节）。forceKey 请求 IDR。
-// 输出为 Annex-B NALU 序列；MFT 尚无输出时返回（nil, nil）。
-func (e *H264Encoder) Encode(frame []byte, forceKey bool) ([]byte, error) {
+// Encode 编码一帧 BGRA（w*h*4 字节）。flipY=true 时源为 bottom-up（垂直
+// 翻转后转 NV12）。forceKey 请求 IDR。输出为 Annex-B NALU 序列。
+func (e *H264Encoder) Encode(frame []byte, forceKey bool, flipY bool) ([]byte, error) {
 	if len(frame) < e.width*e.height*4 {
 		return nil, fmt.Errorf("short frame: %d < %d", len(frame), e.width*e.height*4)
 	}
-	bgraToNV12(frame, e.nv12, e.width, e.height)
+	bgraToNV12(frame, e.nv12, e.width, e.height, flipY)
 
 	if forceKey && e.codecAPI.valid() {
 		// 部分实现要求 VT_BOOL，失败忽略——关键帧仍按 GOP 周期产生。
@@ -487,32 +492,40 @@ func ptrGUID(g *guid) uintptr { return uintptr(unsafe.Pointer(g)) }
 // ---- BGRA → NV12（BT.601，整数近似）----
 
 // bgraToNV12 将 top-down BGRA 帧转换为 NV12（Y 平面 + 交错的 UV 半分辨率
-// 平面）。dst 需为 w*h*3/2 字节。
-func bgraToNV12(bgra, dst []byte, w, h int) {
+// 平面）。dst 需为 w*h*3/2 字节。flipY 控制垂直翻转（DXGI 某些驱动返回
+// bottom-up 行序时需要翻转为 top-down）。
+func bgraToNV12(bgra, dst []byte, w, h int, flipY bool) {
 	yPlane := dst[:w*h]
 	uvPlane := dst[w*h:]
 	stride := w * 4
 
+	rowIdx := func(row int) int {
+		if flipY {
+			return (h - 1 - row) * stride
+		}
+		return row * stride
+	}
+
 	for row := 0; row < h; row++ {
 		yRow := yPlane[row*w : (row+1)*w]
-		srcRow := bgra[row*stride : (row+1)*stride]
+		srcRow := bgra[rowIdx(row) : rowIdx(row)+stride]
 		for x := 0; x < w; x++ {
 			b := int(srcRow[x*4])
 			g := int(srcRow[x*4+1])
 			r := int(srcRow[x*4+2])
-			yRow[x] = byte((66*r + 129*g + 25*b + 128) >> 8 /* +16 由下式合并 */)
+			yRow[x] = byte((66*r + 129*g + 25*b + 128) >> 8)
 			yRow[x] += 16
 		}
 	}
 	for row := 0; row < h/2; row++ {
-		uvRow := uvPlane[row*w : (row+1)*w] // 每像素 2B（U,V），行长 w 字节
-		y0 := row * 2 * stride
-		y1 := (row*2 + 1) * stride
+		uvRow := uvPlane[row*w : (row+1)*w]
+		srcRow0 := rowIdx(row * 2)
+		srcRow1 := rowIdx(row*2 + 1)
 		for cx := 0; cx < w/2; cx++ {
-			b0, g0, r0 := bgra[y0+cx*8+0], bgra[y0+cx*8+1], bgra[y0+cx*8+2]
-			b1, g1, r1 := bgra[y0+cx*8+4], bgra[y0+cx*8+5], bgra[y0+cx*8+6]
-			b2, g2, r2 := bgra[y1+cx*8+0], bgra[y1+cx*8+1], bgra[y1+cx*8+2]
-			b3, g3, r3 := bgra[y1+cx*8+4], bgra[y1+cx*8+5], bgra[y1+cx*8+6]
+			b0, g0, r0 := bgra[srcRow0+cx*8], bgra[srcRow0+cx*8+1], bgra[srcRow0+cx*8+2]
+			b1, g1, r1 := bgra[srcRow0+cx*8+4], bgra[srcRow0+cx*8+5], bgra[srcRow0+cx*8+6]
+			b2, g2, r2 := bgra[srcRow1+cx*8], bgra[srcRow1+cx*8+1], bgra[srcRow1+cx*8+2]
+			b3, g3, r3 := bgra[srcRow1+cx*8+4], bgra[srcRow1+cx*8+5], bgra[srcRow1+cx*8+6]
 			b := (int(b0) + int(b1) + int(b2) + int(b3)) / 4
 			g := (int(g0) + int(g1) + int(g2) + int(g3)) / 4
 			r := (int(r0) + int(r1) + int(r2) + int(r3)) / 4

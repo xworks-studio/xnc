@@ -568,7 +568,7 @@ func captureLoop(ctx context.Context, conn net.Conn, opts captureOpts) error {
 					if g, _, _, gerr := captureGDIFrame(); gerr == nil {
 						// GDI 帧是全分辨率 BGRA，需要缩放到编码器尺寸
 						scaled := scaleBGRA(g, srcW, srcH, outW, outH)
-						if serr := sendEncoded(conn, encoder, scaled, gop, &framesSinceKey, &sentKey); serr == nil {
+						if serr := sendEncoded(conn, encoder, scaled, gop, &framesSinceKey, &sentKey, false); serr == nil {
 							firstFrame = false
 							lastFrame = scaled
 						}
@@ -578,7 +578,7 @@ func captureLoop(ctx context.Context, conn net.Conn, opts captureOpts) error {
 				// 后续静止帧：MFT 启动缓冲自愈逻辑
 				idleTicks++
 				if !sentKey && lastFrame != nil && idleTicks >= idleLimit {
-					if err := sendEncoded(conn, encoder, lastFrame, gop, &framesSinceKey, &sentKey); err != nil {
+					if err := sendEncoded(conn, encoder, lastFrame, gop, &framesSinceKey, &sentKey, false); err != nil {
 						return err
 					}
 				}
@@ -602,17 +602,17 @@ func captureLoop(ctx context.Context, conn net.Conn, opts captureOpts) error {
 		}
 		lastFrame = frame
 
-		if err := sendEncoded(conn, encoder, frame, gop, &framesSinceKey, &sentKey); err != nil {
+		if err := sendEncoded(conn, encoder, frame, gop, &framesSinceKey, &sentKey, false); err != nil {
 			return err
 		}
 	}
 }
 
 // sendEncoded 编码一帧并按关键帧/增量帧类型写 pipe。编码器无输出（MFT
-// 启动缓冲）时静默跳过。
-func sendEncoded(conn net.Conn, encoder frameEncoder, frame []byte, gop int, framesSinceKey *int, sentKey *bool) error {
-	forceKey := !*sentKey || *framesSinceKey >= gop // 首输出前始终请求关键帧
-	data, encErr := encoder.Encode(frame, forceKey)
+// 启动缓冲）时静默跳过。flipY 传递给编码器（BGRA 行序翻转）。
+func sendEncoded(conn net.Conn, encoder frameEncoder, frame []byte, gop int, framesSinceKey *int, sentKey *bool, flipY bool) error {
+	forceKey := !*sentKey || *framesSinceKey >= gop
+	data, encErr := encoder.Encode(frame, forceKey, flipY)
 	if encErr != nil {
 		fmt.Fprintf(os.Stderr, "xnc-screen-helper: encode: %v\n", encErr)
 		return nil

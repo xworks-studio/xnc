@@ -1,7 +1,7 @@
 # XNC v2 — 会话上下文快照（Session Context Snapshot）
 
 > 本文档保存了跨会话的项目全貌，供新会话或 fork 后快速恢复上下文。
-> 最后更新：2026-08-21
+> 最后更新：2026-08-21（Phase 6 执行中途更新）
 
 ---
 
@@ -130,9 +130,29 @@ xnc audit list [--node n] [--user u] [--action a] [--since 7d]
 
 ## 下一步
 
-Phase 6（桌面预览）计划已就绪，待执行：
-- 文件：`docs/superpowers/plans/2026-08-21-xnc-v2-phase6-screen.md`
-- 8 个任务：proto → server 端点 → agent Screen Handler → helper.exe → 注册 → CLI → Web UI → E2E
-- 执行方式：用户选择了 Subagent-Driven
+### Phase 6（桌面流）执行中 — T11 待完成
 
-Phase 6 完成后：Phase 8（Linux，远期）或稳定运行期（3 个月后商业化决策）。
+**当前状态**：T1-T10 已完成并提交到分支 `xnc-v2-phase6`（worktree `.worktrees/xnc-v2-phase6`）。
+
+**已提交**（base 33bb515 → HEAD 1a43916，共 11 commits）：
+- T1+T2: proto screen 词汇 + server POST /screen（`6de6da0` + `d4c1f86`）
+- T3: ScreenStreamManager 单例 + FrameHub 多观众广播（`bb10cd7`）
+- T4+T5: helper 入口 + DXGI 捕获（`ce25a87` + `e157d42` + 修复 `a87cc3f`）
+- T6+T7+T8: H.264 MFT 编码器 + GDI fallback + 注册（`36f4ff1` + `e6df8a9` + `d708c57`）
+- T9+T10: CLI xnc screen + Web UI ScreenPreview（`e3b3769` + `1a43916`）
+
+**T11 待做**：
+1. E2E 脚本 `scripts/e2e_phase6.sh`（dev 栈 + mockagent + --snapshot + 无残留断言）
+2. Final whole-branch review
+3. 合并回 main + 生产部署
+4. 真机 TB16G7 验收（DXGI 捕获 + Web UI 预览 + 三态）
+
+**关键实现细节**（供新会话参考）：
+- DXGI COM 纯 syscall（CGO_ENABLED=0）— vtable 偏移已修正（GetDesc=7, DuplicateOutput=20, AcquireNextFrame=8 等）
+- H.264 MFT 编码器 — IMFTransform vtable: ProcessInput=24, ProcessOutput=25, CLSID 6CA50344
+- ScreenStreamManager 用 `Microsoft/go-winio` 做 named pipe net.Conn
+- helper 独立模块 `xnc/screen-helper`，构建产物 `bin/xnc-screen-helper.exe`
+- Web UI 用 WebCodecs VideoDecoder + canvas 渲染
+- pipe 协议：[1B type][4B length LE][payload]，5 种类型
+
+Phase 6 完成后：Phase 8（Linux，远期）或稳定运行期。

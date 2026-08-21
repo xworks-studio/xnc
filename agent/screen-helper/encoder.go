@@ -14,9 +14,9 @@ import (
 // （top-down，width*height*4 字节）；H.264 模式输出 Annex-B NALU，
 // JPEG 模式输出完整 JPEG（恒为关键帧）。
 type frameEncoder interface {
-	// Encode 编码一帧。forceKey 请求关键帧（JPEG 恒关键帧）。
+	// Encode 编码一帧。forceKey 请求关键帧。flipY 控制 BGRA 行序翻转。
 	// 返回 nil, nil 表示编码器暂无输出（可跳过）。
-	Encode(frame []byte, forceKey bool) ([]byte, error)
+	Encode(frame []byte, forceKey bool, flipY bool) ([]byte, error)
 	// SPSPPS 返回 H.264 参数集（JPEG 模式恒 nil）。
 	SPSPPS() []byte
 	// LastFrameKey 报告最近一次 Encode 输出是否关键帧。
@@ -44,8 +44,8 @@ func newJPEGStreamEncoder(width, height, quality int) *jpegStreamEncoder {
 	}
 }
 
-// Encode 实现 frameEncoder：BGRA→RGBA→JPEG。
-func (j *jpegStreamEncoder) Encode(frame []byte, _ bool) ([]byte, error) {
+// Encode 实现 frameEncoder：BGRA→RGBA→JPEG。flipY 未使用（JPEG path 不需要翻转）。
+func (j *jpegStreamEncoder) Encode(frame []byte, _ bool, _ bool) ([]byte, error) {
 	if len(frame) < j.width*j.height*4 {
 		return nil, fmt.Errorf("short frame: %d < %d", len(frame), j.width*j.height*4)
 	}
