@@ -486,3 +486,42 @@ h2 {
 .term-error {
   padding: 24px 4px;
 }
+
+/* Screen preview */
+.screen-preview {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.screen-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+  background: #16213e;
+  border-bottom: 1px solid #0f3460;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.screen-canvas {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  object-fit: contain;
+  background: #000;
+}
+
+.screen-state {
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.screen-state-capturing { background: #2d6a4f; color: #b7e4c7; }
+.screen-state-locked { background: #7f4f24; color: #ffe6a7; }
+.screen-state-no_session { background: #6c757d; color: #dee2e6; }
+.screen-state-error { background: #8b0000; color: #ffcccc; }
+.screen-state-disconnected { background: #495057; color: #ced4da; }

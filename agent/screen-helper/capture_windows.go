@@ -496,10 +496,13 @@ func captureLoop(ctx context.Context, conn net.Conn, opts captureOpts) error {
 	}
 
 	// DXGI：AcquireNextFrame 超时即节流（timeout ≤ 100ms）；GDI：ticker 节拍。
+	// 首帧使用 2s 超时：静止桌面 DuplicateOutput 后仍需一次全屏脏区标记
+	// 才能产出首帧，100ms 不够。
 	acquireTimeout := frameInterval.Milliseconds()
 	if acquireTimeout <= 0 || acquireTimeout > 100 {
 		acquireTimeout = 100
 	}
+	firstAcquireTimeout := uint(2000)
 	var tickC <-chan time.Time
 	if gdi != nil {
 		t := time.NewTicker(frameInterval)
@@ -535,7 +538,11 @@ func captureLoop(ctx context.Context, conn net.Conn, opts captureOpts) error {
 		var frame []byte
 		var err error
 		if dxgi != nil {
-			frame, _, err = dxgi.AcquireFrame(uint(acquireTimeout))
+			t := uint(acquireTimeout)
+			if firstFrame {
+				t = firstAcquireTimeout
+			}
+			frame, _, err = dxgi.AcquireFrame(t)
 		} else {
 			frame, _, err = gdi.AcquireFrame(0)
 		}
