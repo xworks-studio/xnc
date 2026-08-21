@@ -23,7 +23,7 @@ func main() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(secs)*time.Second)
 	defer cancel()
-	conn, err := winio.DialPipeContext(ctx, `\.\pipe\`+name)
+	conn, err := winio.DialPipeContext(ctx, `\\.\pipe\`+name)
 	if err != nil {
 		fatal("dial: %v", err)
 	}

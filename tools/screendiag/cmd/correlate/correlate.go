@@ -9,8 +9,8 @@ package main
 
 import (
 	"fmt"
-	"image/color"
 	"image"
+	"image/color"
 	_ "image/jpeg"
 	_ "image/png"
 	"os"
@@ -49,7 +49,8 @@ func loadGray(path string) *image.Gray {
 	for y := b.Min.Y; y < b.Max.Y; y++ {
 		for x := b.Min.X; x < b.Max.X; x++ {
 			r, gr, bl, _ := img.At(x, y).RGBA()
-			v := uint8((r + gr + bl) / 768); g.SetGray(x-b.Min.X, y-b.Min.Y, color.Gray{v})
+			v := uint8((r + gr + bl) / 768)
+			g.SetGray(x-b.Min.X, y-b.Min.Y, color.Gray{v})
 		}
 	}
 	return g

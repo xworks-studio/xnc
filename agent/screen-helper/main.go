@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/signal"
 )
 
 const (
@@ -77,7 +76,9 @@ func runJpegSingle(path string, quality int) error {
 }
 
 // runPipe 启动 named pipe 服务端并进入捕获主循环，直至 agent 断开或进程被
-// 终止（ctx 取消于 SIGINT/SIGTERM）。
+// 终止（agent 直接 Kill）。WGC 捕获器与首帧均在 listenPipe 之前获取：
+// listenPipe（winio）之后才建 WGC 会话的旧时序在 TB16G7 上零帧——预取
+// 首帧 + 提前建会话后流式正常（快照路径一直是该时序）。
 func runPipe(pipeName string, opts captureOpts) error {
 	if opts.fps < 1 || opts.fps > 30 {
 		opts.fps = 15
@@ -85,8 +86,23 @@ func runPipe(pipeName string, opts captureOpts) error {
 	if opts.quality < 1 || opts.quality > 100 {
 		opts.quality = 60
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
+	ctx := context.Background()
+
+	cap, cerr := NewWGCCapturer()
+	if cerr != nil {
+		// 不可用：仍需 listen 报告状态（placeholderLoop）。
+		conn, err := listenPipe(ctx, pipeName)
+		if err != nil {
+			return fmt.Errorf("listen pipe: %w", err)
+		}
+		defer conn.Close()
+		return placeholderLoop(ctx, conn, cerr)
+	}
+	defer cap.Close()
+
+	firstFrame, ferr := cap.AcquireFrame(2000)
+	fmt.Fprintf(os.Stderr, "xnc-screen-helper: pre-pipe first frame: err=%v len=%d\n",
+		ferr, len(firstFrame))
 
 	conn, err := listenPipe(ctx, pipeName)
 	if err != nil {
@@ -94,5 +110,5 @@ func runPipe(pipeName string, opts captureOpts) error {
 	}
 	defer conn.Close()
 
-	return captureLoop(ctx, conn, opts)
+	return captureLoopWith(ctx, conn, opts, cap, firstFrame, ferr)
 }

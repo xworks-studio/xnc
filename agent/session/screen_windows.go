@@ -131,9 +131,13 @@ func launchHelperAsUser(log *slog.Logger, helperPath string, stderr io.Writer, a
 			windows.CREATE_NO_WINDOW, nil, dir, si, &pi)
 	} else {
 		defer token.Close()
-		// kernel32 直连 CreateProcessAsUserW。err 必须赋给外层变量——
-		// 曾经的 if 内 err 遮蔽把失败静默吞成"幽灵成功"（err==nil 且
-		// PROCESS_INFORMATION 全零）。
+		// 用户环境上下文：env=NULL 时子进程继承调用方（SYSTEM 服务）的
+		// 环境——WGC 在用户令牌 + SYSTEM 环境的混合上下文里只捕获到黑
+		// 帧。直接传 CreateEnvironmentBlock 的块会被 CreateProcessAsUser
+		// 以 ERROR_INVALID_PARAMETER 拒绝（TB16G7 实测），改用 cmd.exe
+		// 引导：以用户令牌启动 cmd，由它设置用户环境变量后启动 helper。
+		// err 必须赋给外层变量——曾经的 if 内 err 遮蔽把失败静默吞成
+		// "幽灵成功"（err==nil 且 PROCESS_INFORMATION 全零）。
 		r1, _, e1 := procCreateProcessAsUserW.Call(
 			uintptr(token),
 			uintptr(unsafe.Pointer(app16)), uintptr(unsafe.Pointer(cmd16)),

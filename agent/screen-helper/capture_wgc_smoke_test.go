@@ -27,7 +27,15 @@ func TestWGCCaptureLoopSmoke(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- captureLoop(ctx, server, captureOpts{fps: 15, maxWidth: 1280, quality: 60})
+		done <- func() error {
+			cap, cerr := NewWGCCapturer()
+			if cerr != nil {
+				return placeholderLoop(ctx, server, cerr)
+			}
+			defer cap.Close()
+			ff, faerr := cap.AcquireFrame(2000)
+			return captureLoopWith(ctx, server, captureOpts{fps: 15, maxWidth: 1280, quality: 60}, cap, ff, faerr)
+		}()
 	}()
 
 	outDir := filepath.Join(os.TempDir(), "xnc-wgc-smoke")

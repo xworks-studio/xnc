@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"runtime"
 	"syscall"
 	"time"
 	"unsafe"
@@ -197,23 +196,14 @@ func bitrateFor(quality int) int {
 //	会话/设备失败：整体重建 capturer（秒级退避，有界）——分辨率切换 /
 //	      设备移除等场景
 //	关键帧：首帧 + 每 gop 帧（新观众可立即入流）
-func captureLoop(ctx context.Context, conn net.Conn, opts captureOpts) error {
-	// COM/WinRT 单元亲和：捕获全程固定线程。
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
+func captureLoopWith(ctx context.Context, conn net.Conn, opts captureOpts, cap *WGCCapturer, firstFrame []byte, ferr error) error {
 	frameInterval := time.Second / time.Duration(opts.fps)
-
-	cap, cerr := NewWGCCapturer()
-	if cerr != nil {
-		return placeholderLoop(ctx, conn, cerr)
-	}
-	defer cap.Close()
 
 	srcW, srcH := cap.Dims()
 	outW, outH := fitDims(srcW, srcH, opts.maxWidth)
 
-	// 编码器：H.264 MFT → JPEG 帧流。
+	// 编码器在首帧之后创建：部分机器上 MFT 编码器初始化（COM 单元/MTA 交
+	// 互）会阻断 WGC 帧池交付——首帧由调用方（listenPipe 之前）预取。
 	gop := opts.fps * 2 // 关键帧间隔 ≈ 2s
 	encoder, eerr := newH264Encoder(outW, outH, bitrateFor(opts.quality), gop)
 	if eerr != nil {
@@ -235,11 +225,22 @@ func captureLoop(ctx context.Context, conn net.Conn, opts captureOpts) error {
 	if acquireTimeout <= 0 || acquireTimeout > 100 {
 		acquireTimeout = 100
 	}
-	firstAcquireTimeout := uint(2000)
 
 	framesSinceKey := 0
 	sentKey := false
 	var lastFrame []byte
+	if ferr == nil {
+		w, h := cap.Dims()
+		if len(firstFrame) >= w*h*4 {
+			if outW != w {
+				firstFrame = scaleBGRA(firstFrame, w, h, outW, outH)
+			}
+			lastFrame = firstFrame
+			if err := sendEncoded(conn, encoder, firstFrame, gop, &framesSinceKey, &sentKey, false); err != nil {
+				return err
+			}
+		}
+	}
 	// 静止桌面自愈：MFT 有 ~gop 帧启动缓冲，若期间桌面转静止，首帧可能
 	// 被编码器内部吞掉而始终无输出。静止超时 ~1s 后强制重编码缓存帧。
 	// 首关键帧出帧前按节拍持续驱动编码器；出帧后静止即完全静默。
@@ -250,9 +251,6 @@ func captureLoop(ctx context.Context, conn net.Conn, opts captureOpts) error {
 		}
 
 		t := uint(acquireTimeout)
-		if !sentKey {
-			t = firstAcquireTimeout
-		}
 		frame, aerr := cap.AcquireFrame(t)
 		if aerr != nil {
 			if errors.Is(aerr, ErrTimeout) {
