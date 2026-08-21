@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -42,6 +43,14 @@ type Client struct {
 	// 交出该条连接的控制写闭包。重连后再次触发：旧闭包绑定已死连接，接收方
 	// （如会话引擎）必须在回调内整体重建自身，不得跨连接复用旧闭包。nil 跳过。
 	OnReady func(sendControl func(m proto.Message) error)
+	// TargetVersionFunc：快速版本检查回调（HELLO_ACK/心跳 ACK 目标版本）。
+	TargetVersionFunc func(target string)
+	// UpdateOfferFunc：UPDATE_OFFER 到达（独立 goroutine 分发）。携带 send
+	// 供 UPDATE_STATUS 上报。nil 时 offer 静默忽略。
+	UpdateOfferFunc func(ctx context.Context, offer proto.UpdateOffer)
+
+	sendMu      sync.Mutex
+	currentSend func(m proto.Message) error
 }
 
 func NewClient(serverURL string, k *identity.Key, info machineinfo.Info) *Client {
@@ -131,6 +140,11 @@ func (c *Client) handshake(ctx context.Context) (*websocket.Conn, error) {
 	if m.Type != proto.TypeHelloAck {
 		return nil, fmt.Errorf("auth rejected: expected HELLO_ACK, got %q", m.Type)
 	}
+	var hAck proto.HelloAck
+	_ = m.Decode(&hAck)
+	if hAck.TargetVersion != "" {
+		c.OnTargetVersion(hAck.TargetVersion) // 快速版本检查 ①：握手回执
+	}
 	c.Log.Info("control connection ready", "node", c.Key.NodeID)
 	ok = true
 	return ws, nil
@@ -150,6 +164,9 @@ func (c *Client) once(ctx context.Context) error {
 	// 连接拆除）与本条 ws——重连后旧闭包指向死连接，接收方须在回调内重建。
 	if c.OnReady != nil {
 		c.OnReady(func(m proto.Message) error { return writeControl(ctx, ws, m) })
+		c.sendMu.Lock()
+		c.currentSend = func(m proto.Message) error { return writeControl(ctx, ws, m) }
+		c.sendMu.Unlock()
 	}
 
 	// 泄读循环：消费 HEARTBEAT_ACK 等入站帧。不读的话 ACK 积压（~39B/30s）
@@ -176,7 +193,7 @@ func (c *Client) once(ctx context.Context) error {
 		case <-pctx.Done():
 			return errConnDead
 		case <-tick.C:
-			if err := writeMsg(ctx, ws, proto.TypeHeartbeat, struct{}{}); err != nil {
+			if err := writeMsg(ctx, ws, proto.TypeHeartbeat, proto.Heartbeat{Version: c.Info.AgentVersion}); err != nil {
 				return err
 			}
 		}
@@ -195,6 +212,11 @@ func (c *Client) drain(pctx context.Context, ws *websocket.Conn, dead func()) {
 		if err == nil {
 			switch m.Type {
 			case proto.TypeHeartbeatAck:
+				var hAck proto.HeartbeatAck
+				_ = m.Decode(&hAck)
+				if hAck.TargetVersion != "" {
+					c.OnTargetVersion(hAck.TargetVersion) // 快速版本检查 ②：心跳搭车
+				}
 				// 心跳回执，丢弃。
 			case proto.TypeError:
 				var e proto.ErrorPayload
@@ -205,6 +227,11 @@ func (c *Client) drain(pctx context.Context, ws *websocket.Conn, dead func()) {
 				if err := m.Decode(&so); err == nil && c.Handler != nil {
 					h := c.Handler
 					go h.HandleSessionOpen(pctx, so) // 会话处理不得阻塞心跳/读取
+				}
+			case proto.TypeUpdateOffer:
+				var offer proto.UpdateOffer
+				if err := m.Decode(&offer); err == nil {
+					go c.HandleUpdateOffer(pctx, offer) // 下载不得阻塞心跳读取
 				}
 			case proto.TypeSessionClose:
 				var sc proto.SessionClose
@@ -273,3 +300,35 @@ func readMsg(ctx context.Context, ws *websocket.Conn, timeout time.Duration) (pr
 	var m proto.Message
 	return m, json.Unmarshal(data, &m)
 }
+
+// ---- 自更新接入（三入口回调）----
+
+// OnTargetVersion 快速版本检查回调：HELLO_ACK 回执与心跳 ACK 携带的目标
+// 版本到达时调用（nil 跳过）。与 OnUpdateOffer 收敛到同一处理方（updater
+// 幂等去重），三入口（握手/心跳/强制）无需区分来源。
+func (c *Client) OnTargetVersion(target string) {
+	if c.TargetVersionFunc != nil {
+		c.TargetVersionFunc(target)
+	}
+}
+
+// HandleUpdateOffer drain 收到 UPDATE_OFFER 时分发（独立 goroutine，与
+// 会话消息同等待遇——下载不得阻塞心跳读取）。
+func (c *Client) HandleUpdateOffer(pctx context.Context, offer proto.UpdateOffer) {
+	if c.UpdateOfferFunc != nil {
+		c.UpdateOfferFunc(pctx, offer)
+	}
+}
+
+// CurrentSend 返回当前连接的控制写闭包（无连接时返回 nil-safe 占位）。
+// updater 经此上报 UPDATE_STATUS；重连后闭包自然指向新连接。
+func (c *Client) CurrentSend() func(m proto.Message) error {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	if c.currentSend == nil {
+		return func(proto.Message) error { return errNoConn }
+	}
+	return c.currentSend
+}
+
+var errNoConn = fmt.Errorf("control connection not ready")

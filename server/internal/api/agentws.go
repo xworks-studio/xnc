@@ -117,7 +117,16 @@ func (h *handlers) agentConnect(w http.ResponseWriter, r *http.Request) {
 		_ = h.st.Q().TouchNode(context.Background(), node.ID)
 	}()
 
-	h.writeJSON(ctx, c, proto.TypeHelloAck, struct{}{})
+	// 快速版本检查 ①：HELLO_ACK 回执携带目标版本；握手后版本落后则立即
+	// 下发 UPDATE_OFFER（重连/重启/开机场景秒级感知）。
+	targetVer := ""
+	if rel, ok := h.targetReleaseFor(ctx, node.ID); ok {
+		targetVer = rel.Version
+	}
+	h.writeJSON(ctx, c, proto.TypeHelloAck, proto.HelloAck{TargetVersion: targetVer})
+	if targetVer != "" && targetVer != hello.AgentVersion {
+		h.maybeOfferUpdate(ctx, node.ID, hello.AgentVersion, sendControl)
+	}
 
 	// 4. 心跳循环：每条消息读超时 = HeartbeatTimeout
 	for {
@@ -132,9 +141,24 @@ func (h *handlers) agentConnect(w http.ResponseWriter, r *http.Request) {
 				_ = h.st.Q().TouchNode(ctx, node.ID)
 			}
 			conn.Beats++
+			// 快速版本检查 ②：PING/PONG 搭车——agent 报当前版本，ACK
+			// 回目标版本；版本落后即推 OFFER（灰度改 pin 后一个保活周
+			// 期内全网感知，零新增消息类型）。
+			var hb proto.Heartbeat
+			_ = m.Decode(&hb)
+			if hb.Version != "" && targetVer != "" && hb.Version != targetVer {
+				h.maybeOfferUpdate(ctx, node.ID, hb.Version, sendControl)
+			}
 			// ACK 经串行化发送器（与 SESSION_OPEN/CLOSE 单一写路径）
-			ack, _ := proto.NewMsg(proto.TypeHeartbeatAck, struct{}{})
+			ack, _ := proto.NewMsg(proto.TypeHeartbeatAck, proto.HeartbeatAck{TargetVersion: targetVer})
 			_ = sendControl(ack)
+		case proto.TypeUpdateStatus:
+			// agent 更新阶段上报（审计日志；最终确认 = 新版 HELLO 版本）。
+			var us proto.UpdateStatus
+			if m.Decode(&us) == nil {
+				slog.Info("agent update status", "node", node.ID, "version", us.Version,
+					"phase", us.Phase, "err", us.Error)
+			}
 		case proto.TypeSessionRefused:
 			// agent 能力协商失败（如 kind 不支持）：消费为会话关闭，
 			// reason 前缀 refused: 保留 agent 侧错误码。

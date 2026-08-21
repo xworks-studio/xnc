@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 
 	"xnc/agent/connect"
@@ -12,6 +13,7 @@ import (
 	"xnc/agent/identity"
 	"xnc/agent/machineinfo"
 	"xnc/agent/session"
+	"xnc/agent/updater"
 	"xnc/proto"
 )
 
@@ -49,6 +51,15 @@ func (a *Agent) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
+	// 自更新：清扫上次失败的 staging 残留；三入口（握手回执/心跳搭车/
+	// 强制 OFFER）收敛到同一 Updater（幂等去重）。
+	updater.CleanupStale(a.StateDir)
+	upd := &updater.Updater{
+		ServerURL: a.ServerURL, StateDir: a.StateDir,
+		Version: info.AgentVersion, Log: slog.Default(),
+	}
+
 	c := connect.NewClient(a.ServerURL, k, info)
 	// 每次连接就绪（含重连）重建 engine：旧 engine 的 sendControl 绑定旧连接，
 	// 其 active 会话已随断连作废，重建即正确语义。
@@ -60,6 +71,25 @@ func (a *Agent) Run(ctx context.Context) error {
 		engine.Register(proto.KindTunnel, session.NewTunnel(slog.Default()))
 		engine.Register(proto.KindScreen, session.NewScreenHandler())
 		c.Handler = engine
+
+		// 控制连接就绪 = 新版存活的证明：写 apply-update 子进程等的
+		// connected 标记（apply 验证/回滚的判据），并上报 UPDATE_STATUS
+		// done（若本进程是更新产物）。
+		_ = os.WriteFile(updater.ConnectedMarkerPath(a.StateDir), []byte("ok"), 0o644)
+
+		// 目标版本信号（快速检查①②）需要 send 上报 STATUS——每条连接
+		// 重新注入。
+		upd.Report = sendControl
+	}
+	// 快速版本检查：targetVersion ≠ 当前版本时向 server 主动询问式触发
+	// 依赖 server 的 OFFER（服务端在 ACK 后自查）——agent 侧把 target
+	// 视作 offer 的本地等价信号（URL 由 server 在 OFFER 给出；此路径
+	// 仅当日标版本信号先于 OFFER 到达时用于日志感知，不自行构造 URL）。
+	c.TargetVersionFunc = func(target string) {
+		slog.Info("update: target version signal", "target", target, "current", info.AgentVersion)
+	}
+	c.UpdateOfferFunc = func(ctx context.Context, offer proto.UpdateOffer) {
+		upd.Handle(ctx, offer, c.CurrentSend())
 	}
 	return c.Run(ctx)
 }

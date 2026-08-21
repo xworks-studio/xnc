@@ -48,18 +48,36 @@ type EnrollmentToken struct {
 }
 
 type Node struct {
-	ID           uuid.UUID          `json:"id"`
-	ClusterID    uuid.UUID          `json:"cluster_id"`
-	Name         string             `json:"name"`
-	MachineID    string             `json:"machine_id"`
-	Hostname     string             `json:"hostname"`
-	OsVersion    string             `json:"os_version"`
-	AgentVersion string             `json:"agent_version"`
-	ShellType    string             `json:"shell_type"`
-	PublicKey    string             `json:"public_key"`
-	Status       string             `json:"status"`
-	LastSeenAt   pgtype.Timestamptz `json:"last_seen_at"`
-	CreatedAt    time.Time          `json:"created_at"`
+	ID            uuid.UUID          `json:"id"`
+	ClusterID     uuid.UUID          `json:"cluster_id"`
+	Name          string             `json:"name"`
+	MachineID     string             `json:"machine_id"`
+	Hostname      string             `json:"hostname"`
+	OsVersion     string             `json:"os_version"`
+	AgentVersion  string             `json:"agent_version"`
+	ShellType     string             `json:"shell_type"`
+	PublicKey     string             `json:"public_key"`
+	Status        string             `json:"status"`
+	LastSeenAt    pgtype.Timestamptz `json:"last_seen_at"`
+	CreatedAt     time.Time          `json:"created_at"`
+	TargetRelease pgtype.Text        `json:"target_release"`
+}
+
+type Release struct {
+	ID        uuid.UUID `json:"id"`
+	Version   string    `json:"version"`
+	Notes     string    `json:"notes"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type ReleaseArtifact struct {
+	ID        uuid.UUID `json:"id"`
+	ReleaseID uuid.UUID `json:"release_id"`
+	Name      string    `json:"name"`
+	Sha256    string    `json:"sha256"`
+	Size      int64     `json:"size"`
+	Data      []byte    `json:"data"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type User struct {

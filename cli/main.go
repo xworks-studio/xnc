@@ -20,6 +20,7 @@ import (
 const cliVersion = "0.1.0"
 
 func main() {
+	cleanupOldCLI() // 自更新残留清扫（幂等）
 	os.Exit(runCLI(context.Background(), os.Args[1:]))
 }
 
@@ -67,6 +68,7 @@ func newRootCmd() *cobra.Command {
 		newShellCmd(), newUploadCmd(), newDownloadCmd(), newRdpCmd(),
 		newScreenCmd(),
 		newAuditCmd(),
+		newUpdateCmd(),
 	)
 	return root
 }

@@ -84,9 +84,25 @@ func NewRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 	})
 	r.Post("/api/agent/enroll", h.agentEnroll)
 	r.Get("/api/agent/connect", h.agentConnect)
+	// 自更新数据面：agent bundle 下载（OFFER 携带的单次令牌即凭证，无 JWT）
+	r.Get("/api/agent/bundle", h.agentBundleDownload)
 	// 会话 WS（两侧均 token 即凭证，不走 JWT）
 	r.Get("/api/session/{id}", h.clientSessionWS)
 	r.Get("/api/agent/session", h.agentSessionWS)
+
+	// 自更新管理面（admin：部署流水线上传制品 + 灰度 pin/强制下发）
+	r.Route("/api/admin", func(ar chi.Router) {
+		ar.Use(auth.Middleware(cfg.JWTSecret, st))
+		ar.Post("/releases", h.adminUploadRelease)
+		ar.Get("/releases", h.adminListReleases)
+		ar.Post("/rollout", h.adminRollout)
+	})
+	// CLI 自更新（用户 JWT）：元信息 + 二进制
+	r.Route("/api/cli", func(cr chi.Router) {
+		cr.Use(auth.Middleware(cfg.JWTSecret, st))
+		cr.Get("/latest", h.cliLatest)
+		cr.Get("/download", h.cliDownload)
+	})
 	r.Route("/api/nodes", func(nr chi.Router) {
 		nr.Use(auth.Middleware(cfg.JWTSecret, st))
 		nr.Get("/", h.listNodes)
