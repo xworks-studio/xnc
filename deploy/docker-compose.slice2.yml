@@ -1,0 +1,47 @@
+# M1-Slice2 dev topology overlay (docs: scripts/dev-topology.md).
+#
+# Adds, on top of the base + dev overlays:
+#   - coturn (static lt-cred dev user, non-TLS dev TURN; TLS/443 is M2)
+#   - a LAN-reachable server port (0.0.0.0:18080 -> 8080) so the
+#     console-run dev agent on XIAOXIN can reach this dev server.
+#     The dev overlay's 127.0.0.1:8080 binding stays untouched for
+#     local tooling. 18080 is plain HTTP/WS: dev-only, LAN-only posture.
+#
+# Up:
+#   cd deploy && docker compose -f docker-compose.yml -f docker-compose.dev.yml \
+#       -f docker-compose.slice2.yml up -d --build
+#
+# Required env (deploy/.env is read automatically):
+#   XNC_DEV_EXTERNAL_IP   this host's LAN IP (advertised by coturn as
+#                         external-ip; relay ports are mapped 1:1)
+services:
+  xnc-server:
+    ports:
+      - "18080:8080"
+    environment:
+      # Dev-overlay default (10s) targets E2E offline windows; the slice2 dev
+      # loop keeps a long-lived agent whose heartbeat is 30s — anything below
+      # ~35s makes node status flap offline between beats.
+      XNC_HEARTBEAT_TIMEOUT: ${XNC_HEARTBEAT_TIMEOUT:-45s}
+
+  coturn:
+    image: coturn/coturn:alpine
+    # -n: no pid file. --no-tls/--no-dtls: dev TURN is plain turn: ...?transport=tcp.
+    # Static lt-cred user (slice2 dev); M2 moves to REST-cred turnover.
+    command:
+      - -n
+      - --realm=xnc.dev
+      - --fingerprint
+      - --lt-cred-mech
+      - --user=xncdev:xncdev-secret
+      - --listening-port=3478
+      - --min-port=49160
+      - --max-port=49200
+      - --no-cli
+      - --no-tls
+      - --no-dtls
+      - --external-ip=${XNC_DEV_EXTERNAL_IP:?set XNC_DEV_EXTERNAL_IP to this host's LAN IP in deploy/.env}
+    ports:
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+      - "49160-49200:49160-49200/udp"

@@ -21,13 +21,29 @@ type Agent struct {
 	ServerURL string
 	Token     string
 	StateDir  string
+	// HostnameOverride / MachineIDOverride：仅 run-dev-console 使用的一次性
+	// 身份覆盖；空值 = 生产行为完全不变。
+	HostnameOverride  string
+	MachineIDOverride string
 }
 
 func (a *Agent) identityPath() string { return filepath.Join(a.StateDir, "identity.json") }
 
+// info 采集机器信息并应用 dev 覆盖（空覆盖 = 原样返回，生产行为）。
+func (a *Agent) info() machineinfo.Info {
+	i := machineinfo.Collect()
+	if a.HostnameOverride != "" {
+		i.Hostname = a.HostnameOverride
+	}
+	if a.MachineIDOverride != "" {
+		i.MachineID = a.MachineIDOverride
+	}
+	return i
+}
+
 // EnsureEnrolled 加载既有身份；不存在则生成密钥并用 Token 注册。
 func (a *Agent) EnsureEnrolled(ctx context.Context) (*identity.Key, machineinfo.Info, error) {
-	info := machineinfo.Collect()
+	info := a.info()
 	k, err := identity.Load(a.identityPath())
 	if err == nil && k.NodeID != "" {
 		return k, info, nil
