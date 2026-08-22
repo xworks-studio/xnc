@@ -17,8 +17,8 @@
 #include <windows.h>
 #include <sddl.h>
 
-#include "frame.h"
-#include "handshake.h"
+#include "../common/frame.h"
+#include "../common/handshake.h"
 #include "pipe_server.h"
 #include "watchdog.h"
 

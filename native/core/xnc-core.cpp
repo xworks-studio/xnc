@@ -16,7 +16,7 @@
 #include <cstring>
 #include <string>
 
-#include "log.h"
+#include "../common/log.h"
 #include "pipe_server.h"
 
 int SelftestMain();  // selftest.cpp

@@ -12,7 +12,7 @@
 #include <cstdlib>
 #include <thread>
 
-#include "log.h"
+#include "../common/log.h"
 
 namespace xnc {
 

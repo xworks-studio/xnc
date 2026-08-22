@@ -8,9 +8,9 @@
 // payloads reuse frame.cpp/handshake.cpp byte-identical logic.
 #include "pipe_server.h"
 
-#include "frame.h"
-#include "handshake.h"
-#include "log.h"
+#include "../common/frame.h"
+#include "../common/handshake.h"
+#include "../common/log.h"
 #include "watchdog.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
