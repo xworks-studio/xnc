@@ -251,13 +251,14 @@ func (p *Publisher) frameDuration(monoUs uint64) time.Duration {
 // Stats 返回透传统计快照(计数器均为累计值)。
 func (p *Publisher) Stats() PubStats {
 	return PubStats{
-		FramesWritten: p.stats.frames.Load(),
-		BytesWritten:  p.stats.bytes.Load(),
-		PreKeyDropped: p.stats.preKeyDropped.Load(),
-		PLI:           p.stats.pli.Load(),
-		FIR:           p.stats.fir.Load(),
-		NACK:          p.stats.nack.Load(),
-		TWCC:          p.stats.twcc.Load(),
+		FramesWritten:  p.stats.frames.Load(),
+		BytesWritten:   p.stats.bytes.Load(),
+		PreConnDropped: p.stats.preConnDropped.Load(),
+		PreKeyDropped:  p.stats.preKeyDropped.Load(),
+		PLI:            p.stats.pli.Load(),
+		FIR:            p.stats.fir.Load(),
+		NACK:           p.stats.nack.Load(),
+		TWCC:           p.stats.twcc.Load(),
 	}
 }
 

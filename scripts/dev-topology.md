@@ -53,6 +53,12 @@ curl -s -X POST http://127.0.0.1:8080/api/clusters/default/enrollment-tokens \
   -d '{"ttl":"720h","maxUses":50}' | sed -n 's/.*"token":"\([^"]*\)".*/\1/p'
 ```
 
+> ⚠ Secret visibility (dev-only): the enrollment token — and the e2e scripts'
+> `--desktop-core-secret-hex` / core `--smoke-secret` — are stored in plaintext
+> inside `schtasks /TR` task definitions and `C:\xnc-dev\*.cmd` scripts.
+> Acceptable for this dev topology only; production paths use the SCM + stdin
+> secret channel (M2).
+
 ## 3. Run the dev agent on XIAOXIN (via prod `xnc exec`)
 
 Deploy the freshly built agent (build: `cd agent && go build -o ../bin/xnc-agent.exe ./cmd/xnc-agent`),
