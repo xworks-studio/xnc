@@ -1,0 +1,133 @@
+// XNC local IPC schema (spec §9). Source of truth: this file.
+// Codegen wiring lands in M1; M0 payloads on the wire are the fixed-binary
+// handshake messages defined in proto/ipc/frame.go (MsgHello..MsgPong).
+
+// desktop.proto — xnc-desktop 侧消息目录(spec §9.4)。
+// 走 \\.\pipe\xnc-desktop-<pid>(§9.1),XNIP 帧(§9.2)承载。
+syntax = "proto3";
+
+import "core.proto";
+
+package xnc.desktop;
+
+// ---------- Agent→Host ----------
+
+message ATTACH_SUBSCRIBER {
+  string session_id = 1;              // 逻辑会话
+  string ticket = 2;                  // SessionTicket 签名信封(§14.2)
+  repeated string capabilities = 3;
+  bool wants_control = 4;
+}
+
+message DETACH_SUBSCRIBER {
+  string session_id = 1;
+}
+
+message KEYFRAME_REQUEST {
+  uint32 display_id = 1;
+  string reason = 2;
+}
+
+message SET_VIDEO_CONFIG {
+  uint32 display_id = 1;
+  uint32 max_fps = 2;
+  uint32 max_width = 3;
+  uint64 target_bitrate_bps = 4;
+  string quality = 5;                 // 档位标识(标量 spec 未定,M1 codegen 细化)
+}
+
+message SET_ENCODER_BITRATE {
+  uint64 bps = 1;                     // QoS 热调
+}
+
+// INPUT_EVENT = §11.2 的 InputEvent(逐字段引用,zero invention)。
+message INPUT_EVENT {
+  uint64 seq = 1;             // 每 lease 单调递增,Host 检查(重复/回退丢弃)
+  string lease_id = 2;
+  oneof event {
+    PointerMove    pointer_move = 10;     // mouse 通道,可合并
+    PointerButton  pointer_button = 11;   // barrier
+    Wheel          wheel = 12;            // barrier
+    KeyPhysical    key_physical = 13;     // barrier
+    KeyUnicode     key_unicode = 14;      // barrier
+    Text           text = 15;             // IME 合成结果
+    LockState      lock_state = 16;       // caps/num/scroll 同步
+  }
+}
+
+message PointerMove   { int32 x=1; int32 y=2; uint32 buttons=3; uint32 display_id=4; }
+    // x,y = 目标显示器逻辑像素;buttons 位:1L 2R 4M 8X1 16X2
+message PointerButton { uint32 button=1; bool down=2; }
+message Wheel         { sint32 dx=1; sint32 dy=2; bool trackpad=3; }
+message KeyPhysical   { uint32 scan_code=1; bool down=2; bool extended=3; }
+    // scan_code = Windows 扫描码(Set 1);浏览器 KeyboardEvent.code 映射表在 Host 维护
+message KeyUnicode    { uint32 codepoint=1; bool down=2; }
+message Text          { string s=1; }     // 一次注入一串,KEYEVENTF_UNICODE 序列
+message LockState     { bool caps=1; bool num=2; bool scroll=3; }
+
+message CONTROL_LEASE {
+  bool grant = 1;                     // true=grant,false=revoke
+  string lease_id = 2;
+  string session_id = 3;
+  int64 expires_at = 4;
+}
+
+message DRAIN {}
+
+// ---------- Host→Agent ----------
+
+message HOST_HELLO {
+  uint32 generation = 1;
+  repeated xnc.core.DisplayInfo displays = 2;
+  string encoder_backend = 3;         // §7.10 编码梯子(MfD3d11Encoder/MfSoftwareEncoder/JpegFallback)
+  string codec_config = 4;
+}
+
+message ENCODED_FRAME {
+  uint32 display_id = 1;
+  uint64 frame_seq = 2;
+  uint32 flags = 3;                   // bit0 = key
+  uint64 captured_mono_us = 4;
+  uint64 encoded_mono_us = 5;
+  bytes data = 6;                     // Annex-B AU(统一 4 字节起始码,§7.10)
+}
+
+message CURSOR_SHAPE {
+  uint64 shape_id = 1;
+  uint32 w = 2;
+  uint32 h = 3;
+  int32 hotspot_x = 4;
+  int32 hotspot_y = 5;
+  bytes rgba = 6;
+}
+
+message CURSOR_POSITION {
+  uint32 display_id = 1;
+  int32 x = 2;
+  int32 y = 3;
+  bool visible = 4;
+}
+
+message STATE_EVENT {
+  string stable_code = 1;             // §15.3 稳定错误码
+  string backend = 2;
+  bool recoverable = 3;
+  uint32 retry_after_ms = 4;
+  string detail = 5;
+}
+
+message DISPLAY_CHANGED {
+  uint32 generation = 1;
+  string reason = 2;
+}
+
+message DESKTOP_STATE {
+  DesktopState state = 1;             // DEFAULT|WINLOGON|TRANSITION
+}
+
+enum DesktopState {
+  DESKTOP_STATE_UNSPECIFIED = 0;
+  DESKTOP_STATE_DEFAULT = 1;
+  DESKTOP_STATE_WINLOGON = 2;
+  DESKTOP_STATE_TRANSITION = 3;
+}

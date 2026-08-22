@@ -1,0 +1,35 @@
+// XNC local IPC schema (spec §9). Source of truth: this file.
+// Codegen wiring lands in M1; M0 payloads on the wire are the fixed-binary
+// handshake messages defined in proto/ipc/frame.go (MsgHello..MsgPong).
+
+// shell.proto — agent ↔ xnc-shell pipe 数据协议(spec §8.5)。
+// 走 \\.\pipe\xnc-shell-<pid>(§9.1)。
+//
+// pty 裸 binary 流为帧外(out-of-band)数据:不套 XNIP 帧、不区分方向
+// (连接方向即语义),双向直传 VT 字节;本文件只定义帧内控制/终态消息。
+//
+// kill 语义:pipe 关闭或 SESSION_CLOSE → 杀进程树(taskkill /T /F 语义),
+// xnc-core KillShell 兜底(§8.5)。
+syntax = "proto3";
+
+package xnc.shell;
+
+// SHELL_BEGIN — 继承现有 shell 词汇(agent/session/shell.go):会话建立后
+// 首发告知实际使用的 shell;请求省略或降级时可能与客户端预期不同。
+message SHELL_BEGIN {
+  string shell = 1;    // 实际 shell(pwsh / windows-powershell,探测结果)
+}
+
+// SHELL_RESIZE — client → agent:终端尺寸变化。
+message SHELL_RESIZE {
+  uint32 cols = 1;
+  uint32 rows = 2;
+}
+
+// EXEC_RESULT — exec 附加终态;超时/取消/被杀时 exitCode 为 null
+// (继承 proto/session.go ExecResult 字段名)。
+message EXEC_RESULT {
+  optional int32 exitCode = 1;
+  bool timedOut = 2;
+  int64 durationMs = 3;
+}

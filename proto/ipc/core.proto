@@ -1,0 +1,119 @@
+// XNC local IPC schema (spec §9). Source of truth: this file.
+// Codegen wiring lands in M1; M0 payloads on the wire are the fixed-binary
+// handshake messages defined in proto/ipc/frame.go (MsgHello..MsgPong).
+
+// core.proto — xnc-core RPC 目录(spec §6.3)。
+// 传输与帧格式见 §9。所有 RPC 均 request/response(带 request_id),
+// 另有单向事件流 SubscribeEvents。
+// Request/response 消息的字段即各 RPC 注释所列(逐条取自 §6.3,
+// 完整 message 定义随 M1 codegen 落地;枚举/信封词汇见 §14.2)。
+syntax = "proto3";
+
+package xnc.core;
+
+service Core {
+  // ---- 查询 ----
+  rpc GetHostState(GetHostStateRequest) returns (HostStateResponse);
+  //    HostState: windows_sessions[], active_session_id, desktop_state,
+  //    displays[](id,origin,w,h,primary,scale,rotation,virtual),
+  //    capture{pid,backend,health,encoder,generation},
+  //    core_version, agent_min_version
+  rpc GetSessions(Empty) returns (SessionList);          // WTS 会话枚举
+  rpc GetDisplays(Empty) returns (DisplayList);          // = HostState.displays
+
+  // ---- 桌面 ----
+  rpc StartCapture(StartCaptureRequest) returns (StartCaptureResponse);
+  //    req: session_id(逻辑会话), wts_session_id(xnc-core 校验,见 §6.4),
+  //         ticket(SessionTicket), video_config(codec,fps,max_w,max_h)
+  //    resp: host_pid, pipe_name, pipe_secret, generation, displays
+  rpc StopCapture(StopCaptureRequest) returns (Ok);      // 按 wts_session_id
+  rpc SubscribeEvents(SubscribeEventsRequest) returns (stream CoreEvent);
+
+  // ---- Shell ----
+  rpc CreateShell(CreateShellRequest) returns (CreateShellResponse);
+  //    req: session_id, token_kind(USER|SYSTEM), profile(CMD|POWERSHELL|PWSH|BASH),
+  //         mode(INTERACTIVE|ONESHOT), params{cols,rows,cwd,env[],command,timeout_sec},
+  //         ticket(必须含 shell.user 或 shell.system capability)
+  //    resp: host_pid, pipe_name, pipe_secret
+  rpc KillShell(KillShellRequest) returns (Ok);          // 按 host_pid/session_id
+
+  // ---- 虚拟显示 ----
+  rpc CreateVirtualDisplay(CreateVirtualDisplayRequest) returns (DisplayInfo);
+  rpc RemoveVirtualDisplay(RemoveVirtualDisplayRequest) returns (Ok);
+
+  // ---- 电源 ----
+  rpc SetKeepAwake(BoolValue) returns (Ok);              // 见 §13.4
+  rpc Reboot(RebootRequest) returns (Ok);                // capability: power.reboot
+  rpc Shutdown(ShutdownRequest) returns (Ok);
+
+  // ---- 特权杂项 ----
+  rpc SendSas(TicketRequest) returns (Ok);               // capability: input.secure_attention
+
+  // ---- 维护 ----
+  rpc ApplyUpdate(ApplyUpdateRequest) returns (Ok);      // §6.8
+  rpc RestartWorker(RestartWorkerRequest) returns (Ok);  // capability: agent.maintain
+}
+
+// CoreEvent(agent 订阅,驱动 agent 对 server 上报与重连逻辑;spec §6.3)。
+message CoreEvent {
+  oneof event {
+    WtsSessionChanged wts_session_changed = 1;
+    ActiveSessionChanged active_session_changed = 2;     // → agent 触发 xnc-desktop drain & respawn
+    DisplayTopologyChanged display_topology_changed = 3;
+    DesktopHostExited desktop_host_exited = 4;           // 监督事件(xnc-desktop)
+    ShellHostExited shell_host_exited = 5;
+    PowerEvent power_event = 6;
+    UpdateProgress update_progress = 7;
+  }
+}
+
+message WtsSessionChanged {
+  string event = 1;       // WTS_CONSOLE_CONNECT/DISCONNECT/LOGON/LOGOFF...
+  uint32 session_id = 2;
+}
+
+message ActiveSessionChanged {
+  uint32 old = 1;
+  uint32 new = 2;
+}
+
+message DisplayTopologyChanged {
+  repeated DisplayInfo displays = 1;
+}
+
+message DesktopHostExited {
+  uint32 pid = 1;
+  int32 exit_code = 2;
+  string reason = 3;
+}
+
+message ShellHostExited {
+  uint32 pid = 1;
+  string session_id = 2;  // 逻辑会话(与 CreateShell req.session_id 同域)
+  int32 exit_code = 3;
+}
+
+message PowerEvent {
+  bool suspend_resumed = 1;  // ...(其余字段 spec 未列,M1 codegen 细化)
+}
+
+message UpdateProgress {
+  string phase = 1;
+}
+
+// DisplayInfo — HostState.displays 元素,字段逐条取自 §6.3 HostState 注释。
+message DisplayInfo {
+  uint32 id = 1;
+  Point origin = 2;
+  uint32 w = 3;
+  uint32 h = 4;
+  bool primary = 5;
+  double scale = 6;
+  uint32 rotation = 7;    // 度(0/90/180/270)
+  bool virtual = 8;
+}
+
+message Point {
+  int32 x = 1;
+  int32 y = 2;
+}
