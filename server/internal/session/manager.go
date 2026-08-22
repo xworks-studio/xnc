@@ -41,7 +41,8 @@ type Manager struct {
 	ShellIdleTimeout time.Duration
 	ShellMaxLifetime time.Duration
 
-	// —— desktop 会话治理（M1-Slice2）：每节点单会话（采集源单实例，
+	// —— desktop 会话治理（M1-Slice2）：每节点并发会话上限（默认 4，对齐
+	// agent host pipe 的 max_subs=4——多 viewer 各自独立会话，T6 门 ③；
 	// agent 引用计数语义见 T4 报告）+ idle 无信令活动关闭（pump 每帧刷新
 	// lastActivity；5min 无任何方向的信令帧 = 视为无订阅者，janitor 关闭）。
 	DesktopPerNode     int
@@ -100,7 +101,7 @@ func New(reg *registry.Registry, log *slog.Logger) *Manager {
 	m := &Manager{
 		reg: reg, log: log, sessions: map[string]*session{},
 		ShellPerNode: 10, ShellIdleTimeout: 30 * time.Minute, ShellMaxLifetime: 8 * time.Hour,
-		DesktopPerNode: 1, DesktopIdleTimeout: 5 * time.Minute,
+		DesktopPerNode: 4, DesktopIdleTimeout: 5 * time.Minute,
 		janitorInterval: janitorDefaultInterval,
 		stopJanitor:     make(chan struct{}),
 		kickJanitor:     make(chan struct{}, 1),
@@ -153,8 +154,9 @@ func (m *Manager) Create(nodeID, userID uuid.UUID, kind string, params json.RawM
 		}
 	}
 	if kind == proto.KindDesktop {
-		// 每节点单会话（默认 1）：desktop 采集源是节点侧单实例，并发会话
-		// 只会争抢同一 host 的订阅名额；同样在锁内判定防超发。
+		// 每节点并发上限（默认 4，对齐 agent host max_subs）：desktop 采集
+		// host 在节点侧按订阅名额引用计数，超出上限的会话只会被 agent 拒绝
+		// attach；同样在锁内判定防超发。
 		if m.DesktopPerNode > 0 && countByNodeLocked(m.sessions, nodeID, proto.KindDesktop) >= m.DesktopPerNode {
 			m.mu.Unlock()
 			return nil, proto.Err(409, proto.CodeSessionLimited, "desktop session limit reached")

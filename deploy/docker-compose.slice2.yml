@@ -32,6 +32,10 @@ services:
       XNC_TURN_URLS: "turn:${XNC_DEV_EXTERNAL_IP:?set XNC_DEV_EXTERNAL_IP in deploy/.env}:3478?transport=tcp,turn:${XNC_DEV_EXTERNAL_IP}:3478"
       XNC_TURN_USERNAME: xncdev
       XNC_TURN_CREDENTIAL: xncdev-secret
+      # Desktop per-node concurrent viewer cap. Stated explicitly (matches the
+      # built-in default and the agent host pipe's max_subs=4) so the multi-
+      # viewer posture of this overlay is visible here; 0 = unlimited.
+      XNC_DESKTOP_PER_NODE: "4"
 
   coturn:
     image: coturn/coturn:alpine

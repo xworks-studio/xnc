@@ -26,7 +26,7 @@ type Config struct {
 	TurnURLs           []string      // XNC_TURN_URLS，逗号分隔（turn:/turns: URL）
 	TurnUsername       string        // XNC_TURN_USERNAME（dev = lt-cred 静态用户）
 	TurnCredential     string        // XNC_TURN_CREDENTIAL（M2 换 REST 时效凭据）
-	DesktopPerNode     int           // XNC_DESKTOP_PER_NODE，默认 1（采集源单实例），0 = 不限
+	DesktopPerNode     int           // XNC_DESKTOP_PER_NODE，默认 4（对齐 agent host max_subs=4，多 viewer），0 = 不限
 	DesktopIdleTimeout time.Duration // XNC_DESKTOP_IDLE，默认 5m（无信令活动即关），0 = 不限
 }
 
@@ -46,7 +46,7 @@ func Load() (Config, error) {
 		TurnURLs:           envList("XNC_TURN_URLS"),
 		TurnUsername:       os.Getenv("XNC_TURN_USERNAME"),
 		TurnCredential:     os.Getenv("XNC_TURN_CREDENTIAL"),
-		DesktopPerNode:     envInt("XNC_DESKTOP_PER_NODE", 1),
+		DesktopPerNode:     envInt("XNC_DESKTOP_PER_NODE", 4),
 		DesktopIdleTimeout: envDur("XNC_DESKTOP_IDLE", 5*time.Minute),
 	}
 	if c.DatabaseURL == "" {

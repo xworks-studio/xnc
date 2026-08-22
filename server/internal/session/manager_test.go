@@ -187,17 +187,23 @@ func TestMaxLifetimeClosesShell(t *testing.T) {
 	}
 }
 
-// —— M1-Slice2 desktop 会话治理：每节点单会话 + idle 5min janitor ——
+// —— M1-Slice2 desktop 会话治理：每节点并发上限（默认 4，对齐 agent host
+// pipe 的 max_subs=4——多 viewer）+ idle 5min janitor ——
 
-func TestDesktopSinglePerNode(t *testing.T) {
+func TestDesktopPerNodeLimit(t *testing.T) {
 	id, m := onlineMgr(t)
 	defer m.Close()
-	// New 默认 DesktopPerNode=1；显式覆盖证明配置生效。
-	m.DesktopPerNode = 1
+	// New 默认 DesktopPerNode=4（多 viewer）；显式覆盖证明配置生效。
+	require.Equal(t, 4, m.DesktopPerNode)
+	m.DesktopPerNode = 4
 
+	// 默认 4 并发：第 2 个会话（T6 门 ③ 的第二 viewer）至第 4 个均允许
+	for i := 0; i < 4; i++ {
+		_, apiErr := m.Create(id, uuid.New(), proto.KindDesktop, []byte(`{}`))
+		require.Nil(t, apiErr)
+	}
+	// 第 5 个 → 409 SESSION_LIMIT_EXCEEDED
 	_, apiErr := m.Create(id, uuid.New(), proto.KindDesktop, []byte(`{}`))
-	require.Nil(t, apiErr)
-	_, apiErr = m.Create(id, uuid.New(), proto.KindDesktop, []byte(`{}`))
 	require.NotNil(t, apiErr)
 	assert.Equal(t, 409, apiErr.Status)
 	assert.Equal(t, proto.CodeSessionLimited, apiErr.Code)
@@ -206,12 +212,23 @@ func TestDesktopSinglePerNode(t *testing.T) {
 	assert.Nil(t, apiErr)
 	_, apiErr = m.Create(id, uuid.New(), proto.KindScreen, []byte(`{}`))
 	assert.Nil(t, apiErr)
-	// 关掉唯一 desktop 会话后名额归还
+	// 关掉一个 desktop 会话后名额归还
 	d := m.SessionsOf(id, proto.KindDesktop)
-	require.Len(t, d, 1)
+	require.Len(t, d, 4)
 	m.NotifyClose(d[0].ID, "test")
 	_, apiErr = m.Create(id, uuid.New(), proto.KindDesktop, []byte(`{}`))
 	assert.Nil(t, apiErr)
+
+	// env 覆写路径（XNC_DESKTOP_PER_NODE=1）：单会话语义——清空后第 2 发 409
+	for _, s := range m.SessionsOf(id, proto.KindDesktop) {
+		m.NotifyClose(s.ID, "test")
+	}
+	m.DesktopPerNode = 1
+	_, apiErr = m.Create(id, uuid.New(), proto.KindDesktop, []byte(`{}`))
+	require.Nil(t, apiErr)
+	_, apiErr = m.Create(id, uuid.New(), proto.KindDesktop, []byte(`{}`))
+	require.NotNil(t, apiErr)
+	assert.Equal(t, proto.CodeSessionLimited, apiErr.Code)
 	// 0 = 不限
 	m.DesktopPerNode = 0
 	_, apiErr = m.Create(id, uuid.New(), proto.KindDesktop, []byte(`{}`))

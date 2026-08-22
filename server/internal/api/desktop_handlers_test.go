@@ -118,24 +118,28 @@ func TestDesktopDefaultsAndValidation(t *testing.T) {
 	}
 }
 
-// TestDesktopSingleSessionPerNode：desktop 每节点单会话——第二发 409
-// SESSION_LIMITED；关闭后可再建。
-func TestDesktopSingleSessionPerNode(t *testing.T) {
+// TestDesktopPerNodeLimit：desktop 每节点并发默认 4（多 viewer）——第 2 个
+// 会话 202（T6 门 ③ 的第二 viewer），第 5 个 409 SESSION_LIMIT_EXCEEDED；
+// 关闭后名额归还。
+func TestDesktopPerNodeLimit(t *testing.T) {
 	env := NewTestEnv(t)
 	nodeID := env.EnrollNode(t, "WEB-DT3", "mid-dt3")
 	_ = dialControl(t, env, nodeID)
 
-	resp := desktopPost(t, env, nodeID, `{}`)
-	defer resp.Body.Close()
-	require.Equal(t, 202, resp.StatusCode)
+	// 默认 4（含 manager.New 零值兜底，对齐 agent host max_subs=4）：前 4 发均 202
+	for i := 0; i < 4; i++ {
+		resp := desktopPost(t, env, nodeID, `{}`)
+		_ = resp.Body.Close()
+		require.Equal(t, 202, resp.StatusCode, "viewer %d", i+1)
+	}
 
-	r2 := desktopPost(t, env, nodeID, `{}`)
-	defer r2.Body.Close()
+	r5 := desktopPost(t, env, nodeID, `{}`)
+	defer r5.Body.Close()
 	var e struct {
 		Error proto.APIError `json:"error"`
 	}
-	require.Equal(t, 409, r2.StatusCode)
-	require.NoError(t, json.NewDecoder(r2.Body).Decode(&e))
+	require.Equal(t, 409, r5.StatusCode)
+	require.NoError(t, json.NewDecoder(r5.Body).Decode(&e))
 	assert.Equal(t, proto.CodeSessionLimited, e.Error.Code)
 
 	// 会话关闭后名额归还
@@ -169,8 +173,8 @@ func TestDesktopTurnUnconfigured(t *testing.T) {
 }
 
 // TestDesktopRBAC：Scenario F——owner/operator → 202；viewer → 403 FORBIDDEN；
-// 非成员 → 404 NODE_NOT_FOUND。desktop 每节点单会话：每个 202 后关闭会话
-// 再试下一个角色，避免名额挤占混入断言。
+// 非成员 → 404 NODE_NOT_FOUND。desktop 每节点并发有限（默认 4）：每个 202
+// 后关闭会话再试下一个角色，避免名额挤占混入断言。
 func TestDesktopRBAC(t *testing.T) {
 	f := newRBACFixture(t)
 	path := "/api/nodes/" + f.nodeID + "/desktop"
