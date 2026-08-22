@@ -581,7 +581,7 @@ user shell 目标效果 `C:\Users\Alice>`;system shell 不得由 user shell 会�
 连接建立后第一帧必须是 `HELLO{pid, nonce}`:
 
 - **身份**:双方各自用 `GetNamedPipeClientProcessId`/`ServerProcessId` 取对端 PID → `OpenProcess(QUERY_LIMITED_INFORMATION)` → 映像路径必须等于预期 exe 全路径(Program Files 下)且 Authenticode 签名有效(XNC 发布证书);
-- **密钥**:challenge-response 证明 = `HMAC-SHA256(nonce, pipe_secret)`。`pipe_secret` 由 xnc-core 在 spawn 时生成、仅发给该 worker 与 agent 两侧(经继承句柄 / RPC 响应),一次性、短 TTL——**不依赖 machine key**(user-token 的 xnc-shell 进程读不到 SYSTEM 才能读的机器密钥);
+- **密钥**:challenge-response 证明 = `HMAC-SHA256(pipe_secret, nonce)`(密钥在前;RFC 4231 语义)。`pipe_secret` 由 xnc-core 在 spawn 时生成、仅发给该 worker 与 agent 两侧(经继承句柄 / RPC 响应),一次性、短 TTL——**不依赖 machine key**(user-token 的 xnc-shell 进程读不到 SYSTEM 才能读的机器密钥);
 - xnc-desktop / xnc-shell 连接 agent 的 pipe 时同样双向校验。
 - 任一校验失败:断连 + 审计事件 `ipc_auth_failed`。
 

@@ -26,7 +26,7 @@
 **V1(wire 帧):** `Frame{Flags: FlagResponse, MessageType: MsgPing, RequestID: 0xDEADBEEF, Payload: []byte("xnc")}` 编码后精确字节:
 
 ```text
-58 4E 49 50 01 05 10 00 EF BE AD DE 03 00 00 00 78 6E 63
+58 4E 49 50 01 01 10 00 EF BE AD DE 03 00 00 00 78 6E 63
 ```
 
 **V2(HMAC,RFC 4231 Test Case 2):** `Proof([]byte("Jefe"), []byte("what do ya want for nothing?"))` == hex `5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843`
@@ -429,7 +429,7 @@ int SelftestMain() {
         Frame f{kFlagResponse, kMsgPing, 0xDEADBEEF, {0x78,0x6E,0x63}};
         std::vector<uint8_t> wire;
         CHECK("encode", EncodeFrame(f, wire));
-        const uint8_t want[19] = {0x58,0x4E,0x49,0x50,0x01,0x05,0x10,0x00,0xEF,0xBE,0xAD,0xDE,0x03,0x00,0x00,0x00,0x78,0x6E,0x63};
+        const uint8_t want[19] = {0x58,0x4E,0x49,0x50,0x01,0x01,0x10,0x00,0xEF,0xBE,0xAD,0xDE,0x03,0x00,0x00,0x00,0x78,0x6E,0x63};
         CHECK("v1-bytes", wire.size()==19 && std::memcmp(wire.data(), want, 19)==0);
         Frame back;
         CHECK("v1-decode", DecodeFrame(wire.data(), wire.size(), back)==DecodeResult::Ok
