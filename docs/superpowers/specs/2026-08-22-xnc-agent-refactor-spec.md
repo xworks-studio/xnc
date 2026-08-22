@@ -400,7 +400,7 @@ D3D11CreateDevice(adapter=输出所在适配器, VIDEO_SUPPORT | BGRA_SUPPORT)
 - ReleaseFrame 必须在处理完(或 CopyResource 之后)立即归还,不等编码完成(persistent texture 是拷贝目标)。
 - ACCESS_LOST / DEVICE_REMOVED / DEVICE_HUNG → CaptureReset(§7.5)。
 - 无变化帧(WAIT_TIMEOUT):**不编码、不发包**(静止桌面带宽≈0)。采集节奏:有订阅者时按 spf 轮询;HIBERNATE(无订阅)降为 1s 周期探活采集,为「随时可加入的观众」保持 LatestFullFrame 新鲜。
-- 重复编码保活:仅当编码器有启动/内部延迟(软编冷启动)时,最多对同一帧重复送编 2 次,且 force-key 只在第一次设置(E2 教训,§7.10 契约)。
+- 重复编码保活:仅当编码器有启动/内部延迟(软编冷启动,CMSH264EncoderMFT 实测 ~17 帧前瞻窗口)时,对同一帧重复送编**直至首个关键帧输出**(warm-up),上限 = 2× 窗口帧数或 2s 取小;期间绝不重发 force-key(ADR-017),warm-up 计数入日志。
 
 ## 7.5 FrameCache 与统一 CaptureReset(初稿 §12/§13/§32 合并)
 
