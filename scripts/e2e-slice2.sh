@@ -94,6 +94,12 @@ dev_node_online_count() { # count of online nodes named <name>(-N)?
 cleanup() {
   "$XNC" exec "$NODE" "schtasks /Delete /F /TN $DRIVER_TASK" >/dev/null 2>&1 || true
   "$XNC" exec "$NODE" "schtasks /Delete /F /TN $OVERLAY_TASK" >/dev/null 2>&1 || true
+  # fix-round-1 (P2): the one-shot popup-dismiss helper and the per-run
+  # firewall allow rules used to linger as XIAOXIN residue after every run.
+  # The dev core/agent themselves stay running on purpose (owner browser
+  # check); teardown for those lives in dev-topology.md §6.
+  "$XNC" exec "$NODE" "schtasks /Delete /F /TN xnc-dismiss-popup" >/dev/null 2>&1 || true
+  "$XNC" exec "$NODE" 'netsh advfirewall firewall delete rule name="xnc-dev-agent-dev" >$null; netsh advfirewall firewall delete rule name="xnc-dev-agent-dev-out" >$null; exit 0' >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
@@ -300,23 +306,28 @@ gate "3-join-viewer-exit-0"    "$([ "$S3_RC" -eq 0 ] && echo 1 || echo 0)" "e2ev
 
 # --- 9. Scenario ④: PLI over a quiet desktop → on-demand IDR ------------------
 
-say "Scenario 4: periodic PLI (every 2s) over a 1s-tick quiet desktop → IDR ≤2s"
+say "Scenario 4: one-shot PLI (--pli-at 8s) over a 1s-tick quiet desktop → IDR ≤2s"
 # 1s tick: the armed explicit IDR must ride a real frame within the 2s PLI
-# budget (same mechanism finding as ③). --pli-interval 2s: the WiFi link
-# (~10% burst loss) can shred any single IDR; the metric stays "most recent
-# PLI → decoded IDR ≤ 2000ms" (desktop-side idr_delivered ≤2s in core logs;
-# retries only cover link-level destruction of the previous attempt).
+# budget (same mechanism finding as ③). One-shot PLI (fix-round-1 ruling):
+# the old --pli-interval 2s made every send overwrite the viewer's pending
+# pliMu timestamp (e2eviewer main.go), silently forgiving a WiFi-shredded
+# IDR; the gate must assert a SINGLE PLI → next decoded IDR ≤ 2000ms.
+# --keyframe-retry-after still covers the join IDR while no frame has landed;
+# the PLI IDR itself gets no retry — one PLI, one IDR, honest number
+# (desktop-side idr_delivered stays ≤2s in core logs either way). One-shot
+# mode cannot hit the overwrite (a single pliMu store), so main.go is
+# untouched — the script simply abandons interval mode (ruling alternative).
 "$XNC" exec "$NODE" "schtasks /Create /F /TN $OVERLAY_TASK /TR 'powershell -ExecutionPolicy Bypass -File C:\xnc-dev\static-overlay.ps1 -Seconds 40 -TickMs 1000' /SC ONCE /ST 23:59 /RU $CONSOLE_USER /IT"
 "$XNC" exec "$NODE" "schtasks /Run /TN $OVERLAY_TASK"
 sleep 3
 S4_RC=0
 "$E2E" --server "$LAN" --node "$NODE_ID" --token "$JWT" \
   --duration 20s --expect-first-frame-ms 8000 --expect-keyframes 2 \
-  --pli-interval 2s --keyframe-retry-after 1.5s --expect-pli-idr-ms 2000 \
+  --pli-at 8s --keyframe-retry-after 1.5s --expect-pli-idr-ms 2000 \
   --out "$ART/s4-pli.h264" --json > "$ART/s4-pli.json" 2> "$ART/s4-pli.log" || S4_RC=$?
 cat "$ART/s4-pli.json"
 S4_PLI=$(json_num "$ART/s4-pli.json" pliToIdrMaxMs)
-gate "4-pli-to-idr-le-2000ms"  "$([ "${S4_PLI:-0}" -gt 0 ] && [ "${S4_PLI:-99999}" -le 2000 ] && echo 1 || echo 0)" "pliToIdrMaxMs=$S4_PLI (armed force rides the 1s tick)"
+gate "4-pli-to-idr-le-2000ms"  "$([ "${S4_PLI:-0}" -gt 0 ] && [ "${S4_PLI:-99999}" -le 2000 ] && echo 1 || echo 0)" "pliToIdrMaxMs=$S4_PLI (one-shot PLI at +8s; armed force rides the 1s tick)"
 gate "4-viewer-exit-0"         "$([ "$S4_RC" -eq 0 ] && echo 1 || echo 0)" "e2eviewer exit=$S4_RC"
 "$XNC" exec "$NODE" "schtasks /End /TN $OVERLAY_TASK; schtasks /Delete /F /TN $OVERLAY_TASK; exit 0" >/dev/null 2>&1 || true
 

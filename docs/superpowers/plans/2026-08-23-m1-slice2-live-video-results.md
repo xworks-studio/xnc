@@ -4,36 +4,46 @@
 
 **链路**: e2eviewer（本机 Go/Pion）→ POST /api/nodes/{uuid}/desktop → 会话 WS（JSON 信令: ready/offer/answer/ice）→ dev agent（run-dev-console, session 1, `/RL HIGHEST` elevated）→ core XNIP pipe（0x0100 StartCapture, stdin secret）→ xnc-desktop --console-rt（DXGI+Mf 2880x1800@30）→ desktoppipe ATTACH → Pion publisher → coturn TURN relay（relay-only 双端）→ viewer。
 
-## 验收门结果 — **全部 13 门 PASS**（scripts/e2e-slice2.sh run-11, 2026-08-23）
+## 验收门结果 — **12/13 门 PASS**（scripts/e2e-slice2.sh run-13, 2026-08-23 fix-round-1）
 
-| 门 | 判据 | 实测 | 结果 |
+> 历史: run-11 曾 13/13 PASS, 但门④ 用的是 `--pli-interval` 断言——其 pliMu 覆盖缺陷
+> （controller P1）把首个 PLI 的 warm-up 成本记到了下一个 PLI 的时间戳上; 裁决改
+> `--pli-at` 单发后即现原形: ④ = 2351ms（run-12）/ 2392ms（run-13）> 2000ms, 两跑一致
+> 非 variance, 如实记 FAIL。其余 12 门 run-13 全绿（run-12 亦然, 仅③伴飞 viewer 的
+> 非门断言 frames 52>40 超限一次, 伴飞断言不计门）。
+
+| 门 | 判据 | 实测（run-13） | 结果 |
 |---|---|---|---|
-| ① 首帧（变化场景 30s） | ≤5000ms（relay 含 TURN allocation） | **4327ms** | PASS |
-| ① 关键帧（变化场景） | ≥2 | **3**（frames=90） | PASS |
+| ① 首帧（变化场景 30s） | ≤5000ms（relay 含 TURN allocation） | **4267ms** | PASS |
+| ① 关键帧（变化场景） | ≥2 | **2**（frames=60） | PASS |
 | ① viewer 断言 | exit 0 | exit 0（keyframeReqs=1 救回一次被 WiFi 打散的首 IDR） | PASS |
 | ② 静止 45s 帧数 | 解码 AU ≤10 | **0**（纯静止屏, rtpPackets=0） | PASS |
 | ② viewer 全链路存活 | exit 0（会话+信令+relay ICE 完成） | exit 0 | PASS |
 | ③ 静止期第二 viewer 首帧=IDR | firstKey=true | **true** | PASS |
-| ③ 首帧到达 | ≤5000ms | **2606ms** | PASS |
+| ③ 首帧到达 | ≤5000ms | **2515ms** | PASS |
 | ③ viewer 断言 | exit 0 | exit 0（companion viewer 同 0） | PASS |
-| ④ PLI→新 IDR | ≤2000ms | **1979ms** | PASS |
-| ④ viewer 断言 | exit 0 | exit 0（keyframes=6） | PASS |
+| ④ PLI→新 IDR（**单发**） | ≤2000ms | **2392ms**（run-12 复测 2351ms） | **FAIL** |
+| ④ viewer 断言 | exit 0 | exit 1（同上一行断言; plisSent=1, keyframes=3, firstKey=true） | **FAIL** |
 | ⑤ 退订清理 | 无残留 xnc-desktop.exe | tasklist 无此进程 | PASS |
-| ⑤ 0x0100 spawn 证据 | core.log spawn+stop | **4 次 start_capture + stop_capture: terminating** | PASS |
+| ⑤ 0x0100 spawn 证据 | core.log spawn+stop | **5 次 start_capture + stop_capture: terminating** | PASS |
 
-**逐场景 JSON 摘要**（原始产物 + 四份 .h264 dump 在 `.superpowers/sdd/2026-08-23-m1-slice2-live-video/e2e/`）：
+**④ FAIL 分析（单发断言的真实成本构成, 留 controller 裁决）**：desktop 侧 = warm-up 重喂（run-12 core.log: PLI 到达 13:22:53 → `idr_delivered reason=explicit feeds=11` 13:22:55, 即计划「按需 warm-up 上限 2×窗口或 2s」的 2s 上限本身, **desktop 侧 ≤2s 判据仍成立**）; viewer 侧再加 WiFi/relay 传输 + AU 组装滞后 ~0.4s（samplebuilder 无 flush 回调, 稀疏 1s-tick 流上 AU 需等下一 AU 首包才 finalize）→ 2351/2392ms。旧 interval 断言的 1979ms 之所以「过」, 正是 pliMu 覆盖把首个 PLI 的 ~2.4s 成本记到了下一个 PLI 头上——修复后的单发断言暴露真实值。**待裁决**: viewer 侧上界校准（如 ≤3000ms）, 或与门① 的 <2s 同例顺延 M1-Slice3 有线门。
 
-- ① 变化（session-1 ping 驱动）: firstFrame=4327ms firstKey=true rtp=1501 frames=90 keyframes=3 bytes=860KB/33s
-- ② 纯静止（solid overlay 45s）: frames=0 rtp=0 —— §7.4 语义（静止=不编码不出包）在真实 Mf 编码器上的端到端体现
-- ③ 静止期加入: B firstFrame=2606ms **firstKey=true**（15 帧 99KB）; companion A: firstFrame=2541ms frames=36（2s-tick 静默流, keyframes=2）
-- ④ PLI 恢复: pliToIdrMax=**1979ms** ≤2000（1s-tick 静默流, 10 PLI, keyframes=6, keyframeReqs=3）
+**门值出处（裁决留痕, 2026-08-23 controller review — 非计划原文）**：计划 Task 6 原门为「①首帧 p95<2s ②变化期 ≥20fps」。两条 Ruling（`.superpowers/sdd/2026-08-23-m1-slice2-live-video/progress.md`）: **① ≤5s = XIAOXIN WiFi+TURN relay 链路校准值**——计划 2s 是理想 LAN 假设, <2s 顺延 M1-Slice3 有线门; **② ≥20fps = 计划缺陷**——ping 驱动 1 行/s 的内容仅 ~2.7fps, 编码器内容自适应正确, 20fps 门需强驱动器, 顺延 M1-Slice3 输入注入后的交互驱动门, 以「静止 45s 解码 AU ≤10」校准门替代（计划并无 ≤10 数字; 本页此前误引为「计划原文」, 已改为裁决留痕）。④ ≤2s 为计划原值。
+
+**逐场景 JSON 摘要**（原始产物 + 四份 .h264 dump 在 `.superpowers/sdd/2026-08-23-m1-slice2-live-video/e2e/`;run-12 产物另存于 `e2e-run12-artifacts/`）：
+
+- ① 变化（session-1 ping 驱动）: firstFrame=4267ms firstKey=true rtp=1466 frames=60 keyframes=2 bytes=572KB/33s
+- ② 纯静止（solid overlay 45s）: frames=0 rtp=0 —— §7.4 语义（静止=不编码不出包）在真实 Mf 编码器上的端到端体现。（该场景 JSON 里 `connected:false` **不是 ICE 失败**——ICE 连通已由 e2eviewer `waitConnected` 硬校验, 不连则 exit≠0; 该字段是 PC 旧快照语义: 仅在首帧到达时置 true, 0 帧的静止场景恒 false, 不代表连接断开）
+- ③ 静止期加入: B firstFrame=2515ms **firstKey=true**（16 帧 108KB）; companion A: firstFrame=2509ms frames=37（2s-tick 静默流, keyframes=2）
+- ④ PLI 恢复（单发 `--pli-at 8s`）: pliToIdrMax=**2392ms** > 2000（run-12: 2351ms, 两跑一致）——1s-tick 静默流, plisSent=1, keyframes=3, keyframeReqs=3（均发生在首帧落地前, 即加入首 IDR 的 WiFi 自救; 单发 PLI 的 IDR 无 retry, 单发即真实值）。desktop 侧 idr_delivered ≈2s（≤2s 判据成立）, 详见上表 ④ FAIL 分析
 - ⑤: 见上表
 
 ### 场景驱动方式（与计划字面的差异及理由, 全部实测驱动）
 
-- **②「静止」 = solid 黑屏 overlay**（`scripts/static-overlay.ps1 -TickMs 0`）: 计划原文「静止期新增 AU ≤10」。实测发现 XIAOXIN 控制台有 ~1.2fps 背景动画（taskbar 托盘 WiFi 图标被自身流量驱动 + agent 控制台滚动日志, 截图证据 `e2e/console-shot*.png`）——只有确定性纯静止屏才能测「编码器静默」。纯静止屏下 AU=0：Mf 编码器对逐位相同的重喂帧即使 ForceIDR 也跳过不输出（native 侧为 M1 冻结, 无法改）。
+- **②「静止」 = solid 黑屏 overlay**（`scripts/static-overlay.ps1 -TickMs 0`）: 「静止期新增 AU ≤10」为上表所引 controller 裁决校准门（计划无此数字）。实测发现 XIAOXIN 控制台有 ~1.2fps 背景动画（taskbar 托盘 WiFi 图标被自身流量驱动 + agent 控制台滚动日志, 截图证据 `e2e/console-shot*.png`）——只有确定性纯静止屏才能测「编码器静默」。纯静止屏下 AU=0：Mf 编码器对逐位相同的重喂帧即使 ForceIDR 也跳过不输出（native 侧为 M1 冻结, 无法改）。
 - **③④「静止期」 = 2s/1s-tick overlay**（同一 ps1, TickMs>0）: 按需 IDR（sub_join/connect/PLI 武装的 force）**只能骑在下一帧真实变化上浮出**——纯静止屏上永远不出（core 代码注释即此语义, 实测证实）。tick 间隔 = IDR 时延上界, ④ 用 1s tick 满足 ≤2s 门。
-- **WiFi 链路现实**: XIAOXIN 无线（实测 ~10% UDP 突发丢包, 大 IDR≈170 包极易打散）。e2eviewer 新增 `--keyframe-retry-after`（信令级 `keyframe-req` 重请, agent 词汇新增帧类型）——①实测救回一次首 IDR, ④的 3 次 retry 覆盖链路损毁, 但 **门④的 1979ms 计量的是「最近一次 PLI→解码 IDR」**, desktop 侧 idr_delivered(core.log) 均 ≤2s。
+- **WiFi 链路现实**: XIAOXIN 无线（实测 ~10% UDP 突发丢包, 大 IDR≈170 包极易打散）。e2eviewer 新增 `--keyframe-retry-after`（信令级 `keyframe-req` 重请, agent 词汇新增帧类型）——①实测救回一次首 IDR。④ 改单发后 retry 只覆盖加入首帧期（仅在 frames==0 时发出）, 单发 PLI 的 IDR 无 retry——单发即真实值（见上表 ④ FAIL 分析）; desktop 侧 idr_delivered(core.log) 均 ≤2s 不变。
 - 防火墙弹窗处置: dev agent 每次换新 exe 触发 Windows Security 提示, 浮在 TopMost overlay 之上且动画（~1.2fps 来源之一）。脚本加 netsh allow 规则 + `scripts/dismiss-popup.ps1`（FindWindow+WM_CLOSE, 进程 MainWindowTitle 匹配不到服务宿主窗口——实测教训）。
 
 ## T3 承接项闭环（提权 StartCaptureCross → 以 E2E 证据替代）
@@ -61,9 +71,9 @@ dev 拓扑补充，已写入 e2e-slice2.sh 注释与本文件。
 
 **T3 提权债务：closed-by-evidence**（e2e 而非单测；同一代码路径——StartCapture
 握手、spawn、stdin secret、幂等复用（gen 递增）、StopCapture 终止——全部在
-真实 SYSTEM core 上运行了 11 轮）。
+真实 SYSTEM core 上运行了 13 轮）。
 
-## 过程中真实踩坑记录（run-1…run-11 全记录）
+## 过程中真实踩坑记录（run-1…run-13 全记录）
 
 1. **run-1** `xnc put` 覆盖运行中的 dev agent exe 失败（FILE_NOT_FOUND=rename
    到被占用文件）：先停旧 agent 再部署。
@@ -95,6 +105,11 @@ dev 拓扑补充，已写入 e2e-slice2.sh 注释与本文件。
    突发 ~34 AU → ②与③拆窗（②用纯静止=0 AU, ③④用 tick 骑 IDR）。
 9. **run-8 ① 首帧 15s 一次**（WiFi 瞬时恶化, retry 兜回）——重跑 4.3s 正常,
    记录为链路波动非代码问题。
+10. **run-12/13（fix-round-1）单发 PLI 门④ 连续 2351/2392ms FAIL**——非链路
+    variance（两跑一致, 其余 12 门全绿）: desktop warm-up 重喂 2s 上限 + viewer 侧
+    传输/组装 ~0.4s。旧 interval 断言的 1979ms 靠 pliMu 覆盖把首 PLI 成本记到下一
+    PLI 头上（controller P1 覆盖问题的实证——覆盖修掉前该门从未测过真值）。
+    viewer 侧上界留 controller 裁决（见门值出处与 ④ FAIL 分析）。
 
 ## 浏览器页（Deliverable A）
 
@@ -136,6 +151,9 @@ http://192.168.1.12:18080/desktop/070d0123-a1e7-4b6d-8d9f-eee882d37fa4
 
 ## 遗留
 
+- **门④ 单发 PLI viewer 侧 2351/2392ms > 2000ms**（fix-round-1 如实记录;desktop 侧
+  idr_delivered ≤2s 成立）——viewer 侧上界留 controller 裁决: 校准（如 ≤3000ms）或
+  顺延 M1-Slice3 有线门（同门① <2s 先例）。
 - pion 无 TURN/TCP 客户端（`?transport=tcp` 被忽略, 实测）→ WiFi 链路上大
   IDR 依赖 NACK+信令重请兜底；生产 TLS/TCP 化 = M2。
 - ATTACH 的 max_w/bitrate 上限 native 侧未生效（只记日志）——若 M2 要限分辨

@@ -100,6 +100,8 @@
 
 **验收门(XIAOXIN):** ①首帧 p95<2s ②变化期 ≥20fps 有效帧 ③静止期第二 viewer 加入→3s 内收到 IDR 入流 ④PLI→2s 内 IDR ⑤8MiB/队列/退订清理无残留进程。结果入 `docs/superpowers/plans/2026-08-23-m1-slice2-live-video-results.md`。
 
+> **2026-08-23 裁决**(controller,留痕 `.superpowers/sdd/2026-08-23-m1-slice2-live-video/progress.md` Task 6 review):① 校准为 ≤5s(XIAOXIN WiFi+TURN relay 链路;计划 2s 是理想 LAN 假设,<2s 顺延 M1-Slice3 有线门);② 20fps 顺延 Slice3(ping 驱动 1 行/s 内容仅 ~2.7fps,编码器内容自适应正确;输入注入后交互驱动门再测)。
+
 ## Self-Review 记录
 - 承接闭环:Slice1「静止入流」= T2 按需 IDR + T6 门③;M1 spec §10.2 信令时序本片以「dev server 会话 WS 中转 OFFER/ANSWER」最小实现(turn 非 TLS 为 dev 简化,TLS=M2)
 - Slice3 留:输入/DataChannel input+mouse、光标通道、protobuf codegen、BuildChildCommandLine must-fix、lease

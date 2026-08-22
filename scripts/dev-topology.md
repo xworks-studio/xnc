@@ -102,7 +102,17 @@ session 0) and dev agent (LABS, temp state, session 1).
 ## 6. Teardown
 
 ```bash
+# scheduled tasks: dev agent, dev core (SYSTEM console pipe server, e2e-slice2.sh §5),
+# and the one-shot popup-dismiss helper (left behind by any e2e-slice2.sh run;
+# the script's own exit trap also deletes it — fix-round-1 residue sweep)
 $XNC exec $NODE 'schtasks /End /TN xnc-dev-agent; schtasks /Delete /F /TN xnc-dev-agent'
+$XNC exec $NODE 'schtasks /End /TN xnc-dev-core; schtasks /Delete /F /TN xnc-dev-core'
+$XNC exec $NODE 'schtasks /Delete /F /TN xnc-dismiss-popup'
+# firewall allow rules created per dev-agent exe (e2e-slice2.sh console hygiene;
+# the exit trap deletes them too — listed here for hard-killed runs)
+$XNC exec $NODE 'netsh advfirewall firewall delete rule name="xnc-dev-agent-dev"; netsh advfirewall firewall delete rule name="xnc-dev-agent-dev-out"'
+# path-scoped sweep in case a task was hard-killed (never touches C:\xnc prod):
+$XNC exec $NODE 'Get-Process xnc-agent,xnc-core,xnc-desktop -ErrorAction SilentlyContinue | Where-Object {$_.Path -like "C:\xnc-dev*"} | Stop-Process -Force; exit 0'
 # hard-killed runs (task kill / reboot) leave temp dirs behind — sweep:
 $XNC exec $NODE 'Remove-Item C:\Users\LABS\AppData\Local\Temp\xnc-dev-agent-* -Recurse -Force -ErrorAction SilentlyContinue; exit 0'
 cd deploy && docker compose -f docker-compose.yml -f docker-compose.dev.yml \
