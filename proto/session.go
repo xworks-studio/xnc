@@ -20,6 +20,35 @@ const KindTunnel = "tunnel"
 // KindScreen 桌面流会话（DXGI 捕获 + H.264，Phase 6）。
 const KindScreen = "screen"
 
+// KindDesktop 实时桌面会话（M1-Slice2）：agent 侧 xnc-desktop rt pipe →
+// Pion WebRTC publisher（relay-only）→ 会话 WS 只走 JSON 信令（词汇契约
+// 见 agent/desktop/session.go 文件头，T5/T6 消费）。
+const KindDesktop = "desktop"
+
+// DesktopIceAll 是 iceTransportPolicy 的非 relay 覆盖值，仅回环单测使用
+// （无 TURN 环境）；缺省（空或 "relay"）= 生产强约束 relay。
+const DesktopIceAll = "all"
+
+// DesktopTurnConfig 是 desktop 会话的 TURN 中继配置（server 经
+// SESSION_OPEN params 下发；dev = 非 TLS turn:<host>:3478?transport=tcp，
+// TLS/443 = M2）。credential 绝不入任何日志。
+type DesktopTurnConfig struct {
+	URLs       []string `json:"urls"`
+	Username   string   `json:"username"`
+	Credential string   `json:"credential"`
+}
+
+// DesktopParams 会话 Params 的 desktop 形态（M1-Slice2）。
+type DesktopParams struct {
+	// Signaling 目前仅 "webrtc"；空视同 "webrtc"（本片唯一形态）。
+	Signaling string `json:"signaling,omitempty"`
+	Turn      *DesktopTurnConfig `json:"turn,omitempty"`
+	// WTSSession 目标 WTS 会话 id；0 = 活动控制台会话（dev 默认）。
+	WTSSession uint32 `json:"wtsSession,omitempty"`
+	// IceTransportPolicy 缺省 "relay"；DesktopIceAll 仅测试。
+	IceTransportPolicy string `json:"iceTransportPolicy,omitempty"`
+}
+
 // SessionOpen 经控制连接下发：agent 按 WsURL（含 token 的绝对 URL）拨号。
 type SessionOpen struct {
 	SessionID  string          `json:"sessionId"`
