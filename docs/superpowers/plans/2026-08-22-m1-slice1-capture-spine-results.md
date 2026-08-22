@@ -130,3 +130,8 @@ desktop(pid 11776,与 core 日志 child pid 一致)由 session-0 的 core 经 To
 ## 7. M1-Slice1 结论
 
 DXGI 采集 → FrameCache 状态机 → MF 软编 → `--diag-dump` 整形落盘,经 `xnc-core --diag-spawn` 会话桥在真实 console 会话端到端跑通:静止近零输出(0fps)、变化持续编码、无关键帧风暴(IDR 占比 3.68%,GOP 周期性)、IDR 前置 SPS/PPS、统一 4B 起始码、无 AUD —— spec §7.10 编码契约与 §7.5 帧状态机契约在真实桌面负载下成立。
+
+## M1-Slice2 承接(final review)
+
+- ①静止桌面 warm-up 实测 13 feeds < 17 帧前瞻,关键帧仅经 FlushTail 出现——实况流「新观众加入静止桌面拿不到 IDR」须随订阅者/关键帧请求语义(spec §7.5 IDR 合并 + 500ms 最小间隔)在 Slice2 解决,并对 kEncoderLookaheadFrames=17 按机型复测;
+- ②BuildChildCommandLine 引号/尾反斜杠拒绝 = Slice3 RPC 复用前必须修(代码已留 TODO)。

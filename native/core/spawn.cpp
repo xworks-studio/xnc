@@ -46,6 +46,7 @@ bool BuildChildCommandLine(const wchar_t* exe, int argc, wchar_t** argv,
     // Simple quoting: whitespace-bearing args get wrapped in double
     // quotes. Args with embedded quotes are a diag-usage error (never
     // needed by the console-diag flag set).
+    // TODO(slice3-must-fix): reject embedded quotes and trailing backslash in args before RPC reuse (M1-Slice1 final review; ledger deferred)
     if (std::wcspbrk(a, L" \t")) {
       cmd += L"\"";
       cmd += a;
