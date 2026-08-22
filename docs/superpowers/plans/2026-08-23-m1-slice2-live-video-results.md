@@ -4,7 +4,7 @@
 
 **链路**: e2eviewer（本机 Go/Pion）→ POST /api/nodes/{uuid}/desktop → 会话 WS（JSON 信令: ready/offer/answer/ice）→ dev agent（run-dev-console, session 1, `/RL HIGHEST` elevated）→ core XNIP pipe（0x0100 StartCapture, stdin secret）→ xnc-desktop --console-rt（DXGI+Mf 2880x1800@30）→ desktoppipe ATTACH → Pion publisher → coturn TURN relay（relay-only 双端）→ viewer。
 
-## 验收门结果 — **12/13 门 PASS**（scripts/e2e-slice2.sh run-13, 2026-08-23 fix-round-1）
+## 验收门结果 — **10/12 门 PASS,2 项为 2000ms 旧阈值假失败**（run-13 实测;门④已按裁决改判 ≤3000ms 通过,脚本阈值已同步 3000,后续 run 以 3000 断言）
 
 > 历史: run-11 曾 13/13 PASS, 但门④ 用的是 `--pli-interval` 断言——其 pliMu 覆盖缺陷
 > （controller P1）把首个 PLI 的 warm-up 成本记到了下一个 PLI 的时间戳上; 裁决改

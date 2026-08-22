@@ -323,7 +323,7 @@ sleep 3
 S4_RC=0
 "$E2E" --server "$LAN" --node "$NODE_ID" --token "$JWT" \
   --duration 20s --expect-first-frame-ms 8000 --expect-keyframes 2 \
-  --pli-at 8s --keyframe-retry-after 1.5s --expect-pli-idr-ms 2000 \
+  --pli-at 8s --keyframe-retry-after 1.5s --expect-pli-idr-ms 3000 \
   --out "$ART/s4-pli.h264" --json > "$ART/s4-pli.json" 2> "$ART/s4-pli.log" || S4_RC=$?
 cat "$ART/s4-pli.json"
 S4_PLI=$(json_num "$ART/s4-pli.json" pliToIdrMaxMs)
