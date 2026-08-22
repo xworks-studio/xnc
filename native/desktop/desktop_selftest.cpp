@@ -3,22 +3,33 @@
 // pitch compaction, FNV-1a hash and 256-point sampling helpers from
 // dxgi_capture.h; Task 4 scope: BGRA→NV12 BT.601 color math, Annex-B NAL
 // parse helpers, and the MfSoftEncoder contract incl. the E2 one-shot
-// force-key regression). Pure-logic cases need no desktop; the encoder
-// scenarios (a)-(d) feed synthetic color bars straight into the MF software
-// H.264 MFT, so no capture is involved and they run on any Windows box that
-// ships CMSH264EncoderMFT (client SKUs). Any failure prints
+// force-key regression; Task 5 scope: FrameCache state-machine transitions,
+// VclNalus/ShapeAu stream-contract shaping, FlushTail tail recovery, and the
+// full Pipeline::Run end-to-end over a scripted fake ICapture + the real MF
+// encoder). Pure-logic cases need no desktop; the encoder/pipeline scenarios
+// feed synthetic color bars straight into the MF software H.264 MFT, so no
+// capture is involved and they run on any Windows box that ships
+// CMSH264EncoderMFT (client SKUs). Any failure prints
 // "SELFTEST FAIL: <name>" and exits 1; all-pass prints "selftest ok". Entry
 // point SelftestMain() is declared by xnc-desktop.cpp and reachable via
 // `xnc-desktop.exe --selftest` / `build.bat selftest`.
 #include "capture.h"
 #include "diag.h"
 #include "dxgi_capture.h"
+#include "frame_cache.h"
 #include "mf_encoder.h"
 #include "nv12.h"
+#include "pipeline.h"
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>  // GetTempPathW, GetCurrentProcessId, DeleteFileW
 
 #include <cstddef>  // offsetof
 #include <cstdio>
 #include <algorithm>  // std::find
+#include <cstring>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -106,6 +117,139 @@ size_t CountAusWithNal(const std::vector<std::vector<uint8_t>>& aus, uint8_t typ
     if (xnc::NalHasType(au.data(), au.size(), type)) ++n;
   return n;
 };
+
+// ---- Task 5 pipeline fixtures ----
+
+// Scripted ICapture for the end-to-end pipeline scenarios: yields
+// `total_frames` synthetic color-bar frames (moving stripe so P frames
+// flow), then err_timeout forever - "N frames then timeouts" (plan Task 5).
+// When `rebuild_at < total_frames`, the Acquire that would return frame
+// `rebuild_at` instead fires one "err_rebuilt" first (the capture.h retry
+// contract: rebuild consumes one call, no frame), mirroring DxgiCapture's
+// ACCESS_LOST behavior.
+constexpr uint32_t kNoScriptedRebuild = 0xFFFFFFFFu;
+class ScriptedCapture final : public xnc::ICapture {
+ public:
+  ScriptedCapture(uint32_t w, uint32_t h, uint32_t total_frames,
+                  uint32_t rebuild_at = kNoScriptedRebuild)
+      : bars_(w, h), w_(w), h_(h), total_(total_frames), rebuild_at_(rebuild_at) {}
+  bool Acquire(xnc::FrameBlob& blob, std::string* err = nullptr) override {
+    if (err) err->clear();
+    if (next_ == rebuild_at_ && !rebuild_fired_) {
+      rebuild_fired_ = true;
+      ++rebuilds_;
+      if (err) *err = "err_rebuilt";  // retryable, no frame this call
+      return false;
+    }
+    if (next_ < total_) {
+      const uint8_t* p = bars_.Frame(next_);
+      blob.bgra.assign(p, p + bars_.Bytes());
+      blob.w = w_;
+      blob.h = h_;
+      blob.mono_us = ++mono_;
+      ++next_;
+      return true;
+    }
+    if (err) *err = "err_timeout";  // static screen from here on
+    return false;
+  }
+  uint32_t Width() const override { return w_; }
+  uint32_t Height() const override { return h_; }
+  uint32_t RebuildCount() const override { return rebuilds_; }
+  uint32_t yielded() const { return next_ < total_ ? next_ : total_; }
+
+ private:
+  SyntheticBars bars_;
+  uint32_t w_, h_, total_, rebuild_at_;
+  uint32_t next_ = 0, rebuilds_ = 0;
+  bool rebuild_fired_ = false;
+  uint64_t mono_ = 0;
+};
+
+// Reads a whole FILE* back from the start (pipeline output goes to a
+// TempBinFile - %TEMP%\xnc-selftest-<pid>-<slot>.bin, auto-removed).
+std::vector<uint8_t> ReadAll(FILE* f) {
+  std::vector<uint8_t> v;
+  if (!f) return v;
+  std::fseek(f, 0, SEEK_SET);
+  uint8_t buf[4096];
+  size_t n = 0;
+  while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) v.insert(v.end(), buf, buf + n);
+  return v;
+}
+
+// tmpfile() replacement without the MSVC deprecation warning: named file in
+// %TEMP%, unique per process/slot, deleted on destruction.
+class TempBinFile {
+ public:
+  bool Open(int slot) {
+    wchar_t dir[MAX_PATH] = L"";
+    const UINT n = GetTempPathW(MAX_PATH, dir);
+    if (n == 0 || n >= MAX_PATH) return false;
+    wchar_t path[MAX_PATH];
+    if (swprintf_s(path, L"%sxnc-selftest-%lu-%d.bin", dir,
+                   static_cast<unsigned long>(GetCurrentProcessId()), slot) < 0)
+      return false;
+    if (_wfopen_s(&f_, path, L"w+b") != 0 || f_ == nullptr) return false;
+    path_ = path;
+    return true;
+  }
+  ~TempBinFile() {
+    if (f_ != nullptr) std::fclose(f_);
+    if (!path_.empty()) DeleteFileW(path_.c_str());
+  }
+  FILE* get() const { return f_; }
+
+ private:
+  FILE* f_ = nullptr;
+  std::wstring path_;
+};
+
+// Sequence of NAL types (header byte & 0x1F) in Annex-B order, up to max.
+std::vector<uint8_t> StreamNalTypes(const uint8_t* d, size_t n, size_t max_types) {
+  std::vector<uint8_t> types;
+  if (!d) return types;
+  const size_t kNpos = static_cast<size_t>(-1);
+  size_t i = 0;
+  while (types.size() < max_types) {
+    size_t hdr = kNpos;
+    for (size_t j = i; j + 3 < n; ++j) {
+      if (d[j] == 0 && d[j + 1] == 0) {
+        if (d[j + 2] == 1) { hdr = j + 3; break; }
+        if (d[j + 2] == 0 && j + 4 < n && d[j + 3] == 1) { hdr = j + 4; break; }
+      }
+    }
+    if (hdr == kNpos || hdr >= n) break;
+    types.push_back(static_cast<uint8_t>(d[hdr] & 0x1F));
+    i = hdr + 1;
+  }
+  return types;
+}
+
+// Total NALUs of a type in a raw stream (counted via repeated find).
+size_t CountNalTypeInStream(const uint8_t* d, size_t n, uint8_t type) {
+  size_t cnt = 0, from = 0;
+  for (;;) {
+    const size_t hdr = xnc::nal_detail::FindTypeFrom(d, n, from, type);
+    if (hdr == xnc::nal_detail::kNpos) break;
+    ++cnt;
+    from = hdr + 1;
+  }
+  return cnt;
+}
+
+// True when the first shaped AU of the stream is a keyframe AU: NAL order
+// starts SPS(7), PPS(8) and the first VCL NALU (type 1 or 5) is the IDR (5).
+// SEI (6) between PPS and IDR is tolerated (the MFT may prepend one).
+bool StreamStartsWithKeyframe(const std::vector<uint8_t>& stream) {
+  const std::vector<uint8_t> t = StreamNalTypes(stream.data(), stream.size(), 6);
+  if (t.size() < 3 || t[0] != 7 || t[1] != 8) return false;
+  for (size_t k = 2; k < t.size(); ++k) {
+    if (t[k] == 5) return true;   // IDR before any non-IDR slice
+    if (t[k] == 1) return false;
+  }
+  return false;
+}
 
 }  // namespace
 
@@ -481,6 +625,321 @@ int SelftestMain() {
       // (d) 稳态下 SpsPps 持续可用且不变
       CHECK("mf-c-spspps-stable-nonempty", enc.SpsPps().size() > 10);
       std::printf("SELFTEST NOTE: mf-c aus=%zu idrs=%zu\n", aus.size(), idrs);
+    }
+  }
+  // ---- Task 5:FrameCache 状态机(spec §7.5;纯逻辑,无编码器) ----
+  {
+    xnc::FrameCache c;
+    CHECK("fc-init-state", c.state() == xnc::FrameCache::State::kInit &&
+                               std::strcmp(c.StateName(), "INIT") == 0 && c.NeedsBaseFrame());
+    CHECK("fc-no-pending-before-rebuild", c.TakePendingIdrReason() == nullptr);
+    CHECK("fc-counters-zero-default", c.counters().captured == 0 && c.counters().encoded == 0 &&
+          c.counters().keyframes == 0 && c.counters().timeouts == 0 &&
+          c.counters().warmup_feeds == 0 && c.counters().rebuilds == 0);
+    c.Start();
+    CHECK("fc-start-wait-base", c.state() == xnc::FrameCache::State::kWaitBaseFrame &&
+                                    std::strcmp(c.StateName(), "WAIT_BASE_FRAME") == 0 &&
+                                    c.NeedsBaseFrame());
+    CHECK("fc-start-idempotent-after-init", (c.Start(), c.state() == xnc::FrameCache::State::kWaitBaseFrame));
+    CHECK("fc-first-frame-is-base", c.OnCapturedFrame() &&
+                                        c.state() == xnc::FrameCache::State::kHaveBase &&
+                                        std::strcmp(c.StateName(), "HAVE_BASE") == 0 &&
+                                        !c.NeedsBaseFrame() && c.counters().captured == 1);
+    CHECK("fc-second-frame-incremental", !c.OnCapturedFrame() &&
+                                             c.state() == xnc::FrameCache::State::kIncremental &&
+                                             std::strcmp(c.StateName(), "INCREMENTAL") == 0);
+    c.OnTimeout();
+    c.OnTimeout();
+    CHECK("fc-timeout-counts-no-state-change",
+          c.counters().timeouts == 2 && c.state() == xnc::FrameCache::State::kIncremental);
+    // warm-up bookkeeping invariant: encoded == captured + warmup_feeds
+    c.OnEncoded();
+    c.OnWarmupFeed();
+    CHECK("fc-warmup-feed-counts-encoded",
+          c.counters().encoded == 2 && c.counters().warmup_feeds == 1);
+    CHECK("fc-no-keyframe-yet", !c.HaveKeyframe());
+    c.OnKeyframeAu();
+    CHECK("fc-keyframe-ends-warmup", c.HaveKeyframe() && c.counters().keyframes == 1);
+    // rebuild:回 WAIT_BASE_FRAME + 一次性 "rebuild" IDR 请求;计数累计保留
+    c.OnRebuild();
+    CHECK("fc-rebuild-rewinds-state", c.state() == xnc::FrameCache::State::kWaitBaseFrame &&
+                                          c.NeedsBaseFrame() && !c.HaveKeyframe());
+    CHECK("fc-rebuild-counters-cumulative",
+          c.counters().rebuilds == 1 && c.counters().captured == 2 &&
+          c.counters().timeouts == 2 && c.counters().keyframes == 1);
+    const char* reason = c.TakePendingIdrReason();
+    CHECK("fc-rebuild-idr-reason", reason != nullptr && std::strcmp(reason, "rebuild") == 0);
+    CHECK("fc-rebuild-idr-reason-one-shot", c.TakePendingIdrReason() == nullptr);
+    CHECK("fc-post-rebuild-frame-is-base",
+          c.OnCapturedFrame() && c.state() == xnc::FrameCache::State::kHaveBase);
+    // 防御:未 Start 直接喂帧 → 仍按 base 处理(首帧全量语义不依赖调用顺序)
+    xnc::FrameCache c2;
+    CHECK("fc-unstarted-first-frame-base", c2.OnCapturedFrame());
+    // CaptureReset 二连发:每次重建都重新武装一次性请求
+    xnc::FrameCache c3;
+    c3.Start();
+    c3.OnCapturedFrame();
+    c3.OnRebuild();
+    c3.OnRebuild();
+    CHECK("fc-double-rebuild-counts", c3.counters().rebuilds == 2);
+    CHECK("fc-double-rebuild-one-reason", c3.TakePendingIdrReason() != nullptr &&
+                                              c3.TakePendingIdrReason() == nullptr);
+  }
+  { // Task 5:VclNalus/ShapeAu 码流整形(vclNALUs 语义移植:丢 7/8/9,
+    // 4 字节起始码归一,尾零回退;IDR AU = 缓存 SpsPps + VCL)
+    const uint8_t au[] = {0, 0, 0, 1, 0x09, 0xF0,                     // AUD(9) 4B
+                          0, 0, 1, 0x67, 0xAA,                          // SPS(7) 3B
+                          0, 0, 0, 1, 0x68, 0xBB,                       // PPS(8) 4B
+                          0, 0, 0, 1, 0x65, 0xCC, 0, 0,                 // IDR(5) + 尾零
+                          0, 0, 1, 0x06, 0xDD};                         // SEI(6) 3B
+    std::vector<uint8_t> vcl;
+    xnc::VclNalus(au, sizeof(au), &vcl);
+    const uint8_t want[] = {0, 0, 0, 1, 0x65, 0xCC, 0, 0, 0, 1, 0x06, 0xDD};
+    CHECK("vcl-drops-aud-sps-pps-keeps-idr-sei",
+          vcl.size() == sizeof(want) && std::equal(vcl.begin(), vcl.end(), want));
+    std::vector<uint8_t> empty;
+    const uint8_t none[] = {0x11, 0x22, 0x33};
+    xnc::VclNalus(none, sizeof(none), &empty);
+    CHECK("vcl-no-startcode-empty", empty.empty());
+    xnc::VclNalus(nullptr, 0, &empty);
+    CHECK("vcl-null-noop", empty.empty());
+    std::vector<uint8_t> appended;
+    appended.push_back(0xEE);  // 追加语义(与 NalExtractTypes 一致)
+    const uint8_t p[] = {0, 0, 1, 0x41, 0x05};
+    xnc::VclNalus(p, sizeof(p), &appended);
+    CHECK("vcl-appends-and-normalizes",
+          appended.size() == 7 && appended[0] == 0xEE && appended[1] == 0 &&
+          appended[2] == 0 && appended[3] == 0 && appended[4] == 1 && appended[5] == 0x41 &&
+          appended[6] == 0x05);
+    // ShapeAu:IDR → 缓存参数集前置 + VCL;非 IDR → 仅 VCL
+    std::vector<uint8_t> spspps = {0, 0, 0, 1, 0x67, 0xAA, 0, 0, 0, 1, 0x68, 0xBB};
+    std::vector<uint8_t> shaped;
+    xnc::ShapeAu(au, sizeof(au), true, spspps, &shaped);
+    const uint8_t want_idr[] = {0, 0, 0, 1, 0x67, 0xAA, 0, 0, 0, 1, 0x68, 0xBB,
+                                0, 0, 0, 1, 0x65, 0xCC, 0, 0, 0, 1, 0x06, 0xDD};
+    CHECK("shape-au-idr-prefixed", shaped.size() == sizeof(want_idr) &&
+                                      std::equal(shaped.begin(), shaped.end(), want_idr));
+    xnc::ShapeAu(au, sizeof(au), false, spspps, &shaped);
+    CHECK("shape-au-nonidr-no-prefix",
+          shaped.size() == 12 && shaped[4] == 0x65 && shaped[10] == 0x06);
+  }
+  { // Task 5:stats.json 字段(同每秒日志字段 + duration/w/h/bitrate)
+    xnc::PipelineResult r;
+    r.counters.captured = 3;
+    r.counters.encoded = 5;
+    r.counters.keyframes = 1;
+    r.counters.timeouts = 7;
+    r.counters.warmup_feeds = 2;
+    r.counters.rebuilds = 1;
+    r.width = 64;
+    r.height = 48;
+    r.aus_written = 6;
+    r.bytes_written = 1234;
+    xnc::PipelineOpts o;
+    o.duration_s = 2;
+    o.fps = 15;
+    o.target_bitrate_bps = 2300000;
+    const std::string j = xnc::FormatStatsJson(r, o);
+    CHECK("statsjson-duration", j.find("\"duration_s\": 2") != std::string::npos);
+    CHECK("statsjson-dims", j.find("\"width\": 64") != std::string::npos &&
+                                j.find("\"height\": 48") != std::string::npos);
+    CHECK("statsjson-bitrate", j.find("\"bitrate_bps\": 2300000") != std::string::npos);
+    CHECK("statsjson-counters", j.find("\"captured\": 3") != std::string::npos &&
+                                    j.find("\"encoded\": 5") != std::string::npos &&
+                                    j.find("\"keyframes\": 1") != std::string::npos &&
+                                    j.find("\"timeouts\": 7") != std::string::npos &&
+                                    j.find("\"warmup_feeds\": 2") != std::string::npos &&
+                                    j.find("\"rebuilds\": 1") != std::string::npos);
+    CHECK("statsjson-aus-bytes", j.find("\"aus_written\": 6") != std::string::npos &&
+                                     j.find("\"bytes_written\": 1234") != std::string::npos);
+    // 文件系统路径(也是捕获/编码器初始化失败分支写零计数 sidecar 的路径):
+    // sidecar 落在 h264 路径同目录、名字固定 stats.json,内容可回读
+    wchar_t dir[MAX_PATH] = L"";
+    const UINT dn = GetTempPathW(MAX_PATH, dir);
+    CHECK("statsjson-tempdir", dn > 0 && dn < MAX_PATH);
+    if (dn > 0 && dn < MAX_PATH) {
+      wchar_t hp[MAX_PATH];
+      if (swprintf_s(hp, L"%sxnc-selftest-%lu-stats.h264", dir,
+                     static_cast<unsigned long>(GetCurrentProcessId())) > 0) {
+        std::wstring werr;
+        CHECK("statsjson-write-ok", xnc::WriteStatsJson(hp, r, o, &werr));
+        wchar_t sp[MAX_PATH];
+        swprintf_s(sp, L"%sstats.json", dir);
+        FILE* sf = nullptr;
+        if (_wfopen_s(&sf, sp, L"rb") == 0 && sf != nullptr) {
+          const std::vector<uint8_t> content = ReadAll(sf);
+          std::fclose(sf);
+          DeleteFileW(sp);
+          const std::string text(content.begin(), content.end());
+          CHECK("statsjson-sidecar-content",
+                text.find("\"keyframes\": 1") != std::string::npos &&
+                    text.find("\"duration_s\": 2") != std::string::npos &&
+                    !text.empty() && text.back() == '\n');
+        } else {
+          CHECK("statsjson-sidecar-open", false);
+        }
+      }
+    }
+  }
+  { // Task 5:致命 Acquire 错误 → Run 立即失败(未初始化编码器也安全)
+    struct FatalCapture final : xnc::ICapture {
+      bool Acquire(xnc::FrameBlob&, std::string* err = nullptr) override {
+        if (err) *err = "err_fatal_probe";
+        return false;
+      }
+      uint32_t Width() const override { return 64; }
+      uint32_t Height() const override { return 48; }
+    };
+    FatalCapture cap;
+    xnc::MfSoftEncoder uninit;  // fatal 在首次提交前发生,编码器从未被调用
+    xnc::PipelineOpts o;
+    o.duration_s = 1;
+    o.fps = 15;
+    TempBinFile tf;
+    CHECK("pipe-fatal-tmpfile", tf.Open(0));
+    if (tf.get() != nullptr) {
+      xnc::PipelineResult res = xnc::Pipeline::Run(cap, uninit, tf.get(), o);
+      CHECK("pipe-fatal-not-ok", !res.ok);
+      CHECK("pipe-fatal-err-propagated", res.err.find("err_fatal_probe") != std::string::npos);
+      CHECK("pipe-fatal-no-aus", res.aus_written == 0 && res.bytes_written == 0);
+      CHECK("pipe-fatal-timeout-zero", res.counters.timeouts == 0);
+    }
+  }
+  // ---- Task 5:FlushTail(尾帧不丢;Task 4 评审遗留项) ----
+  {
+    xnc::MfSoftEncoder uninit;
+    std::vector<std::vector<uint8_t>> noop;
+    uninit.FlushTail(noop);
+    CHECK("mf-flush-before-init-noop", noop.empty());  // 与 Drain 同样的防御
+  }
+  {
+    // 直接喂 20 帧(无 force、无 Drain):冷启动 ~17 帧前瞻 → 期间至多 3 AU
+    // 自然产出;FlushTail 排空剩余 → 总数应恢复到全部帧(尾帧不丢)。
+    const uint32_t w = 64, h = 48, fps = 15;
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(w, h, fps, 500000, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: mf-init-flush err=%s\n", err.c_str());
+    CHECK("mf-flush-init", init_ok);
+    if (init_ok) {
+      SyntheticBars bars(w, h);
+      std::vector<std::vector<uint8_t>> aus;
+      std::string e2;
+      bool ok = true;
+      for (uint32_t i = 0; i < 20 && ok; ++i) {
+        std::vector<std::vector<uint8_t>> frame_aus;
+        if (!enc.Encode(bars.Frame(i), bars.Bytes(), frame_aus, &e2)) { ok = false; break; }
+        aus.insert(aus.end(), frame_aus.begin(), frame_aus.end());
+      }
+      CHECK("mf-flush-feed-ok", ok);
+      if (ok) {
+        const size_t during = aus.size();
+        enc.FlushTail(aus);  // 追加
+        const size_t flushed = aus.size() - during;
+        std::printf("SELFTEST NOTE: mf-flush during=%zu flushed=%zu total=%zu\n",
+                    during, flushed, aus.size());
+        CHECK("mf-flush-total-not-dropped", aus.size() >= 3);  // 计划下限 20-17
+        // 实测(与本 selftest 同机型/SDK):CMSH264EncoderMFT 严格 1:1 顺序
+        // 输出(Task 4),20 帧喂入 → 恰 20 AU;FlushTail 丢失任何尾帧即 FAIL
+        CHECK("mf-flush-total-exact-1to1", aus.size() == 20);
+        CHECK("mf-flush-total-bounded", aus.size() <= 20);
+        // 首个输出 AU 含 SPS+PPS+IDR(任务措辞=包含;原始 AU 的 NAL 顺序
+        // 由 MFT 决定(AUD/SEI 可能前置),顺序契约由整形后的管线流断言)
+        CHECK("mf-flush-first-au-keyframe", !aus.empty() &&
+                  xnc::NalHasType(aus[0].data(), aus[0].size(), 7) &&
+                  xnc::NalHasType(aus[0].data(), aus[0].size(), 8) &&
+                  xnc::NalHasType(aus[0].data(), aus[0].size(), 5));
+        const std::vector<uint8_t> first_types =
+            StreamNalTypes(aus[0].data(), aus[0].size(), 8);
+        std::printf("SELFTEST NOTE: mf-flush first-au-nal=%zu types:",
+                    first_types.size());
+        for (const uint8_t t : first_types) std::printf(" %u", t);
+        std::printf("\n");
+        size_t vcl = 0;
+        for (const auto& au : aus)
+          if (xnc::NalHasType(au.data(), au.size(), 1) ||
+              xnc::NalHasType(au.data(), au.size(), 5)) ++vcl;
+        CHECK("mf-flush-every-au-vcl", vcl == aus.size());
+      }
+    }
+  }
+  // ---- Task 5:Pipeline 端到端(FAKE ICapture + 真 MfSoftEncoder,64x48@15) ----
+  {
+    // 场景 1 warm-up(§7.4 修订):3 帧后静止 → 无关键帧输出前重喂 base,
+    // 上限内收敛,绝不二次 force → 恰 1 个 IDR;首 AU = SPS+PPS+IDR
+    const uint32_t w = 64, h = 48, fps = 15;
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(w, h, fps, 500000, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: mf-init-pipe-warm err=%s\n", err.c_str());
+    CHECK("pipe-warm-init", init_ok);
+    if (init_ok) {
+      ScriptedCapture cap(w, h, 3);
+      xnc::PipelineOpts o;
+      o.duration_s = 2;
+      o.fps = fps;
+      o.target_bitrate_bps = 500000;
+      TempBinFile tf;
+      CHECK("pipe-warm-tmpfile", tf.Open(1));
+      if (tf.get() != nullptr) {
+        xnc::PipelineResult res = xnc::Pipeline::Run(cap, enc, tf.get(), o);
+        const xnc::FrameCacheCounters& c = res.counters;
+        std::printf("SELFTEST NOTE: pipe-warm ok=%d captured=%llu encoded=%llu feeds=%llu timeouts=%llu keyframes=%llu aus=%llu bytes=%llu\n",
+                    res.ok ? 1 : 0, (unsigned long long)c.captured,
+                    (unsigned long long)c.encoded, (unsigned long long)c.warmup_feeds,
+                    (unsigned long long)c.timeouts, (unsigned long long)c.keyframes,
+                    (unsigned long long)res.aus_written, (unsigned long long)res.bytes_written);
+        CHECK("pipe-warm-ok", res.ok);
+        CHECK("pipe-warm-captured", c.captured == 3);
+        CHECK("pipe-warm-feeds-happened", c.warmup_feeds >= 1);
+        CHECK("pipe-warm-feeds-bounded", c.warmup_feeds <= xnc::WarmupFeedBound(fps));
+        CHECK("pipe-warm-encoded-invariant", c.encoded == c.captured + c.warmup_feeds);
+        CHECK("pipe-warm-exactly-one-idr", c.keyframes == 1);  // E2 风暴回归(管线级)
+        CHECK("pipe-warm-aus-written", res.aus_written >= 1);
+        const std::vector<uint8_t> stream = ReadAll(tf.get());
+        CHECK("pipe-warm-bytes-match", stream.size() == (size_t)res.bytes_written);
+        CHECK("pipe-warm-first-au-sps-pps-idr", StreamStartsWithKeyframe(stream));
+        CHECK("pipe-warm-stream-idr-count",
+              CountNalTypeInStream(stream.data(), stream.size(), 5) == c.keyframes);
+      }
+    }
+  }
+  {
+    // 场景 2 重建:第 12 帧处 err_rebuilt → 状态机回 WAIT_BASE_FRAME、
+    // 恰一次 "rebuild" force(新 base 提交时消费)→ 流中共 2 个 IDR
+    //(第二个 IDR 落在尾窗内,只有 FlushTail 能把它带出来)
+    const uint32_t w = 64, h = 48, fps = 15;
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(w, h, fps, 500000, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: mf-init-pipe-reb err=%s\n", err.c_str());
+    CHECK("pipe-reb-init", init_ok);
+    if (init_ok) {
+      ScriptedCapture cap(w, h, 25, 12);
+      xnc::PipelineOpts o;
+      o.duration_s = 3;
+      o.fps = fps;
+      o.target_bitrate_bps = 500000;
+      TempBinFile tf;
+      CHECK("pipe-reb-tmpfile", tf.Open(2));
+      if (tf.get() != nullptr) {
+        xnc::PipelineResult res = xnc::Pipeline::Run(cap, enc, tf.get(), o);
+        const xnc::FrameCacheCounters& c = res.counters;
+        std::printf("SELFTEST NOTE: pipe-reb ok=%d captured=%llu encoded=%llu feeds=%llu keyframes=%llu timeouts=%llu rebuilds=%u aus=%llu\n",
+                    res.ok ? 1 : 0, (unsigned long long)c.captured,
+                    (unsigned long long)c.encoded, (unsigned long long)c.warmup_feeds,
+                    (unsigned long long)c.keyframes, (unsigned long long)c.timeouts,
+                    c.rebuilds, (unsigned long long)res.aus_written);
+        CHECK("pipe-reb-ok", res.ok);
+        CHECK("pipe-reb-rebuild-counted", c.rebuilds == 1 && cap.RebuildCount() == 1);
+        CHECK("pipe-reb-captured", c.captured == 25);
+        CHECK("pipe-reb-encoded-invariant", c.encoded == c.captured + c.warmup_feeds);
+        CHECK("pipe-reb-two-idrs", c.keyframes == 2);  // 自然首 IDR + 重建 IDR 各一次
+        const std::vector<uint8_t> stream = ReadAll(tf.get());
+        CHECK("pipe-reb-stream-idr-count",
+              CountNalTypeInStream(stream.data(), stream.size(), 5) == 2);
+        CHECK("pipe-reb-first-au-keyframe", StreamStartsWithKeyframe(stream));
+      }
     }
   }
   if (fails == 0) std::printf("selftest ok\n");

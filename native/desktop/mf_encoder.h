@@ -144,6 +144,16 @@ class MfSoftEncoder {
   // Never applies or re-arms a force-key request - that is the E2 contract.
   void Drain(std::vector<std::vector<uint8_t>>& aus);
 
+  // End-of-stream flush (Task 5; the Task 4 review's deferred minor):
+  // sends MFT_MESSAGE_NOTIFY_END_OF_STREAM + MFT_MESSAGE_COMMAND_DRAIN,
+  // then collects every remaining output AU (appending to aus, NOT cleared).
+  // This recovers the frames still inside the ~17-frame lookahead window
+  // when the pipeline stops - Drain alone cannot surface them because the
+  // MFT will not emit a buffered frame while more input is still expected.
+  // Never touches the force-key state. After FlushTail the encoder is
+  // drained - do not feed it again; call Init to reuse the object.
+  void FlushTail(std::vector<std::vector<uint8_t>>& aus);
+
  private:
   bool CollectOutputs(std::vector<std::vector<uint8_t>>& aus, std::string* err);
   void Shutdown();

@@ -330,6 +330,25 @@ void MfSoftEncoder::Drain(std::vector<std::vector<uint8_t>>& aus) {
   CollectOutputs(aus, &ignored);  // appends; never touches force_pending_
 }
 
+void MfSoftEncoder::FlushTail(std::vector<std::vector<uint8_t>>& aus) {
+  if (!impl_ || impl_->mft.Get() == nullptr) return;
+  // Canonical MFT flush: no more input (END_OF_STREAM), then COMMAND_DRAIN =
+  // produce all pending output; CollectOutputs stops at
+  // MF_E_TRANSFORM_NEED_MORE_INPUT, which drained encoders return once the
+  // window is empty. Message failures are logged and tolerated - collecting
+  // is still attempted.
+  HRESULT hr = impl_->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+  if (FAILED(hr))
+    XNC_LOG_INFO("flush_tail end_of_stream hr=0x%08x (continuing)",
+                 static_cast<unsigned int>(hr));
+  hr = impl_->mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+  if (FAILED(hr))
+    XNC_LOG_INFO("flush_tail drain hr=0x%08x (continuing)", static_cast<unsigned int>(hr));
+  std::string ignored;
+  if (!CollectOutputs(aus, &ignored))
+    XNC_LOG_INFO("flush_tail collect stopped early (see previous error line)");
+}
+
 bool MfSoftEncoder::CollectOutputs(std::vector<std::vector<uint8_t>>& aus, std::string* err) {
   bool any_au = false;
   bool has_idr = false;

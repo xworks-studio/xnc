@@ -1,26 +1,25 @@
 // xnc-desktop.cpp - entry point + CLI (Task 2). Modes:
 //   --selftest      run the native/desktop selftest (arg parse + FrameBlob +
-//                   Task 3 capture-helper units: blob math, pitch
-//                   compaction, FNV hash, point sampling)
+//                   capture-helper units, encoder contract, FrameCache state
+//                   machine and the end-to-end pipeline)
 //   --help          usage text, exit 0
 //   --console-diag [--duration <sec>] [--out <file.h264>] [--fps <n>]
-//       diagnostic capture loop in the console session. Task 3 wires the
-//       DXGI capture backend: per-second counters (captured/timeouts/
-//       rebuilds/w/h), a first-frame hash + non-black check, captured frames
-//       throttled to --fps. The --out file is created (empty) so an
-//       unwritable path surfaces immediately - the encoder lands in Task 4/5.
-//       If desktop duplication is refused (no interactive desktop, e.g. run
-//       as SYSTEM in session 0) the process logs dxgi_access_denied_session0
-//       and exits 1; the Task 6 session bridge makes that path work.
-// Exit codes: 0 ok; 1 internal error (cannot open --out, capture init or
-// repeated acquire failure); 2 usage error. These flag names are the Task 6
-// spawn contract - do not rename.
+//       diagnostic capture loop in the console session: DXGI capture ->
+//       FrameCache state machine -> MF software H.264 encoder -> shaped
+//       Annex-B AUs into --out, plus a stats.json sidecar next to it
+//       (written even when capture/encoder init fails, with zeroed
+//       counters). If desktop duplication is refused (no interactive
+//       desktop, e.g. run as SYSTEM in session 0) the process logs
+//       dxgi_access_denied_session0 and exits 1; the Task 6 session bridge
+//       makes that path work.
+// Exit codes: 0 ok; 1 internal error (cannot open --out, capture/encoder
+// init or repeated acquire failure); 2 usage error. These flag names are the
+// Task 6 spawn contract - do not rename.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>  // GetTickCount64, Sleep
 
-#include <algorithm>  // std::min
 #include <cstdint>
 #include <cstdio>
 #include <cwchar>
@@ -30,7 +29,9 @@
 #include "../common/log.h"
 #include "capture.h"       // capture contract (ICapture/FrameBlob)
 #include "diag.h"
-#include "dxgi_capture.h"  // TryCreateDxgiCapture, Fnv1a64, sampling
+#include "dxgi_capture.h"  // TryCreateDxgiCapture, DxgiErrIsDesktopAccessDenied
+#include "mf_encoder.h"    // MfSoftEncoder
+#include "pipeline.h"      // Pipeline::Run + stats.json sidecar
 
 int SelftestMain();  // desktop_selftest.cpp
 
@@ -43,16 +44,15 @@ void Usage(FILE* out) {
       L"       xnc-desktop.exe --selftest | --help\n"
       L"  --console-diag  diagnostic capture loop in the console session\n"
       L"  --duration      seconds to run (default 10, must be > 0)\n"
-      L"  --out           output H.264 path (required with --console-diag)\n"
+      L"  --out           output H.264 path (required with --console-diag);\n"
+      L"                  a stats.json sidecar is written next to it\n"
       L"  --fps           target fps (default 30, must be > 0)\n"
-      L"  --selftest      arg parsing + FrameBlob/capture-helper selftest\n"
+      L"  --selftest      arg parsing + FrameBlob/encoder/pipeline selftest\n"
       L"  --help          this usage text\n"
-      L"console-diag runs the DXGI capture loop (captured/timeouts/rebuilds\n"
-      L"per-second counters, first-frame non-black check); stream encoding\n"
-      L"arrives in Tasks 4-5\n");
+      L"console-diag runs DXGI capture -> FrameCache -> MF H.264 encode and\n"
+      L"writes shaped Annex-B AUs to --out (SPS/PPS before IDR, 4-byte start\n"
+      L"codes, no AUD) plus per-second counters and a stats.json sidecar\n");
 }
-
-uint64_t NowMs() { return GetTickCount64(); }
 
 }  // namespace
 
@@ -126,6 +126,9 @@ bool ParseDiagArgs(int argc, wchar_t** argv, DiagOptions* opt, std::wstring* err
 
 namespace {
 
+// Diag default bitrate (task 5 wiring): 2.3 Mbps.
+constexpr uint32_t kDiagBitrateBps = 2300000;
+
 int RunConsoleDiag(const xnc::DiagOptions& opt) {
   FILE* out = nullptr;
   const errno_t open_err = _wfopen_s(&out, opt.out_path.c_str(), L"wb");
@@ -133,8 +136,29 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
     XNC_LOG_ERROR("open out failed path=%ls errno=%d", opt.out_path.c_str(), open_err);
     return 1;
   }
-  XNC_LOG_INFO("console_diag_start duration=%us fps=%u out=%ls",
-               opt.duration_s, opt.fps, opt.out_path.c_str());
+  XNC_LOG_INFO("console_diag_start duration=%us fps=%u bitrate=%u out=%ls",
+               opt.duration_s, opt.fps, kDiagBitrateBps, opt.out_path.c_str());
+
+  xnc::PipelineOpts popt;
+  popt.duration_s = opt.duration_s;
+  popt.fps = opt.fps;
+  popt.target_bitrate_bps = kDiagBitrateBps;
+
+  // Every diag run leaves a stats.json sidecar next to --out - including the
+  // init-failure paths below (zeroed counters, ok=false + the reason), so a
+  // missing sidecar always means "the process never got that far", never
+  // "it ran and vanished".
+  const auto write_stats = [&opt, &popt](const xnc::PipelineResult& r) {
+    std::wstring serr;
+    if (!xnc::WriteStatsJson(opt.out_path, r, popt, &serr))
+      XNC_LOG_ERROR("stats_json_write_failed err=\"%ls\"", serr.c_str());
+  };
+  const auto fail_result = [](const char* why) {
+    xnc::PipelineResult r;
+    r.ok = false;
+    r.err = why;
+    return r;
+  };
 
   // Task 3: real DXGI capture. Init failure paths:
   //   - desktop access denied (session 0 SYSTEM direct run) is EXPECTED
@@ -145,68 +169,40 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
   if (!capture) {
     if (xnc::DxgiErrIsDesktopAccessDenied(cap_err)) {
       XNC_LOG_ERROR("dxgi_access_denied_session0 err=\"%s\"", cap_err.c_str());
+      write_stats(fail_result("dxgi_access_denied_session0"));
     } else {
       XNC_LOG_ERROR("capture_init_failed err=\"%s\"", cap_err.c_str());
+      write_stats(fail_result("capture_init_failed"));
     }
     std::fclose(out);
     return 1;
   }
   XNC_LOG_INFO("capture_init w=%u h=%u", capture->Width(), capture->Height());
 
-  const uint64_t t0 = NowMs();
-  uint32_t next_beat_s = 0;
-  unsigned long long captured = 0, timeouts = 0;
-  bool first_frame_logged = false;
-  uint64_t last_capture_ms = 0;
-  const uint32_t spf_ms = 1000u / opt.fps;  // throttle captured frames to --fps
-  xnc::FrameBlob blob;
-  std::string acq_err;
-  for (;;) {
-    const uint64_t now = NowMs();
-    if (now - t0 >= static_cast<uint64_t>(opt.duration_s) * 1000ull) break;
-    acq_err.clear();
-    if (capture->Acquire(blob, &acq_err)) {
-      ++captured;
-      if (!first_frame_logged) {
-        first_frame_logged = true;
-        const size_t head = std::min<size_t>(64, blob.bgra.size());
-        const unsigned long long hash =
-            static_cast<unsigned long long>(xnc::Fnv1a64(blob.bgra.data(), head));
-        const bool non_black = xnc::SamplePointsNotUniform(blob.bgra.data(), blob.w, blob.h);
-        XNC_LOG_INFO("first_frame hash_head64=%016llx non_black=%d w=%u h=%u mono_us=%llu",
-                     hash, non_black ? 1 : 0, blob.w, blob.h,
-                     static_cast<unsigned long long>(blob.mono_us));
-        if (!non_black)
-          XNC_LOG_ERROR("first_frame_uniform (all 256 sampled pixels equal - suspect black/garbage frame)");
-      }
-      // Pace captured frames to the target fps (timeouts are already paced
-      // by the 100ms AcquireNextFrame wait).
-      if (last_capture_ms != 0) {
-        const uint64_t since = NowMs() - last_capture_ms;
-        if (since < spf_ms) Sleep(static_cast<DWORD>(spf_ms - since));
-      }
-      last_capture_ms = NowMs();
-    } else if (acq_err == "err_timeout") {
-      ++timeouts;  // static screen: silent, no blob
-    } else if (acq_err == "err_rebuilt") {
-      // access lost + in-place rebuild; rebuilds_ counter covers it
-    } else {
-      XNC_LOG_ERROR("acquire_failed err=\"%s\"", acq_err.c_str());
-      std::fclose(out);
-      return 1;
-    }
-    const uint32_t elapsed_s = static_cast<uint32_t>((NowMs() - t0) / 1000);
-    if (elapsed_s >= next_beat_s) {
-      XNC_LOG_INFO("diag_capture elapsed=%us captured=%llu timeouts=%llu rebuilds=%u w=%u h=%u",
-                   elapsed_s, captured, timeouts, capture->RebuildCount(),
-                   capture->Width(), capture->Height());
-      next_beat_s = elapsed_s + 1;
-    }
+  // Task 5: capture -> FrameCache -> MF software encode -> shaped Annex-B
+  // AUs into --out; encoder at the capture's dimensions, fps from args.
+  xnc::MfSoftEncoder encoder;
+  std::string enc_err;
+  if (!encoder.Init(capture->Width(), capture->Height(), opt.fps, kDiagBitrateBps,
+                    &enc_err)) {
+    XNC_LOG_ERROR("encoder_init_failed err=\"%s\"", enc_err.c_str());
+    write_stats(fail_result("encoder_init_failed"));
+    std::fclose(out);
+    return 1;
   }
-  XNC_LOG_INFO("console_diag_stop elapsed=%us captured=%llu timeouts=%llu rebuilds=%u",
-               opt.duration_s, captured, timeouts, capture->RebuildCount());
+
+  xnc::PipelineResult res = xnc::Pipeline::Run(*capture, encoder, out, popt);
+  write_stats(res);
+  const xnc::FrameCacheCounters& c = res.counters;
+  XNC_LOG_INFO("console_diag_stop duration=%us captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu rebuilds=%u aus=%llu ok=%d",
+               opt.duration_s, static_cast<unsigned long long>(c.captured),
+               static_cast<unsigned long long>(c.encoded),
+               static_cast<unsigned long long>(c.keyframes),
+               static_cast<unsigned long long>(c.timeouts),
+               static_cast<unsigned long long>(c.warmup_feeds), c.rebuilds,
+               static_cast<unsigned long long>(res.aus_written), res.ok ? 1 : 0);
   std::fclose(out);
-  return 0;
+  return res.ok ? 0 : 1;
 }
 
 }  // namespace
