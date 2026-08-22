@@ -1,28 +1,36 @@
 // xnc-desktop.cpp - entry point + CLI (Task 2). Modes:
-//   --selftest      run the native/desktop selftest (arg parse + FrameBlob)
+//   --selftest      run the native/desktop selftest (arg parse + FrameBlob +
+//                   Task 3 capture-helper units: blob math, pitch
+//                   compaction, FNV hash, point sampling)
 //   --help          usage text, exit 0
 //   --console-diag [--duration <sec>] [--out <file.h264>] [--fps <n>]
-//       diagnostic capture loop in the console session. Task 2 has no
-//       capture backend yet (TryCreateDxgiCapture lands in Task 3, encoder
-//       in Task 4/5): the loop heartbeats once per second with
-//       "diag_no_capture" and exits 0 when the duration elapses. The --out
-//       file is created (empty) so an unwritable path surfaces immediately,
-//       not after a 60s diag run.
-// Exit codes: 0 ok; 1 internal error (e.g. cannot open --out); 2 usage
-// error. These flag names are the Task 6 spawn contract - do not rename.
+//       diagnostic capture loop in the console session. Task 3 wires the
+//       DXGI capture backend: per-second counters (captured/timeouts/
+//       rebuilds/w/h), a first-frame hash + non-black check, captured frames
+//       throttled to --fps. The --out file is created (empty) so an
+//       unwritable path surfaces immediately - the encoder lands in Task 4/5.
+//       If desktop duplication is refused (no interactive desktop, e.g. run
+//       as SYSTEM in session 0) the process logs dxgi_access_denied_session0
+//       and exits 1; the Task 6 session bridge makes that path work.
+// Exit codes: 0 ok; 1 internal error (cannot open --out, capture init or
+// repeated acquire failure); 2 usage error. These flag names are the Task 6
+// spawn contract - do not rename.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>  // GetTickCount64, Sleep
 
+#include <algorithm>  // std::min
 #include <cstdint>
 #include <cstdio>
 #include <cwchar>
+#include <memory>
 #include <string>
 
 #include "../common/log.h"
-#include "capture.h"  // capture contract; Task 3 wires TryCreateDxgiCapture
+#include "capture.h"       // capture contract (ICapture/FrameBlob)
 #include "diag.h"
+#include "dxgi_capture.h"  // TryCreateDxgiCapture, Fnv1a64, sampling
 
 int SelftestMain();  // desktop_selftest.cpp
 
@@ -37,10 +45,11 @@ void Usage(FILE* out) {
       L"  --duration      seconds to run (default 10, must be > 0)\n"
       L"  --out           output H.264 path (required with --console-diag)\n"
       L"  --fps           target fps (default 30, must be > 0)\n"
-      L"  --selftest      arg parsing + FrameBlob layout selftest\n"
+      L"  --selftest      arg parsing + FrameBlob/capture-helper selftest\n"
       L"  --help          this usage text\n"
-      L"capture/encoder backends arrive in Tasks 3-5; console-diag currently\n"
-      L"only heartbeats (diag_no_capture) and writes no stream data\n");
+      L"console-diag runs the DXGI capture loop (captured/timeouts/rebuilds\n"
+      L"per-second counters, first-frame non-black check); stream encoding\n"
+      L"arrives in Tasks 4-5\n");
 }
 
 uint64_t NowMs() { return GetTickCount64(); }
@@ -126,22 +135,76 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
   }
   XNC_LOG_INFO("console_diag_start duration=%us fps=%u out=%ls",
                opt.duration_s, opt.fps, opt.out_path.c_str());
-  // Task 3 constructs TryCreateDxgiCapture() here; with no capture source
-  // the Task 2 contract is a per-second heartbeat until the duration
-  // elapses. First beat fires immediately (elapsed=0), then one per second.
+
+  // Task 3: real DXGI capture. Init failure paths:
+  //   - desktop access denied (session 0 SYSTEM direct run) is EXPECTED
+  //     until the Task 6 session bridge: log a clear marker, exit 1;
+  //   - anything else is a genuine backend failure, exit 1.
+  std::string cap_err;
+  std::unique_ptr<xnc::ICapture> capture = xnc::TryCreateDxgiCapture(&cap_err);
+  if (!capture) {
+    if (xnc::DxgiErrIsDesktopAccessDenied(cap_err)) {
+      XNC_LOG_ERROR("dxgi_access_denied_session0 err=\"%s\"", cap_err.c_str());
+    } else {
+      XNC_LOG_ERROR("capture_init_failed err=\"%s\"", cap_err.c_str());
+    }
+    std::fclose(out);
+    return 1;
+  }
+  XNC_LOG_INFO("capture_init w=%u h=%u", capture->Width(), capture->Height());
+
   const uint64_t t0 = NowMs();
   uint32_t next_beat_s = 0;
+  unsigned long long captured = 0, timeouts = 0;
+  bool first_frame_logged = false;
+  uint64_t last_capture_ms = 0;
+  const uint32_t spf_ms = 1000u / opt.fps;  // throttle captured frames to --fps
+  xnc::FrameBlob blob;
+  std::string acq_err;
   for (;;) {
+    const uint64_t now = NowMs();
+    if (now - t0 >= static_cast<uint64_t>(opt.duration_s) * 1000ull) break;
+    acq_err.clear();
+    if (capture->Acquire(blob, &acq_err)) {
+      ++captured;
+      if (!first_frame_logged) {
+        first_frame_logged = true;
+        const size_t head = std::min<size_t>(64, blob.bgra.size());
+        const unsigned long long hash =
+            static_cast<unsigned long long>(xnc::Fnv1a64(blob.bgra.data(), head));
+        const bool non_black = xnc::SamplePointsNotUniform(blob.bgra.data(), blob.w, blob.h);
+        XNC_LOG_INFO("first_frame hash_head64=%016llx non_black=%d w=%u h=%u mono_us=%llu",
+                     hash, non_black ? 1 : 0, blob.w, blob.h,
+                     static_cast<unsigned long long>(blob.mono_us));
+        if (!non_black)
+          XNC_LOG_ERROR("first_frame_uniform (all 256 sampled pixels equal - suspect black/garbage frame)");
+      }
+      // Pace captured frames to the target fps (timeouts are already paced
+      // by the 100ms AcquireNextFrame wait).
+      if (last_capture_ms != 0) {
+        const uint64_t since = NowMs() - last_capture_ms;
+        if (since < spf_ms) Sleep(static_cast<DWORD>(spf_ms - since));
+      }
+      last_capture_ms = NowMs();
+    } else if (acq_err == "err_timeout") {
+      ++timeouts;  // static screen: silent, no blob
+    } else if (acq_err == "err_rebuilt") {
+      // access lost + in-place rebuild; rebuilds_ counter covers it
+    } else {
+      XNC_LOG_ERROR("acquire_failed err=\"%s\"", acq_err.c_str());
+      std::fclose(out);
+      return 1;
+    }
     const uint32_t elapsed_s = static_cast<uint32_t>((NowMs() - t0) / 1000);
-    if (elapsed_s >= opt.duration_s) break;
     if (elapsed_s >= next_beat_s) {
-      XNC_LOG_INFO("diag_no_capture elapsed=%us duration=%us captured=0",
-                   elapsed_s, opt.duration_s);
+      XNC_LOG_INFO("diag_capture elapsed=%us captured=%llu timeouts=%llu rebuilds=%u w=%u h=%u",
+                   elapsed_s, captured, timeouts, capture->RebuildCount(),
+                   capture->Width(), capture->Height());
       next_beat_s = elapsed_s + 1;
     }
-    Sleep(50);
   }
-  XNC_LOG_INFO("console_diag_stop elapsed=%us captured=0", opt.duration_s);
+  XNC_LOG_INFO("console_diag_stop elapsed=%us captured=%llu timeouts=%llu rebuilds=%u",
+               opt.duration_s, captured, timeouts, capture->RebuildCount());
   std::fclose(out);
   return 0;
 }

@@ -1,15 +1,18 @@
 // desktop_selftest.cpp - native/desktop selftest (Task 2 scope: console-diag
-// arg parsing + FrameBlob/ICapture layout). Pure logic - no desktop or DXGI
-// needed, so it runs on LABS-DEV (owner is RDP'd in; capture only on
-// XIAOXIN). Any failure prints "SELFTEST FAIL: <name>" and exits 1; all-pass
-// prints "selftest ok". Entry point SelftestMain() is declared by
-// xnc-desktop.cpp and reachable via `xnc-desktop.exe --selftest` /
-// `build.bat selftest`.
+// arg parsing + FrameBlob/ICapture layout; Task 3 scope: BGRA byte math,
+// pitch compaction, FNV-1a hash and 256-point sampling helpers from
+// dxgi_capture.h). Pure logic - no desktop or DXGI needed, so it runs on
+// LABS-DEV (owner is RDP'd in; capture only on XIAOXIN). Any failure prints
+// "SELFTEST FAIL: <name>" and exits 1; all-pass prints "selftest ok". Entry
+// point SelftestMain() is declared by xnc-desktop.cpp and reachable via
+// `xnc-desktop.exe --selftest` / `build.bat selftest`.
 #include "capture.h"
 #include "diag.h"
+#include "dxgi_capture.h"
 
 #include <cstddef>  // offsetof
 #include <cstdio>
+#include <algorithm>  // std::find
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -39,7 +42,7 @@ ParseOutcome Parse(const std::vector<std::wstring>& args) {
 // Selftest-only fake backend: proves ICapture is implementable/abstract and
 // is reusable by Task 5's synthetic-capture pipeline tests.
 struct FakeCapture final : xnc::ICapture {
-  bool Acquire(xnc::FrameBlob&) override { return false; }
+  bool Acquire(xnc::FrameBlob&, std::string* = nullptr) override { return false; }
   uint32_t Width() const override { return 0; }
   uint32_t Height() const override { return 0; }
 };
@@ -106,7 +109,80 @@ int SelftestMain() {
     FakeCapture fc;
     xnc::ICapture* iface = &fc;
     xnc::FrameBlob fb;
-    CHECK("icapture-virtual-dispatch", !iface->Acquire(fb) && iface->Width() == 0 && iface->Height() == 0);
+    std::string acq_err;
+    CHECK("icapture-virtual-dispatch",
+          !iface->Acquire(fb, &acq_err) && iface->Width() == 0 && iface->Height() == 0);
+    CHECK("icapture-default-acquire-err-optional", !iface->Acquire(fb));  // err 参数可省
+    CHECK("icapture-default-rebuilds", iface->RebuildCount() == 0);
+  }
+  { // FrameBlob 尺寸算术(w*h*4,溢出护栏):Task 3 blob 大小契约
+    CHECK("bgra-bytes-64x32", xnc::BgraBytes(64, 32) == 64u * 32u * 4u);
+    CHECK("bgra-bytes-1080p", xnc::BgraBytes(1920, 1080) == 8294400u);
+    CHECK("bgra-bytes-zero-dim", xnc::BgraBytes(0, 100) == 0 && xnc::BgraBytes(100, 0) == 0);
+    CHECK("bgra-bytes-overflow-guard", xnc::BgraBytes(0xFFFFFFFFu, 0xFFFFFFFFu) == 0);
+    // 真实 FrameBlob 尺寸对齐:resize(BgraBytes) 后 size == w*h*4
+    xnc::FrameBlob fb;
+    fb.w = 1920; fb.h = 1080;
+    fb.bgra.resize(xnc::BgraBytes(fb.w, fb.h));
+    CHECK("blob-size-matches-math", fb.bgra.size() == (size_t)fb.w * fb.h * 4);
+  }
+  { // 行距压缩(Map RowPitch > w*4 是常态):合成 pitched 数据逐行核对
+    const uint32_t w = 8, h = 6;
+    const size_t tight = (size_t)w * 4;      // 32
+    const size_t pitch = tight + 16;         // GPU 加长行距
+    std::vector<uint8_t> src(pitch * h + 7, 0xAB);  // +7 尾部哨兵
+    for (uint32_t r = 0; r < h; ++r) {
+      uint8_t* row = src.data() + r * pitch;
+      for (size_t i = 0; i < tight; ++i) row[i] = static_cast<uint8_t>(r * 8 + (i % 8));
+      for (size_t i = tight; i < pitch; ++i) row[i] = 0xCD;  // 行内 padding 垃圾
+    }
+    std::vector<uint8_t> dst(w * h * 4, 0);
+    xnc::CompactBgraRows(src.data(), pitch, dst.data(), w, h);
+    bool rows_ok = true;
+    for (uint32_t r = 0; r < h && rows_ok; ++r)
+      for (size_t i = 0; i < tight; ++i)
+        if (dst[(size_t)r * tight + i] != ((r * 8 + (i % 8)) & 0xFF)) { rows_ok = false; break; }
+    CHECK("compact-rows-content", rows_ok);
+    CHECK("compact-rows-no-padding", std::find(dst.begin(), dst.end(), 0xCD) == dst.end());
+    CHECK("compact-rows-size", dst.size() == xnc::BgraBytes(w, h));
+    // 退化:RowPitch == w*4(无 padding)也必须逐行正确
+    std::vector<uint8_t> src2(tight * h, 0x11);
+    for (uint32_t r = 0; r < h; ++r)
+      for (size_t i = 0; i < tight; ++i) src2[r * tight + i] = static_cast<uint8_t>(0x40 + r);
+    std::vector<uint8_t> dst2(w * h * 4, 0);
+    xnc::CompactBgraRows(src2.data(), tight, dst2.data(), w, h);
+    bool tight_ok = dst2.size() == tight * h;
+    for (uint32_t r = 0; r < h && tight_ok; ++r)
+      if (dst2[r * tight] != 0x40 + r) tight_ok = false;
+    CHECK("compact-rows-tight-pitch", tight_ok);
+  }
+  { // FNV-1a 64 已知向量(诊断首帧哈希工具)
+    CHECK("fnv1a64-empty", xnc::Fnv1a64(nullptr, 0) == 0xcbf29ce484222325ull);
+    const uint8_t a[] = {'a'};
+    CHECK("fnv1a64-a", xnc::Fnv1a64(a, 1) == 0xaf63dc4c8601ec8cull);
+    const uint8_t foobar[] = {'f', 'o', 'o', 'b', 'a', 'r'};
+    CHECK("fnv1a64-foobar", xnc::Fnv1a64(foobar, 6) == 0x85944171f73967e8ull);
+  }
+  { // 256 点采样非全等判定(诊断非全黑检查)
+    const uint32_t w = 64, h = 48;
+    std::vector<uint8_t> black((size_t)w * h * 4, 0);
+    CHECK("sample-uniform-black", !xnc::SamplePointsNotUniform(black.data(), w, h));
+    std::vector<uint8_t> same((size_t)w * h * 4, 0x77);  // 均一非黑仍全等
+    CHECK("sample-uniform-nonblack", !xnc::SamplePointsNotUniform(same.data(), w, h));
+    std::vector<uint8_t> grad((size_t)w * h * 4, 0);
+    for (uint32_t y = 0; y < h; ++y)
+      for (uint32_t x = 0; x < w; ++x) {
+        uint8_t* px = grad.data() + ((size_t)y * w + x) * 4;
+        px[0] = static_cast<uint8_t>(x); px[1] = static_cast<uint8_t>(y);
+        px[2] = 0x40; px[3] = 0xFF;
+      }
+    CHECK("sample-gradient-nonuniform", xnc::SamplePointsNotUniform(grad.data(), w, h));
+    // 单像素变化落在采样点 (i=128 → x=32,y=24) 上即可检出
+    std::vector<uint8_t> one = black;
+    uint8_t* px = one.data() + ((size_t)24 * w + 32) * 4;
+    px[2] = 0xFF;
+    CHECK("sample-single-sample-point-change", xnc::SamplePointsNotUniform(one.data(), w, h));
+    CHECK("sample-degenerate-1x1-safe", !xnc::SamplePointsNotUniform(black.data(), 1, 1));
   }
   if (fails == 0) std::printf("selftest ok\n");
   return fails == 0 ? 0 : 1;

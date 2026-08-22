@@ -1,9 +1,10 @@
 @echo off
 rem build.bat - build bin/xnc-desktop.exe (native/desktop: console-diag
-rem process skeleton; Task 3 adds the DXGI capture backend, Task 4 the MF
+rem process skeleton + Task 3 DXGI capture backend; Task 4 adds the MF
 rem software encoder) with MSVC. Requires VS2022 (vcvars64). Static CRT (/MT)
 rem so nodes need no VC runtime installed. Shares log.h from ..\common;
-rem artifacts go to ..\..\bin (gitignored).
+rem dxgi_capture.cpp needs d3d11.lib (D3D11CreateDevice); artifacts go to
+rem ..\..\bin (gitignored).
 rem Targets:
 rem   build.bat            build ..\..\bin\xnc-desktop.exe
 rem   build.bat selftest   build + run bin\xnc-desktop.exe --selftest
@@ -16,7 +17,7 @@ if errorlevel 1 (
 cd /d "%~dp0"
 
 if not exist ..\..\bin mkdir ..\..\bin
-cl /nologo /utf-8 /W3 /MT /std:c++17 /EHsc xnc-desktop.cpp desktop_selftest.cpp /Fe:..\..\bin\xnc-desktop.exe /Fo:..\..\bin\
+cl /nologo /utf-8 /W3 /MT /std:c++17 /EHsc xnc-desktop.cpp dxgi_capture.cpp desktop_selftest.cpp /Fe:..\..\bin\xnc-desktop.exe /Fo:..\..\bin\ /link d3d11.lib
 if errorlevel 1 exit /b 1
 
 echo [desktop] built ..\..\bin\xnc-desktop.exe

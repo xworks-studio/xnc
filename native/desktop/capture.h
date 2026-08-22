@@ -13,22 +13,30 @@
 namespace xnc {
 
 // One captured frame: tightly packed 8-bit BGRA (bgra.size() == w * h * 4)
-// plus the capture timestamp in monotonic-clock microseconds.
+// plus the capture timestamp in monotonic-clock microseconds. Fields are
+// default-initialized so a default-constructed blob is {empty, 0, 0, 0}
+// (value semantics matter: diag/pipeline code reuses FrameBlob locals).
 struct FrameBlob {
   std::vector<uint8_t> bgra;
-  uint32_t w, h;
-  uint64_t mono_us;
+  uint32_t w = 0, h = 0;
+  uint64_t mono_us = 0;
 };
 
 // Capture backend. Acquire semantics (pinned for Task 3/5): true = FrameBlob
-// filled in; false with silent retry = timeout (screen static);
+// filled in; false + *err == "err_timeout" = no change (screen static, retry
+// silently, no blob); false + *err == "err_rebuilt" = access lost and the
+// backend rebuilt its duplication in place (no frame this call, retry);
+// any other *err = fatal (repeated rebuild failure etc.).
 // ACCESS_LOST/DEVICE_REMOVED are rebuilt internally by the backend.
 class ICapture {
  public:
   virtual ~ICapture() = default;
-  virtual bool Acquire(FrameBlob&) = 0;
+  virtual bool Acquire(FrameBlob&, std::string* err = nullptr) = 0;
   virtual uint32_t Width() const = 0;
   virtual uint32_t Height() const = 0;
+  // Total in-place rebuilds so far (ACCESS_LOST/DEVICE_REMOVED) - diag
+  // observability only; default 0 for backends that never rebuild.
+  virtual uint32_t RebuildCount() const { return 0; }
 };
 
 // Task 3 implements this (DXGI CPU readback). Returns null and sets *err
