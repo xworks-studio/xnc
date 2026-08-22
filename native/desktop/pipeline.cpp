@@ -4,8 +4,18 @@
 //   encode; warm-up re-feed while no keyframe AU yet) | err_rebuilt
 //   (FrameCache.OnRebuild + one-shot "rebuild" force) | fatal (stop)
 //   -> Encode -> shape every AU (SPS/PPS prefix on IDR, 4B start codes,
-//   AUD dropped) -> fwrite; per-second counter beat; at end FlushTail
+//   AUD dropped) -> sink->OnAu; per-second counter beat; at end FlushTail
 //   recovers the lookahead window's AUs through the same shaping path.
+//
+// M1-Slice2 Task 2: the loop emits through an AuSink. The diag FILE* dump
+// is FileAuSink below (identical behavior to the pre-slice code, including
+// error strings); RtServer is the fan-out sink. On-demand IDR (spec §7.5 +
+// Slice1 carry-over): while the screen is static a subscriber join
+// (PendingIdrReason, e.g. "sub_join") arms ONE ForceNextIdr - at most once
+// per kIdrMinIntervalMs, only after the stream's first keyframe, never
+// while a previous request is in flight - and the cached base frame is
+// re-fed on the timeout path (same bounds as warm-up: 2 x lookahead window
+// or 2 s; never re-forcing) until the IDR AU emerges (on-demand warm-up).
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -14,6 +24,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -31,18 +42,67 @@ uint64_t NowMs() { return GetTickCount64(); }
 // keeps the loop off the CPU in both cases.
 constexpr DWORD kIdleSleepMs = 15;
 
-// Warm-up wall-clock bound (spec §7.4): 2 s.
+// Warm-up wall-clock bound (spec §7.4): 2 s. Also bounds the on-demand
+// IDR re-feed window (same rule, spec §7.5 carry-over).
 constexpr uint64_t kWarmupWallBoundMs = 2000ull;
 
-// One submission (real captured frame or warm-up re-feed): paces to the
-// target fps, applies any pending one-shot IDR request (armed by a capture
-// rebuild - E2 contract: it rides the next submission exactly once and is
-// never re-armed), encodes, shapes and writes every output AU. Returns
-// false on fatal failure (res->ok already false, res->err set).
-bool SubmitFrame(MfSoftEncoder& enc, FILE* out, const uint8_t* bgra, size_t len,
-                 FrameCache& cache, PipelineResult* res, bool warmup, uint32_t spf_ms,
-                 uint64_t* last_submit_ms, std::vector<std::vector<uint8_t>>& aus,
-                 std::vector<uint8_t>& shaped) {
+// On-demand (subscriber-initiated) IDR state. "Armed" spans from the
+// ForceNextIdr call to the IDR AU actually emerging: while armed no new
+// request is honored (one in flight) and the timeout path re-feeds the
+// cached base frame, bounded like the initial warm-up and never re-forcing
+// (the force is one-shot and rides the FIRST submission after arming).
+struct OnDemandIdr {
+  bool armed = false;
+  bool exhaust_logged = false;
+  uint64_t armed_ms = 0;
+  uint32_t feeds = 0;
+  char reason[32] = {0};
+
+  void Arm(const char* why, uint64_t now_ms) {
+    armed = true;
+    exhaust_logged = false;
+    armed_ms = now_ms;
+    feeds = 0;
+    std::snprintf(reason, sizeof(reason), "%s", why != nullptr ? why : "?");
+  }
+  // True while a re-feed is allowed (static screen): the IDR has not
+  // emerged yet and neither bound is hit.
+  bool FeedAllowed(uint64_t now_ms, uint32_t feed_bound) const {
+    return armed && feeds < feed_bound && now_ms - armed_ms < kWarmupWallBoundMs;
+  }
+};
+
+// Diag FILE* sink: the exact pre-slice dump behavior (binary fwrite of
+// every shaped AU; fatal error string "fwrite out failed").
+class FileAuSink final : public AuSink {
+ public:
+  explicit FileAuSink(FILE* f) : f_(f) {}
+  const char* OnAu(bool, uint64_t, const uint8_t* au, size_t len) override {
+    if (std::fwrite(au, 1, len, f_) != len) {
+      XNC_LOG_ERROR("write_out_failed");
+      return "fwrite out failed";
+    }
+    return nullptr;
+  }
+
+ private:
+  FILE* f_;
+};
+
+// One submission (real captured frame, warm-up re-feed or on-demand IDR
+// re-feed): paces to the target fps, applies any pending one-shot IDR
+// request (armed by a capture rebuild - E2 contract: it rides the next
+// submission exactly once and is never re-armed), encodes, shapes and
+// delivers every output AU to the sink. mono_us is the capture timestamp
+// of the submitted frame (the base frame's for re-feeds) and stamps every
+// AU of this submission. Returns nullptr on success; a non-null fatal
+// message (res already flagged) aborts the run.
+const char* SubmitFrame(MfSoftEncoder& enc, AuSink& sink, const uint8_t* bgra,
+                        size_t len, uint64_t mono_us, FrameCache& cache,
+                        PipelineResult* res, bool warmup, uint32_t spf_ms,
+                        uint64_t* last_submit_ms, uint64_t* last_mono_us,
+                        std::vector<std::vector<uint8_t>>& aus,
+                        std::vector<uint8_t>& shaped, OnDemandIdr* ondemand) {
   // Pace submissions to the target fps (the encoder timestamps with the
   // wall clock, so submit cadence == frame cadence).
   if (*last_submit_ms != 0) {
@@ -50,6 +110,7 @@ bool SubmitFrame(MfSoftEncoder& enc, FILE* out, const uint8_t* bgra, size_t len,
     if (since < spf_ms) Sleep(static_cast<DWORD>(spf_ms - since));
   }
   *last_submit_ms = NowMs();
+  *last_mono_us = mono_us;
 
   const char* idr_reason = cache.TakePendingIdrReason();
   if (idr_reason != nullptr) enc.ForceNextIdr(idr_reason);
@@ -59,7 +120,7 @@ bool SubmitFrame(MfSoftEncoder& enc, FILE* out, const uint8_t* bgra, size_t len,
     res->ok = false;
     res->err = eerr.empty() ? "encode failed" : eerr;
     XNC_LOG_ERROR("encode_failed err=\"%s\"", res->err.c_str());
-    return false;
+    return "encode";
   }
   if (warmup) {
     cache.OnWarmupFeed();
@@ -70,32 +131,31 @@ bool SubmitFrame(MfSoftEncoder& enc, FILE* out, const uint8_t* bgra, size_t len,
     const bool is_idr = NalHasType(au.data(), au.size(), 5);
     ShapeAu(au.data(), au.size(), is_idr, enc.SpsPps(), &shaped);
     if (!shaped.empty()) {
-      if (std::fwrite(shaped.data(), 1, shaped.size(), out) != shaped.size()) {
-        res->ok = false;
-        res->err = "fwrite out failed";
-        XNC_LOG_ERROR("write_out_failed");
-        return false;
-      }
       res->aus_written++;
       res->bytes_written += shaped.size();
+      if (const char* err = sink.OnAu(is_idr, mono_us, shaped.data(), shaped.size())) {
+        res->ok = false;
+        res->err = err;
+        return err;
+      }
     }
-    if (is_idr) cache.OnKeyframeAu();  // ends warm-up (§7.4)
+    if (is_idr) {
+      cache.OnKeyframeAu();  // ends warm-up (§7.4)
+      if (ondemand->armed) {
+        XNC_LOG_INFO("idr_delivered reason=%s feeds=%u", ondemand->reason,
+                     ondemand->feeds);
+        ondemand->armed = false;
+      }
+    }
   }
-  return true;
+  return nullptr;
 }
 
-}  // namespace
-
-PipelineResult Pipeline::Run(ICapture& cap, MfSoftEncoder& enc, FILE* out,
-                             const PipelineOpts& opt) {
+PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
+                       const PipelineOpts& opt) {
   PipelineResult res;
   res.width = cap.Width();
   res.height = cap.Height();
-  if (out == nullptr) {
-    res.ok = false;
-    res.err = "out file is null";
-    return res;
-  }
   if (opt.fps == 0) {
     res.ok = false;
     res.err = "fps must be > 0";
@@ -117,18 +177,39 @@ PipelineResult Pipeline::Run(ICapture& cap, MfSoftEncoder& enc, FILE* out,
   const uint64_t duration_ms = static_cast<uint64_t>(opt.duration_s) * 1000ull;
   uint32_t next_beat_s = 1;
   uint64_t last_submit_ms = 0;
-  uint64_t warmup_started_ms = 0;   // base submission time (2 s wall bound)
-  uint32_t warmup_gen_feeds = 0;    // re-feeds this generation (rebuild resets)
-  bool warmup_phase_logged = false; // one warmup_done/exhausted log per gen
+  uint64_t last_mono_us = 0;       // stamps FlushTail AUs
+  uint64_t base_mono_us = 0;       // cached base frame timestamp (re-feeds)
+  uint64_t warmup_started_ms = 0;  // base submission time (2 s wall bound)
+  uint64_t last_initiated_idr_ms = 0;  // kIdrMinIntervalMs throttle anchor
+  uint32_t warmup_gen_feeds = 0;   // re-feeds this generation (rebuild resets)
+  bool warmup_phase_logged = false;  // one warmup_done/exhausted log per gen
   bool first_frame_logged = false;
+  OnDemandIdr ondemand;
 
   for (;;) {
     if (NowMs() - t0 >= duration_ms) break;
+    if (opt.stop != nullptr && opt.stop->load()) break;
+
+    // Merged IDR request (spec §7.5): arm at most once per 500 ms, only
+    // after the stream's first keyframe (an in-progress initial warm-up
+    // will deliver that IDR anyway) and never while one is in flight.
+    const char* pending_reason = sink.PendingIdrReason();
+    if (pending_reason != nullptr && cache.HaveKeyframe() && !ondemand.armed &&
+        NowMs() - last_initiated_idr_ms >= kIdrMinIntervalMs) {
+      enc.ForceNextIdr(pending_reason);
+      sink.ConsumePendingIdr(pending_reason);
+      last_initiated_idr_ms = NowMs();
+      ondemand.Arm(pending_reason, NowMs());
+      XNC_LOG_INFO("idr_request reason=%s min_interval_ms=%llu", pending_reason,
+                   static_cast<unsigned long long>(kIdrMinIntervalMs));
+    }
+
     acq_err.clear();
     if (cap.Acquire(blob, &acq_err)) {
       const bool is_base = cache.OnCapturedFrame();  // captured++ inside
       if (is_base) {
         base = blob.bgra;  // full frame: warm-up re-feed source
+        base_mono_us = blob.mono_us;
         res.width = blob.w;
         res.height = blob.h;
         warmup_started_ms = 0;  // re-anchored at this generation's first submit
@@ -149,20 +230,30 @@ PipelineResult Pipeline::Run(ICapture& cap, MfSoftEncoder& enc, FILE* out,
           XNC_LOG_ERROR("first_frame_uniform (all 256 sampled pixels equal - suspect black/garbage frame)");
       }
       if (warmup_started_ms == 0) warmup_started_ms = NowMs();
-      if (!SubmitFrame(enc, out, blob.bgra.data(), blob.bgra.size(), cache, &res, false,
-                       spf_ms, &last_submit_ms, aus, shaped))
+      if (SubmitFrame(enc, sink, blob.bgra.data(), blob.bgra.size(), blob.mono_us, cache,
+                      &res, false, spf_ms, &last_submit_ms, &last_mono_us, aus, shaped,
+                      &ondemand) != nullptr)
         break;
     } else if (acq_err == "err_timeout") {
       cache.OnTimeout();  // static screen: no encode, no packet (§7.4)
       const bool have_base = !cache.NeedsBaseFrame() && !base.empty();
       const uint64_t warmup_elapsed = warmup_started_ms != 0 ? NowMs() - warmup_started_ms : 0;
-      const bool feed_ok = have_base && !cache.HaveKeyframe() &&
-                           warmup_gen_feeds < warmup_feed_bound &&
-                           warmup_elapsed < kWarmupWallBoundMs;
-      if (feed_ok) {
-        ++warmup_gen_feeds;
-        if (!SubmitFrame(enc, out, base.data(), base.size(), cache, &res, true, spf_ms,
-                         &last_submit_ms, aus, shaped))
+      const bool warmup_feed_ok = have_base && !cache.HaveKeyframe() &&
+                                  warmup_gen_feeds < warmup_feed_bound &&
+                                  warmup_elapsed < kWarmupWallBoundMs;
+      // On-demand IDR re-feed (static screen + armed subscriber request):
+      // same source frame, same bounds, never a second force (§7.5).
+      const bool ondemand_feed_ok =
+          have_base && cache.HaveKeyframe() && ondemand.FeedAllowed(NowMs(), warmup_feed_bound);
+      if (warmup_feed_ok || ondemand_feed_ok) {
+        if (warmup_feed_ok) {
+          ++warmup_gen_feeds;
+        } else {
+          ++ondemand.feeds;
+        }
+        if (SubmitFrame(enc, sink, base.data(), base.size(), base_mono_us, cache, &res,
+                        true, spf_ms, &last_submit_ms, &last_mono_us, aus, shaped,
+                        &ondemand) != nullptr)
           break;
       } else {
         // One warm-up outcome log per generation: done (first keyframe AU
@@ -181,6 +272,15 @@ PipelineResult Pipeline::Run(ICapture& cap, MfSoftEncoder& enc, FILE* out,
                          static_cast<unsigned long long>(cache.counters().keyframes));
           }
         }
+        // On-demand window exhausted without an IDR: log once; the armed
+        // force stays consumed and the IDR surfaces with the next real
+        // frame batch (still never re-forced).
+        if (ondemand.armed && !ondemand.exhaust_logged && have_base &&
+            !ondemand.FeedAllowed(NowMs(), warmup_feed_bound)) {
+          ondemand.exhaust_logged = true;
+          XNC_LOG_INFO("idr_feed_exhausted reason=%s feeds=%u bound=%u",
+                       ondemand.reason, ondemand.feeds, warmup_feed_bound);
+        }
         Sleep(kIdleSleepMs);
       }
     } else if (acq_err == "err_rebuilt") {
@@ -192,11 +292,13 @@ PipelineResult Pipeline::Run(ICapture& cap, MfSoftEncoder& enc, FILE* out,
       warmup_started_ms = 0;
       warmup_gen_feeds = 0;
       warmup_phase_logged = false;
+      sink.OnState("capture_rebuilt", true);
       XNC_LOG_INFO("capture_rebuild handled rebuilds=%u state=%s",
                    cache.counters().rebuilds, cache.StateName());
     } else {
       res.ok = false;
       res.err = acq_err.empty() ? "acquire failed" : acq_err;
+      sink.OnState("capture_fatal", false);
       XNC_LOG_ERROR("acquire_failed err=\"%s\"", res.err.c_str());
       break;
     }
@@ -227,22 +329,21 @@ PipelineResult Pipeline::Run(ICapture& cap, MfSoftEncoder& enc, FILE* out,
       const bool is_idr = NalHasType(au.data(), au.size(), 5);
       ShapeAu(au.data(), au.size(), is_idr, enc.SpsPps(), &shaped);
       if (!shaped.empty()) {
-        if (std::fwrite(shaped.data(), 1, shaped.size(), out) != shaped.size()) {
-          res.ok = false;
-          res.err = "fwrite out failed (flush)";
-          break;
-        }
         res.aus_written++;
         res.bytes_written += shaped.size();
+        const char* err = sink.OnAu(is_idr, last_mono_us, shaped.data(), shaped.size());
+        if (err != nullptr) {
+          res.ok = false;
+          res.err = std::strcmp(err, "fwrite out failed") == 0
+                        ? "fwrite out failed (flush)"
+                        : err;
+          break;
+        }
       }
       if (is_idr) cache.OnKeyframeAu();
     }
   }
-  if (std::fflush(out) != 0) {
-    res.ok = false;
-    res.err = "fflush out failed";
-    XNC_LOG_ERROR("fflush_out_failed errno=%d", errno);
-  }
+  sink.OnState("stream_end", res.ok);
 
   res.counters = cache.counters();
   const FrameCacheCounters& c = res.counters;
@@ -256,6 +357,38 @@ PipelineResult Pipeline::Run(ICapture& cap, MfSoftEncoder& enc, FILE* out,
                static_cast<unsigned long long>(res.aus_written),
                static_cast<unsigned long long>(res.bytes_written), res.ok ? 1 : 0);
   return res;
+}
+
+}  // namespace
+
+PipelineResult Pipeline::Run(ICapture& cap, MfSoftEncoder& enc, FILE* out,
+                             const PipelineOpts& opt) {
+  if (out == nullptr) {
+    PipelineResult res;
+    res.ok = false;
+    res.err = "out file is null";
+    return res;
+  }
+  FileAuSink sink(out);
+  return RunCore(cap, enc, sink, opt);
+}
+
+PipelineResult Pipeline::Run(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
+                             const PipelineOpts& opt) {
+  return RunCore(cap, enc, sink, opt);
+}
+
+PipelineResult Pipeline::Run(ICapture& cap, MfSoftEncoder& enc, FILE* out,
+                             AuSink& extra, const PipelineOpts& opt) {
+  if (out == nullptr) {
+    PipelineResult res;
+    res.ok = false;
+    res.err = "out file is null";
+    return res;
+  }
+  FileAuSink file_sink(out);
+  TeeAuSink tee(&file_sink, &extra);
+  return RunCore(cap, enc, tee, opt);
 }
 
 std::string FormatStatsJson(const PipelineResult& r, const PipelineOpts& o) {

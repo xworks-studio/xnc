@@ -6,13 +6,20 @@
 // force-key regression; Task 5 scope: FrameCache state-machine transitions,
 // VclNalus/ShapeAu stream-contract shaping, FlushTail tail recovery, and the
 // full Pipeline::Run end-to-end over a scripted fake ICapture + the real MF
-// encoder). Pure-logic cases need no desktop; the encoder/pipeline scenarios
-// feed synthetic color bars straight into the MF software H.264 MFT, so no
-// capture is involved and they run on any Windows box that ships
-// CMSH264EncoderMFT (client SKUs). Any failure prints
-// "SELFTEST FAIL: <name>" and exits 1; all-pass prints "selftest ok". Entry
-// point SelftestMain() is declared by xnc-desktop.cpp and reachable via
-// `xnc-desktop.exe --selftest` / `build.bat selftest`.
+// encoder; M1-Slice2 Task 2 scope: rt CLI args, fixed-binary pipe message
+// codecs, the subscriber drop/merge policy, and the real RtServer over REAL
+// pipe handles with fake in-process clients: ① attach -> HOST_HELLO + IDR
+// ② static-screen second attach -> fresh IDR reason=sub_join (the Slice1
+// carry-forward regression) ③ stuck subscriber -> queue overflow -> delta
+// drop + merged IDR ④ detach cleanup). Pure-logic cases need no desktop;
+// the encoder/pipeline scenarios feed synthetic color bars straight into the
+// MF software H.264 MFT, so no capture is involved and they run on any
+// Windows box that ships CMSH264EncoderMFT (client SKUs). The rt loopback
+// uses a permissive TEST-ONLY DACL pipe (precedent: native/core/selftest.cpp
+// loopback). Any failure prints "SELFTEST FAIL: <name>" and exits 1; all-pass
+// prints "selftest ok". Entry point SelftestMain() is declared by
+// xnc-desktop.cpp and reachable via `xnc-desktop.exe --selftest` /
+// `build.bat selftest`.
 #include "capture.h"
 #include "diag.h"
 #include "dxgi_capture.h"
@@ -20,17 +27,22 @@
 #include "mf_encoder.h"
 #include "nv12.h"
 #include "pipeline.h"
+#include "rt_pipe_server.h"
+#include "subscribers.h"
+
+#include "../common/handshake.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include <windows.h>  // GetTempPathW, GetCurrentProcessId, DeleteFileW
+#include <windows.h>  // GetTempPathW, GetCurrentProcessId, DeleteFileW, pipes
 
 #include <cstddef>  // offsetof
 #include <cstdio>
 #include <algorithm>  // std::find
 #include <cstring>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -166,6 +178,44 @@ class ScriptedCapture final : public xnc::ICapture {
   uint64_t mono_ = 0;
 };
 
+// rt 场景 ③ 专用:确定性 LCG 噪声帧(320x240,逐帧全噪声 → 压缩后 AU
+// 数 KB 级)。合成的 64x48 彩条压缩后只有 ~160B/AU,永远填不满管道
+// 缓冲,队列溢出不可达;噪声帧让卡死订阅者的 64KB 管道缓冲 + 深度 3
+// 队列在 ~1s 内确定打满(溢出语义的真实路径测试)。
+class NoisyCapture final : public xnc::ICapture {
+ public:
+  NoisyCapture(uint32_t w, uint32_t h, uint32_t total)
+      : bgra_((size_t)w * h * 4), w_(w), h_(h), total_(total) {}
+  bool Acquire(xnc::FrameBlob& blob, std::string* err = nullptr) override {
+    if (err) err->clear();
+    if (next_ < total_) {
+      uint32_t st = 0x1234567u + next_ * 7919u;
+      for (size_t i = 0; i < bgra_.size(); i += 4) {
+        st = st * 1664525u + 1013904223u;
+        bgra_[i] = static_cast<uint8_t>(st >> 24);
+        bgra_[i + 1] = static_cast<uint8_t>(st >> 16);
+        bgra_[i + 2] = static_cast<uint8_t>(st >> 8);
+        bgra_[i + 3] = 0xFF;
+      }
+      blob.bgra = bgra_;
+      blob.w = w_;
+      blob.h = h_;
+      blob.mono_us = ++mono_;
+      ++next_;
+      return true;
+    }
+    if (err) *err = "err_timeout";
+    return false;
+  }
+  uint32_t Width() const override { return w_; }
+  uint32_t Height() const override { return h_; }
+
+ private:
+  std::vector<uint8_t> bgra_;
+  uint32_t w_, h_, total_, next_ = 0;
+  uint64_t mono_ = 0;
+};
+
 // Reads a whole FILE* back from the start (pipeline output goes to a
 // TempBinFile - %TEMP%\xnc-selftest-<pid>-<slot>.bin, auto-removed).
 std::vector<uint8_t> ReadAll(FILE* f) {
@@ -249,6 +299,164 @@ bool StreamStartsWithKeyframe(const std::vector<uint8_t>& stream) {
     if (t[k] == 1) return false;
   }
   return false;
+}
+
+// ---- M1-Slice2 Task 2: rt pipe server fixtures ----
+
+// Fake in-process subscriber over a REAL pipe handle (core selftest
+// loopback pattern): client half of the M0 handshake via the blocking
+// common/frame.cpp path, then ATTACH + poll-based frame reads so no
+// assertion can hang forever.
+class RtTestClient {
+ public:
+  ~RtTestClient() {
+    if (h_ != INVALID_HANDLE_VALUE) CloseHandle(h_);
+  }
+
+  // Retries CreateFileW until the server's listening instance shows up
+  // (<= 4s), then runs the mutual-proof handshake.
+  bool Connect(const wchar_t* name, const uint8_t* secret, size_t secret_len) {
+    for (int i = 0; i < 400 && h_ == INVALID_HANDLE_VALUE; ++i) {
+      h_ = CreateFileW(name, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                       OPEN_EXISTING, 0, nullptr);
+      if (h_ == INVALID_HANDLE_VALUE) {
+        const DWORD e = GetLastError();
+        if (e == ERROR_PIPE_BUSY) WaitNamedPipeW(name, 200);
+        else Sleep(10);
+      }
+    }
+    if (h_ == INVALID_HANDLE_VALUE) return false;
+    uint8_t nonce[16];
+    for (int i = 0; i < 16; ++i) nonce[i] = static_cast<uint8_t>(i * 7 + 1);
+    if (!xnc::WriteFrame(
+            h_, xnc::Frame{0, xnc::kMsgHello, 0,
+                           xnc::EncodeHello(GetCurrentProcessId(), nonce)}))
+      return false;
+    xnc::Frame hp;
+    if (!ReadFrameT(hp, 3000) || hp.message_type != xnc::kMsgHelloProof) return false;
+    uint32_t spid = 0;
+    uint8_t snonce[16], sproof[32], want[32];
+    if (xnc::DecodeHelloProof(hp, spid, snonce, sproof) != xnc::DecodeResult::Ok)
+      return false;
+    if (!xnc::HmacSha256(secret, secret_len, nonce, 16, want) ||
+        std::memcmp(want, sproof, 32) != 0)
+      return false;
+    uint8_t myproof[32];
+    if (!xnc::HmacSha256(secret, secret_len, snonce, 16, myproof)) return false;
+    return xnc::WriteFrame(h_,
+                           xnc::Frame{0, xnc::kMsgProof, 0, xnc::EncodeProof(myproof)});
+  }
+
+  // ATTACH then expect HOST_HELLO as the very first frame back (any FRAME
+  // before it is an ordering bug; STATE/error means the attach failed).
+  bool Attach(uint32_t sub_id) {
+    const xnc::AttachPayload ap{sub_id, 30, 1920, 2300000};
+    if (!xnc::WriteFrame(h_, xnc::Frame{0, xnc::kMsgAttach, 1, xnc::EncodeAttach(ap)}))
+      return false;
+    for (;;) {
+      xnc::Frame f;
+      if (!ReadFrameT(f, 3000)) return false;
+      if (f.message_type == xnc::kMsgHostHello) {
+        hello_ok_ = xnc::DecodeHostHello(f, &hello_);
+        return hello_ok_;
+      }
+      if (f.message_type == xnc::kMsgFrame) {
+        frame_before_hello_ = true;
+        return false;
+      }
+      if (f.message_type == xnc::kMsgState || (f.flags & xnc::kFlagError) != 0) {
+        xnc::StateEventPayload st;
+        xnc::DecodeStateEvent(f, &st);
+        std::printf("SELFTEST NOTE: attach rejected: state=%s\n", st.code);
+        return false;
+      }
+    }
+  }
+
+  bool SendDetach(uint32_t sub_id) {
+    return xnc::WriteFrame(h_, xnc::Frame{0, xnc::kMsgDetach, 2, xnc::EncodeDetach(sub_id)});
+  }
+
+  // Reads + counts frames until stop_if() or the deadline. Never blocks
+  // past deadline (PeekNamedPipe poll underneath).
+  template <typename Pred>
+  uint32_t Pump(DWORD timeout_ms, Pred stop_if) {
+    const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+    uint32_t n = 0;
+    for (;;) {
+      const ULONGLONG now = GetTickCount64();
+      if (now >= deadline) break;
+      xnc::Frame f;
+      if (!ReadFrameT(f, static_cast<DWORD>(deadline - now))) break;
+      ++n;
+      CountFrame(f);
+      if (stop_if()) break;
+    }
+    return n;
+  }
+  uint32_t Pump(DWORD timeout_ms) { return Pump(timeout_ms, [] { return false; }); }
+
+  // Poll-read: PeekNamedPipe until one FULL frame is buffered, then the
+  // blocking ReadFrame returns instantly. False on EOF/break or deadline.
+  bool ReadFrameT(xnc::Frame& out, DWORD timeout_ms) {
+    const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+    for (;;) {
+      uint8_t hdr[xnc::kHeaderSize];
+      DWORD got = 0, total = 0;
+      if (!PeekNamedPipe(h_, hdr, sizeof(hdr), &got, &total, nullptr)) return false;
+      if (got >= xnc::kHeaderSize) {
+        const uint32_t n = static_cast<uint32_t>(hdr[12]) |
+                           static_cast<uint32_t>(hdr[13]) << 8 |
+                           static_cast<uint32_t>(hdr[14]) << 16 |
+                           static_cast<uint32_t>(hdr[15]) << 24;
+        if (static_cast<uint64_t>(total) >=
+            static_cast<uint64_t>(xnc::kHeaderSize) + n)
+          return xnc::ReadFrame(h_, out) == xnc::DecodeResult::Ok;
+      }
+      if (GetTickCount64() >= deadline) return false;
+      Sleep(5);
+    }
+  }
+
+  void CountFrame(const xnc::Frame& f) {
+    if (f.message_type == xnc::kMsgFrame) {
+      xnc::FrameEventPayload ev;
+      if (xnc::DecodeFrameEvent(f, &ev)) {
+        frames_++;
+        if (ev.key != 0) {
+          keys_++;
+          first_key_mono_us_ = first_key_mono_us_ == 0 ? ev.mono_us : first_key_mono_us_;
+          last_key_mono_us_ = ev.mono_us;
+          last_key_payload_ = ev.au;
+        }
+      }
+    } else if (f.message_type == xnc::kMsgState) {
+      xnc::StateEventPayload st;
+      if (xnc::DecodeStateEvent(f, &st) && std::strcmp(st.code, "stream_end") == 0)
+        saw_stream_end_ = true;
+    }
+  }
+
+  // counters / observations
+  uint64_t frames_ = 0, keys_ = 0;
+  uint64_t first_key_mono_us_ = 0, last_key_mono_us_ = 0;
+  std::vector<uint8_t> last_key_payload_;
+  xnc::HostHelloPayload hello_{};
+  bool hello_ok_ = false, saw_stream_end_ = false, frame_before_hello_ = false;
+
+ private:
+  HANDLE h_ = INVALID_HANDLE_VALUE;
+};
+
+// Per-scenario rt test secret + unique pipe name (pid + slot).
+const uint8_t kRtSecret[16] = {'r', 't', '-', 's', 'e', 'l', 'f', 't',
+                               'e', 's', 't', '-', 'k', 'e', 'y', '1'};
+const wchar_t* RtPipeNameOf(int slot) {
+  static wchar_t names[8][96] = {};
+  if (slot >= 0 && slot < 8)
+    std::swprintf(names[slot], 96, L"\\\\.\\pipe\\xnc-desktop-rt-selftest-%lu-%d",
+                  static_cast<unsigned long>(GetCurrentProcessId()), slot);
+  return names[slot];
 }
 
 }  // namespace
@@ -940,6 +1148,471 @@ int SelftestMain() {
               CountNalTypeInStream(stream.data(), stream.size(), 5) == 2);
         CHECK("pipe-reb-first-au-keyframe", StreamStartsWithKeyframe(stream));
       }
+    }
+  }
+  // ---- M1-Slice2 Task 2: rt CLI args ----
+  { // --console-rt 默认值:pipe 默认名、secret 必填、max_subs=4
+    auto p = Parse({L"--console-rt", L"--secret", L"0011ff"});
+    CHECK("rt-args-ok-defaults", p.ok);
+    CHECK("rt-args-default-pipe",
+          p.ok && p.opt.pipe_name == xnc::kDefaultRtPipe);
+    CHECK("rt-args-secret-bytes",
+          p.ok && p.opt.secret.size() == 3 && p.opt.secret[0] == 0x00 &&
+                p.opt.secret[1] == 0x11 && p.opt.secret[2] == 0xFF);
+    CHECK("rt-args-default-max-subs", p.ok && p.opt.max_subs == 4);
+    CHECK("rt-args-mode", p.ok && p.opt.console_rt);
+  }
+  { // secret 必填/校验:缺失、空、奇数长度、非 hex 一律参数错(exit 2 路径)
+    const auto ms = Parse({L"--console-rt"});
+    CHECK("rt-secret-missing", !ms.ok);
+    CHECK("rt-secret-missing-err",
+          !ms.ok && ms.err.find(L"--secret") != std::wstring::npos);
+    CHECK("rt-secret-empty", !Parse({L"--console-rt", L"--secret", L""}).ok);
+    CHECK("rt-secret-odd", !Parse({L"--console-rt", L"--secret", L"ABC"}).ok);
+    CHECK("rt-secret-garbage", !Parse({L"--console-rt", L"--secret", L"GG"}).ok);
+    CHECK("rt-secret-0x-prefix-rejected",
+          !Parse({L"--console-rt", L"--secret", L"0x00"}).ok);
+    CHECK("rt-secret-missing-value", !Parse({L"--console-rt", L"--secret"}).ok);
+    CHECK("rt-secret-hex-case-ok", Parse({L"--console-rt", L"--secret", L"aAbB"}).ok);
+  }
+  { // --pipe 显式覆盖;--max-subs 边界 1..4;模式互斥;diag+pipe+secret 组合
+    auto p = Parse({L"--console-rt", L"--secret", L"00", L"--pipe", L"\\\\.\\pipe\\x",
+                    L"--max-subs", L"2", L"--fps", L"15"});
+    CHECK("rt-args-explicit", p.ok && p.opt.pipe_name == L"\\\\.\\pipe\\x" &&
+                                  p.opt.max_subs == 2 && p.opt.fps == 15);
+    CHECK("rt-max-subs-zero", !Parse({L"--console-rt", L"--secret", L"00",
+                                      L"--max-subs", L"0"}).ok);
+    CHECK("rt-max-subs-over", !Parse({L"--console-rt", L"--secret", L"00",
+                                      L"--max-subs", L"5"}).ok);
+    CHECK("rt-max-subs-ok-bounds",
+          Parse({L"--console-rt", L"--secret", L"00", L"--max-subs", L"1"}).ok &&
+              Parse({L"--console-rt", L"--secret", L"00", L"--max-subs", L"4"}).ok);
+    CHECK("rt-mode-exclusive-with-diag",
+          !Parse({L"--console-rt", L"--secret", L"00", L"--console-diag",
+                  L"--out", L"t"}).ok);
+    CHECK("rt-mode-exclusive-with-selftest",
+          !Parse({L"--console-rt", L"--secret", L"00", L"--selftest"}).ok);
+    auto d = Parse({L"--console-diag", L"--out", L"t.h264", L"--pipe",
+                    L"\\\\.\\pipe\\y", L"--secret", L"beef"});
+    CHECK("rt-diag-combo-ok", d.ok && d.opt.console_diag && d.opt.secret.size() == 2);
+    CHECK("rt-diag-combo-secret-required",
+          !Parse({L"--console-diag", L"--out", L"t", L"--pipe", L"\\\\.\\pipe\\y"}).ok);
+  }
+  // ---- M1-Slice2 Task 2:固定二进制消息 codec(精确字节向量) ----
+  {
+    const xnc::AttachPayload ap{7, 30, 1920, 2300000};
+    const std::vector<uint8_t> aw = xnc::EncodeAttach(ap);
+    const uint8_t want_a[16] = {7, 0, 0, 0, 30, 0, 0, 0, 0x80, 0x07, 0, 0,
+                                0x60, 0x18, 0x23, 0x00};  // 2300000 = 0x231860
+    CHECK("codec-attach-bytes",
+          aw.size() == 16 && std::equal(aw.begin(), aw.end(), want_a));
+    xnc::AttachPayload ap2;
+    CHECK("codec-attach-rt",
+          xnc::DecodeAttach(xnc::Frame{0, xnc::kMsgAttach, 0, aw}, &ap2) &&
+              ap2.sub_id == 7 && ap2.max_fps == 30 && ap2.max_w == 1920 &&
+              ap2.bitrate == 2300000);
+    CHECK("codec-attach-bad-len",
+          !xnc::DecodeAttach(xnc::Frame{0, xnc::kMsgAttach, 0, {1, 2, 3}}, &ap2));
+    CHECK("codec-attach-zero-sub-rejected",
+          !xnc::DecodeAttach(
+              xnc::Frame{0, xnc::kMsgAttach, 0, xnc::EncodeAttach({0, 30, 0, 0})},
+              &ap2));
+    const std::vector<uint8_t> dw = xnc::EncodeDetach(9);
+    CHECK("codec-detach-bytes", dw.size() == 4 && dw[0] == 9 && dw[1] == 0 &&
+                                    dw[2] == 0 && dw[3] == 0);
+    const std::vector<uint8_t> kw = xnc::EncodeKeyframeReq(3, "pli");
+    CHECK("codec-keyframe-req-size", kw.size() == 36 && kw[0] == 3);
+    CHECK("codec-keyframe-req-pad", kw[4] == 'p' && kw[5] == 'l' && kw[6] == 'i' &&
+                                        kw[7] == 0 && kw[35] == 0);
+    xnc::KeyframeReqPayload kr;
+    CHECK("codec-keyframe-req-rt",
+          xnc::DecodeKeyframeReq(xnc::Frame{0, xnc::kMsgKeyframeReq, 0, kw}, &kr) &&
+              kr.sub_id == 3 && std::strcmp(kr.reason, "pli") == 0);
+    const xnc::HostHelloPayload hh{1, 64, 48, 15, 4};
+    const std::vector<uint8_t> hw = xnc::EncodeHostHello(hh);
+    const uint8_t want_h[20] = {1, 0, 0, 0, 64, 0, 0, 0, 48, 0, 0, 0,
+                                15, 0, 0, 0, 4, 0, 0, 0};
+    CHECK("codec-hello-bytes",
+          hw.size() == 20 && std::equal(hw.begin(), hw.end(), want_h));
+    xnc::HostHelloPayload hh2;
+    CHECK("codec-hello-rt",
+          xnc::DecodeHostHello(xnc::Frame{0, xnc::kMsgHostHello, 0, hw}, &hh2) &&
+              hh2.gen == 1 && hh2.w == 64 && hh2.h == 48 && hh2.fps == 15 &&
+              hh2.max_subs == 4);
+    const std::vector<uint8_t> sw = xnc::EncodeStateEvent("capture_rebuilt", true);
+    CHECK("codec-state-size", sw.size() == 33 && sw[32] == 1 &&
+                                  std::memcmp(sw.data(), "capture_rebuilt", 15) == 0);
+    xnc::StateEventPayload st;
+    CHECK("codec-state-rt",
+          xnc::DecodeStateEvent(xnc::Frame{0, xnc::kMsgState, 0, sw}, &st) &&
+              std::strcmp(st.code, "capture_rebuilt") == 0 && st.recoverable == 1);
+    const uint8_t au3[3] = {0xAA, 0xBB, 0xCC};
+    const std::vector<uint8_t> fw = xnc::EncodeFrameEvent(0x0102030405060708ull, true,
+                                                          au3, sizeof(au3));
+    const uint8_t want_f[20] = {0, 0, 0, 0, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03,
+                                0x02, 0x01, 1, 3, 0, 0, 0, 0xAA, 0xBB, 0xCC};
+    CHECK("codec-frame-bytes",
+          fw.size() == 20 && std::equal(fw.begin(), fw.end(), want_f));
+    xnc::FrameEventPayload fe;
+    CHECK("codec-frame-rt",
+          xnc::DecodeFrameEvent(xnc::Frame{0, xnc::kMsgFrame, 0, fw}, &fe) &&
+              fe.target_sub_id == 0 && fe.key == 1 &&
+              fe.mono_us == 0x0102030405060708ull && fe.au.size() == 3);
+    CHECK("codec-frame-bad-len",
+          !xnc::DecodeFrameEvent(xnc::Frame{0, xnc::kMsgFrame, 0, {0, 0, 0}}, &fe));
+    CHECK("codec-frame-len-mismatch",
+          !xnc::DecodeFrameEvent(
+              xnc::Frame{0, xnc::kMsgFrame, 0,
+                         std::vector<uint8_t>(fw.begin(), fw.begin() + 19)},
+              &fe));
+    // AU bound constants + frame-cap guard: AUs above 8MiB are dropped by
+    // RtServer::OnAu (kMaxAuBytes); payloads above the XNIP 9MiB frame cap
+    // encode to empty.
+    CHECK("codec-au-bound-8mib", xnc::kMaxAuBytes == (size_t(8) << 20));
+    std::vector<uint8_t> big(xnc::kMaxFrameBytes, 0);  // 9 MiB > cap - 17
+    CHECK("codec-frame-oversize-empty",
+          xnc::EncodeFrameEvent(1, false, big.data(), big.size()).empty());
+    std::vector<uint8_t> ok_au(1000, 0xAB);
+    CHECK("codec-frame-normal-nonempty",
+          !xnc::EncodeFrameEvent(1, false, ok_au.data(), ok_au.size()).empty());
+  }
+  // ---- M1-Slice2 Task 2:订阅者丢弃/合并策略(纯逻辑) ----
+  {
+    using A = xnc::SubSendQueue::AuAction;
+    xnc::SubscriberTable t;
+    auto q1 = std::make_shared<xnc::SubSendQueue>();
+    auto q2 = std::make_shared<xnc::SubSendQueue>();
+    CHECK("sub-attach", t.Attach(1, q1) && t.size() == 1);
+    CHECK("sub-attach-dup-rejected", !t.Attach(1, q2) && t.size() == 1);
+    CHECK("sub-attach-marks-needs", q1->needs_keyframe());
+    CHECK("sub-attach-sets-sub-join-reason",
+          t.pending_reason() != nullptr &&
+              std::strcmp(t.pending_reason(), "sub_join") == 0);
+    const xnc::Frame delta{xnc::kFlagEvent, xnc::kMsgFrame, 0, {1}};
+    const xnc::Frame key{xnc::kFlagEvent, xnc::kMsgFrame, 0, {2}};
+    // joiner 语义:needs_keyframe 期间 delta 直接丢(从 IDR 入流)
+    CHECK("sub-delta-dropped-while-needs",
+          q1->PushAu(false, delta) == A::kDroppedNeedKey);
+    // key 入队并解除 needs
+    CHECK("sub-key-enqueued-clears-needs", q1->PushAu(true, key) == A::kEnqueued);
+    CHECK("sub-needs-cleared", !q1->needs_keyframe());
+    CHECK("sub-pending-cleared-after-key", t.pending_reason() == nullptr);
+    // 队列深度 3:从空队列起填 3 个 delta,第 4 个丢弃 + 标记 needs
+    xnc::Frame drained;
+    while (q1->Pop(&drained)) {}  // 清掉刚入队的 key,从空队列开始
+    CHECK("sub-fill", q1->PushAu(false, delta) == A::kEnqueued &&
+                          q1->PushAu(false, delta) == A::kEnqueued &&
+                          q1->PushAu(false, delta) == A::kEnqueued &&
+                          q1->video_depth() == 3);
+    CHECK("sub-overflow-drops-delta",
+          q1->PushAu(false, delta) == A::kDroppedQueueFull && q1->needs_keyframe());
+    t.MarkNeedsKeyframe(1, "queue_overflow");
+    CHECK("sub-overflow-reason",
+          t.pending_reason() != nullptr &&
+              std::strcmp(t.pending_reason(), "queue_overflow") == 0);
+    // key 永不丢:挤掉旧 delta
+    CHECK("sub-key-displaces-deltas",
+          q1->PushAu(true, key) == A::kEnqueuedDisplacingDeltas &&
+              q1->video_depth() == 1 && !q1->needs_keyframe());
+    // 控制消息不丢(独立队列,先于视频)
+    bool ctrl_push_ok = true;
+    for (int i = 0; i < 10; ++i)
+      if (!q1->PushControl(xnc::Frame{xnc::kFlagEvent, xnc::kMsgState, 0, {}}))
+        ctrl_push_ok = false;
+    CHECK("sub-ctrl-never-dropped", ctrl_push_ok);
+    xnc::Frame popped;
+    bool ctrl_first = true;
+    int ctrl_seen = 0, video_seen = 0;
+    while (q1->Pop(&popped)) {
+      if (popped.message_type == xnc::kMsgState) {
+        ++ctrl_seen;
+        if (video_seen != 0) ctrl_first = false;
+      } else {
+        ++video_seen;
+      }
+    }
+    CHECK("sub-ctrl-count", ctrl_seen == 10);
+    CHECK("sub-ctrl-before-video", ctrl_first && video_seen == 1);
+    // 合并语义:第二个订阅者的 needs 也汇入同一 pending reason
+    CHECK("sub-second-attach", t.Attach(2, q2) && t.size() == 2);
+    CHECK("sub-merged-pending", t.pending_reason() != nullptr);
+    CHECK("sub-detach", t.Detach(1) && t.size() == 1);
+    CHECK("sub-detach-unknown", !t.Detach(99));
+    CHECK("sub-find", t.Find(2) == q2.get() && t.Find(1) == nullptr);
+    // 控制背压上限:超过即 false(连接判死)
+    xnc::SubSendQueue q3;
+    bool never_false = true;
+    for (uint32_t i = 0; i <= xnc::kCtrlBacklogMax + 1; ++i)
+      if (!q3.PushControl(delta)) never_false = false;
+    CHECK("sub-ctrl-backlog-bound", !never_false);
+    // 深度参数边界:0 视为 1(key 可入,delta 即溢出)
+    xnc::SubSendQueue q4(0);
+    CHECK("sub-depth-zero-clamped-key", q4.PushAu(true, delta) == A::kEnqueued);
+    CHECK("sub-depth-zero-clamped-overflow",
+          q4.PushAu(false, delta) == A::kDroppedQueueFull);
+  }
+  // ---- M1-Slice2 Task 2:AuSink 默认行为 + TeeAuSink ----
+  {
+    // defaults: a sink implementing only OnAu inherits no-op IDR/state hooks
+    struct MinimalSink final : xnc::AuSink {
+      const char* OnAu(bool, uint64_t, const uint8_t*, size_t) override { return nullptr; }
+    };
+    MinimalSink m;
+    CHECK("sink-default-no-pending", m.PendingIdrReason() == nullptr);
+    m.ConsumePendingIdr("sub_join");  // no-op, must not crash
+    m.OnState("capture_rebuilt", true);
+    CHECK("sink-default-noop-ok", true);
+    struct CounterSink final : xnc::AuSink {
+      const char* OnAu(bool is_idr, uint64_t, const uint8_t*, size_t) override {
+        aus++;
+        if (is_idr) keys++;
+        return nullptr;
+      }
+      const char* PendingIdrReason() override { return want_idr ? "sub_join" : nullptr; }
+      void ConsumePendingIdr(const char* r) override { consumed.push_back(r); }
+      void OnState(const char* c, bool) override { states.push_back(c); }
+      int aus = 0, keys = 0;
+      bool want_idr = false;
+      std::vector<const char*> consumed, states;
+    };
+    CounterSink a, b;
+    xnc::TeeAuSink tee(&a, &b);
+    const char* e = tee.OnAu(true, 42, nullptr, 0);
+    CHECK("tee-onau-both", e == nullptr && a.aus == 1 && b.aus == 1 && a.keys == 1);
+    CHECK("tee-pending-none", tee.PendingIdrReason() == nullptr);
+    b.want_idr = true;
+    CHECK("tee-pending-from-b", tee.PendingIdrReason() != nullptr);
+    a.want_idr = true;
+    tee.ConsumePendingIdr("sub_join");
+    CHECK("tee-consume-both", a.consumed.size() == 1 && b.consumed.size() == 1);
+    tee.OnState("stream_end", false);
+    CHECK("tee-state-both", a.states.size() == 1 && b.states.size() == 1);
+    // fatal error short-circuit: a fails -> b gets nothing
+    struct FailingSink final : xnc::AuSink {
+      const char* OnAu(bool, uint64_t, const uint8_t*, size_t) override { return "boom"; }
+    };
+    FailingSink f;
+    CounterSink c2;
+    xnc::TeeAuSink tee2(&f, &c2);
+    CHECK("tee-fatal-first-wins",
+          std::strcmp(tee2.OnAu(false, 1, nullptr, 0), "boom") == 0 && c2.aus == 0);
+  }
+  // ---- M1-Slice2 Task 2:RtServer 端到端(真 pipe + 真 MF 编码器 + 合成采集)----
+  // 管线跑在子线程(有界 duration),fake 订阅者在主线程轮询读;每个场景
+  // 独立 encoder/RtServer/pipe 名(slot N)。DACL = selftest 专用宽松 Everyone
+  // (native/core/selftest.cpp loopback 先例;生产 DACL 在 rt_pipe_server.cpp)。
+  const uint32_t kRtW = 64, kRtH = 48, kRtFps = 15, kRtBitrate = 500000;
+  auto rt_opts = [=](int slot) {
+    xnc::RtServer::Opts ro;
+    ro.pipe_name = RtPipeNameOf(slot);
+    ro.secret = kRtSecret;
+    ro.secret_len = sizeof(kRtSecret);
+    ro.max_subs = 4;
+    ro.fps = kRtFps;
+    ro.bitrate_bps = kRtBitrate;
+    ro.sddl_override = L"D:P(A;;GA;;;WD)";  // TEST-ONLY permissive DACL
+    return ro;
+  };
+  { // 场景 ①:attach → 立即 HOST_HELLO(字段正确)→ 首帧 FRAME = IDR
+    //(SPS/PPS 前置整形);结束时收到 STATE{stream_end}
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(kRtW, kRtH, kRtFps, kRtBitrate, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: rt1-init err=%s\n", err.c_str());
+    CHECK("rt1-init", init_ok);
+    if (init_ok) {
+      xnc::RtServer rt;
+      const xnc::RtServer::Opts ro = rt_opts(0);
+      CHECK("rt1-start", rt.Start(ro, kRtW, kRtH));
+      ScriptedCapture cap(kRtW, kRtH, 3);  // 3 帧后静止
+      xnc::PipelineOpts po;
+      po.duration_s = 3;
+      po.fps = kRtFps;
+      po.target_bitrate_bps = kRtBitrate;
+      xnc::PipelineResult res;
+      std::thread pipe_th([&] { res = xnc::Pipeline::Run(cap, enc, rt, po); });
+      RtTestClient a;
+      CHECK("rt1-connect", a.Connect(ro.pipe_name.c_str(), kRtSecret, sizeof(kRtSecret)));
+      CHECK("rt1-attach-hello", a.Attach(7));
+      CHECK("rt1-no-frame-before-hello", !a.frame_before_hello_);
+      CHECK("rt1-hello-fields",
+            a.hello_ok_ && a.hello_.w == kRtW && a.hello_.h == kRtH &&
+                a.hello_.fps == kRtFps && a.hello_.max_subs == 4 && a.hello_.gen == 1);
+      a.Pump(2800, [&a] { return a.keys_ >= 1; });
+      pipe_th.join();
+      a.Pump(700);  // let the sender flush the stream_end STATE
+      rt.Shutdown();
+      CHECK("rt1-first-key", a.keys_ >= 1);
+      CHECK("rt1-frames-received", a.frames_ >= 1);
+      CHECK("rt1-key-payload-shaped", StreamStartsWithKeyframe(a.last_key_payload_));
+      CHECK("rt1-key-mono-us", a.last_key_mono_us_ >= 1);
+      CHECK("rt1-stream-end-state", a.saw_stream_end_);
+      CHECK("rt1-pipeline-ok", res.ok);
+      CHECK("rt1-encoded-invariant",
+            res.counters.encoded == res.counters.captured + res.counters.warmup_feeds);
+      CHECK("rt1-warmup-bounded",
+            res.counters.warmup_feeds <= xnc::WarmupFeedBound(kRtFps));
+      const xnc::RtServer::Stats st = rt.stats();
+      CHECK("rt1-stats-attach", st.attaches == 1 && st.detaches == 0);
+      std::printf("SELFTEST NOTE: rt1 keys=%llu frames=%llu emitted=%llu enq=%llu drop=%llu sub_join=%llu\n",
+                  (unsigned long long)a.keys_, (unsigned long long)a.frames_,
+                  (unsigned long long)st.aus_emitted, (unsigned long long)st.frames_enqueued,
+                  (unsigned long long)st.frames_dropped, (unsigned long long)st.idr_sub_join);
+    }
+  }
+  { // 场景 ②(承接语义回归):静止桌面 + 第二订阅者 → 管线重喂 base 产出
+    // 新 IDR(reason=sub_join);恰 2 个 IDR、无风暴、无溢出误报
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(kRtW, kRtH, kRtFps, kRtBitrate, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: rt2-init err=%s\n", err.c_str());
+    CHECK("rt2-init", init_ok);
+    if (init_ok) {
+      xnc::RtServer rt;
+      const xnc::RtServer::Opts ro = rt_opts(1);
+      CHECK("rt2-start", rt.Start(ro, kRtW, kRtH));
+      ScriptedCapture cap(kRtW, kRtH, 3);  // 3 帧后永久静止
+      xnc::PipelineOpts po;
+      po.duration_s = 6;
+      po.fps = kRtFps;
+      po.target_bitrate_bps = kRtBitrate;
+      xnc::PipelineResult res;
+      std::thread pipe_th([&] { res = xnc::Pipeline::Run(cap, enc, rt, po); });
+      RtTestClient a;
+      CHECK("rt2-a-connect", a.Connect(ro.pipe_name.c_str(), kRtSecret, sizeof(kRtSecret)));
+      CHECK("rt2-a-attach", a.Attach(7));
+      a.Pump(4500, [&a] { return a.keys_ >= 1; });  // 等 A 的首个 IDR(初始 warm-up)
+      CHECK("rt2-a-first-key", a.keys_ >= 1);
+      // 静止期第二订阅者加入(B 只可能拿到一个"新"IDR:旧 IDR 无回填)
+      RtTestClient b;
+      CHECK("rt2-b-connect", b.Connect(ro.pipe_name.c_str(), kRtSecret, sizeof(kRtSecret)));
+      CHECK("rt2-b-attach", b.Attach(9));
+      const ULONGLONG t_end = GetTickCount64() + 4500;
+      while (GetTickCount64() < t_end && (b.keys_ < 1 || a.keys_ < 2)) {
+        a.Pump(80);
+        b.Pump(80);
+      }
+      pipe_th.join();
+      a.Pump(500);
+      b.Pump(500);
+      rt.Shutdown();
+      CHECK("rt2-b-got-idr", b.keys_ >= 1);              // THE carry-forward assertion
+      CHECK("rt2-b-first-frame-is-key", b.keys_ >= 1 && b.frames_ >= b.keys_);
+      CHECK("rt2-a-second-key", a.keys_ >= 2);           // broadcast reached the old sub too
+      CHECK("rt2-exactly-two-idrs", res.counters.keyframes == 2);
+      CHECK("rt2-encoded-invariant",
+            res.counters.encoded == res.counters.captured + res.counters.warmup_feeds);
+      CHECK("rt2-on-demand-feeds-bounded",
+            res.counters.warmup_feeds <= 2 * xnc::WarmupFeedBound(kRtFps));
+      const xnc::RtServer::Stats st = rt.stats();
+      CHECK("rt2-reason-sub_join-once", st.idr_sub_join == 1);
+      CHECK("rt2-no-spurious-reasons",
+            st.idr_queue_overflow == 0 && st.idr_explicit == 0 && st.idr_other == 0);
+      // 注:运行期无溢出合并 IDR(上一条)。帧级 dropped 计数不做断言 ——
+      // 结束时 FlushTail 一次吐 ~17 个 AU,超过深度 3 的队列属预期丢弃
+      //(joiner 语义的 needkey 丢弃同理由 B 在拿到 IDR 前产生)。
+      CHECK("rt2-two-attaches", st.attaches == 2);
+      std::printf("SELFTEST NOTE: rt2 a_keys=%llu b_keys=%llu keyframes=%llu feeds=%llu sub_join=%llu\n",
+                  (unsigned long long)a.keys_, (unsigned long long)b.keys_,
+                  (unsigned long long)res.counters.keyframes,
+                  (unsigned long long)res.counters.warmup_feeds,
+                  (unsigned long long)st.idr_sub_join);
+    }
+  }
+  { // 场景 ③:队列溢出 —— 卡死订阅者(attach 后从不读)→ 管道缓冲 +
+    // 发送队列满 → 丢 delta + needsKeyframe → 合并 IDR(reason=queue_overflow);
+    // 健康订阅者收到第二个关键帧。噪声帧(320x240)保证 AU 足够大、
+    // 溢出路径确定触发(64x48 彩条 AU 仅 ~160B,打不满 64KB 管道缓冲)。
+    const uint32_t nw = 320, nh = 240, nfps = 15, nbitrate = 2300000;
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(nw, nh, nfps, nbitrate, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: rt3-init err=%s\n", err.c_str());
+    CHECK("rt3-init", init_ok);
+    if (init_ok) {
+      xnc::RtServer rt;
+      xnc::RtServer::Opts ro = rt_opts(2);
+      ro.fps = nfps;
+      ro.bitrate_bps = nbitrate;
+      CHECK("rt3-start", rt.Start(ro, nw, nh));
+      NoisyCapture cap(nw, nh, 130);  // ~8.7s 连续噪声帧
+      xnc::PipelineOpts po;
+      po.duration_s = 9;
+      po.fps = nfps;
+      po.target_bitrate_bps = nbitrate;
+      xnc::PipelineResult res;
+      std::thread pipe_th([&] { res = xnc::Pipeline::Run(cap, enc, rt, po); });
+      RtTestClient a;  // 健康订阅者
+      CHECK("rt3-a-connect", a.Connect(ro.pipe_name.c_str(), kRtSecret, sizeof(kRtSecret)));
+      CHECK("rt3-a-attach", a.Attach(7));
+      RtTestClient b;  // 卡死订阅者:attach 后一个字节都不读
+      CHECK("rt3-b-connect", b.Connect(ro.pipe_name.c_str(), kRtSecret, sizeof(kRtSecret)));
+      CHECK("rt3-b-attach", b.Attach(9));
+      a.Pump(8500, [&a] { return a.keys_ >= 2; });
+      pipe_th.join();
+      a.Pump(500);
+      rt.Shutdown();
+      CHECK("rt3-a-two-keys", a.keys_ >= 2);  // 溢出合并的 IDR 也广播给了健康订阅者
+      CHECK("rt3-pipeline-ok", res.ok);
+      const xnc::RtServer::Stats st = rt.stats();
+      CHECK("rt3-deltas-dropped", st.frames_dropped_overflow >= 1);
+      CHECK("rt3-overflow-merged-idr", st.idr_queue_overflow >= 1);
+      std::printf("SELFTEST NOTE: rt3 a_keys=%llu drop_of=%llu drop_nk=%llu overflow_idr=%llu emitted=%llu\n",
+                  (unsigned long long)a.keys_,
+                  (unsigned long long)st.frames_dropped_overflow,
+                  (unsigned long long)st.frames_dropped_needkey,
+                  (unsigned long long)st.idr_queue_overflow,
+                  (unsigned long long)st.aus_emitted);
+    }
+  }
+  { // 场景 ④:DETACH 清理 —— 表项即刻移除、发送队列排空后断连(EOF)、
+    // 线程全部回收(Shutdown 不挂)
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(kRtW, kRtH, kRtFps, kRtBitrate, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: rt4-init err=%s\n", err.c_str());
+    CHECK("rt4-init", init_ok);
+    if (init_ok) {
+      xnc::RtServer rt;
+      const xnc::RtServer::Opts ro = rt_opts(3);
+      CHECK("rt4-start", rt.Start(ro, kRtW, kRtH));
+      ScriptedCapture cap(kRtW, kRtH, 40);
+      xnc::PipelineOpts po;
+      po.duration_s = 4;
+      po.fps = kRtFps;
+      po.target_bitrate_bps = kRtBitrate;
+      xnc::PipelineResult res;
+      std::thread pipe_th([&] { res = xnc::Pipeline::Run(cap, enc, rt, po); });
+      RtTestClient a;
+      CHECK("rt4-a-connect", a.Connect(ro.pipe_name.c_str(), kRtSecret, sizeof(kRtSecret)));
+      CHECK("rt4-a-attach", a.Attach(5));
+      a.Pump(800);
+      CHECK("rt4-detach-send", a.SendDetach(5));
+      bool zero = false;
+      for (int i = 0; i < 100 && !zero; ++i) {
+        if (rt.SubscriberCount() == 0) zero = true;
+        else Sleep(10);
+      }
+      CHECK("rt4-sub-count-zero", zero);
+      // 排空在途帧后服务器断连:客户端读到 EOF
+      bool eof_seen = false;
+      const ULONGLONG dl = GetTickCount64() + 2500;
+      while (GetTickCount64() < dl) {
+        xnc::Frame f;
+        if (!a.ReadFrameT(f, 200)) {
+          eof_seen = true;
+          break;
+        }
+        a.CountFrame(f);
+      }
+      CHECK("rt4-eof-after-detach", eof_seen);
+      pipe_th.join();
+      rt.Shutdown();  // must not hang: all threads reaped
+      const xnc::RtServer::Stats st = rt.stats();
+      CHECK("rt4-detach-counted", st.detaches == 1 && st.attaches == 1);
+      CHECK("rt4-final-subs-zero", rt.SubscriberCount() == 0);
+      std::printf("SELFTEST NOTE: rt4 frames=%llu detaches=%u\n",
+                  (unsigned long long)a.frames_, st.detaches);
     }
   }
   if (fails == 0) std::printf("selftest ok\n");

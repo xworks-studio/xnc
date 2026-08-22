@@ -28,6 +28,7 @@
 #ifndef XNC_NATIVE_DESKTOP_PIPELINE_H_
 #define XNC_NATIVE_DESKTOP_PIPELINE_H_
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -44,6 +45,9 @@ struct PipelineOpts {
   uint32_t duration_s = 10;            // run length in seconds (> 0)
   uint32_t fps = 30;                   // target fps (paces submissions)
   uint32_t target_bitrate_bps = 2300000;
+  // Optional early-stop flag (real-time mode: Ctrl+C / RtServer::Shutdown).
+  // Checked once per loop iteration; nullptr = run the full duration.
+  const std::atomic<bool>* stop = nullptr;
 };
 
 struct PipelineResult {
@@ -66,6 +70,11 @@ inline uint32_t WarmupFeedBound(uint32_t fps) {
   const uint32_t by_time = 2u * (fps > 0 ? fps : 1u);
   return by_window < by_time ? by_window : by_time;
 }
+
+// Minimum interval between pipeline-INITIATED IDRs (spec §7.5: 主动 IDR
+// 请求最小间隔 500ms). The natural first IDR and rebuild forces are not
+// pipeline-initiated and are not throttled by this.
+inline constexpr uint64_t kIdrMinIntervalMs = 500;
 
 // Appends every NALU of `data` except parameter sets (7/8) and AUD (9),
 // each re-emitted with a 4-byte start code, trailing zero bytes before the
@@ -125,6 +134,70 @@ inline void ShapeAu(const uint8_t* au, size_t len, bool is_idr,
   VclNalus(au, len, out);
 }
 
+// Receiver of the pipeline's shaped Annex-B AUs (M1-Slice2 Task 2): the
+// diag file dump and the real-time pipe fan-out are two implementations of
+// ONE pipeline loop. All methods are called on the pipeline thread.
+class AuSink {
+ public:
+  virtual ~AuSink() = default;
+
+  // One shaped AU (SPS/PPS-prefixed on IDR, 4-byte start codes, no AUD);
+  // mono_us = capture timestamp of the submission that produced it.
+  // Returns nullptr on success; a non-null fatal message aborts the run
+  // (PipelineResult::err = message).
+  virtual const char* OnAu(bool is_idr, uint64_t mono_us, const uint8_t* au,
+                           size_t len) = 0;
+
+  // Merged IDR request (spec §7.5): non-null when the sink wants a
+  // pipeline-initiated IDR (e.g. "sub_join"/"queue_overflow"/"explicit").
+  // The pipeline polls this once per loop iteration and, when it arms
+  // MfSoftEncoder::ForceNextIdr (throttled by kIdrMinIntervalMs, only after
+  // the stream's first keyframe, never while a previous request is still in
+  // flight), acknowledges it via ConsumePendingIdr with the same reason.
+  virtual const char* PendingIdrReason() { return nullptr; }
+  virtual void ConsumePendingIdr(const char* reason) { (void)reason; }
+
+  // State transitions worth surfacing to subscribers (STATE events):
+  // "capture_rebuilt" (recoverable), "capture_fatal"/"encoder_fatal"
+  // (fatal) - raised where the per-second log raises the matching marker.
+  virtual void OnState(const char* code, bool recoverable) {
+    (void)code;
+    (void)recoverable;
+  }
+};
+
+// Fan-in of two sinks: AUs go to both (first fatal error wins); IDR
+// requests come from either and are acknowledged to both; states too. Used
+// by --console-diag --pipe <name> --secret <hex> (file dump + rt server on
+// one pipeline run).
+class TeeAuSink final : public AuSink {
+ public:
+  TeeAuSink(AuSink* a, AuSink* b) : a_(a), b_(b) {}
+  const char* OnAu(bool is_idr, uint64_t mono_us, const uint8_t* au,
+                   size_t len) override {
+    const char* e = a_ ? a_->OnAu(is_idr, mono_us, au, len) : nullptr;
+    if (e != nullptr) return e;
+    return b_ ? b_->OnAu(is_idr, mono_us, au, len) : nullptr;
+  }
+  const char* PendingIdrReason() override {
+    if (a_ != nullptr) {
+      if (const char* r = a_->PendingIdrReason()) return r;
+    }
+    return b_ ? b_->PendingIdrReason() : nullptr;
+  }
+  void ConsumePendingIdr(const char* reason) override {
+    if (a_ != nullptr) a_->ConsumePendingIdr(reason);
+    if (b_ != nullptr) b_->ConsumePendingIdr(reason);
+  }
+  void OnState(const char* code, bool recoverable) override {
+    if (a_ != nullptr) a_->OnState(code, recoverable);
+    if (b_ != nullptr) b_->OnState(code, recoverable);
+  }
+
+ private:
+  AuSink *a_, *b_;
+};
+
 class Pipeline {
  public:
   // Runs the loop described in the header comment for opts.duration_s wall
@@ -134,6 +207,13 @@ class Pipeline {
   // counters/totals; counters are also visible in the per-second log lines.
   static PipelineResult Run(ICapture& capture, MfSoftEncoder& encoder, FILE* out,
                             const PipelineOpts& opts);
+  // Same loop, AUs delivered to `sink` instead of a file (real-time mode).
+  static PipelineResult Run(ICapture& capture, MfSoftEncoder& encoder, AuSink& sink,
+                            const PipelineOpts& opts);
+  // File dump AND sink on one run (--console-diag with an optional rt
+  // pipe): AUs are shaped once and delivered to both.
+  static PipelineResult Run(ICapture& capture, MfSoftEncoder& encoder, FILE* out,
+                            AuSink& sink, const PipelineOpts& opts);
 };
 
 // One-line-per-field JSON for the stats.json sidecar (pure, so the selftest
