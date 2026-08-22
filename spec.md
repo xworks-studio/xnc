@@ -832,41 +832,52 @@ Server 验证 Node Identity 后：
 
 ---
 
-# 14. PowerShell Exec
+# 14. Exec（多 Shell 命令执行）
 
-Exec 用于一次性命令执行。
-
-例如：
+Exec 用于一次性命令/脚本执行，支持 5 种 shell：
 
 ```text
-xnc exec web-01 "Get-Service"
+xnc exec web-01 "hostname"                        # auto（探测最佳）
+xnc exec web-01 --shell bash "ls -la"             # Git Bash / WSL
+xnc exec web-01 --shell pwsh "Get-Service"        # PowerShell Core
+xnc exec web-01 --shell powershell "Get-Process"  # Windows PS 5.1
+xnc exec web-01 --shell cmd "dir"                 # cmd.exe
+xnc exec web-01 --file deploy.ps1                 # 脚本文件
+cat script.sh | xnc exec web-01 -                  # stdin 管道
+xnc exec web-01 --cwd C:\x --env DEBUG=1 "tool"   # env + cwd
 ```
 
 客户端：
 
 ```text
 Client
-   ↓ POST /api/nodes/{id}/exec
-Server（统一会话管理器）
+   ↓ POST /api/nodes/{id}/exec {command|script, shell?, env?, cwd?, timeoutSec}
+Server（统一会话管理器，透传 shell/env 字段）
    ↓ 控制连接下发 SESSION_OPEN（kind=exec）
 Agent 拨会话 WS，双侧粘合
    ↓
-PowerShell 子进程
+Shell 子进程（bash/pwsh/powershell/cmd，按请求分发）
 ```
 
 会话词汇（exec 会话 WS 内，text = 控制，binary = 数据）：
 
 ```text
-SESSION_OPEN params: {command? | script?, timeoutSec=300, cwd?}
+SESSION_OPEN params: {command? | script?, shell?, env?[], cwd?, timeoutSec=300}
 binary frame: [1 字节流标识][字节块]     0x01=stdout  0x02=stderr
 text frame:   EXEC_RESULT {exitCode|null, timedOut, durationMs}
 ```
 
-规则：
+Shell 执行规则：
+* `auto`：探测顺序 bash → pwsh → powershell → cmd（agent 上报 shells 列表）
+* `bash`：查找 PATH → Git Bash 常见路径 → WSL；命令经 `bash -c`，脚本直接执行
+* `cmd`：命令经 `cmd /c`，环境变量用 `set K=V&&` 前缀
+* `pwsh`/`powershell`：命令经 `-Command`，脚本经 `-File -ExecutionPolicy Bypass`
+* `env`：命令模式按 shell 语法前缀注入（bash: export，PS: $env:）；脚本模式设到子进程 env
 
-* script ≤ 256 KB，agent 落地 `%TEMP%\xnc-<sessionId>.ps1` 执行后必删（含失败路径）。
+通用规则：
+* script ≤ 256 KB，agent 落地 `%TEMP%\xnc-<sessionId>.<ext>` 执行后必删（含失败路径）。
 * 超时：agent 计时到点 kill 进程树，发 `EXEC_RESULT {exitCode: null, timedOut: true}` 后关会话。
-* 取消：client 断开会话 WS → server 发 SESSION_CLOSE → agent kill 进程树（无需回传结果，连接已断）。
+* 取消：client 断开会话 WS → server 发 SESSION_CLOSE → agent kill 进程树。
 * 1 字节流前缀保住 CLI 契约：`--json` 的 data 含独立的 stdout / stderr 字段。
 
 已论证接受的代价：每次 exec 多一次 agent 侧会话拨号（+1 RTT，几十 ms 量级），远小于 pwsh 子进程冷启动（100-500ms），属噪音级。
@@ -1803,27 +1814,48 @@ sql-01    offline
 
 ---
 
-# 45. Agent 更新
+# 45. Agent 更新（自更新系统）
 
-MVP 不实现自动更新。
+服务端驱动的全自动更新。Agent 收到 UPDATE_OFFER 后完成：下载 → sha256 校验 → staging（解包逐文件验哈希）→ apply（杀 helper、删 DLL 缓存、spawn --apply-update 子进程）→ 服务重启 → 新版本 HELLO 上报。
 
-第一版通过人工升级：
-
-```text
-xnc-agent.exe upgrade
-```
-
-未来可以加入：
+## 快速版本检查（三通道，零轮询）
 
 ```text
-signed package
-download
-signature verification
-service restart
-rollback
+① HELLO_ACK 携带 targetVersion    ← 重连/重启秒级感知
+② PING/PONG 搭车双版本            ← 稳态一个保活周期内收敛
+③ admin rollout 强制下发           ← 即时（"现在就更新"场景）
 ```
 
-但不作为当前架构依赖。
+## 发布频道
+
+```text
+stable    正式发布（默认）
+dev       开发测试线
+```
+
+目标版本 = COALESCE(nodes.target_release, 最新 release WHERE channel = 节点.channel)。
+
+## 协议消息
+
+```text
+UPDATE_OFFER  {version, url, sha256}         server → agent
+UPDATE_STATUS {version, phase, error}        agent → server
+phase: downloading | verifying | staging | applying | done | failed
+```
+
+## CLI 自更新
+
+```text
+xnc update [--channel stable|dev]
+```
+
+Windows 自替换舞（rename 当前 exe → .old，写新 exe，.old 下次运行清扫）。
+
+## 安全
+
+* sha256 信任根 = 已认证控制通道（OFFER 哈希即真相）
+* bundle 下载走短时效单次令牌（绑定节点）
+* agent apply-update 子进程含回滚（connected 标记超时 → .old 恢复）
 
 ---
 
@@ -1834,27 +1866,38 @@ rollback
 ```text
 deploy/
 ├── docker-compose.yml     caddy + xnc-server + postgres 三容器
-├── Caddyfile              :443 TLS termination，Let's Encrypt 自动签发
+├── Caddyfile              :443 TLS + 短域 xnc.app 安装端点直通
 └── .env.example           域名 / PG 凭据 / Bootstrap Admin 环境变量
 
 Internet → :443 Caddy(容器) → xnc-server(容器) → PostgreSQL(容器)
 ```
 
-推荐 MVP 部署形态：
+## 双域名
 
 ```text
-单台云服务器（Ubuntu 22.04+，2C4G 起步）
-域名：control.example.com
+control.xnc.app    主域名：Web UI / REST / WS
+xnc.app            短域：快捷安装端点直接响应，其余 301 到主域
 ```
+
+Caddyfile 环境变量：`XNC_DOMAIN`（主域）、`XNC_SHORT_DOMAIN`（短域）。
+
+## 快捷安装
+
+```cmd
+curl -sL xnc.app/a/<enrollment-token> | cmd    :: agent 安装
+curl -sL xnc.app/c | cmd                       :: CLI 安装
+curl -sL xnc.app/a-dev/<token> | cmd           :: dev 频道 agent
+curl -sL xnc.app/c-dev | cmd                   :: dev 频道 CLI
+```
+
+返回 .cmd 批处理 → PS 脚本（ExecutionPolicy Bypass）→ 下载 bundle → 安装到 Program Files / LOCALAPPDATA → 注册服务 / 加 PATH。终端 UI 含 ASCII banner + 步骤编号 + 颜色。
 
 要求：
 
 * xnc-server 镜像：多阶段构建，distroless/static 基底（Go 静态二进制），CI 构建推送。
-* Caddy 对 WSS 的透传：WebSocket Upgrade 自动处理；tunnel / screen 等流式路径配置 `flush_interval -1` 禁用响应缓冲，保证转发低延迟。
-* 长连接：代理层不得设低于心跳判定窗口的 idle 超时（在线判定 90s，代理 idle timeout 需大于 90s 或禁用）。
+* Caddy 对 WSS 的透传：WebSocket Upgrade 自动处理；流式路径配置 `flush_interval -1`。
+* 长连接：代理 idle timeout > 90s 或禁用。
 * PostgreSQL 数据卷持久化；全部凭据经 `.env` 注入，不入库。
-* 单实例约束不变：一套 compose 栈即单实例（见第 42 节）。
-* E2E 测试的 docker-compose 与本生产栈同构（仅追加 mockagent / cli 服务），开发与生产环境一致性由同一配方保证。
 
 ---
 
@@ -2559,41 +2602,42 @@ skills/xnc/references/cli.md     完整命令参考：命令树 / flag / 退出�
 ## 命令树
 
 ```text
-xnc login [--server URL]                    # 凭证写入配置文件
-xnc whoami
+xnc login [--email <e>]                          # 密码走 stdin（非 TTY）
 
-xnc cluster list|show|create|delete
-xnc cluster member list|add|remove
+# 核心操作
+xnc exec <node> [flags] <command...> | --file <f> | -
+                                                 # 统一执行入口（合并旧 exec+run）
+                                                 # --shell auto|bash|pwsh|powershell|cmd
+                                                 # --env KEY=VAL（可重复）
+                                                 # --cwd PATH, --timeout N, --json
+xnc run <node> (- | --file <f>)                  # exec --stdin 的别名（兼容）
+xnc shell <node> [--cols N] [--rows N]           # 交互终端（~. 断开）
+xnc upload <node> <local> <remote>               # 别名: put
+xnc download <node> <remote> <local>             # 别名: get
+xnc screen <node> --snap out.jpg | --open        # 截图 | 实时预览
+xnc rdp <node> [--local-port N]
 
-xnc token create <cluster> [--ttl 30m] [--max-uses 1]
-xnc token revoke <id>
-
+# 节点与管理
 xnc node list [--cluster c] [--status online]
 xnc node show <node>
 xnc node disable|enable <node>
-
-xnc exec <node> [--timeout 300] [--cwd PATH] -- <command...>
-xnc run <node> (--file x.ps1 | -) [--timeout 300]     # - 表示 stdin
-xnc shell <node> [--cols N] [--rows N]
-xnc rdp <node> [--local-port N]
-
-xnc upload <node> <local> <remote>
-xnc download <node> <remote> <local>
-xnc screen <node> [--snapshot out.jpg | --open] [--fps 1]
-
+xnc cluster list|show|create|delete
+xnc cluster member list|add|remove
+xnc token create <cluster> [--ttl 30m] [--max-uses 1]
 xnc audit list [--node n] [--user u] [--action a] [--since 7d]
 
+# 自更新与信息
+xnc update [--channel stable|dev]                # CLI 自更新
+xnc whoami
+xnc status                                       # Server 连通性
 xnc version
-xnc status                                  # Server 连通性
 ```
 
 ## Node 选择器
 
 ```text
 web-01                 唯一名
-production/web-01      cluster + name
 <node-id>              UUID
---cluster production   组合 flag
 ```
 
 名称歧义时报错并列出候选。
@@ -2604,8 +2648,7 @@ production/web-01      cluster + name
 --server        默认 $XNC_SERVER
 --token         默认 $XNC_TOKEN，其次配置文件
 --output        json | table（默认 table）
---timeout       请求超时（默认 30s；exec/run 默认 300s）
---yes           破坏性命令确认
+--json          单命令 JSON 输出（等价 --output json）
 ```
 
 ## JSON envelope
@@ -2908,98 +2951,72 @@ Linux 无 RDP 概念，Remote Desktop 仅作为 Windows 节点能力。
 
 ---
 
-# 64. 桌面预览（Screen Preview，Phase 6）
+# 64. 桌面预览（Screen Preview，Phase 6+）
 
 ## 动机
 
-RDP 连接本身会改变会话状态：
+RDP 连接本身会改变会话状态。预览解决"先无扰动看一眼"。Phase 6 后升级为 H.264 视频流。
 
-```text
-接管 console 会话 → 本地屏幕被锁定
-或新建独立会话   → 看到的不是物理桌面
-```
-
-预览解决"先无扰动看一眼"：是否有弹窗卡住、安装器是否在等输入、谁登录着——判断清楚再决定是否 RDP。
-
-## 边界（不演变为视频流）
-
-```text
-只读：无键鼠注入，控制仍走 RDP Tunnel
-低频：默认 1 fps，上限 5 fps
-压缩：JPEG 质量 ~60，宽度 ≤ 1280，单帧 ≤ 300 KB
-按需：预览会话存在才捕获，关闭即停止
-```
-
-## 架构（Session 0 问题与 helper）
-
-Agent 是 Session 0 服务，无法直接访问用户桌面（Session 1+）：
+## 架构（DXGI + C DLL + H.264）
 
 ```text
 screen 会话引擎 internal/session/screen (service, session 0)
    │ WTSQueryUserToken + CreateProcessAsUser
    ▼
 xnc-screen-helper.exe (user console session)
-   │ GDI BitBlt → 缩放 → JPEG
-   ▼ named pipe
-screen 会话引擎
-   ▼ 会话 WS（JPEG binary frame）
-Server（纯转发，不解析不落盘）
+   │ xnc-dda.dll (C ABI, 嵌入 helper exe)
+   │   ├─ DXGI Desktop Duplication → GPU BGRA → CPU 读回
+   │   ├─ 备援: WGC (Win10 1903+)
+   │   └─ 光标合成 (GDI 指针形状 → BGRA 叠加)
+   │ pixel 模块: scale → BT.601 NV12 (黄金测试锁定)
+   │ MFT H.264 编码 (墙钟 PTS, 时间基 GOP ≥2s, fps 节流)
+   │ 码流整形: IDR 前必有 SPS/PPS + 统一 4 字节起始码
+   ▼ named pipe [type][len][payload]
+screen 会话引擎 (pipe 读循环 → 分帧 → 订阅者广播)
+   ▼ 会话 WS (binary 帧带 1 字节子头)
+Server (纯转发, 帧上限 proto.MaxSessionFrameBytes = 8MiB)
    ▼
-Web 预览面板 / xnc screen --snapshot
+Web 预览面板 (WebCodecs H.264) / xnc screen
 ```
 
-* MVP 用 GDI：Win10 1809+ 全兼容，1 fps 下单帧 capture+encode < 100ms，开销可忽略。
-* Windows.Graphics.Capture 为后续优化（1903+，GPU 加速），对外接口不变。
-* 捕获活动 console 会话主显示器，多显示器以 monitor 参数预留。
+关键设计决策：
+* 采集层以 C ABI DLL 实现（Go syscall COM 在 DuplicateOutput 上系统性失败，根因未明；C 实现三机全通过）
+* DLL 嵌入 helper exe（go:embed），运行期自解压加载，单 exe 部署
+* helper 与 agent 管道帧协议 `[1B 类型][4B 长度 LE][payload]`
 
-## 状态而非硬抓
+## 边界
 
 ```text
-no_session    无交互会话（未登录）
-locked        锁屏 / 无输入桌面
-capturing     正常出帧
+只读：无键鼠注入，控制仍走 RDP Tunnel
+按需：预览会话存在才捕获，关闭即停止
+帧率：默认 15 fps，上限 30
+编码：H.264 MFT (软件编码，跨机一致)
+分辨率：maxWidth 默认 1920
+快照：--snap 单帧 JPEG（WGC 单帧路径）
 ```
 
 ## 协议
 
-screen 会话（统一会话模型的一种 kind，Phase 6 交付、协议现在锁定；建立流程见第 11.2 节）：
+screen 会话 WS 词汇：
 
 ```text
-SESSION_OPEN params: {fps=1, quality=60, maxWidth=1280}
-text frame:   SCREEN_BEGIN {width, height, state}
-text frame:   SCREEN_STATE {state}            capturing / locked / no_session
-binary frame: 单帧完整 JPEG（WS message 即一帧）
+SESSION_OPEN params: {fps=15, quality=60, maxWidth=1920, snapshot?}
+text frame:   SCREEN_BEGIN {width, height, state, codec}
+text frame:   SCREEN_STATE {state}        capturing / locked / no_session
+text frame:   SCREEN_FEEDBACK {message}   ← 观众→agent 解码器错误回传
+binary frame: [1B 子头][H.264 Annex-B AU]  0x01=key 0x02=delta 0x03=JPEG
 ```
 
-REST：
-
-```text
-POST /api/nodes/{id}/screen    {fps?, quality?, maxWidth?}
-→ 202 {sessionId, token, expiresAt, websocketUrl}
-```
+REST：`POST /api/nodes/{id}/screen` → 202
 
 ## 权限与隐私
 
+operator+（viewer 403）；帧数据不落盘、不进日志（XNC_DUMP_H264 环境变量仅诊断用）。
+
+## CLI
+
 ```text
-operator+（viewer 不可见，桌面可能含敏感信息）
-audit: screen.open / screen.close
-帧数据不落盘、不进日志
+xnc screen <node> --snap out.jpg    # 单帧快照
+xnc screen <node> --open            # 浏览器实时预览 (WebCodecs)
 ```
-
-## CLI（Agent-First）
-
-```text
-xnc screen <node> --snapshot out.jpg    # 单帧快照，--json 返回元数据
-xnc screen <node> --open                # 浏览器打开实时预览
-```
-
-## 测试
-
-```text
-helper 拉起：有 / 无用户会话两种路径
-帧预算：<100ms / 帧、≤300KB
-预览 WS 关闭 → helper 进程退出无残留
-viewer 403 权限矩阵
-审计记录完整
-Node 离线 → 预览会话关闭
 ```
