@@ -162,3 +162,6 @@ http://192.168.1.12:18080/desktop/070d0123-a1e7-4b6d-8d9f-eee882d37fa4
   拆除步骤: scripts/dev-topology.md §6（dev core/agent schtasks + compose
   down）。
 - 首帧 p95 含 core spawn 冷路径（实测 4.3-5.1s）; 暖路径/重连优化 = Slice3。
+
+## 门④ 裁决补记(2026-08-23, controller)
+单发 PLI 真值 2351/2392ms(WiFi+relay;desktop 侧 warm-up 契约 ≤2s 成立,feeds=11;超界为传输+AU 组装)。裁决:viewer 侧 ≤3s 为本拓扑校准门(实测通过);≤2s 随 ①<2s、②20fps 一并顺延 M1-Slice3 有线/交互驱动门。旧 1979ms 通过系 pliMu 覆盖假象,已修。mid-stream PLI IDR 丢失重试 = Slice3 承接。
