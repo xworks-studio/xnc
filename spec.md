@@ -1086,6 +1086,8 @@ Agent 只负责 TCP Forward。
 
 注意：RDP 连接会改变会话状态（接管 console 导致本地锁屏，或新建独立会话）。无扰动观察桌面用桌面预览（第 64 节）。
 
+> **方向更新（2026-08-22）**：Agent 模块重构（第 65 节）引入自研浏览器交互桌面（xnc-desktop 引擎：免 3389、免 Windows 凭据、无扰动控制）。本节原生 RDP 转发降级为兼容与应急路径 `xnc rdp --native`；§22 的 mstsc 流程对应 `--native` 模式。
+
 ---
 
 # 22. RDP Client Flow
@@ -2610,12 +2612,13 @@ xnc exec <node> [flags] <command...> | --file <f> | -
                                                  # --shell auto|bash|pwsh|powershell|cmd
                                                  # --env KEY=VAL（可重复）
                                                  # --cwd PATH, --timeout N, --json
+                                                 # --system（SYSTEM 令牌执行；默认登录用户令牌，重构 M2 起）
 xnc run <node> (- | --file <f>)                  # exec --stdin 的别名（兼容）
-xnc shell <node> [--cols N] [--rows N]           # 交互终端（~. 断开）
+xnc shell <node> [--cols N] [--rows N] [--system]  # 交互终端（~. 断开；--system 同上，M2 起）
 xnc upload <node> <local> <remote>               # 别名: put
 xnc download <node> <remote> <local>             # 别名: get
 xnc screen <node> --snap out.jpg | --open        # 截图 | 实时预览
-xnc rdp <node> [--local-port N]
+xnc rdp <node> [--local-port N] [--native]       # 默认浏览器 desktop；--native = mstsc tunnel（M2 起）
 
 # 节点与管理
 xnc node list [--cluster c] [--status online]
@@ -2987,7 +2990,7 @@ Web 预览面板 (WebCodecs H.264) / xnc screen
 ## 边界
 
 ```text
-只读：无键鼠注入，控制仍走 RDP Tunnel
+只读：无键鼠注入（legacy 引擎；交互控制由第 65 节 desktop 引擎承接，本引擎 M2 退役，--snap 语义保留）
 按需：预览会话存在才捕获，关闭即停止
 帧率：默认 15 fps，上限 30
 编码：H.264 MFT (软件编码，跨机一致)
@@ -3019,4 +3022,30 @@ operator+（viewer 403）；帧数据不落盘、不进日志（XNC_DUMP_H264 �
 xnc screen <node> --snap out.jpg    # 单帧快照
 xnc screen <node> --open            # 浏览器实时预览 (WebCodecs)
 ```
+
+---
+
+# 65. Agent 模块重构（Desktop 引擎，进行中）
+
+自 2026-08-22 起启动 agent 模块整体重构。权威设计文档：
+
+```text
+docs/superpowers/specs/2026-08-22-xnc-agent-refactor-spec.md
 ```
+
+要点：
+
+```text
+进程家族：  xnc-agent（低权 Go，网络面）/ xnc-core（SYSTEM C++，特权 RPC）
+           / xnc-desktop（SYSTEM@会话 N，C++，采集+编码+输入）
+           / xnc-shell（用户|SYSTEM 令牌，Go，ConPTY+exec）
+数据面：    WebRTC（Pion）relay-only，TURN/TLS 443；RTP 视频 + 4 条 DataChannel
+边界：      新 desktop session kind；legacy screen（§64）M2 退役；
+           RDP tunnel（§21–26）保留为 xnc rdp --native 兼容路径
+安全：      SessionTicket capability 双验（agent 与 xnc-core 各自独立）；
+           exec/shell 默认用户令牌，--system 显式授权
+迁移：      M0 管线修复 → M1 垂直原型 → M2 可靠远控（第一个可交付版）
+           → M3 无人值守（IDD/headless）→ M4 性能（硬编/AV1）
+```
+
+本规格与该设计文档冲突处，以该文档为准（其 §1.4 列明对既有章节的覆盖关系）。
