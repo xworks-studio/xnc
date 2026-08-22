@@ -37,7 +37,7 @@ func main() {
 // newRootCmd 构建命令树（抽出供测试直接驱动 flag 解析路径）。
 func newRootCmd() *cobra.Command {
 	var server, token, stateDir string
-	var devName, devLogFile string
+	var devName, devLogFile, devCorePipe, devCoreSecretHex string
 	root := &cobra.Command{
 		Use:          "xnc-agent",
 		Short:        "XNC Windows node agent",
@@ -56,7 +56,7 @@ func newRootCmd() *cobra.Command {
 		Use:   "run-dev-console",
 		Short: "throwaway foreground dev agent: fresh %TEMP% state, no SCM, Ctrl+C exits clean",
 		RunE: func(_ *cobra.Command, _ []string) error {
-			return runDevConsole(server, token, devName, devLogFile)
+			return runDevConsole(server, token, devName, devLogFile, devCorePipe, devCoreSecretHex)
 		},
 	}
 	install := &cobra.Command{
@@ -83,6 +83,13 @@ func newRootCmd() *cobra.Command {
 	runDev.Flags().StringVar(&token, "token", "", "enrollment token (required; fresh identity every run)")
 	runDev.Flags().StringVar(&devName, "name", "", "node name override (default <hostname>-DEV)")
 	runDev.Flags().StringVar(&devLogFile, "log-file", "", "also append logs to this file")
+	// dev 桌面采集 seam(T6):等价设置 XNC_DESKTOP_CORE_PIPE /
+	// XNC_DESKTOP_CORE_SECRET_HEX —— schtasks /TR 里 cmd set 包装太脆,
+	// flag 交给 run-dev-console 自己 Setenv。两者齐全才注册 desktop kind。
+	runDev.Flags().StringVar(&devCorePipe, "desktop-core-pipe", "",
+		"dev desktop: core XNIP pipe (full \\\\.\\pipe\\name), enables desktop sessions")
+	runDev.Flags().StringVar(&devCoreSecretHex, "desktop-core-secret-hex", "",
+		"dev desktop: core pipe secret (64 hex chars; never logged)")
 	_ = runDev.MarkFlagRequired("server")
 	_ = runDev.MarkFlagRequired("token")
 	root.AddCommand(run, runDev, install, uninstall)

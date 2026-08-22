@@ -11,11 +11,15 @@
 //     会话 WS 走 agent/desktop/session.go 的 JSON 信令词汇
 //     (ready/offer/answer/ice/state/error)。
 //
-// 断言(--expect-*;0/1 退出码,e2e 脚本消费):
+// 断言(--expect-*;0/1 退出码,e2 脚本消费):
 //
 //	首帧时延(run 开始→首个解码 AU)≤ --expect-first-frame-ms(默认 2000)
 //	关键帧数 ≥ --expect-keyframes(默认 1)
-//	若发过 PLI:PLI→新 IDR ≤ --expect-pli-idr-ms(默认 2000;0=跳过)
+//	帧数 ≤ --expect-frames-max(0=跳过;静止场景断言低产出,T6 门②)
+//	首个 AU 为 IDR(--expect-first-key;静止期第二 viewer 的按需 IDR
+//	承接断言,T6 门③)
+//	若发过 PLI(--pli-interval 周期 或 --pli-at 单发):PLI→新 IDR ≤
+//	--expect-pli-idr-ms(默认 2000;0=跳过,T6 门④)
 //
 // 输出:--out dump.h264 落盘 RTP 重组的 Annex-B 流(depacketizer 已带
 // 4 字节起始码,直接追加);stdout 尾部一行 JSON 摘要(--json 仅打 JSON)。
@@ -63,8 +67,12 @@ type config struct {
 	duration            time.Duration
 	expectFirstFrameMs  int
 	expectKeyframes     int
+	expectFramesMax     int // 0=跳过;帧数上限(静止场景低产出断言)
+	expectFirstKey      bool
 	expectPliIdrMs      int
 	pliInterval         time.Duration
+	pliAt               time.Duration // 0=off;run 内该时刻单发一次 PLI
+	keyframeRetryAfter  time.Duration // 0=off;server 模式无帧到达超过此时长发 keyframe-req(丢包自救)
 	jsonOnly            bool
 }
 
@@ -81,8 +89,13 @@ func parseFlags() *config {
 	flag.DurationVar(&c.duration, "duration", 30*time.Second, "run duration")
 	flag.IntVar(&c.expectFirstFrameMs, "expect-first-frame-ms", 2000, "fail if first frame later than this (0=skip)")
 	flag.IntVar(&c.expectKeyframes, "expect-keyframes", 1, "fail if fewer keyframes (0=skip)")
+	flag.IntVar(&c.expectFramesMax, "expect-frames-max", 0, "fail if MORE frames than this (0=skip; static-desktop gate)")
+	flag.BoolVar(&c.expectFirstKey, "expect-first-key", false, "fail if the first decoded AU is not a keyframe")
 	flag.IntVar(&c.expectPliIdrMs, "expect-pli-idr-ms", 2000, "fail if PLI->IDR slower than this (0=skip)")
 	flag.DurationVar(&c.pliInterval, "pli-interval", 0, "send RTCP PLI every interval (0=off)")
+	flag.DurationVar(&c.pliAt, "pli-at", 0, "send one RTCP PLI this far into the run (0=off)")
+	flag.DurationVar(&c.keyframeRetryAfter, "keyframe-retry-after", 0,
+		"server mode: if no AU has decoded yet for this long, send a {keyframe-req} signaling frame (0=off; lossy-link self-heal)")
 	flag.BoolVar(&c.jsonOnly, "json", false, "print only the JSON summary")
 	flag.Parse()
 	return c
@@ -142,11 +155,19 @@ type viewer struct {
 	trackCh  chan *webrtc.TrackRemote
 	plisSent atomic.Uint64
 
+	// keyframeReqFn(server 模式注入):发送 {"type":"keyframe-req"} 信令帧。
+	// 丢包链路上首个 IDR 可能整包损坏,viewer 以此自救重请(T6 门③④)。
+	keyframeReqFn func()
+	keyframeReqs  atomic.Uint64
+	lastKeyReqAt  atomic.Int64 // 最近一次 keyframe-req 发出(UnixNano)
+	lastAUAt      atomic.Int64 // 最近一个解码 AU(UnixNano;0=尚无)
+
 	rtpPkts   atomic.Uint64
 	frames    atomic.Uint64
 	keyframes atomic.Uint64
 	bytes     atomic.Uint64
 	firstAt   atomic.Int64 // UnixNano;0 = 未收帧
+	firstKey  atomic.Bool  // 首个解码 AU 是否 IDR(门③承接断言)
 
 	pliMu     atomic.Int64 // 最近一次 PLI 发出(UnixNano;0=无待验证)
 	pliIDRMax atomic.Int64 // PLI→IDR 最大时延(ms;0=未发生)
@@ -207,7 +228,11 @@ func newViewer(c *config, ice []webrtc.ICEServer, relay bool, log *slog.Logger) 
 				}
 				v.frames.Add(1)
 				v.bytes.Add(uint64(len(smp.Data)))
-				v.firstAt.CompareAndSwap(0, time.Now().UnixNano())
+				now := time.Now().UnixNano()
+				v.lastAUAt.Store(now)
+				if v.firstAt.CompareAndSwap(0, now) {
+					v.firstKey.Store(desktop.IsKeyframeAU(smp.Data))
+				}
 				if desktop.IsKeyframeAU(smp.Data) {
 					if t := v.pliMu.Load(); t != 0 {
 						ms := time.Since(time.Unix(0, t)).Milliseconds()
@@ -264,6 +289,7 @@ type summary struct {
 	Mode             string   `json:"mode"`
 	Connected        bool     `json:"connected"`
 	FirstFrameMs     int64    `json:"firstFrameMs"`
+	FirstKey         bool     `json:"firstKey"`
 	RtpPackets       uint64   `json:"rtpPackets"`
 	Frames           uint64   `json:"frames"`
 	Keyframes        uint64   `json:"keyframes"`
@@ -271,6 +297,7 @@ type summary struct {
 	DumpFile         string   `json:"dumpFile,omitempty"`
 	Relay            bool     `json:"relay"`
 	PlisSent         uint64   `json:"plisSent"`
+	KeyframeReqs     uint64   `json:"keyframeReqs"`
 	PliToIdrMaxMs    int64    `json:"pliToIdrMaxMs"`
 	DurationMs       int64    `json:"durationMs"`
 	AssertionsPassed bool     `json:"assertionsPassed"`
@@ -282,12 +309,13 @@ func (v *viewer) collect(mode, dump string, ran time.Duration) *summary {
 		Mode: mode, Relay: v.relay, DumpFile: dump,
 		RtpPackets: v.rtpPkts.Load(), Frames: v.frames.Load(),
 		Keyframes: v.keyframes.Load(), Bytes: v.bytes.Load(),
-		PlisSent: v.plisSent.Load(), PliToIdrMaxMs: v.pliIDRMax.Load(),
+		PlisSent: v.plisSent.Load(), KeyframeReqs: v.keyframeReqs.Load(), PliToIdrMaxMs: v.pliIDRMax.Load(),
 		DurationMs: ran.Milliseconds(),
 	}
 	if t := v.firstAt.Load(); t != 0 {
 		s.FirstFrameMs = time.Unix(0, t).Sub(v.start).Milliseconds()
 		s.Connected = true
+		s.FirstKey = v.firstKey.Load()
 	}
 	return s
 }
@@ -303,6 +331,16 @@ func (s *summary) evaluate(c *config) {
 	}
 	if c.expectKeyframes > 0 && s.Keyframes < uint64(c.expectKeyframes) {
 		s.Failures = append(s.Failures, fmt.Sprintf("keyframes %d < %d", s.Keyframes, c.expectKeyframes))
+	}
+	if c.expectFramesMax > 0 && s.Frames > uint64(c.expectFramesMax) {
+		s.Failures = append(s.Failures, fmt.Sprintf("frames %d > %d (static desktop should stay near-silent)", s.Frames, c.expectFramesMax))
+	}
+	if c.expectFirstKey {
+		if s.FirstFrameMs == 0 {
+			s.Failures = append(s.Failures, "no frames at all; cannot verify first AU is IDR")
+		} else if !s.FirstKey {
+			s.Failures = append(s.Failures, "first decoded AU was not a keyframe (join must land on IDR)")
+		}
 	}
 	if c.expectPliIdrMs > 0 && s.PlisSent > 0 {
 		if s.PliToIdrMaxMs == 0 {
@@ -326,7 +364,7 @@ func (s *summary) report(c *config) {
 	}
 }
 
-// runFor 跑满 duration:PLI 心跳(可选)+ 中途进度一行。
+// runFor 跑满 duration:PLI 心跳(可选)+ 单发 PLI(--pli-at)+ 中途进度一行。
 func (v *viewer) runFor(ctx context.Context, c *config) {
 	deadline := time.Now().Add(c.duration)
 	var pliTick <-chan time.Time
@@ -334,6 +372,12 @@ func (v *viewer) runFor(ctx context.Context, c *config) {
 		t := time.NewTicker(c.pliInterval)
 		defer t.Stop()
 		pliTick = t.C
+	}
+	var pliOnce <-chan time.Time
+	if c.pliAt > 0 {
+		t := time.NewTimer(c.pliAt)
+		defer t.Stop()
+		pliOnce = t.C
 	}
 	for {
 		if ctx.Err() != nil || time.Now().After(deadline) {
@@ -344,7 +388,24 @@ func (v *viewer) runFor(ctx context.Context, c *config) {
 			return
 		case <-pliTick:
 			v.sendPLI(2 * time.Second)
+		case <-pliOnce:
+			pliOnce = nil // 单发
+			if ok := v.sendPLI(2 * time.Second); ok {
+				v.log.Info("one-shot PLI sent (--pli-at)")
+			}
 		case <-time.After(200 * time.Millisecond):
+			// 丢包自救:首帧迟迟未落地(首 IDR 被链路打散)→ 经信令重请
+			// 关键帧,节流 = 冷却期不短于 --keyframe-retry-after 的一半。
+			if c.keyframeRetryAfter > 0 && v.keyframeReqFn != nil && v.frames.Load() == 0 {
+				ref := v.lastKeyReqAt.Load()
+				if ref == 0 {
+					ref = v.start.UnixNano()
+				}
+				if time.Since(time.Unix(0, ref)) >= c.keyframeRetryAfter {
+					v.keyframeReqFn()
+					v.lastKeyReqAt.Store(time.Now().UnixNano())
+				}
+			}
 			v.log.Info("progress", "frames", v.frames.Load(), "keyframes", v.keyframes.Load())
 		}
 	}
@@ -536,9 +597,21 @@ func runServer(c *config) (*summary, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 信令级关键帧重请(丢包自救):keyframeReqFn 由 runFor 的冷却逻辑调用。
+	v.keyframeReqFn = func() {
+		v.keyframeReqs.Add(1)
+		wctx, wcancel := context.WithTimeout(ctx, 10*time.Second)
+		defer wcancel()
+		b, _ := json.Marshal(map[string]any{"type": "keyframe-req"})
+		_ = ws.Write(wctx, websocket.MessageText, b)
+	}
 
-	// 入站信令泵:answer/ice/state → viewer PC。
+	// 入站信令泵:单 goroutine 读全部帧——coder/websocket 禁止并发 Reader。
+	// T4 写法里 waitReady 与本泵并发读同一连接,server 模式当时未经 live
+	// 验证,T6 实测暴露:泵死于 concurrent read,answer 永远到不了 viewer
+	// (表现为 PC 恒 new)。ready 经 channel 交给主流程后再发 offer。
 	wsErr := make(chan error, 1)
+	readyCh := make(chan struct{}, 1)
 	go func() {
 		for {
 			mt, r, err := ws.Reader(ctx)
@@ -564,6 +637,11 @@ func runServer(c *config) (*summary, error) {
 				continue
 			}
 			switch f.Type {
+			case "ready":
+				select {
+				case readyCh <- struct{}{}:
+				default:
+				}
 			case "answer":
 				if err := v.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: f.SDP}); err != nil {
 					wsErr <- fmt.Errorf("set answer: %w", err)
@@ -583,8 +661,12 @@ func runServer(c *config) (*summary, error) {
 	}()
 
 	// ready → offer;trickle 反向(回调先于 SetLocal 注册,理由见 runDirect)。
-	if err := waitReady(ctx, ws); err != nil {
+	select {
+	case <-readyCh:
+	case err := <-wsErr:
 		return v.collect("server", c.out, time.Since(v.start)), err
+	case <-ctx.Done():
+		return v.collect("server", c.out, time.Since(v.start)), ctx.Err()
 	}
 	v.pc.OnICECandidate(func(cand *webrtc.ICECandidate) {
 		if cand == nil {
@@ -620,37 +702,6 @@ func runServer(c *config) (*summary, error) {
 		_ = v.out.Close()
 	}
 	return v.collect("server", c.out, time.Since(v.start)), nil
-}
-
-// waitReady 消费信令流直到 ready(忽略更早到达的 ice 等)。
-func waitReady(ctx context.Context, ws *websocket.Conn) error {
-	for {
-		mt, r, err := ws.Reader(ctx)
-		if err != nil {
-			return err
-		}
-		if mt != websocket.MessageText {
-			continue
-		}
-		b, err := io.ReadAll(io.LimitReader(r, 1<<20))
-		if err != nil {
-			return err
-		}
-		var f struct {
-			Type  string `json:"type"`
-			Code  string `json:"code"`
-			Width uint32 `json:"width"`
-		}
-		if json.Unmarshal(b, &f) != nil {
-			continue
-		}
-		switch f.Type {
-		case "ready":
-			return nil
-		case "error":
-			return fmt.Errorf("agent error frame: %s", f.Code)
-		}
-	}
 }
 
 func main() {

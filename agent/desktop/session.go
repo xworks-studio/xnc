@@ -23,6 +23,9 @@
 //	{"type":"offer","sdp":"v=0..."}             恰一次;触发建 PC + answer。
 //	{"type":"ice","candidate":{...}|null}       trickle 候选;null(浏览器
 //	    end-of-candidates)忽略——pion 自行完成收集。
+//	{"type":"keyframe-req"}                     显式关键帧请求(T6 加:浏览器无
+//	    法从 JS 发 RTCP PLI,实验页 PLI 按钮走此帧;映射到与真 PLI 同一条
+//	    RequestKeyframe 路径,reason="viewer-pli")。
 //
 // 二进制帧:本 kind 无。未知 type 一律忽略(向后兼容)。
 //
@@ -48,12 +51,13 @@ import (
 
 // 信令帧 type 词汇(与文件头注释一一对应;T5/T6 契约)。
 const (
-	vocabReady  = "ready"
-	vocabOffer  = "offer"
-	vocabAnswer = "answer"
-	vocabICE    = "ice"
-	vocabState  = "state"
-	vocabError  = "error"
+	vocabReady       = "ready"
+	vocabOffer       = "offer"
+	vocabAnswer      = "answer"
+	vocabICE         = "ice"
+	vocabState       = "state"
+	vocabError       = "error"
+	vocabKeyframeReq = "keyframe-req"
 )
 
 const (
@@ -178,14 +182,24 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 	for {
 		mt, r, err := ws.Reader(ctx)
 		if err != nil {
+			// 会话终因可见性(T6 调试加):ctx 取消 / viewer 断开 / server 关泵。
+			log.Info("desktop session ended", "err", err.Error())
 			return // ctx 取消 / viewer 断开 / server 关泵
 		}
 		if mt != websocket.MessageText {
 			continue
 		}
+		// 必须先把整帧读尽再解析:json.Decoder.Decode 在值结束处即停,
+		// 大 SDP 经真实网络分段到达时会留下未读字节,下一次 Reader() 即
+		// "previous message not read to completion" 断流(回环单分段测不出,
+		// T6 XIAOXIN 实测暴露)。ReadAll 后 Unmarshal 与 e2eviewer 同款。
+		b, err := io.ReadAll(io.LimitReader(r, sigReadLimit))
+		if err != nil {
+			continue
+		}
 		var f compactFrame
-		if err := json.NewDecoder(io.LimitReader(r, sigReadLimit)).Decode(&f); err != nil {
-			continue // 非 JSON/超限:忽略,信令流自愈
+		if json.Unmarshal(b, &f) != nil {
+			continue // 非 JSON:忽略,信令流自愈
 		}
 		switch f.Type {
 		case vocabOffer:
@@ -204,6 +218,12 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 			}
 			if err := pub.AddCandidate(*f.Candidate); err != nil {
 				log.Debug("add ice candidate failed", "err", err)
+			}
+		case vocabKeyframeReq:
+			// 浏览器 PLI 按钮(T6):无法从 JS 发 RTCP PLI,信令帧走同一
+			// RequestKeyframe 路径(reason="viewer-pli" 进 host 记账)。
+			if err := src.RequestKeyframe("viewer-pli"); err != nil {
+				log.Debug("viewer keyframe request failed", "err", err)
 			}
 		default:
 			// 未知 type:忽略(向后兼容词汇演进)。

@@ -501,6 +501,25 @@ func TestSessionLoopbackVideoAndPLI(t *testing.T) {
 	}
 	waitKeyframes(t, vstats, kf0+1, 5*time.Second) // PLI → 新 IDR(松弛 5s 抗抖动)
 
+	// ④b keyframe-req 信令帧(浏览器 PLI 按钮路径,T6)→ 同一
+	// RequestKeyframe 路径(reason="viewer-pli")→ 新 IDR。
+	kf1 := vstats.keyframes.Load()
+	sendJSON(t, ctx, vws, map[string]any{"type": vocabKeyframeReq})
+	gotViewerPLI := false
+	deadline = time.Now().Add(5 * time.Second)
+	for !gotViewerPLI && time.Now().Before(deadline) {
+		for _, r := range src.KeyRequests() {
+			if r == "viewer-pli" {
+				gotViewerPLI = true
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !gotViewerPLI {
+		t.Fatalf("keyframe-req never reached source as RequestKeyframe(\"viewer-pli\"); reqs=%v", src.KeyRequests())
+	}
+	waitKeyframes(t, vstats, kf1+1, 5*time.Second)
+
 	// ⑤ 会话关闭:ctx 取消 → Source 关闭 + Stop 恰一次 + Handler 返回。
 	cancel()
 	select {

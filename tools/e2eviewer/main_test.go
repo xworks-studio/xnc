@@ -73,6 +73,29 @@ func TestSummaryEvaluate(t *testing.T) {
 	if !none.AssertionsPassed {
 		t.Fatalf("no-assert config should pass: %+v", none)
 	}
+
+	// T6 静止/承接断言:--expect-frames-max 与 --expect-first-key。
+	sc := &config{expectFramesMax: 10, expectFirstKey: true, duration: time.Second}
+	quiet := &summary{FirstFrameMs: 900, FirstKey: true, Keyframes: 1, Frames: 4}
+	quiet.evaluate(sc)
+	if !quiet.AssertionsPassed {
+		t.Fatalf("quiet static case failed: %+v", quiet)
+	}
+	noisy := &summary{FirstFrameMs: 900, FirstKey: true, Keyframes: 1, Frames: 40}
+	noisy.evaluate(sc)
+	if noisy.AssertionsPassed || len(noisy.Failures) != 1 {
+		t.Fatalf("noisy static case should fail on frames-max: %+v", noisy)
+	}
+	deltaJoin := &summary{FirstFrameMs: 900, FirstKey: false, Keyframes: 1, Frames: 5}
+	deltaJoin.evaluate(sc)
+	if deltaJoin.AssertionsPassed || len(deltaJoin.Failures) != 1 {
+		t.Fatalf("non-IDR first AU should fail expect-first-key: %+v", deltaJoin)
+	}
+	noFrames := &summary{}
+	noFrames.evaluate(sc)
+	if noFrames.AssertionsPassed || len(noFrames.Failures) != 1 {
+		t.Fatalf("no frames should fail expect-first-key (not crash): %+v", noFrames)
+	}
 }
 
 // 编译期锁 ICE server 形态(pion 版本升级时的兼容哨兵)。

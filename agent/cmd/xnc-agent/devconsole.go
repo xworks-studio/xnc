@@ -67,8 +67,17 @@ func devMachineID(name string) string {
 }
 
 // runDevConsole 前台运行 dev agent：Ctrl+C（ctx 取消）视为正常退出，
-// 状态目录随返回整体删除。
-func runDevConsole(server, token, name, logFile string) error {
+// 状态目录随返回整体删除。desktopCorePipe/desktopCoreSecretHex 是 dev
+// 桌面采集 seam（M1-Slice2 T6）：齐全时映射到 XNC_DESKTOP_CORE_PIPE /
+// XNC_DESKTOP_CORE_SECRET_HEX（agent/desktop.NewHandlerFromEnv 的注册开关；
+// core 以 --console --smoke-secret 诊断模式跑时 pipe 名/secret 即其 argv）。
+// secret 只进环境变量，绝不入日志。
+func runDevConsole(server, token, name, logFile, desktopCorePipe, desktopCoreSecretHex string) error {
+	if desktopCorePipe != "" && desktopCoreSecretHex != "" {
+		os.Setenv("XNC_DESKTOP_CORE_PIPE", desktopCorePipe)
+		os.Setenv("XNC_DESKTOP_CORE_SECRET_HEX", desktopCoreSecretHex)
+		slog.Info("dev agent: desktop kind enabled (core pipe configured)") // 无 secret
+	}
 	if logFile != "" {
 		if f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
 			defer f.Close()
