@@ -151,8 +151,14 @@ bool ServerHandshake(TimedIo& io, const uint8_t* secret, size_t secret_len,
     return false;
   }
   uint8_t ononce[kNonceSize];
-  if (!BCRYPT_SUCCESS(BCryptGenRandom(nullptr, ononce, static_cast<ULONG>(kNonceSize), 0))) {
-    XNC_LOG_ERROR("handshake: BCryptGenRandom failed");
+  // NULL algorithm handle requires BCRYPT_USE_SYSTEM_PREFERRED_RNG; without
+  // the flag BCryptGenRandom fails with STATUS_INVALID_HANDLE and every
+  // handshake (real IO path) would abort right after HELLO (M0 elevated-gate
+  // bug; caught by the in-process loopback selftest).
+  NTSTATUS rng = BCryptGenRandom(nullptr, ononce, static_cast<ULONG>(kNonceSize),
+                                 BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+  if (!BCRYPT_SUCCESS(rng)) {
+    XNC_LOG_ERROR("handshake: BCryptGenRandom failed status=0x%08lX", (unsigned long)rng);
     return false;
   }
   uint8_t proof[kProofSize];
@@ -222,6 +228,24 @@ void ServeFrames(TimedIo& io, Watchdog* wd, uint32_t client_pid) {
 
 }  // namespace
 
+// Serve one already-accepted overlapped pipe instance: the mutual-proof
+// handshake, then the PING/PONG frame loop until the client disconnects.
+// This is RunPipeServer's exact per-connection path, exposed so the
+// selftest loopback can drive it in-process against a permissive
+// test-only DACL pipe (production DACL is spec 9.1, untouched).
+bool ServeConnection(HANDLE pipe, Watchdog* wd, const uint8_t* secret,
+                     size_t secret_len, uint32_t* client_pid) {
+  TimedIo io(pipe, wd);
+  if (!io.Ok()) {
+    XNC_LOG_ERROR("CreateEvent failed err=%lu", GetLastError());
+    return false;
+  }
+  *client_pid = 0;
+  if (!ServerHandshake(io, secret, secret_len, client_pid)) return false;
+  ServeFrames(io, wd, *client_pid);
+  return true;
+}
+
 int RunPipeServer(const wchar_t* pipe_name, const uint8_t* secret, size_t secret_len) {
   SetConsoleCtrlHandler(OnCtrlEvent, TRUE);  // best effort; loop polls g_stop
   Watchdog wd;
@@ -288,13 +312,8 @@ int RunPipeServer(const wchar_t* pipe_name, const uint8_t* secret, size_t secret
     wd.Heartbeat();
     XNC_LOG_INFO("client connected");
     {
-      TimedIo io(pipe, &wd);
       uint32_t client_pid = 0;
-      if (!io.Ok()) {
-        XNC_LOG_ERROR("CreateEvent failed err=%lu", GetLastError());
-      } else if (ServerHandshake(io, secret, secret_len, &client_pid)) {
-        ServeFrames(io, &wd, client_pid);
-      }
+      ServeConnection(pipe, &wd, secret, secret_len, &client_pid);
     }
     FlushFileBuffers(pipe);  // best-effort drain before teardown
     DisconnectNamedPipe(pipe);
