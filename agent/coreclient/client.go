@@ -1,19 +1,28 @@
 //go:build windows
 
 // Package coreclient 实现 agent 侧 XNIP named pipe 客户端(spec §9):
-// winio 拨号 + 双向认证握手(§9.3)+ 保活 Ping。帧编解码与证明计算
-// 复用 xnc/proto/ipc;PID/映像路径校验(OpenProcess + Authenticode)
-// 属连接层,由 xnc-core 侧(M1)补全,本包不感知。
+// winio 拨号 + 双向认证握手(§9.3)+ 保活 Ping + START/STOP_CAPTURE
+// RPC(M1-Slice2,固定二进制 payload,protobuf 迁移 Slice3)。帧编解码
+// 与证明计算复用 xnc/proto/ipc;PID/映像路径校验(OpenProcess +
+// Authenticode)属连接层,由 xnc-core 侧(M1)补全,本包不感知。
 //
 // 仅 Windows 构建(named pipe);与 agent/session 的 windows-only 测试
-// 同风格。Client M0 阶段非并发安全:Ping 期间独占连接。
+// 同风格。
+//
+// 并发边界(M1-Slice2):请求路径(Ping/StartCapture/StopCapture/Close)
+// goroutine 安全——单一后台读泵按 RequestID 关联 pending map,写侧
+// 互斥串行。剩余限制(ledger 项):Dial/ServerHandshake 仍为同步单发;
+// 服务端主动事件帧(core→agent,M2)当前被泵丢弃;Close 不等待泵退出。
 package coreclient
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/Microsoft/go-winio"
@@ -23,15 +32,44 @@ import (
 const (
 	// handshakeTimeout 覆盖拨号等待与整个三步握手,防对端僵死挂起。
 	handshakeTimeout = 5 * time.Second
-	// pingTimeout 是 Ping 等待 Pong 的读 deadline。
+	// pingTimeout 是 Ping 等待 Pong 的时限。
 	pingTimeout = 2 * time.Second
+	// rpcTimeout 覆盖 START/STOP_CAPTURE:核心侧含子进程 spawn +
+	// pipe 就绪等待(≤2s)+ 会话令牌铸造,取充裕上界。
+	rpcTimeout = 15 * time.Second
+	// captureSecretLen 是 START_CAPTURE 响应携带的 desktop pipe secret
+	// 固定长度(与 native/core 生成侧一致)。
+	captureSecretLen = 32
 )
 
-// Client 是一条已完成握手的 pipe 连接。conn 仅经方法访问。
+// 应用 RPC 类型(0x0100 注册块;native/core/pipe_server.h 的 Go 镜像)。
+const (
+	MsgStartCapture uint16 = 0x0100
+	MsgStopCapture  uint16 = 0x0101
+)
+
+// Client 是一条已完成握手的 pipe 连接。请求经 roundTrip 走后台读泵;
+// conn 的读侧仅由泵访问,写侧由 writeMu 串行。
 type Client struct {
-	conn  net.Conn
-	reqID uint32
+	conn    net.Conn
+	writeMu sync.Mutex // 串行化请求帧写入
+
+	mu      sync.Mutex // 守护以下字段
+	reqID   uint32
+	pending map[uint32]chan rpcResult
+	readErr error // 置位后连接判死,后续请求立即失败
+	started bool   // 读泵已启动
+	closed  bool
+	wg      sync.WaitGroup
 }
+
+// rpcResult 是一次挂起请求的交付物:响应帧或连接级错误。
+type rpcResult struct {
+	f   *ipc.Frame
+	err error
+}
+
+var errClosed = errors.New("coreclient: connection closed")
 
 // Dial 连接 named pipe 并完成三步握手:
 //
@@ -87,33 +125,210 @@ func Dial(pipeName string, secret []byte) (*Client, error) {
 }
 
 // Ping 发送 MsgPing 并等待同 RequestID 的 MsgPong 响应,返回 RTT。
-// 读设 2s deadline;期间到达的不相干帧(事件流等)被丢弃继续等待。
+// 不相干帧(事件流等)由读泵丢弃。RTT 可为 0:Windows 单调钟粒度
+// ~0.5ms,本地 pipe 往返常低于一个 tick;成功判据是 err==nil。
 func (c *Client) Ping() (time.Duration, error) {
+	start := time.Now()
+	if _, err := c.roundTrip(pingTimeout, ipc.MsgPing, nil); err != nil {
+		return 0, err
+	}
+	return time.Since(start), nil
+}
+
+// StartCapture 请求核心在指定 WTS 会话启动桌面采集(0x0100):
+// 请求 payload `[u32 wts][u32 pad=0]`;成功响应 payload
+// `[u32 pid][u16 nameLen][name utf8 字节][32B secret][u32 gen]`
+// (nameLen = name 的 UTF-8 字节长度)。核心侧幂等:采集已运行时返回
+// 既有 pipe/secret/gen,不重复 spawn。FlagError 响应以 payload 文本
+// (ASCII 错误码)进错误。
+func (c *Client) StartCapture(wtsSession uint32) (hostPid uint32, pipeName string, secret []byte, gen uint32, err error) {
+	f, err := c.roundTrip(rpcTimeout, MsgStartCapture, encodeStartCaptureReq(wtsSession))
+	if err != nil {
+		return 0, "", nil, 0, err
+	}
+	return decodeStartCaptureResp(f.Payload)
+}
+
+// StopCapture 请求核心停止桌面采集(0x0101,空 payload)。核心侧
+// Slice2 为 TerminateProcess 子进程(优雅排水在后续);空闲时同样回
+// 成功(幂等)。
+func (c *Client) StopCapture() error {
+	_, err := c.roundTrip(rpcTimeout, MsgStopCapture, nil)
+	return err
+}
+
+// roundTrip 写一条请求帧并等待同 RequestID 的 FlagResponse(时限
+// timeout)。FlagError 响应转为携带 payload 文本的错误。goroutine
+// 安全:并发调用各自挂入 pending map,由单一读泵配对交付。
+func (c *Client) roundTrip(timeout time.Duration, mt uint16, payload []byte) (*ipc.Frame, error) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, errClosed
+	}
+	if c.readErr != nil {
+		err := fmt.Errorf("coreclient: connection unusable: %w", c.readErr)
+		c.mu.Unlock()
+		return nil, err
+	}
+	if c.pending == nil {
+		c.pending = make(map[uint32]chan rpcResult)
+	}
 	c.reqID++
 	id := c.reqID
-	_ = c.conn.SetReadDeadline(time.Now().Add(pingTimeout))
-	defer func() { _ = c.conn.SetReadDeadline(time.Time{}) }()
-
-	start := time.Now()
-	if err := ipc.WriteFrame(c.conn, &ipc.Frame{
-		MessageType: ipc.MsgPing,
-		RequestID:   id,
-	}); err != nil {
-		return 0, fmt.Errorf("coreclient: send ping: %w", err)
+	ch := make(chan rpcResult, 1) // 缓冲 1:泵交付后无需等待接收方
+	c.pending[id] = ch
+	if !c.started {
+		c.started = true
+		c.wg.Add(1)
+		go c.readPump()
 	}
+	c.mu.Unlock()
+
+	c.writeMu.Lock()
+	werr := ipc.WriteFrame(c.conn, &ipc.Frame{MessageType: mt, RequestID: id, Payload: payload})
+	c.writeMu.Unlock()
+	if werr != nil {
+		c.failPending(id, nil)
+		return nil, fmt.Errorf("coreclient: send %s: %w", msgName(mt), werr)
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			return nil, fmt.Errorf("coreclient: %s: %w", msgName(mt), r.err)
+		}
+		if r.f.Flags&ipc.FlagError != 0 {
+			return nil, fmt.Errorf("coreclient: %s rejected: %s", msgName(mt), respText(r.f))
+		}
+		return r.f, nil
+	case <-timer.C:
+		c.failPending(id, nil)
+		return nil, fmt.Errorf("coreclient: %s: no response within %s", msgName(mt), timeout)
+	}
+}
+
+// readPump 是唯一读方:读到响应帧按 RequestID 交付,无挂起方的帧
+// (服务端主动事件,M2 接线)当前丢弃;读错误置死连接并唤醒全部
+// 挂起请求。
+func (c *Client) readPump() {
+	defer c.wg.Done()
 	for {
 		f, err := ipc.ReadFrame(c.conn)
+		c.mu.Lock()
 		if err != nil {
-			return 0, fmt.Errorf("coreclient: read pong: %w", err)
+			c.readErr = err
+			pend := c.pending
+			c.pending = nil
+			c.mu.Unlock()
+			for _, ch := range pend {
+				ch <- rpcResult{err: err}
+			}
+			return
 		}
-		if f.MessageType == ipc.MsgPong && f.Flags&ipc.FlagResponse == ipc.FlagResponse && f.RequestID == id {
-			return time.Since(start), nil
+		ch, ok := c.pending[f.RequestID]
+		if ok {
+			delete(c.pending, f.RequestID)
+		}
+		c.mu.Unlock()
+		if ok {
+			ch <- rpcResult{f: f}
 		}
 	}
 }
 
-// Close 关闭底层连接。
-func (c *Client) Close() error { return c.conn.Close() }
+// failPending 摘除一条挂起请求;err 非 nil 时向其交付连接级错误。
+func (c *Client) failPending(id uint32, err error) {
+	c.mu.Lock()
+	ch, ok := c.pending[id]
+	if ok {
+		delete(c.pending, id)
+	}
+	c.mu.Unlock()
+	if ok && err != nil {
+		ch <- rpcResult{err: err}
+	}
+}
+
+// Close 关闭底层连接并唤醒全部挂起请求(以 errClosed)。幂等;不等待
+// 读泵退出(连接关闭即令其退出)。
+func (c *Client) Close() error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil
+	}
+	c.closed = true
+	pend := c.pending
+	c.pending = nil
+	c.mu.Unlock()
+	err := c.conn.Close()
+	for _, ch := range pend {
+		ch <- rpcResult{err: errClosed}
+	}
+	return err
+}
+
+// ---- 0x0100/0x0101 payload 编解码(布局见方法注释;小端) ----
+
+// encodeStartCaptureReq 编码请求 `[u32 wts][u32 pad=0]`。
+func encodeStartCaptureReq(wts uint32) []byte {
+	p := make([]byte, 8)
+	binary.LittleEndian.PutUint32(p, wts)
+	binary.LittleEndian.PutUint32(p[4:], 0) // 保留位,发送侧恒 0
+	return p
+}
+
+// decodeStartCaptureResp 解码响应 `[u32 pid][u16 nameLen][name utf8]
+// [32B secret][u32 gen]`;长度不自洽或 name 为空即协议错误。
+func decodeStartCaptureResp(p []byte) (pid uint32, name string, secret []byte, gen uint32, err error) {
+	const hdr = 6 // u32 pid + u16 nameLen
+	if len(p) < hdr+captureSecretLen+4 {
+		return 0, "", nil, 0, fmt.Errorf("coreclient: start_capture response %d bytes, want >= %d", len(p), hdr+captureSecretLen+4)
+	}
+	pid = binary.LittleEndian.Uint32(p)
+	nameLen := int(binary.LittleEndian.Uint16(p[4:hdr]))
+	if len(p) != hdr+nameLen+captureSecretLen+4 {
+		return 0, "", nil, 0, fmt.Errorf("coreclient: start_capture response length mismatch: nameLen=%d total=%d", nameLen, len(p))
+	}
+	off := hdr
+	name = string(p[off : off+nameLen])
+	off += nameLen
+	if name == "" {
+		return 0, "", nil, 0, errors.New("coreclient: start_capture response: empty pipe name")
+	}
+	secret = append([]byte(nil), p[off:off+captureSecretLen]...)
+	off += captureSecretLen
+	gen = binary.LittleEndian.Uint32(p[off:])
+	return pid, name, secret, gen, nil
+}
+
+func msgName(mt uint16) string {
+	switch mt {
+	case ipc.MsgPing:
+		return "ping"
+	case MsgStartCapture:
+		return "start_capture"
+	case MsgStopCapture:
+		return "stop_capture"
+	}
+	return fmt.Sprintf("msg %#04x", mt)
+}
+
+// respText 提取 FlagError 帧的 ASCII 错误码(不可打印则给字节数)。
+func respText(f *ipc.Frame) string {
+	if len(f.Payload) == 0 {
+		return "<empty>"
+	}
+	for _, b := range f.Payload {
+		if b < 0x20 || b > 0x7E {
+			return fmt.Sprintf("<%d binary bytes>", len(f.Payload))
+		}
+	}
+	return string(f.Payload)
+}
 
 // ServerHandshake 在已接受的连接上执行服务端握手半边:
 //

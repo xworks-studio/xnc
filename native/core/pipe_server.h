@@ -22,12 +22,15 @@ class Watchdog;
 constexpr size_t kMaxPipeSecretBytes = 128;
 
 // App RPC types, start of the 0x0100 registry block (spec 9.2: 0x0001..0x000F
-// are frame-level, 0x0100+ are app RPC). Payload wiring is M1-Slice3; the
-// reserved request layout for kMsgStartCapture is
-//   [wts_session u32][ascii exe-rel-path][ascii args, \x1f-separated]
-// (fixed-width little-endian header, no protobuf yet) and the response
-// [pid u32][exit_semantics]. Until then the server answers these types with
-// a FlagError frame whose payload is the ASCII "NOT_IMPLEMENTED".
+// are frame-level, 0x0100+ are app RPC). M1-Slice2 fixed-binary layouts
+// (little-endian; protobuf migration is Slice3):
+//   kMsgStartCapture request  [wts_session u32][pad u32 = 0]
+//     -> ok response  [pid u32][name_len u16][pipe name utf8 bytes]
+//                     [secret 32B][gen u32]
+//     -> error response = FlagError frame, payload ASCII stable code
+//        (BAD_PAYLOAD / SESSION_MISMATCH / RNG_FAILED / TOKEN_FAILED /
+//         SPAWN_FAILED / PIPE_TIMEOUT / INTERNAL)
+//   kMsgStopCapture  request  (empty) -> empty FlagResponse (idempotent)
 constexpr uint16_t kMsgStartCapture = 0x0100, kMsgStopCapture = 0x0101;
 
 // Serve <pipe_name> with the pipe secret (secret_len bytes). Blocks for the

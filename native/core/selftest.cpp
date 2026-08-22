@@ -200,27 +200,38 @@ int SelftestMain() {
         Frame pong;
         CHECK("loopback-pong", ReadFrame(c, pong) == DecodeResult::Ok && pong.message_type == kMsgPong &&
                               (pong.flags & kFlagResponse) != 0 && pong.request_id == 7);
-        // Task 6: START/STOP_CAPTURE(0x0100/0x0101)分派桩 —— payload 接线在
-        // M1-Slice3,现在必须回 FlagError + "NOT_IMPLEMENTED"(ping 仍正常)。
-        CHECK("loopback-start-capture-send",
-              WriteFrame(c, Frame{0, kMsgStartCapture, 8, {}}));
+        // Task 3 (M1-Slice2): START/STOP_CAPTURE 已实装。selftest 走封闭
+        // 路径(不真 spawn):坏 payload(pad!=0)→ BAD_PAYLOAD;错会话
+        // (0x00ABCDEF 永不等于活动 console 会话;无头机 active=
+        // 0xFFFFFFFF 同样 mismatch)→ SESSION_MISMATCH;空闲 STOP →
+        // 幂等空响应(无 FlagError)。真 spawn 路径由提权门
+        // coreclient.TestStartCaptureCross 覆盖。
+        CHECK("loopback-start-capture-badpayload-send",
+              WriteFrame(c, Frame{0, kMsgStartCapture, 8,
+                                  {0x01,0,0,0, 0x09,0,0,0}}));
         Frame sc;
-        CHECK("loopback-start-capture-notimpl",
+        CHECK("loopback-start-capture-badpayload",
               ReadFrame(c, sc) == DecodeResult::Ok && sc.message_type == kMsgStartCapture &&
               (sc.flags & (kFlagResponse | kFlagError)) == (kFlagResponse | kFlagError) &&
-              sc.request_id == 8 &&
-              sc.payload.size() == 15 &&
-              std::memcmp(sc.payload.data(), "NOT_IMPLEMENTED", 15) == 0);
+              sc.request_id == 8 && sc.payload.size() == 11 &&
+              std::memcmp(sc.payload.data(), "BAD_PAYLOAD", 11) == 0);
+        CHECK("loopback-start-capture-badsession-send",
+              WriteFrame(c, Frame{0, kMsgStartCapture, 11,
+                                  {0xEF,0xBC,0xAB,0x00, 0,0,0,0}}));
+        Frame sc2;
+        CHECK("loopback-start-capture-badsession",
+              ReadFrame(c, sc2) == DecodeResult::Ok && sc2.message_type == kMsgStartCapture &&
+              (sc2.flags & (kFlagResponse | kFlagError)) == (kFlagResponse | kFlagError) &&
+              sc2.request_id == 11 && sc2.payload.size() == 16 &&
+              std::memcmp(sc2.payload.data(), "SESSION_MISMATCH", 16) == 0);
         CHECK("loopback-stop-capture-send",
               WriteFrame(c, Frame{0, kMsgStopCapture, 9, {}}));
         Frame st;
-        CHECK("loopback-stop-capture-notimpl",
+        CHECK("loopback-stop-capture-idle-ok",
               ReadFrame(c, st) == DecodeResult::Ok && st.message_type == kMsgStopCapture &&
-              (st.flags & (kFlagResponse | kFlagError)) == (kFlagResponse | kFlagError) &&
-              st.request_id == 9 &&
-              st.payload.size() == 15 &&
-              std::memcmp(st.payload.data(), "NOT_IMPLEMENTED", 15) == 0);
-        // 桩之后 PING 仍工作(握手/ping 不受影响)。
+              (st.flags & kFlagResponse) != 0 && (st.flags & kFlagError) == 0 &&
+              st.request_id == 9 && st.payload.empty());
+        // RPC 之后 PING 仍工作(握手/ping 不受影响)。
         CHECK("loopback-ping-after-stub", WriteFrame(c, Frame{0, kMsgPing, 10, {}}));
         Frame pong2;
         CHECK("loopback-pong-after-stub",
