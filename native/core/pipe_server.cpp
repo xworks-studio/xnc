@@ -212,6 +212,21 @@ void ServeFrames(TimedIo& io, Watchdog* wd, uint32_t client_pid) {
         if (!WriteFrameTimed(io, pong)) return;
         break;
       }
+      case kMsgStartCapture:
+      case kMsgStopCapture: {
+        // Dispatch stub (Task 6): the real payload parse + TokenManager /
+        // SpawnInSession wiring is M1-Slice3. Clients probing now get a
+        // clean NOT_IMPLEMENTED error frame instead of a generic unknown-
+        // type reply, so support is detectable.
+        XNC_LOG_INFO("message type=0x%04x from pid=%lu: not implemented "
+                     "(M1-Slice3 payload wiring)",
+                     f.message_type, client_pid);
+        const char ni[] = "NOT_IMPLEMENTED";
+        Frame stub{kFlagResponse | kFlagError, f.message_type, f.request_id,
+                   std::vector<uint8_t>(ni, ni + sizeof(ni) - 1)};
+        if (!WriteFrameTimed(io, stub)) return;
+        break;
+      }
       case kMsgBye:
         XNC_LOG_INFO("client pid=%lu said BYE", client_pid);
         return;

@@ -21,6 +21,15 @@ class Watchdog;
 // (64 hex chars). The real one arrives via the spawn channel in M1.
 constexpr size_t kMaxPipeSecretBytes = 128;
 
+// App RPC types, start of the 0x0100 registry block (spec 9.2: 0x0001..0x000F
+// are frame-level, 0x0100+ are app RPC). Payload wiring is M1-Slice3; the
+// reserved request layout for kMsgStartCapture is
+//   [wts_session u32][ascii exe-rel-path][ascii args, \x1f-separated]
+// (fixed-width little-endian header, no protobuf yet) and the response
+// [pid u32][exit_semantics]. Until then the server answers these types with
+// a FlagError frame whose payload is the ASCII "NOT_IMPLEMENTED".
+constexpr uint16_t kMsgStartCapture = 0x0100, kMsgStopCapture = 0x0101;
+
 // Serve <pipe_name> with the pipe secret (secret_len bytes). Blocks for the
 // process lifetime; returns the process exit code (0 on Ctrl+C, 1 on fatal).
 int RunPipeServer(const wchar_t* pipe_name, const uint8_t* secret, size_t secret_len);

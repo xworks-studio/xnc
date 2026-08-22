@@ -20,6 +20,8 @@
 #include "../common/frame.h"
 #include "../common/handshake.h"
 #include "pipe_server.h"
+#include "spawn.h"
+#include "token_manager.h"
 #include "watchdog.h"
 
 #include <atomic>
@@ -71,6 +73,59 @@ int SelftestMain() {
         Frame hp{0, kMsgHelloProof, 0, EncodeHelloProof(7, nonce, proof)};
         uint8_t n3[16], p3[32];
         CHECK("helloproof-rt", DecodeHelloProof(hp, pid, n3, p3)==DecodeResult::Ok && pid==7 && std::memcmp(p3,proof,32)==0);
+    }
+    { // Task 6: 纯校验路径(不触真实令牌操作 —— 那需要 SYSTEM/SeTcb)
+      // 会话目标:仅活动 console 会话合法;锁屏 console 同样合法由
+      // WTSGetActiveConsoleSessionId 语义保证(纯函数只比较值,spec §6.4)。
+      CHECK("sess-allowed", SessionTargetAllowed(1, 1));
+      CHECK("sess-allowed-0", SessionTargetAllowed(0, 0));
+      CHECK("sess-wrong-id", !SessionTargetAllowed(2, 1));          // 非活动会话
+      CHECK("sess-swapped", !SessionTargetAllowed(1, 2));
+      CHECK("sess-no-console", !SessionTargetAllowed(1, 0xFFFFFFFF)); // 无物理 console
+      CHECK("sess-invalid-target", !SessionTargetAllowed(0xFFFFFFFF, 1));
+      // exe 白名单:仅接受同目录相对名 xnc-desktop.exe(可带 .\ 前缀,
+      // 大小写不敏感);绝对路径/穿越/子目录/多余后缀一律拒绝。
+      CHECK("exe-allowed", SpawnExeArgAllowed(L"xnc-desktop.exe"));
+      CHECK("exe-allowed-dotslash", SpawnExeArgAllowed(L".\\xnc-desktop.exe"));
+      CHECK("exe-allowed-case", SpawnExeArgAllowed(L"XNC-Desktop.Exe"));
+      CHECK("exe-wrong-name", !SpawnExeArgAllowed(L"cmd.exe"));
+      CHECK("exe-double-ext", !SpawnExeArgAllowed(L"xnc-desktop.exe.exe"));
+      CHECK("exe-absolute", !SpawnExeArgAllowed(L"C:\\xnc-diag\\xnc-desktop.exe"));
+      CHECK("exe-unc", !SpawnExeArgAllowed(L"\\\\srv\\share\\xnc-desktop.exe"));
+      CHECK("exe-traversal", !SpawnExeArgAllowed(L"..\\xnc-desktop.exe"));
+      CHECK("exe-subdir", !SpawnExeArgAllowed(L"bin\\xnc-desktop.exe"));
+      CHECK("exe-double-dotslash", !SpawnExeArgAllowed(L".\\.\\xnc-desktop.exe"));
+      CHECK("exe-empty", !SpawnExeArgAllowed(L""));
+      CHECK("exe-null", !SpawnExeArgAllowed(nullptr));
+      CHECK("exe-leading-space", !SpawnExeArgAllowed(L" xnc-desktop.exe"));
+      CHECK("exe-trailing-space", !SpawnExeArgAllowed(L"xnc-desktop.exe "));
+      CHECK("exe-only-dotslash", !SpawnExeArgAllowed(L".\\"));
+      // 同目录解析:dir + "\" + name(容忍 dir 尾斜杠,不产生双斜杠)。
+      CHECK("join-plain", JoinSiblingPath(L"C:\\xnc-diag", L"xnc-desktop.exe")
+                             == L"C:\\xnc-diag\\xnc-desktop.exe");
+      CHECK("join-trailing-slash", JoinSiblingPath(L"C:\\xnc-diag\\", L"xnc-desktop.exe")
+                             == L"C:\\xnc-diag\\xnc-desktop.exe");
+      CHECK("join-empty-dir", JoinSiblingPath(L"", L"xnc-desktop.exe")
+                             == L"xnc-desktop.exe");
+      // 子命令行拼装(--diag-spawn 之后原样转发,含空格参数加引号)。
+      {
+        wchar_t a0[] = L"prog", a1[] = L"--console-diag", a2[] = L"--duration",
+                a3[] = L"60", sp[] = L"C:\\my dir\\out.h264";
+        wchar_t* av[] = {a0, a1, a2, a3};
+        std::wstring cmd;
+        CHECK("cmd-simple", BuildChildCommandLine(L"xnc-desktop.exe", 4, av, 1, &cmd)
+                             && cmd == L"xnc-desktop.exe --console-diag --duration 60");
+        wchar_t* av2[] = {a0, a1, sp};
+        CHECK("cmd-quotes-spaces", BuildChildCommandLine(L"xnc-desktop.exe", 3, av2, 1, &cmd)
+                             && cmd == L"xnc-desktop.exe --console-diag \"C:\\my dir\\out.h264\"");
+        CHECK("cmd-exe-only", BuildChildCommandLine(L"xnc-desktop.exe", 1, av, 1, &cmd)
+                             && cmd == L"xnc-desktop.exe");
+        CHECK("cmd-bad-from", !BuildChildCommandLine(L"xnc-desktop.exe", 2, av, 3, &cmd));
+        wchar_t* av3[] = {a0, nullptr};
+        CHECK("cmd-null-arg", !BuildChildCommandLine(L"xnc-desktop.exe", 2, av3, 1, &cmd));
+        wchar_t* av4[] = {a0, (wchar_t*)L""};
+        CHECK("cmd-empty-arg", !BuildChildCommandLine(L"xnc-desktop.exe", 2, av4, 1, &cmd));
+      }
     }
     { // 真实 IO 路径 in-process loopback(修复波新增):
       // 服务端线程跑生产 ServeConnection(overlapped TimedIo + 握手 +
@@ -145,6 +200,32 @@ int SelftestMain() {
         Frame pong;
         CHECK("loopback-pong", ReadFrame(c, pong) == DecodeResult::Ok && pong.message_type == kMsgPong &&
                               (pong.flags & kFlagResponse) != 0 && pong.request_id == 7);
+        // Task 6: START/STOP_CAPTURE(0x0100/0x0101)分派桩 —— payload 接线在
+        // M1-Slice3,现在必须回 FlagError + "NOT_IMPLEMENTED"(ping 仍正常)。
+        CHECK("loopback-start-capture-send",
+              WriteFrame(c, Frame{0, kMsgStartCapture, 8, {}}));
+        Frame sc;
+        CHECK("loopback-start-capture-notimpl",
+              ReadFrame(c, sc) == DecodeResult::Ok && sc.message_type == kMsgStartCapture &&
+              (sc.flags & (kFlagResponse | kFlagError)) == (kFlagResponse | kFlagError) &&
+              sc.request_id == 8 &&
+              sc.payload.size() == 15 &&
+              std::memcmp(sc.payload.data(), "NOT_IMPLEMENTED", 15) == 0);
+        CHECK("loopback-stop-capture-send",
+              WriteFrame(c, Frame{0, kMsgStopCapture, 9, {}}));
+        Frame st;
+        CHECK("loopback-stop-capture-notimpl",
+              ReadFrame(c, st) == DecodeResult::Ok && st.message_type == kMsgStopCapture &&
+              (st.flags & (kFlagResponse | kFlagError)) == (kFlagResponse | kFlagError) &&
+              st.request_id == 9 &&
+              st.payload.size() == 15 &&
+              std::memcmp(st.payload.data(), "NOT_IMPLEMENTED", 15) == 0);
+        // 桩之后 PING 仍工作(握手/ping 不受影响)。
+        CHECK("loopback-ping-after-stub", WriteFrame(c, Frame{0, kMsgPing, 10, {}}));
+        Frame pong2;
+        CHECK("loopback-pong-after-stub",
+              ReadFrame(c, pong2) == DecodeResult::Ok && pong2.message_type == kMsgPong &&
+              pong2.request_id == 10 && (pong2.flags & kFlagError) == 0);
         CHECK("loopback-bye", WriteFrame(c, Frame{0, kMsgBye, 0, {}}));
         CloseHandle(c);
         server_thread.join();
