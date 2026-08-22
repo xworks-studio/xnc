@@ -1,14 +1,20 @@
 // desktop_selftest.cpp - native/desktop selftest (Task 2 scope: console-diag
 // arg parsing + FrameBlob/ICapture layout; Task 3 scope: BGRA byte math,
 // pitch compaction, FNV-1a hash and 256-point sampling helpers from
-// dxgi_capture.h). Pure logic - no desktop or DXGI needed, so it runs on
-// LABS-DEV (owner is RDP'd in; capture only on XIAOXIN). Any failure prints
+// dxgi_capture.h; Task 4 scope: BGRA→NV12 BT.601 color math, Annex-B NAL
+// parse helpers, and the MfSoftEncoder contract incl. the E2 one-shot
+// force-key regression). Pure-logic cases need no desktop; the encoder
+// scenarios (a)-(d) feed synthetic color bars straight into the MF software
+// H.264 MFT, so no capture is involved and they run on any Windows box that
+// ships CMSH264EncoderMFT (client SKUs). Any failure prints
 // "SELFTEST FAIL: <name>" and exits 1; all-pass prints "selftest ok". Entry
 // point SelftestMain() is declared by xnc-desktop.cpp and reachable via
 // `xnc-desktop.exe --selftest` / `build.bat selftest`.
 #include "capture.h"
 #include "diag.h"
 #include "dxgi_capture.h"
+#include "mf_encoder.h"
+#include "nv12.h"
 
 #include <cstddef>  // offsetof
 #include <cstdio>
@@ -45,6 +51,60 @@ struct FakeCapture final : xnc::ICapture {
   bool Acquire(xnc::FrameBlob&, std::string* = nullptr) override { return false; }
   uint32_t Width() const override { return 0; }
   uint32_t Height() const override { return 0; }
+};
+
+// Synthetic content for the encoder scenarios (a)-(d): vertical color bars
+// (bar width = w/8, so 2x2 chroma subsampling never mixes colors) plus a
+// moving 4px stripe per frame so consecutive frames differ and P frames
+// flow. Deterministic, no desktop or capture involved (plan Task 4: 合成彩条).
+class SyntheticBars {
+ public:
+  SyntheticBars(uint32_t w, uint32_t h) : bgra_((size_t)w * h * 4), w_(w), h_(h) {
+    DrawBars();  // frame 0 is the pristine bar pattern
+  }
+  const uint8_t* Frame(uint32_t i) {
+    if (i > 0) {  // redraw base + move the stripe (cheap at selftest sizes)
+      DrawBars();
+      DrawStripe(i);
+    }
+    return bgra_.data();
+  }
+  size_t Bytes() const { return bgra_.size(); }
+
+ private:
+  void SetPx(uint32_t x, uint32_t y, uint8_t b, uint8_t g, uint8_t r) {
+    uint8_t* px = bgra_.data() + ((size_t)y * w_ + x) * 4;
+    px[0] = b; px[1] = g; px[2] = r; px[3] = 0xFF;
+  }
+  void DrawBars() {
+    static const uint8_t kBars[5][3] = {{0, 0, 255}, {0, 255, 0}, {255, 0, 0},
+                                        {255, 255, 255}, {0, 0, 0}};  // B,G,R
+    const uint32_t bw = w_ / 8;
+    for (uint32_t y = 0; y < h_; ++y)
+      for (uint32_t x = 0; x < w_; ++x) {
+        const uint8_t* c = kBars[(x / bw) % 5];
+        SetPx(x, y, c[0], c[1], c[2]);
+      }
+  }
+  void DrawStripe(uint32_t frame) {
+    static const uint8_t kStripe[3][3] = {{255, 255, 0}, {255, 0, 255}, {0, 255, 255}};
+    const uint8_t* c = kStripe[frame % 3];
+    const uint32_t sw = 4;
+    const uint32_t x0 = (frame * 9) % (w_ - sw);
+    for (uint32_t y = 0; y < h_; ++y)
+      for (uint32_t x = x0; x < x0 + sw; ++x) SetPx(x, y, c[0], c[1], c[2]);
+  }
+  std::vector<uint8_t> bgra_;
+  uint32_t w_, h_;
+};
+
+// Number of AUs containing a NALU of the given type (5 = IDR; this MFT emits
+// at most one VCL NAL set per AU, so AU count == NAL count in practice).
+size_t CountAusWithNal(const std::vector<std::vector<uint8_t>>& aus, uint8_t type) {
+  size_t n = 0;
+  for (const auto& au : aus)
+    if (xnc::NalHasType(au.data(), au.size(), type)) ++n;
+  return n;
 };
 
 }  // namespace
@@ -183,6 +243,245 @@ int SelftestMain() {
     px[2] = 0xFF;
     CHECK("sample-single-sample-point-change", xnc::SamplePointsNotUniform(one.data(), w, h));
     CHECK("sample-degenerate-1x1-safe", !xnc::SamplePointsNotUniform(black.data(), 1, 1));
+  }
+  { // BGRA→NV12 (BT.601 有限范围,整数近似):合成 5 色竖条,条宽 8px
+    // (2x2 色度子采样永不跨色),定点抽查 Y/U/V;期望值由 pixel_windows.go
+    // 公式手算(red Y=82 U=90 V=240 / green Y=144 U=54 V=34 /
+    // blue Y=41 U=240 V=110 / white Y=235 U=V=128 / black Y=16 U=V=128)
+    const uint32_t w = 40, h = 8;
+    const uint8_t bars[5][3] = {{0, 0, 255}, {0, 255, 0}, {255, 0, 0},
+                                {255, 255, 255}, {0, 0, 0}};  // B,G,R
+    std::vector<uint8_t> bgra((size_t)w * h * 4);
+    for (uint32_t y = 0; y < h; ++y)
+      for (uint32_t x = 0; x < w; ++x) {
+        const uint8_t* c = bars[(x / 8) % 5];
+        uint8_t* px = bgra.data() + ((size_t)y * w + x) * 4;
+        px[0] = c[0]; px[1] = c[1]; px[2] = c[2]; px[3] = 0xFF;
+      }
+    CHECK("nv12-bytes", xnc::Nv12Bytes(w, h) == (size_t)w * h * 3 / 2);
+    CHECK("nv12-bytes-odd-dims", xnc::Nv12Bytes(41, 8) == 0 && xnc::Nv12Bytes(40, 7) == 0);
+    CHECK("nv12-bytes-overflow", xnc::Nv12Bytes(0xFFFFFFFFu, 0xFFFFFFFFu) == 0);
+    std::vector<uint8_t> nv12((size_t)w * h * 3 / 2, 0xEE);
+    CHECK("nv12-convert-ok", xnc::BgraToNv12(bgra.data(), bgra.size(), nv12.data(), nv12.size(), w, h));
+    CHECK("nv12-convert-short-src", !xnc::BgraToNv12(bgra.data(), bgra.size() - 1, nv12.data(), nv12.size(), w, h));
+    CHECK("nv12-convert-short-dst", !xnc::BgraToNv12(bgra.data(), bgra.size(), nv12.data(), nv12.size() - 1, w, h));
+    const int exp[5][3] = {{82, 90, 240}, {144, 54, 34}, {41, 240, 110},
+                           {235, 128, 128}, {16, 128, 128}};  // Y,U,V
+    bool bars_ok = true;
+    for (uint32_t k = 0; k < 5; ++k) {
+      const size_t yidx = (size_t)4 * w + k * 8 + 4;         // 像素 (k*8+4, 4)
+      const size_t uvidx = (size_t)w * h + 2 * w + (k * 4 + 2) * 2;  // 色度 (k*4+2, 2)
+      const int y = nv12[yidx], u = nv12[uvidx], v = nv12[uvidx + 1];
+      if (y < exp[k][0] - 3 || y > exp[k][0] + 3 || u < exp[k][1] - 3 ||
+          u > exp[k][1] + 3 || v < exp[k][2] - 3 || v > exp[k][2] + 3) {
+        std::printf("SELFTEST NOTE: bar %u Y=%d U=%d V=%d (want %d/%d/%d)\n",
+                    k, y, u, v, exp[k][0], exp[k][1], exp[k][2]);
+        bars_ok = false;
+      }
+    }
+    CHECK("nv12-color-bars-yuv", bars_ok);
+    { // 2x2 混色块:像素级竖条(偶 x=红,奇 x=绿)→ 单个色度块内
+      // 2 红 + 2 绿,RGB 均值(127,127,0)→ U≈72 V≈137;Y 逐像素保留
+      const uint32_t mw = 4, mh = 4;
+      std::vector<uint8_t> m((size_t)mw * mh * 4);
+      for (uint32_t y = 0; y < mh; ++y)
+        for (uint32_t x = 0; x < mw; ++x) {
+          uint8_t* px = m.data() + ((size_t)y * mw + x) * 4;
+          px[3] = 0xFF;
+          if ((x % 2) == 0) { px[2] = 255; }  // red
+          else              { px[1] = 255; }  // green
+        }
+      std::vector<uint8_t> mn((size_t)mw * mh * 3 / 2);
+      CHECK("nv12-mixed-convert", xnc::BgraToNv12(m.data(), m.size(), mn.data(), mn.size(), mw, mh));
+      const int u = mn[mw * mh], v = mn[mw * mh + 1];
+      CHECK("nv12-mixed-chroma-avg", u >= 70 && u <= 74 && v >= 135 && v <= 139);
+      CHECK("nv12-mixed-y-red-green", mn[0] >= 79 && mn[0] <= 85 && mn[1] >= 141 && mn[1] <= 147);
+    }
+  }
+  { // Annex-B NAL 解析(纯逻辑,与 encode_windows_test.go 同一向量):
+    // SPS(7)+PPS(8)+IDR(5)+非 IDR(1)
+    const uint8_t stream[] = {0, 0, 0, 1, 0x67, 0xAA, 0, 0, 0, 1, 0x68, 0xBB,
+                              0, 0, 0, 1, 0x65, 0xCC, 0, 0, 0, 1, 0x41, 0xDD};
+    const size_t n = sizeof(stream);
+    CHECK("nal-has-idr", xnc::NalHasType(stream, n, 5));
+    CHECK("nal-has-sps", xnc::NalHasType(stream, n, 7));
+    CHECK("nal-has-pps", xnc::NalHasType(stream, n, 8));
+    CHECK("nal-has-aud-absent", !xnc::NalHasType(stream, n, 9));
+    const uint8_t types[] = {7, 8};
+    std::vector<uint8_t> spspps;
+    xnc::NalExtractTypes(stream, n, types, 2, &spspps);
+    const uint8_t want[] = {0, 0, 0, 1, 0x67, 0xAA, 0, 0, 0, 1, 0x68, 0xBB};
+    CHECK("nal-extract-spspps", spspps.size() == sizeof(want) &&
+                               std::equal(spspps.begin(), spspps.end(), want));
+    // 3 字节起始码归一化为 4 字节;IDR 提取只含 IDR
+    const uint8_t sc3[] = {0x99, 0, 0, 1, 0x65, 0xCC};
+    std::vector<uint8_t> idr;
+    const uint8_t t5[] = {5};
+    xnc::NalExtractTypes(sc3, sizeof(sc3), t5, 1, &idr);
+    const uint8_t want2[] = {0, 0, 0, 1, 0x65, 0xCC};
+    CHECK("nal-extract-normalizes-4b-startcode", idr.size() == sizeof(want2) &&
+                                                std::equal(idr.begin(), idr.end(), want2));
+  }
+  // ---- MfSoftEncoder 场景 (a)-(d)(合成彩条 → MF 软编,无桌面依赖) ----
+  const uint32_t kEncW = 128, kEncH = 96, kEncFps = 15, kEncBitrate = 500000;
+  { // 参数护栏:未 Init 编码拒绝;短帧拒绝(不崩溃)
+    xnc::MfSoftEncoder enc;
+    std::vector<std::vector<uint8_t>> aus;
+    std::string err;
+    CHECK("mf-encode-before-init", !enc.Encode(nullptr, 0, aus, &err) && !err.empty());
+    CHECK("mf-drain-before-init-noop", (enc.Drain(aus), aus.empty()));
+    xnc::MfSoftEncoder enc2;
+    std::string ierr;
+    CHECK("mf-init-odd-dims-rejected", !enc2.Init(127, 96, kEncFps, kEncBitrate, &ierr) && !ierr.empty());
+  }
+  { // (a) 编码 60 帧合成彩条 → ≥1 输出、首输出含 SPS/PPS+IDR;每个 AU 都有
+    // VCL NAL;(d) SpsPps 首 IDR 后就绪且稳定、LastWasKey 与输出一致
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(kEncW, kEncH, kEncFps, kEncBitrate, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: mf-init-a err=%s\n", err.c_str());
+    CHECK("mf-init-a", init_ok);
+    if (init_ok) {
+      SyntheticBars bars(kEncW, kEncH);
+      std::vector<std::vector<uint8_t>> aus;
+      bool ok = true, all_vcl = true, lastkey_consistent = true, p_only_seen = false;
+      std::vector<uint8_t> spspps_at_first_idr;
+      std::string e2;
+      for (uint32_t i = 0; i < 60; ++i) {
+        std::vector<std::vector<uint8_t>> frame_aus;
+        if (!enc.Encode(bars.Frame(i), bars.Bytes(), frame_aus, &e2)) { ok = false; break; }
+        bool call_has_idr = false, call_vcl = frame_aus.empty();
+        for (const auto& au : frame_aus) {
+          aus.push_back(au);
+          const bool idr = xnc::NalHasType(au.data(), au.size(), 5);
+          call_has_idr = call_has_idr || idr;
+          call_vcl = idr || xnc::NalHasType(au.data(), au.size(), 1);
+          if (idr && spspps_at_first_idr.empty() && !enc.SpsPps().empty())
+            spspps_at_first_idr = enc.SpsPps();
+        }
+        if (!frame_aus.empty()) {
+          lastkey_consistent = lastkey_consistent && (enc.LastWasKey() == call_has_idr);
+          if (!call_has_idr) p_only_seen = true;
+        }
+        all_vcl = all_vcl && call_vcl;
+      }
+      CHECK("mf-a-encode-ok", ok);
+      CHECK("mf-a-has-output", aus.size() >= 1);
+      if (!aus.empty()) {
+        CHECK("mf-a-first-sps", xnc::NalHasType(aus[0].data(), aus[0].size(), 7));
+        CHECK("mf-a-first-pps", xnc::NalHasType(aus[0].data(), aus[0].size(), 8));
+        CHECK("mf-a-first-idr", xnc::NalHasType(aus[0].data(), aus[0].size(), 5));
+      }
+      CHECK("mf-a-every-au-vcl", all_vcl);
+      // (d) LastWasKey/SpsPps 一致性
+      CHECK("mf-d-spspps-ready", spspps_at_first_idr.size() > 10);
+      CHECK("mf-d-spspps-4b-sps-head",
+            spspps_at_first_idr.size() >= 5 && spspps_at_first_idr[0] == 0 &&
+            spspps_at_first_idr[1] == 0 && spspps_at_first_idr[2] == 0 &&
+            spspps_at_first_idr[3] == 1 && (spspps_at_first_idr[4] & 0x1F) == 7);
+      CHECK("mf-d-spspps-has-pps",
+            xnc::NalHasType(spspps_at_first_idr.data(), spspps_at_first_idr.size(), 8));
+      CHECK("mf-d-spspps-no-vcl",
+            !xnc::NalHasType(spspps_at_first_idr.data(), spspps_at_first_idr.size(), 5) &&
+            !xnc::NalHasType(spspps_at_first_idr.data(), spspps_at_first_idr.size(), 1));
+      CHECK("mf-d-spspps-stable", enc.SpsPps() == spspps_at_first_idr);
+      CHECK("mf-d-lastkey-consistent", lastkey_consistent);
+      CHECK("mf-d-p-only-call-seen", p_only_seen);
+      std::printf("SELFTEST NOTE: mf-a aus=%zu idrs=%zu\n", aus.size(),
+                  CountAusWithNal(aus, 5));
+    }
+  }
+  { // (b) force-key 契约(E2 关键帧风暴回归):冷启动缓冲期对连续 5 帧只
+    // 调一次 ForceNextIdr + Drain 排空 → 输出中 IDR 恰 1 个。若契约破坏
+    // (以「未见关键帧输出」为由每次 Encode 重复置位)→ 多个 IDR → FAIL。
+    // 注:CMSH264EncoderMFT 有 ~17 帧内部缓冲(实测),5 帧内无输出;Drain
+    // 排不穿前瞻窗口,故在零额外 force 的前提下补喂帧直至首输出再 Drain
+    // (本机实测:此 MFT 输出严格 1:1 按输入顺序,首个 AU=首帧)。
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(kEncW, kEncH, kEncFps, kEncBitrate, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: mf-init-b err=%s\n", err.c_str());
+    CHECK("mf-init-b", init_ok);
+    if (init_ok) {
+      enc.ForceNextIdr("selftest-cold-start");  // 唯一一次
+      SyntheticBars bars(kEncW, kEncH);
+      std::vector<std::vector<uint8_t>> aus;    // Encode 追加 + Drain 追加
+      std::string e2;
+      bool ok = true;
+      for (uint32_t i = 0; i < 5 && ok; ++i) {  // 计划规定的连续 5 帧
+        std::vector<std::vector<uint8_t>> frame_aus;
+        if (!enc.Encode(bars.Frame(i), bars.Bytes(), frame_aus, &e2)) { ok = false; break; }
+        aus.insert(aus.end(), frame_aus.begin(), frame_aus.end());
+      }
+      // 冷启动仍无输出(前瞻缓冲):继续喂帧,绝不二次 force
+      for (uint32_t i = 5; ok && i < 45 && aus.empty(); ++i) {
+        std::vector<std::vector<uint8_t>> frame_aus;
+        if (!enc.Encode(bars.Frame(i), bars.Bytes(), frame_aus, &e2)) { ok = false; break; }
+        aus.insert(aus.end(), frame_aus.begin(), frame_aus.end());
+      }
+      CHECK("mf-b-encode-ok", ok);
+      if (ok) {
+        enc.Drain(aus);  // 冷启动缓冲排空:重复 ProcessOutput 至 NEED_MORE_INPUT
+        // 首输出后再喂 5 帧(仍零额外 force):正确实现只应追 P 帧
+        for (uint32_t i = 45; ok && i < 50; ++i) {
+          std::vector<std::vector<uint8_t>> frame_aus;
+          if (!enc.Encode(bars.Frame(i), bars.Bytes(), frame_aus, &e2)) { ok = false; break; }
+          aus.insert(aus.end(), frame_aus.begin(), frame_aus.end());
+        }
+        CHECK("mf-b-postdrain-encode-ok", ok);
+        CHECK("mf-b-has-output", !aus.empty());
+        const size_t idrs = CountAusWithNal(aus, 5);
+        std::printf("SELFTEST NOTE: mf-b aus=%zu idrs=%zu\n", aus.size(), idrs);
+        CHECK("mf-b-exactly-one-idr", idrs == 1);
+      }
+    }
+  }
+  { // (c) 稳态第 30 帧提交前 ForceNextIdr → 该帧自己的 AU(0 基第 30 个
+    // 输出,1:1 顺序映射)= IDR,且整个 50 帧无第三个 IDR(一次性消费)
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(kEncW, kEncH, kEncFps, kEncBitrate, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: mf-init-c err=%s\n", err.c_str());
+    CHECK("mf-init-c", init_ok);
+    if (init_ok) {
+      SyntheticBars bars(kEncW, kEncH);
+      std::vector<std::vector<uint8_t>> aus;
+      size_t idrs = 0;
+      bool lastkey_captured = false, lastkey_on_forced = false, ok = true;
+      std::string e2;
+      for (uint32_t i = 0; i < 50; ++i) {
+        if (i == 30) enc.ForceNextIdr("selftest-steady-30");
+        std::vector<std::vector<uint8_t>> frame_aus;
+        if (!enc.Encode(bars.Frame(i), bars.Bytes(), frame_aus, &e2)) { ok = false; break; }
+        for (const auto& au : frame_aus) {
+          aus.push_back(au);
+          if (xnc::NalHasType(au.data(), au.size(), 5)) ++idrs;
+        }
+        // 第二个 IDR 出现的那个 Encode 调用:LastWasKey 必须为 true
+        if (!frame_aus.empty() && idrs == 2 && !lastkey_captured) {
+          lastkey_on_forced = enc.LastWasKey();
+          lastkey_captured = true;
+        }
+      }
+      CHECK("mf-c-encode-ok", ok);
+      CHECK("mf-c-min-aus-for-mapping", aus.size() >= 32);  // AU#30 及邻帧已产出
+      const size_t want_idx = 30;
+      CHECK("mf-c-idr-total-2", idrs == 2);
+      if (aus.size() > want_idx + 1) {
+        const bool idr30 = xnc::NalHasType(aus[want_idx].data(), aus[want_idx].size(), 5);
+        const bool idr29 = xnc::NalHasType(aus[29].data(), aus[29].size(), 5);
+        const bool idr31 = xnc::NalHasType(aus[31].data(), aus[31].size(), 5);
+        if (!(idr30 && !idr29 && !idr31) || idrs != 2)
+          std::printf("SELFTEST NOTE: mf-c aus=%zu idrs=%zu au29=%d au30=%d au31=%d\n",
+                      aus.size(), idrs, idr29 ? 1 : 0, idr30 ? 1 : 0, idr31 ? 1 : 0);
+        // 下一输出(= 第 30 帧的 AU)为 IDR,邻帧不是
+        CHECK("mf-c-forced-frame-au-is-idr", idr30 && !idr29 && !idr31);
+      }
+      CHECK("mf-c-lastkey-on-forced-idr", lastkey_on_forced);
+      // (d) 稳态下 SpsPps 持续可用且不变
+      CHECK("mf-c-spspps-stable-nonempty", enc.SpsPps().size() > 10);
+      std::printf("SELFTEST NOTE: mf-c aus=%zu idrs=%zu\n", aus.size(), idrs);
+    }
   }
   if (fails == 0) std::printf("selftest ok\n");
   return fails == 0 ? 0 : 1;
