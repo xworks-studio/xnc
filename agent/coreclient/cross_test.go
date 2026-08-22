@@ -88,9 +88,14 @@ func TestCrossLanguageHandshake(t *testing.T) {
 	}
 	defer c.Close()
 	rtt, err := c.Ping()
-	if err != nil || rtt <= 0 {
+	if err != nil {
 		dumpServerEvidence()
-		t.Fatalf("ping: %v %v (server stderr: %s)", err, rtt, stderrPath)
+		t.Fatalf("ping: %v (server stderr: %s)", err, stderrPath)
 	}
+	// rtt==0s 是合法读数:Windows 单调钟粒度 ~0.5ms(本机实测最小正
+	// delta 347µs),本地 pipe 往返常低于一个 tick(实测 476/500 次为
+	// 0s)。成功判据是 err==nil —— Ping 仅在严格匹配 MsgPong +
+	// FlagResponse + 同 RequestID 的回帧时返回 nil,无 Pong 会以 2s 读
+	// 超时报错,不存在“假成功”;不得断言 rtt>0。
 	t.Logf("cross-language PING/PONG ok, rtt=%v", rtt)
 }
