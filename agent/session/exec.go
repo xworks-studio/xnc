@@ -6,15 +6,17 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
+	"strings"
 	"sync"
 	"time"
+	"xnc/agent/machineinfo"
 
 	"github.com/coder/websocket"
 
@@ -183,26 +185,90 @@ func (ex *Exec) result(ctx context.Context, ws *websocket.Conn, code *int, timed
 	_ = ws.Close(websocket.StatusNormalClosure, "")
 }
 
-// buildCommand 按平台选 shell：windows 上 pwsh 优先（缺则 powershell），
-// 其余 sh。命令模式经 -Command/-c 内联执行；脚本模式执行已落盘的文件。
+// buildCommand 按请求的 shell 类型构建执行命令。
+//
+// shell 值：auto（探测最佳）、bash、pwsh、powershell、cmd。
+// 命令模式内联执行（-c / -Command / cmd /c）；脚本模式执行已落盘文件。
+// 环境变量经前缀注入（按 shell 语法）。
 func (ex *Exec) buildCommand(p proto.ExecParams, sessionID string) (*exec.Cmd, error) {
-	if runtime.GOOS == "windows" {
-		shell := "powershell"
-		if _, err := exec.LookPath("pwsh"); err == nil {
-			shell = "pwsh"
+	shell := p.Shell
+	if shell == "" || shell == "auto" {
+		shells := machineinfo.DetectShells()
+		shell = shells[0]
+	}
+
+	// 环境变量前缀（命令模式时拼在命令前；脚本模式设到子进程 env）。
+	prefix := envPrefix(shell, p.Env)
+
+	var cmd *exec.Cmd
+	scriptPath := ex.scriptPath(sessionID)
+
+	switch shell {
+	case "bash":
+		exe := machineinfo.FindBash()
+		if exe == "" {
+			return nil, fmt.Errorf("bash not available on this node")
 		}
+		if p.Script != "" {
+			cmd = exec.Command(exe, scriptPath)
+		} else {
+			cmd = exec.Command(exe, "-c", prefix+p.Command)
+		}
+
+	case "cmd":
+		if p.Script != "" {
+			cmd = exec.Command("cmd", "/c", prefix+scriptPath)
+		} else {
+			cmd = exec.Command("cmd", "/c", prefix+p.Command)
+		}
+
+	case "pwsh", "powershell":
 		if p.Script != "" {
 			// -ExecutionPolicy Bypass：默认 Restricted 策略会拒绝加载 .ps1 文件
 			// （agent 以 LocalSystem 运行，本就是管理通道，策略在此非安全边界）。
-			return exec.Command(shell, "-NoLogo", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-				"-File", ex.scriptPath(sessionID)), nil
+			cmd = exec.Command(shell, "-NoLogo", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+				"-File", scriptPath)
+		} else {
+			cmd = exec.Command(shell, "-NoLogo", "-NonInteractive", "-Command", prefix+p.Command)
 		}
-		return exec.Command(shell, "-NoLogo", "-NonInteractive", "-Command", p.Command), nil
+
+	default:
+		return nil, fmt.Errorf("unsupported shell %q (available: bash, pwsh, powershell, cmd)", shell)
 	}
-	if p.Script != "" {
-		return exec.Command("sh", ex.scriptPath(sessionID)), nil
+
+	// 脚本模式的环境变量直接设到子进程 env（比前缀注入更可靠）。
+	if p.Script != "" && len(p.Env) > 0 {
+		for _, kv := range p.Env {
+			if k, v, ok := strings.Cut(kv, "="); ok {
+				cmd.Env = append(cmd.Environ(), k+"="+v)
+			}
+		}
 	}
-	return exec.Command("sh", "-c", p.Command), nil
+
+	return cmd, nil
+}
+
+// envPrefix 按 shell 语法构建环境变量注入前缀。
+func envPrefix(shell string, env []string) string {
+	if len(env) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for _, kv := range env {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		switch shell {
+		case "bash":
+			sb.WriteString(fmt.Sprintf("export %s='%s'; ", k, v))
+		case "cmd":
+			sb.WriteString(fmt.Sprintf("set %s=%s&& ", k, v))
+		default: // pwsh / powershell
+			sb.WriteString(fmt.Sprintf("$env:%s='%s'; ", k, v))
+		}
+	}
+	return sb.String()
 }
 
 func (ex *Exec) writeScript(sessionID, script string) (string, error) {

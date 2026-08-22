@@ -140,10 +140,11 @@ func collectExec(t *testing.T, ws *websocket.Conn) (string, string, *proto.ExecR
 
 func TestExecCommandStreamsAndExits(t *testing.T) {
 	cmd := `Write-Output hello; Write-Error boom; exit 7`
+	params := proto.ExecParams{Command: cmd, TimeoutSec: 30, Shell: "powershell"}
 	if !isWindows() {
 		cmd = `echo hello; echo boom 1>&2; exit 7`
 	}
-	ws := runExec(t, proto.ExecParams{Command: cmd, TimeoutSec: 30})
+	ws := runExec(t, params)
 	stdout, stderr, res := collectExec(t, ws)
 	assert.Contains(t, stdout, "hello")
 	assert.Contains(t, stderr, "boom")
@@ -159,7 +160,7 @@ func TestExecTimeoutKillsAndReports(t *testing.T) {
 		cmd = `sleep 60`
 	}
 	start := time.Now()
-	ws := runExec(t, proto.ExecParams{Command: cmd, TimeoutSec: 1})
+	ws := runExec(t, proto.ExecParams{Command: cmd, TimeoutSec: 1, Shell: "powershell"})
 	_, _, res := collectExec(t, ws)
 	assert.True(t, res.TimedOut)
 	assert.Nil(t, res.ExitCode)
@@ -172,7 +173,7 @@ func TestExecScriptLifecycle(t *testing.T) {
 	if !isWindows() {
 		script = "echo from-script\nexit 3"
 	}
-	ws, done := runExecIn(t, "sess-script", dir, proto.ExecParams{Script: script, TimeoutSec: 30})
+	ws, done := runExecIn(t, "sess-script", dir, proto.ExecParams{Script: script, TimeoutSec: 30, Shell: "powershell"})
 	stdout, _, res := collectExec(t, ws)
 	assert.Contains(t, stdout, "from-script")
 	require.NotNil(t, res.ExitCode)

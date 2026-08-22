@@ -75,7 +75,7 @@ func newLoginCmd() *cobra.Command {
 				token, user = t, u
 			}
 
-			if err := SaveConfig(Config{Server: server, Token: token, RememberedEmail: user.Email}); err != nil {
+			if err := SaveConfig(Config{Server: server, Token: token, RememberedEmail: user.Email, Channel: savedChannel()}); err != nil {
 				return failAPI(cmd, proto.Err(0, proto.CodeInternal, "save config: "+err.Error()))
 			}
 			if jsonOut(cmd) {

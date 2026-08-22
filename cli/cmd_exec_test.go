@@ -371,7 +371,7 @@ func TestRunOversizeScriptRejectedLocally(t *testing.T) {
 		"run", "n1", "--file", path, "--json", "--server", "http://127.0.0.1:1", "--token", "tk"})
 	assert.Equal(t, 2, code) // usage error (local precheck, no request sent)
 	assert.Contains(t, out, "256KB")
-	assert.Contains(t, out, "Phase 4")
+	assert.Contains(t, out, "use upload + exec")
 }
 
 func TestRunMissingScriptArgUsage(t *testing.T) {

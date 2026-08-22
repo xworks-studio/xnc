@@ -45,10 +45,12 @@ type SessionClose struct {
 
 // ExecParams 会话 Params 的 exec 形态；command 与 script 二选一。
 type ExecParams struct {
-	Command    string `json:"command,omitempty"`
-	Script     string `json:"script,omitempty"`
-	TimeoutSec int    `json:"timeoutSec,omitempty"`
-	Cwd        string `json:"cwd,omitempty"`
+	Command    string   `json:"command,omitempty"`
+	Script     string   `json:"script,omitempty"`
+	TimeoutSec int      `json:"timeoutSec,omitempty"`
+	Cwd        string   `json:"cwd,omitempty"`
+	Shell      string   `json:"shell,omitempty"`    // auto|bash|pwsh|powershell|cmd
+	Env        []string `json:"env,omitempty"`      // KEY=VAL 列表
 }
 
 // ExecResult exec 会话 WS 的终态 text 帧；超时/被杀时 ExitCode 为 null。

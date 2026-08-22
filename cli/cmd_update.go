@@ -63,10 +63,10 @@ func runUpdate(cmd *cobra.Command, channelFlag string) error {
 		return failAPI(cmd, err)
 	}
 	if latest.Version == cliVersion {
-		fmt.Fprintf(cmd.OutOrStdout(), "已是最新版本 (%s, %s)\n", cliVersion, channelFlag)
+		fmt.Fprintf(cmd.OutOrStdout(), "Already up to date (%s, %s)\n", cliVersion, channelFlag)
 		return nil
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "当前 %s → 最新 %s [%s]\n", cliVersion, latest.Version, channelFlag)
+	fmt.Fprintf(cmd.OutOrStdout(), "%s -> %s [%s]\n", cliVersion, latest.Version, channelFlag)
 
 	// 2. 下载（Bearer 认证的裸 HTTP）。
 	body, err := downloadAuthenticated(cl, "/api/cli/download?channel="+channelFlag)
@@ -93,7 +93,7 @@ func runUpdate(cmd *cobra.Command, channelFlag string) error {
 		_ = os.Rename(old, exe)
 		return failUsage(cmd, "write new: "+err.Error())
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "已更新到 %s（旧版本备份为 %s，下次运行自动清理）\n",
+	fmt.Fprintf(cmd.OutOrStdout(), "Updated to %s (old version backed up as %s, cleaned on next run)\n",
 		latest.Version, old)
 	return nil
 }

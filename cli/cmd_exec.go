@@ -1,3 +1,13 @@
+// cmd_exec.go — xnc exec：统一远程执行入口（合并旧 exec + run）。
+//
+// 三种输入方式：
+//
+//	xnc exec <node> "command"                  ← 内联命令
+//	xnc exec <node> --file <path>              ← 脚本文件
+//	echo ... | xnc exec <node> -               ← stdin 管道
+//
+// Shell 选择（--shell auto|bash|pwsh|powershell|cmd）+ 环境变量（--env K=V）
+// + 工作目录（--cwd）+ 超时（--timeout 秒）。
 package main
 
 import (
@@ -22,12 +32,154 @@ const (
 )
 
 const execTimeoutDefault = 300
-
-// execTimeoutMax 与服务端 [1, 86400] 上限一致；客户端先于任何网络请求本地校验。
 const execTimeoutMax = 86400
+const execScriptMax = 256 * 1024
+
+type execOutcome struct {
+	node      string
+	exitCode  *int
+	timedOut  bool
+	duration  int64
+	gotResult bool
+	stdout    strings.Builder
+	stderr    strings.Builder
+}
+
+func newExecCmd() *cobra.Command {
+	var (
+		timeout int
+		cwd     string
+		shell   string
+		env     []string
+		file    string
+	)
+	cmd := &cobra.Command{
+		Use:   "exec <node> [flags] <command...> | --file <path> | -",
+		Short: "Run a command or script on a node",
+		Long: `Run a command or script on a node.
+
+Input modes (exactly one):
+  positional args    inline command (joined with spaces)
+  --file <path>      script file
+  - (positional)     read script from stdin
+
+Shells:
+  --shell auto       detect best available (bash > pwsh > powershell)
+  --shell bash       Git Bash / WSL (simplest quoting)
+  --shell pwsh       PowerShell Core
+  --shell powershell Windows PowerShell 5.1
+  --shell cmd        cmd.exe
+
+Examples:
+  xnc exec node1 "hostname"
+  xnc exec node1 --shell bash "grep error /var/log/syslog"
+  xnc exec node1 --shell cmd "dir C:\\xnc"
+  xnc exec node1 --file deploy.ps1
+  cat script.sh | xnc exec node1 -
+  xnc exec node1 --cwd C:\\xnc --env DEBUG=1 "tool.exe"`,
+		Args: cobra.MinimumNArgs(1),
+		RunE: func(c *cobra.Command, args []string) error {
+			return runExecUnified(c, args, timeout, cwd, shell, env, file)
+		},
+	}
+	cmd.Flags().IntVar(&timeout, "timeout", execTimeoutDefault,
+		"timeout in seconds (1-86400)")
+	cmd.Flags().StringVar(&cwd, "cwd", "", "working directory on the node")
+	cmd.Flags().StringVar(&shell, "shell", "auto",
+		"shell type: auto, bash, pwsh, powershell, cmd")
+	cmd.Flags().StringArrayVar(&env, "env", nil,
+		"environment variable KEY=VAL (repeatable)")
+	cmd.Flags().StringVar(&file, "file", "",
+		"script file path (alternative to positional command)")
+	addJSONFlag(cmd)
+	return cmd
+}
+
+// newRunCmd 保留 run 作为 exec --stdin 的别名（脚本兼容）。
+func newRunCmd() *cobra.Command {
+	var timeout int
+	cmd := &cobra.Command{
+		Use:   "run <node> (- | --file <path>) [--timeout N]",
+		Short: "Run a script on a node (alias for: exec --stdin)",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(c *cobra.Command, args []string) error {
+			file, _ := c.Flags().GetString("file")
+			return runExecUnified(c, args, timeout, "", "auto", nil, file)
+		},
+	}
+	cmd.Flags().IntVar(&timeout, "timeout", execTimeoutDefault,
+		"script timeout in seconds (1-86400)")
+	var runFile string
+	cmd.Flags().StringVar(&runFile, "file", "", "script file path (or use - for stdin)")
+	addJSONFlag(cmd)
+	return cmd
+}
+
+// runExecUnified 统一执行入口。
+func runExecUnified(cmd *cobra.Command, args []string, timeout int, cwd, shell string, env []string, file string) error {
+	if e := checkExecTimeout(cmd, timeout); e != nil {
+		return e
+	}
+	if shell != "auto" && shell != "bash" && shell != "pwsh" && shell != "powershell" && shell != "cmd" {
+		return failUsage(cmd, "shell must be auto, bash, pwsh, powershell, or cmd")
+	}
+
+	// 解析输入源：--file > "-" stdin > 位置参数（dial 之前——本地校验
+	// 优先，坏输入不产生网络请求）。
+	var script, command string
+	switch {
+	case file != "":
+		b, err := os.ReadFile(file)
+		if err != nil {
+			return failUsage(cmd, "read "+file+": "+err.Error())
+		}
+		script = string(b)
+	case len(args) > 1 && args[1] == "-":
+		b, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return failUsage(cmd, "read stdin: "+err.Error())
+		}
+		script = string(b)
+	default:
+		command = strings.Join(args[1:], " ")
+	}
+
+	// 无输入源（既无命令也无脚本）→ 用法错误。
+	if script == "" && command == "" {
+		return failUsage(cmd, "provide a command, --file <path>, or - (stdin)")
+	}
+
+	// 脚本大小校验（同样在 dial 之前）。
+	if len(script) > execScriptMax {
+		return failUsage(cmd, "script exceeds 256KB; use upload + exec --file")
+	}
+
+	cl, usage := dial(cmd, true)
+	if usage != "" {
+		return failUsage(cmd, usage)
+	}
+	ref, e := resolveNode(cl, args[0])
+	if e != nil {
+		return failAPI(cmd, e)
+	}
+
+	body := map[string]any{"timeoutSec": timeout, "shell": shell}
+	if command != "" {
+		body["command"] = command
+	}
+	if script != "" {
+		body["script"] = script
+	}
+	if cwd != "" {
+		body["cwd"] = cwd
+	}
+	if len(env) > 0 {
+		body["env"] = env
+	}
+	return runSession(cl, ref, body, cmd)
+}
 
 // checkExecTimeout: --timeout 越界（<1 或 >86400）→ 用法错误（exit 2）。
-// 在 dial 之前调用：坏值绝不产生网络流量，也不进入服务端 400 路径。
 func checkExecTimeout(cmd *cobra.Command, timeout int) error {
 	if timeout < 1 || timeout > execTimeoutMax {
 		return failUsage(cmd, "timeout must be 1-86400 seconds")
@@ -35,132 +187,10 @@ func checkExecTimeout(cmd *cobra.Command, timeout int) error {
 	return nil
 }
 
-// execScriptMax caps the inline script payload for `xnc run`: bigger scripts
-// wait for the upload+exec flow (Phase 4).
-const execScriptMax = 256 * 1024
-
-// execOutcome accumulates a finished exec run for the --json envelope.
-type execOutcome struct {
-	node      string
-	exitCode  *int
-	timedOut  bool
-	duration  int64
-	gotResult bool // terminal EXEC_RESULT frame was received
-	stdout    strings.Builder
-	stderr    strings.Builder
-}
-
-func newExecCmd() *cobra.Command {
-	var timeout int
-	var cwd string
-	cmd := &cobra.Command{
-		Use:   "exec <node> [--timeout N] [--cwd PATH] [--] <command...>",
-		Short: "Run a command on a node and stream its output",
-		Args:  cobra.MinimumNArgs(2),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return runExec(cmd, args, timeout, cwd)
-		},
-	}
-	cmd.Flags().IntVar(&timeout, "timeout", execTimeoutDefault,
-		"command timeout in seconds (1-86400)")
-	cmd.Flags().StringVar(&cwd, "cwd", "", "working directory on the node")
-	addJSONFlag(cmd)
-	return cmd
-}
-
-func newRunCmd() *cobra.Command {
-	var timeout int
-	var file string
-	cmd := &cobra.Command{
-		Use:   "run <node> (--file x.ps1 | -) [--timeout N]",
-		Short: "Run a PowerShell script from a file or stdin on a node",
-		Args:  cobra.MinimumNArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return runRun(cmd, args, timeout, file)
-		},
-	}
-	cmd.Flags().IntVar(&timeout, "timeout", execTimeoutDefault,
-		"script timeout in seconds (1-86400)")
-	cmd.Flags().StringVar(&file, "file", "", "script file path, or - to read stdin")
-	addJSONFlag(cmd)
-	return cmd
-}
-
-// runExec: validate --timeout → resolve node → hand the command body to the
-// shared session loop.
-func runExec(cmd *cobra.Command, args []string, timeout int, cwd string) error {
-	if e := checkExecTimeout(cmd, timeout); e != nil {
-		return e
-	}
-	cl, usage := dial(cmd, true)
-	if usage != "" {
-		return failUsage(cmd, usage)
-	}
-	ref, e := resolveNode(cl, args[0])
-	if e != nil {
-		return failAPI(cmd, e)
-	}
-	command := strings.Join(args[1:], " ")
-
-	body := map[string]any{"command": command, "timeoutSec": timeout}
-	if cwd != "" {
-		body["cwd"] = cwd
-	}
-	return runSession(cl, ref, body, cmd)
-}
-
-// runRun: `xnc run <node> (--file <path> | -) [--timeout N]`. The script
-// payload is read locally (--file PATH, or "-" for stdin; the positional form
-// `run n1 -` is accepted too), prechecked against the 256KB inline cap, and
-// then rides the same exec session loop with body {script, timeoutSec}. Every
-// local failure is a usage error (exit 2) checked before any request is sent.
-func runRun(cmd *cobra.Command, args []string, timeout int, file string) error {
-	if e := checkExecTimeout(cmd, timeout); e != nil {
-		return e
-	}
-	src := file
-	if src == "" && len(args) > 1 {
-		src = args[1] // positional form: xnc run n1 -
-	}
-	var script []byte
-	var err error
-	switch {
-	case src == "-":
-		script, err = io.ReadAll(os.Stdin)
-	case src != "":
-		script, err = os.ReadFile(src)
-	default:
-		err = fmt.Errorf("--file or - required")
-	}
-	if err != nil {
-		return failUsage(cmd, err.Error())
-	}
-	if len(script) > execScriptMax {
-		return failUsage(cmd, "script exceeds 256KB; upload+exec arrives in Phase 4")
-	}
-
-	cl, usage := dial(cmd, true)
-	if usage != "" {
-		return failUsage(cmd, usage)
-	}
-	ref, e := resolveNode(cl, args[0])
-	if e != nil {
-		return failAPI(cmd, e)
-	}
-	return runSession(cl, ref, map[string]any{
-		"script": string(script), "timeoutSec": timeout}, cmd)
-}
-
-// runSession drives the shared kind=exec flow behind `xnc exec` and `xnc run`:
-// POST body to /api/nodes/{id}/exec → dial the session WS → stream binary
-// frames live while accumulating them → capture the EXEC_RESULT terminal
-// frame → print the envelope → map to the process exit code (passthrough; 243
-// only when timed out per EXEC_RESULT; 245 NETWORK when the connection ended
-// without a result frame).
-//
-// With --json the live stream and the final envelope interleave on stdout by
-// design: the envelope is emitted after the stream, so line-based (jsonl)
-// consumers are unaffected.
+// runSession drives the shared kind=exec flow:
+// POST body → dial the session WS → stream binary frames live while
+// accumulating them → capture the EXEC_RESULT terminal frame → print the
+// envelope → map to the process exit code (passthrough).
 func runSession(cl *Client, ref nodeRef, body map[string]any, cmd *cobra.Command) error {
 	var created struct {
 		SessionID    string `json:"sessionId"`
@@ -179,14 +209,14 @@ func runSession(cl *Client, ref nodeRef, body map[string]any, cmd *cobra.Command
 
 	label := ref.Name
 	if label == "" {
-		label = ref.ID // UUID arg: no name resolution round trip happened
+		label = ref.ID
 	}
 	out := execOutcome{node: label}
 	ctx := cmd.Context()
 	for {
 		kind, data, err := readWS(ctx, ws)
 		if err != nil {
-			break // connection closed (normal path: EXEC_RESULT then agent close)
+			break
 		}
 		switch kind {
 		case "binary":
@@ -194,7 +224,7 @@ func runSession(cl *Client, ref nodeRef, body map[string]any, cmd *cobra.Command
 				continue
 			}
 			if data[0] == frameStdout {
-				if !jsonOut(cmd) { // --json：静默积累，不实时打印（管道消费友好）
+				if !jsonOut(cmd) {
 					os.Stdout.Write(data[1:])
 				}
 				out.stdout.Write(data[1:])
@@ -217,11 +247,6 @@ func runSession(cl *Client, ref nodeRef, body map[string]any, cmd *cobra.Command
 		}
 	}
 
-	// --json mode is now silent (no streaming output on stdout), so the
-	// envelope separator is no longer needed — stdout contains only the envelope.
-
-	// Disconnect before the terminal frame is a NETWORK failure (245), not a
-	// timeout: 243 is reserved for EXEC_RESULT.TimedOut (cli.md contract).
 	if !out.gotResult {
 		e := proto.Err(0, "NETWORK", "session ended without result")
 		if jsonOut(cmd) {
@@ -244,11 +269,10 @@ func runSession(cl *Client, ref nodeRef, body map[string]any, cmd *cobra.Command
 	}
 	switch {
 	case out.exitCode == nil:
-		// timed out (or result with no exit code: killed / refused start)
 		return &exitError{code: exitTimeout}
 	case *out.exitCode == 0:
 		return nil
 	default:
-		return &exitError{code: *out.exitCode} // passthrough
+		return &exitError{code: *out.exitCode}
 	}
 }

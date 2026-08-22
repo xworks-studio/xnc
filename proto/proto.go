@@ -45,10 +45,11 @@ type ChallengeResponse struct {
 }
 
 type Hello struct {
-	NodeID       string `json:"nodeId"`
-	Hostname     string `json:"hostname"`
-	AgentVersion string `json:"agentVersion"`
-	ShellType    string `json:"shellType"`
+	NodeID       string   `json:"nodeId"`
+	Hostname     string   `json:"hostname"`
+	AgentVersion string   `json:"agentVersion"`
+	ShellType    string   `json:"shellType"`
+	Shells       []string `json:"shells,omitempty"` // 可用 shell 列表（bash/pwsh/powershell/cmd）
 }
 
 // HelloAck 携带目标版本（快速版本检查三通道之一）：agent 比对后若落后，

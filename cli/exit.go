@@ -35,6 +35,8 @@ func ExitCode(e *proto.APIError) int {
 		return exitMissing
 	case "NETWORK":
 		return exitNet
+	case "USAGE":
+		return exitUsage // client-side validation error（upload 超限等）
 	default:
 		return exitInternal
 	}

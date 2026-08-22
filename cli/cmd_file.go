@@ -23,9 +23,10 @@ const fileMaxBytes = 256 * 1024 * 1024
 
 func newUploadCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "upload <node> <local> <remote>",
-		Short: "Upload a file to a node (sha256 verified)",
-		Args:  cobra.ExactArgs(3),
+		Use:     "upload <node> <local> <remote>",
+		Aliases: []string{"put"},
+		Short:   "Upload a file to a node (alias: put)",
+		Args:    cobra.ExactArgs(3),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runFileTransfer(cmd, args[0], "upload", args[1], args[2])
 		},
@@ -36,9 +37,10 @@ func newUploadCmd() *cobra.Command {
 
 func newDownloadCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "download <node> <remote> <local>",
-		Short: "Download a file from a node (sha256 verified)",
-		Args:  cobra.ExactArgs(3),
+		Use:     "download <node> <remote> <local>",
+		Aliases: []string{"get"},
+		Short:   "Download a file from a node (alias: get)",
+		Args:    cobra.ExactArgs(3),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runFileTransfer(cmd, args[0], "download", args[2], args[1])
 		},
@@ -108,7 +110,7 @@ func runFileTransfer(cmd *cobra.Command, node, direction, local, remote string) 
 			data, _ := os.ReadFile(local)
 			total := len(data)
 			for off := 0; off < total; off += 64 * 1024 {
-				end := off + 64 * 1024
+				end := off + 64*1024
 				if end > total {
 					end = total
 				}

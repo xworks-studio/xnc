@@ -70,6 +70,7 @@ func newRootCmd() *cobra.Command {
 		newAuditCmd(),
 		newUpdateCmd(),
 	)
+	// 短名 alias：put = upload, get = download。
 	return root
 }
 
@@ -144,3 +145,5 @@ func dial(cmd *cobra.Command, needToken bool) (*Client, string) {
 	}
 	return NewClient(server, token), ""
 }
+
+// aliasCmd 返回一个使用不同名称的命令浅拷贝（共享 RunE 与 flags）。
