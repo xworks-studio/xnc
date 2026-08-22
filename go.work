@@ -8,6 +8,7 @@ use (
 	./proto
 	./server
 	./shellsmoke
+	./tools/e2eviewer
 	./tools/nalcheck
 	./tools/screendiag
 )
