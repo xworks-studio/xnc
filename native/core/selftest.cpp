@@ -3,8 +3,8 @@
 // V2 = RFC 4231 HMAC-SHA256 test case 2. Byte-level equality between the
 // C++ and Go implementations is enforced by these vectors.
 // Any failure prints "SELFTEST FAIL: <name>" and exits 1; all-pass prints
-// "selftest ok". Entry point SelftestMain() is linked by selftest_main.cpp
-// until Task 5 provides the real main.
+// "selftest ok". Entry point SelftestMain() is declared by xnc-core.cpp and
+// reachable via `xnc-core.exe --selftest` / `build.bat selftest`.
 #include "frame.h"
 #include "handshake.h"
 #include <cstdio>
@@ -31,6 +31,8 @@ int SelftestMain() {
         std::vector<uint8_t> wire; EncodeFrame(f, wire); wire[4]=2;
         CHECK("bad-version", DecodeFrame(wire.data(), wire.size(), back)==DecodeResult::BadVersion);
         CHECK("truncated", DecodeFrame(wire.data(), 3, back)==DecodeResult::Truncated);
+        wire[4]=1; wire[12]=0x01; wire[13]=0x00; wire[14]=0x90; wire[15]=0x00;  // payloadLength = 9MiB+1
+        CHECK("too-large", DecodeFrame(wire.data(), wire.size(), back)==DecodeResult::TooLarge);
     }
     { // V2 RFC4231
         const char* k="Jefe"; const char* d="what do ya want for nothing?";
