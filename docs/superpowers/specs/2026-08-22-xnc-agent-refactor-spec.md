@@ -2,6 +2,7 @@
 
 - 日期:2026-08-22
 - 状态:**已核定** — 全部开放决策点(DD-01~DD-14)于 2026-08-22 由 owner 批准,一律采纳建议
+- 修订:v1.3 — owner 决策:M0 不在旧 helper 上做任何修复或加层(详见 §20 M0),M0 收窄为新架构地基
 - 修订:v1.2 — 二次自审修订(UAC 采集风险条目、无活动会话 shell 语义、file kind 降权影响、多观众 PeerConnection 澄清、探活节奏消歧、SendSAS 措辞、事件命名一致性、CLI 演进、EDR 灰度提示、M1 简化 lease;§21 转决策记录)
 - 修订:v1.1 — 自审修订 10 项(fps 上限、光标形状通道、pipe 握手密钥、锁屏会话校验、息屏与 headless 冲突、screen 退役衔接、修饰键机制简化、共享编码器需求取值、shell pipe ACL、M1 验收标注);命名定稿 core 家族
 - 上游输入:
@@ -1008,11 +1009,14 @@ XNC/
 
 # 20. 实施阶段与验收
 
-## M0 — 现存管线修复与协议基础(约 1–2 周)
+## M0 — 新架构地基(约 1–2 周)
 
-- 修 E2 关键帧风暴(force-key 一次性语义)与 MFT 时基对齐——**在旧 helper 上修**,保住日常 screen 可用性;
-- 落地已计划的 browser desktop Phase 1(XNCD 头/ACK/观测,legacy screen 之上)——词汇全部迁移进新协议,投资不浪费;
-- proto/ipc 骨架 + xnc-core C++ 骨架(pipe/握手/日志/watchdog)。
+- proto/ipc:XNIP 帧编解码(Go + C++ 双侧字节级一致)、握手(pipe_secret + HMAC-SHA256 双向证明)、core/desktop/shell schema 定稿(protobuf codegen M1 接入);
+- xnc-core C++ 骨架:named pipe 服务端、双向认证握手、结构化日志、watchdog 线程、`--console` 诊断模式;
+- agent 侧 coreclient:拨号、握手、PING/PONG;
+- 跨语言 smoke:Go client ↔ xnc-core 完成握手与往返(自动化,CI 可跑)。
+
+> **2026-08-22 owner 决策:不在旧 helper 上做任何修复或加层。** 原 M0 的「旧 helper 修关键帧风暴」与「legacy screen 之上的 browser desktop Phase 1 观测切片」撤销——E2 教训(force-key 一次性消费、MFT 时基对齐)直接作为 xnc-desktop 编码器契约实现(§7.10/ADR-017),不再回头修 legacy;DD-12 中「M0 在 legacy screen 上验证协议词汇」不再执行。legacy screen 维持现状(含已知关键帧风暴与高运动 ~5fps),直到 M2 被 xnc-desktop 替换;期间 screen 可用性问题以「提前 M2 交付」回应,而非修补旧路径。
 
 ## M1 — 垂直原型(初稿 Phase 0,约 4–6 周)
 
