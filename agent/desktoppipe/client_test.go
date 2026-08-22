@@ -11,6 +11,7 @@ package desktoppipe
 import (
 	"encoding/binary"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -224,6 +225,15 @@ func TestDialAndPump(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("FrameCh not closed after Close")
 	}
+	// 主动 Close 的终结语义:Done 关闭、Err 为 nil(非故障下线)。
+	select {
+	case <-sub.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("Done() not closed after Close")
+	}
+	if err := sub.Err(); err != nil {
+		t.Fatalf("Err() = %v, want nil after Close", err)
+	}
 }
 
 // TestDialRejectsWrongSecret:握手证明失败必须断连报错。
@@ -248,5 +258,226 @@ func TestDialTooManySubs(t *testing.T) {
 func TestDialRejectsZeroSubID(t *testing.T) {
 	if _, err := Dial(`\\.\pipe\xnc-desktoppipe-none`, "s", 0, SubOpts{}); err == nil {
 		t.Fatal("Dial must reject subID 0")
+	}
+}
+
+// ---- FrameCh 溢出 / 断连路径(fix wave 补测)----
+
+// overflowHost:握手 → ATTACH → HOST_HELLO 后按 burstCh 指令突发 delta;
+// 每收到一条 KEYFRAME_REQ 记录 reason 并回一个 key 帧(解除客户端的
+// 合并位,使下一轮溢出可再次触发)。
+type overflowHost struct {
+	ln      net.Listener
+	secret  string
+	burstCh chan int
+	kfCh    chan string // 每条收到的 KEYFRAME_REQ reason
+}
+
+func startOverflowHost(t *testing.T, secret string) *overflowHost {
+	t.Helper()
+	ln, err := winio.ListenPipe(`\\.\pipe\xnc-desktoppipe-test-`+t.Name(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	h := &overflowHost{
+		ln: ln, secret: secret,
+		burstCh: make(chan int, 4),
+		kfCh:    make(chan string, 16),
+	}
+	// close(burstCh) 让 serve 退出并关闭已接受的连接:同进程重复运行
+	//(-count>1)时旧 pipe 实例不残留,重名 ListenPipe 不再 Access denied。
+	t.Cleanup(func() { close(h.burstCh) })
+	go h.serve()
+	return h
+}
+
+func (h *overflowHost) name() string { return h.ln.Addr().String() }
+
+func (h *overflowHost) serve() {
+	conn, err := h.ln.Accept()
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	if err := coreclient.ServerHandshake(conn, []byte(h.secret)); err != nil {
+		return
+	}
+	f, err := ipc.ReadFrame(conn)
+	if err != nil || f.MessageType != msgAttach {
+		return
+	}
+	if err := ipc.WriteFrame(conn, &ipc.Frame{Flags: ipc.FlagEvent, MessageType: msgHostHello,
+		Payload: tEncHostHello(1, 64, 48, 15, 4)}); err != nil {
+		return
+	}
+	var wmu sync.Mutex // 串行化 burst 写与 key 帧应答写
+	go func() { // 控制帧读取:KEYFRAME_REQ → 记 reason → 回 key
+		for {
+			f, err := ipc.ReadFrame(conn)
+			if err != nil {
+				return
+			}
+			if f.MessageType != msgKeyframeReq || len(f.Payload) != 36 {
+				continue
+			}
+			reason := string(f.Payload[4:36])
+			for i := 0; i < len(reason); i++ {
+				if reason[i] == 0 {
+					reason = reason[:i]
+					break
+				}
+			}
+			h.kfCh <- reason
+			wmu.Lock()
+			_ = ipc.WriteFrame(conn, &ipc.Frame{Flags: ipc.FlagEvent, MessageType: msgFrame,
+				Payload: tEncFrame(999, true, []byte{0, 0, 0, 1, 0x65})})
+			wmu.Unlock()
+		}
+	}()
+	for n := range h.burstCh {
+		for i := 0; i < n; i++ {
+			wmu.Lock()
+			err := ipc.WriteFrame(conn, &ipc.Frame{Flags: ipc.FlagEvent, MessageType: msgFrame,
+				Payload: tEncFrame(uint64(i+1), false, []byte{0, 0, 0, 1, 0x41})})
+			wmu.Unlock()
+			if err != nil {
+				return
+			}
+		}
+	}
+}
+
+// drainUntilKeyFrame 消费 FrameCh 直到出现 key 帧,返回沿途 delta 数。
+func drainUntilKeyFrame(t *testing.T, s *Sub) int {
+	t.Helper()
+	deltas := 0
+	for {
+		select {
+		case f, ok := <-s.FrameCh():
+			if !ok {
+				t.Fatal("FrameCh closed before a key frame arrived")
+			}
+			if f.Key {
+				return deltas
+			}
+			deltas++
+		case <-time.After(3 * time.Second):
+			t.Fatal("timeout waiting for key frame")
+		}
+	}
+}
+
+// TestFrameChOverflowMergesKeyframeRequest:消费侧不读 → FrameCh(16)满 →
+// 丢 delta 并合并恰一次 reason=client_overflow 的 KEYFRAME_REQ(§7.9 客户端
+// 镜像);key 帧送达清位后,第二轮溢出再次恰触发一次。
+func TestFrameChOverflowMergesKeyframeRequest(t *testing.T) {
+	h := startOverflowHost(t, "desktop-pipe-secret")
+	sub, err := Dial(h.name(), "desktop-pipe-secret", 7, SubOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	// 第一轮:20 delta(> 缓冲 16)不消费 → 溢出丢帧 + 恰一次合并请求。
+	// (等待 kfCh 期间测试不读 FrameCh,首个溢出 delta 必然已丢弃。)
+	h.burstCh <- 20
+	if got := recvOrFatal[string](t, h.kfCh, "first client_overflow request"); got != "client_overflow" {
+		t.Fatalf("first keyframe reason = %q, want client_overflow", got)
+	}
+	// host 收到请求即回 key;key 阻塞送达直到消费侧开始读。
+	d1 := drainUntilKeyFrame(t, sub)
+
+	// 第二轮:仍不消费 → 再次溢出 → 恰第二次合并请求。
+	h.burstCh <- 20
+	if got := recvOrFatal[string](t, h.kfCh, "second client_overflow request"); got != "client_overflow" {
+		t.Fatalf("second keyframe reason = %q, want client_overflow", got)
+	}
+	// 合并语义:两轮突发共 40 delta,只允许 2 条请求 —— 稳定窗口内无第三条。
+	select {
+	case extra := <-h.kfCh:
+		t.Fatalf("unexpected extra KEYFRAME_REQ %q (merge broken)", extra)
+	case <-time.After(300 * time.Millisecond):
+	}
+	// 断言确实发生了丢弃:两轮共 40 delta,送达的远少于 40。
+	d2 := 0
+drain:
+	for {
+		select {
+		case f, ok := <-sub.FrameCh():
+			if !ok {
+				t.Fatal("FrameCh closed while draining round 2")
+			}
+			if !f.Key {
+				d2++
+			}
+		default:
+			break drain
+		}
+	}
+	if d1+d2 >= 40 {
+		t.Fatalf("no deltas dropped: delivered %d+%d of 40", d1, d2)
+	}
+}
+
+// TestDoneErrOnHostDisconnect:HOST_HELLO 后 host 不辞而别(进程退出形态)
+// → 泵以读错误下线:Done() 关闭、Err() 非 nil、FrameCh/StateCh 关闭,
+// 其后 Close() 仍安全幂等。
+func TestDoneErrOnHostDisconnect(t *testing.T) {
+	secret := "desktop-pipe-secret"
+	ln, err := winio.ListenPipe(`\\.\pipe\xnc-desktoppipe-test-`+t.Name(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if err := coreclient.ServerHandshake(conn, []byte(secret)); err != nil {
+			return
+		}
+		f, err := ipc.ReadFrame(conn)
+		if err != nil || f.MessageType != msgAttach {
+			return
+		}
+		_ = ipc.WriteFrame(conn, &ipc.Frame{Flags: ipc.FlagEvent, MessageType: msgHostHello,
+			Payload: tEncHostHello(1, 64, 48, 15, 4)})
+		// 不发 DETACH、不发 BYE:直接断连。
+	}()
+
+	sub, err := Dial(ln.Addr().String(), secret, 7, SubOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-sub.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("Done() not closed after host disconnect")
+	}
+	if err := sub.Err(); err == nil {
+		t.Fatal("Err() must be non-nil after host disconnect")
+	}
+	select {
+	case _, ok := <-sub.FrameCh():
+		if ok {
+			t.Fatal("FrameCh must be closed after host disconnect")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("FrameCh not closed after host disconnect")
+	}
+	select {
+	case _, ok := <-sub.StateCh():
+		if ok {
+			t.Fatal("StateCh must be closed after host disconnect")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("StateCh not closed after host disconnect")
+	}
+	_ = sub.Close() // 幂等安全;Err 保持非 nil(下线原因不被抹除)
+	if err := sub.Err(); err == nil {
+		t.Fatal("Err() must stay non-nil after post-disconnect Close")
 	}
 }

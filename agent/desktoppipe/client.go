@@ -174,7 +174,12 @@ func Dial(pipe, secret string, subID uint32, opts SubOpts) (*Sub, error) {
 				conn.Close()
 				return nil, fmt.Errorf("desktoppipe: attach rejected: %s", ev.Code)
 			}
-			s.stateCh <- ev // 稀疏;缓冲足够
+			// 与 pump 相同的非阻塞语义:pre-hello STATE 帧多于缓冲时丢弃,
+			// 绝不阻塞 Dial(事件稀疏且多为瞬时提示)。
+			select {
+			case s.stateCh <- ev:
+			default:
+			}
 		case msgAttach:
 			if f.Flags&ipc.FlagError != 0 {
 				conn.Close()
