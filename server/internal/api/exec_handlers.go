@@ -32,10 +32,12 @@ const (
 // execReq 的 TimeoutSec 为指针：缺省（nil）→ 默认 300；显式给出则必须
 // 落在 [1, 86400]——显式 0 视为非法（客户端想用默认值应省略字段）。
 type execReq struct {
-	Command    string `json:"command"`
-	Script     string `json:"script"`
-	TimeoutSec *int   `json:"timeoutSec"`
-	Cwd        string `json:"cwd"`
+	Command    string   `json:"command"`
+	Script     string   `json:"script"`
+	TimeoutSec *int     `json:"timeoutSec"`
+	Cwd        string   `json:"cwd"`
+	Shell      string   `json:"shell"`
+	Env        []string `json:"env"`
 }
 
 func pgUUID(id uuid.UUID) pgtype.UUID { return pgtype.UUID{Bytes: id, Valid: true} }
@@ -78,6 +80,7 @@ func (h *handlers) execStart(w http.ResponseWriter, r *http.Request) {
 
 	params, err := json.Marshal(proto.ExecParams{
 		Command: req.Command, Script: req.Script, TimeoutSec: timeout, Cwd: req.Cwd,
+		Shell: req.Shell, Env: req.Env,
 	})
 	if err != nil {
 		respondError(w, proto.Err(500, proto.CodeInternal, "encode params"))

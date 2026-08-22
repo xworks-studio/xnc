@@ -17,7 +17,7 @@ import (
 	"xnc/proto"
 )
 
-const cliVersion = "0.1.0"
+const cliVersion = "0.3.0"
 
 func main() {
 	cleanupOldCLI() // 自更新残留清扫（幂等）
@@ -44,8 +44,29 @@ func runCLI(ctx context.Context, args []string) int {
 
 func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
-		Use:           "xnc",
-		Short:         "XNC control plane CLI",
+		Use:   "xnc",
+		Short: "XNC — remote node control",
+		Long: `XNC control plane CLI.
+
+Manage remote Windows nodes: execute commands, transfer files, view screens,
+open remote desktops, and manage clusters.
+
+Quick start:
+  xnc login                          connect to a server
+  xnc node list                      see your nodes
+  xnc exec <node> "hostname"         run a command
+  xnc exec <node> --shell bash "ls" run in bash (simplest quoting)
+
+Global flags:
+  --server URL    server base (env XNC_SERVER, or config)
+  --token TOKEN   auth token (env XNC_TOKEN, or config)
+  --output FMT    table | json (affects data commands)
+  --json          per-command shorthand for --output json
+
+Exit codes:
+  0 success | 2 usage | 240 auth | 241 forbidden | 242 node offline
+  243 timeout | 244 not found | 245 network | 246 quota | 250 internal
+  Other values: remote process exit code passthrough (exec only)`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Version:       cliVersion, // enables --version flag
@@ -56,6 +77,10 @@ func newRootCmd() *cobra.Command {
 			}
 			return nil
 		},
+		// 无参数时打印完整帮助（比 cobra 默认的裸 usage 更友好）。
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return cmd.Help()
+		},
 	}
 	root.PersistentFlags().String("server", "",
 		"XNC server base URL (env XNC_SERVER, then config file)")
@@ -63,14 +88,17 @@ func newRootCmd() *cobra.Command {
 		"API bearer token (env XNC_TOKEN, then config file)")
 	root.PersistentFlags().String("output", "table", "output format: table or json")
 	root.AddCommand(
+		// Core operations
+		newExecCmd(), newRunCmd(), newShellCmd(),
+		newUploadCmd(), newDownloadCmd(),
+		newScreenCmd(), newRdpCmd(),
+		// Node & cluster management
+		newNodeCmd(), newClusterCmd(), newTokenCmd(),
+		// Auth & info
 		newLoginCmd(), newWhoamiCmd(), newStatusCmd(), newVersionCmd(),
-		newClusterCmd(), newTokenCmd(), newNodeCmd(), newExecCmd(), newRunCmd(),
-		newShellCmd(), newUploadCmd(), newDownloadCmd(), newRdpCmd(),
-		newScreenCmd(),
-		newAuditCmd(),
-		newUpdateCmd(),
+		// Admin & maintenance
+		newAuditCmd(), newUpdateCmd(),
 	)
-	// 短名 alias：put = upload, get = download。
 	return root
 }
 
