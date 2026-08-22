@@ -127,6 +127,30 @@ int SelftestMain() {
         CHECK("cmd-empty-arg", !BuildChildCommandLine(L"xnc-desktop.exe", 2, av4, 1, &cmd));
       }
     }
+    { // M1-Slice2 Task 3 fix wave: EncodeStartCaptureOk success layout,
+      // byte-level (test side builds the expected payload independently).
+      uint8_t secret[32];
+      for (int i = 0; i < 32; i++) secret[i] = (uint8_t)(i + 1);
+      Frame ok = EncodeStartCaptureOk(Frame{0, kMsgStartCapture, 0xABCD, {}},
+                                      0x11223344,
+                                      L"\\\\.\\pipe\\xnc-desktop-rt-77", secret, 9);
+      const char* name = "\\\\.\\pipe\\xnc-desktop-rt-77";  // 26 chars
+      std::vector<uint8_t> want;
+      auto put32 = [&want](uint32_t v) {
+        for (int i = 0; i < 4; i++) want.push_back((uint8_t)(v >> (8 * i)));
+      };
+      put32(0x11223344);                       // pid u32 LE
+      want.push_back(26); want.push_back(0);   // name_len u16 LE
+      for (const char* p = name; *p; ++p) want.push_back((uint8_t)*p);
+      for (int i = 0; i < 32; i++) want.push_back(secret[i]);
+      put32(9);                                // gen u32 LE
+      CHECK("sc-ok-frame-meta",
+            ok.message_type == kMsgStartCapture && ok.flags == kFlagResponse &&
+            ok.request_id == 0xABCD);
+      CHECK("sc-ok-layout-bytes",
+            ok.payload.size() == want.size() &&
+            std::memcmp(ok.payload.data(), want.data(), want.size()) == 0);
+    }
     { // 真实 IO 路径 in-process loopback(修复波新增):
       // 服务端线程跑生产 ServeConnection(overlapped TimedIo + 握手 +
       // PING/PONG 帧循环);客户端用阻塞 ReadFrame/WriteFrame(HANDLE)。
@@ -200,12 +224,13 @@ int SelftestMain() {
         Frame pong;
         CHECK("loopback-pong", ReadFrame(c, pong) == DecodeResult::Ok && pong.message_type == kMsgPong &&
                               (pong.flags & kFlagResponse) != 0 && pong.request_id == 7);
-        // Task 3 (M1-Slice2): START/STOP_CAPTURE 已实装。selftest 走封闭
-        // 路径(不真 spawn):坏 payload(pad!=0)→ BAD_PAYLOAD;错会话
-        // (0x00ABCDEF 永不等于活动 console 会话;无头机 active=
-        // 0xFFFFFFFF 同样 mismatch)→ SESSION_MISMATCH;空闲 STOP →
-        // 幂等空响应(无 FlagError)。真 spawn 路径由提权门
-        // coreclient.TestStartCaptureCross 覆盖。
+        // Task 3 (M1-Slice2): START/STOP_CAPTURE implemented. selftest walks the
+        // closed paths (no real spawn): bad payload (pad!=0) → BAD_PAYLOAD;
+        // wrong session (0x00ABCDEF never equals the active console session;
+        // headless boxes active=0xFFFFFFFF likewise) → SESSION_MISMATCH;
+        // idle STOP → idempotent empty response (no FlagError). The real
+        // spawn path (secret now via inherited stdin, never argv - spec 1.5)
+        // stays behind the elevated gate coreclient.TestStartCaptureCross.
         CHECK("loopback-start-capture-badpayload-send",
               WriteFrame(c, Frame{0, kMsgStartCapture, 8,
                                   {0x01,0,0,0, 0x09,0,0,0}}));

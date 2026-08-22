@@ -11,7 +11,9 @@
 // pipe handles with fake in-process clients: ① attach -> HOST_HELLO + IDR
 // ② static-screen second attach -> fresh IDR reason=sub_join (the Slice1
 // carry-forward regression) ③ stuck subscriber -> queue overflow -> delta
-// drop + merged IDR ④ detach cleanup). Pure-logic cases need no desktop;
+// drop + merged IDR ④ detach cleanup). Task 3 fix wave adds the
+// --secret-stdin service-path secret (stdin line codec + arg matrix; spec
+// 1.5: the secret never rides argv). Pure-logic cases need no desktop;
 // the encoder/pipeline scenarios feed synthetic color bars straight into the
 // MF software H.264 MFT, so no capture is involved and they run on any
 // Windows box that ships CMSH264EncoderMFT (client SKUs). The rt loopback
@@ -1197,6 +1199,68 @@ int SelftestMain() {
     CHECK("rt-diag-combo-ok", d.ok && d.opt.console_diag && d.opt.secret.size() == 2);
     CHECK("rt-diag-combo-secret-required",
           !Parse({L"--console-diag", L"--out", L"t", L"--pipe", L"\\\\.\\pipe\\y"}).ok);
+  }
+  { // --secret-stdin(服务路径,spec 1.5:secret 不走 argv):rt 模式
+    // 二选一 —— stdin 注入或交互 --secret;两者同给 = 参数错
+    auto p = Parse({L"--console-rt", L"--secret-stdin"});
+    CHECK("rt-stdin-flag", p.ok && p.opt.console_rt && p.opt.secret_stdin &&
+                                p.opt.secret.empty());
+    CHECK("rt-stdin-default-pipe",
+          p.ok && p.opt.pipe_name == xnc::kDefaultRtPipe);
+    CHECK("rt-stdin-with-pipe-and-opts",
+          Parse({L"--console-rt", L"--secret-stdin", L"--pipe",
+                 L"\\\\.\\pipe\\x", L"--max-subs", L"2", L"--fps", L"15"}).ok);
+    CHECK("rt-both-secret-channels-exclusive",
+          !Parse({L"--console-rt", L"--secret", L"00", L"--secret-stdin"}).ok);
+    CHECK("rt-no-secret-channel",
+          !Parse({L"--console-rt", L"--pipe", L"\\\\.\\pipe\\x"}).ok);
+    // --secret-stdin 不带值:紧随的值 token 按未知参数拒绝
+    CHECK("rt-stdin-takes-no-value",
+          !Parse({L"--console-rt", L"--secret-stdin", L"0011"}).ok);
+    auto d2 = Parse({L"--console-diag", L"--out", L"t.h264", L"--pipe",
+                     L"\\\\.\\pipe\\y", L"--secret-stdin"});
+    CHECK("rt-diag-combo-stdin", d2.ok && d2.opt.secret_stdin && d2.opt.secret.empty());
+    CHECK("rt-diag-stdin-standalone",
+          Parse({L"--console-diag", L"--out", L"t", L"--secret-stdin"}).ok);
+  }
+  { // ParseSecretStdinLine(纯逻辑):固定 64 hex chars = 32B,可选尾随换行
+    std::string hex64, hex64up;
+    std::vector<uint8_t> want;
+    for (int i = 0; i < 32; ++i) {
+      char lo[3], up[3];
+      sprintf_s(lo, 3, "%02x", (i + 1) & 0xFF);
+      sprintf_s(up, 3, "%02X", (i + 1) & 0xFF);
+      hex64 += lo;
+      hex64up += up;
+      want.push_back(static_cast<uint8_t>((i + 1) & 0xFF));
+    }
+    std::vector<uint8_t> out;
+    CHECK("stdin-line-plain",
+          xnc::ParseSecretStdinLine(hex64.c_str(), &out) && out == want);
+    CHECK("stdin-line-lf",
+          xnc::ParseSecretStdinLine((hex64 + "\n").c_str(), &out) && out == want);
+    CHECK("stdin-line-crlf",
+          xnc::ParseSecretStdinLine((hex64 + "\r\n").c_str(), &out) && out == want);
+    CHECK("stdin-line-cr",
+          xnc::ParseSecretStdinLine((hex64 + "\r").c_str(), &out) && out == want);
+    CHECK("stdin-line-uppercase",
+          xnc::ParseSecretStdinLine(hex64up.c_str(), &out) && out == want);
+    CHECK("stdin-line-63-chars",
+          !xnc::ParseSecretStdinLine(hex64.substr(0, 63).c_str(), &out));
+    CHECK("stdin-line-65-chars",
+          !xnc::ParseSecretStdinLine((hex64 + "0").c_str(), &out));
+    CHECK("stdin-line-nonhex",
+          !xnc::ParseSecretStdinLine(("g" + hex64.substr(1)).c_str(), &out));
+    CHECK("stdin-line-empty", !xnc::ParseSecretStdinLine("", &out));
+    CHECK("stdin-line-leading-newline",
+          !xnc::ParseSecretStdinLine(("\n" + hex64).c_str(), &out));
+    CHECK("stdin-line-second-line",
+          !xnc::ParseSecretStdinLine((hex64 + "\n" + hex64).c_str(), &out));
+    CHECK("stdin-line-double-newline",
+          !xnc::ParseSecretStdinLine((hex64 + "\n\n").c_str(), &out));
+    CHECK("stdin-line-null-args",
+          !xnc::ParseSecretStdinLine(nullptr, &out) &&
+          !xnc::ParseSecretStdinLine(hex64.c_str(), nullptr));
   }
   // ---- M1-Slice2 Task 2:固定二进制消息 codec(精确字节向量) ----
   {

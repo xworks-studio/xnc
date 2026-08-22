@@ -70,7 +70,8 @@ std::string Narrow(const wchar_t* s) {
 }  // namespace
 
 bool SpawnInSession(HANDLE token, const wchar_t* exe, const wchar_t* cmdline,
-                    DWORD* pid, HANDLE* child_process, std::string* err) {
+                    DWORD* pid, HANDLE* child_process, std::string* err,
+                    HANDLE child_stdin) {
   auto fail = [err](const char* what, DWORD e) {
     if (err) *err = std::string(what) + " err=" + std::to_string(e);
     return false;
@@ -115,10 +116,15 @@ bool SpawnInSession(HANDLE token, const wchar_t* exe, const wchar_t* cmdline,
     XNC_LOG_INFO("stdio redirect unavailable (err=%lu); child logs go nowhere",
                  GetLastError());
   }
-  if (redirect) {
+  // Caller-supplied stdin (the pipe-secret channel, spec 1.5): an already
+  // INHERITABLE handle passed through as the child's hStdInput.
+  const bool stdin_redirect =
+      child_stdin != nullptr && child_stdin != INVALID_HANDLE_VALUE;
+  if (redirect || stdin_redirect) {
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdOutput = out_dup;
     si.hStdError = err_dup;
+    si.hStdInput = stdin_redirect ? child_stdin : nullptr;
   }
 
   std::vector<wchar_t> cmd(cmdline, cmdline + std::wcslen(cmdline) + 1);
@@ -128,8 +134,8 @@ bool SpawnInSession(HANDLE token, const wchar_t* exe, const wchar_t* cmdline,
   // redirected handles above).
   const BOOL ok = CreateProcessAsUserW(
       token, full.c_str(), cmd.data(), nullptr, nullptr,
-      redirect /*bInheritHandles*/, CREATE_NO_WINDOW, nullptr, nullptr, &si,
-      &pi);
+      redirect || stdin_redirect /*bInheritHandles*/, CREATE_NO_WINDOW,
+      nullptr, nullptr, &si, &pi);
   const DWORD e = GetLastError();
   if (out_dup) CloseHandle(out_dup);
   if (err_dup) CloseHandle(err_dup);

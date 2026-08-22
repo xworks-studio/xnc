@@ -12,6 +12,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include <vector>
+
+#include "../common/frame.h"
 
 namespace xnc {
 
@@ -32,6 +36,13 @@ constexpr size_t kMaxPipeSecretBytes = 128;
 //         SPAWN_FAILED / PIPE_TIMEOUT / INTERNAL)
 //   kMsgStopCapture  request  (empty) -> empty FlagResponse (idempotent)
 constexpr uint16_t kMsgStartCapture = 0x0100, kMsgStopCapture = 0x0101;
+
+// Pure ok-response codec for kMsgStartCapture (little-endian layout above;
+// the pipe name is program-constructed ASCII so the utf8 pass is a plain
+// copy). Exposed so the selftest can assert the success layout byte for
+// byte (native/desktop rt codec precedent). Secret/gen never logged.
+Frame EncodeStartCaptureOk(const Frame& req, DWORD pid, const std::wstring& pipe,
+                           const uint8_t* secret, uint32_t gen);
 
 // Serve <pipe_name> with the pipe secret (secret_len bytes). Blocks for the
 // process lifetime; returns the process exit code (0 on Ctrl+C, 1 on fatal).

@@ -189,26 +189,6 @@ Frame ErrorFrame(uint16_t type, uint32_t request_id, const char* code) {
                std::vector<uint8_t>(code, code + std::strlen(code))};
 }
 
-// [u32 pid][u16 nameLen][name utf8 bytes][32B secret][u32 gen]; the pipe
-// name is program-constructed ASCII, so the "utf8" pass is a plain copy.
-Frame EncodeStartCaptureOk(const Frame& req, DWORD pid, const std::wstring& pipe,
-                           const uint8_t* secret, uint32_t gen) {
-  std::string name;
-  for (wchar_t c : pipe) name.push_back(c < 128 ? static_cast<char>(c) : '?');
-  std::vector<uint8_t> p;
-  p.reserve(6 + name.size() + kDesktopSecretLen + 4);
-  auto put32 = [&p](uint32_t v) {
-    for (int i = 0; i < 4; i++) p.push_back(static_cast<uint8_t>(v >> (8 * i)));
-  };
-  put32(pid);
-  p.push_back(static_cast<uint8_t>(name.size()));
-  p.push_back(static_cast<uint8_t>(name.size() >> 8));  // u16 LE nameLen
-  p.insert(p.end(), name.begin(), name.end());
-  p.insert(p.end(), secret, secret + kDesktopSecretLen);
-  put32(gen);
-  return Frame{kFlagResponse, kMsgStartCapture, req.request_id, std::move(p)};
-}
-
 // Wait until the child's rt pipe has a listenable instance. FILE_NOT_FOUND
 // (not created yet) and PIPE_BUSY (all instances connected mid-handoff) are
 // retryable; anything else fails fast. Sliced + heartbeated like every
@@ -217,8 +197,10 @@ bool WaitPipeReady(const wchar_t* name, Watchdog* wd) {
   const ULONGLONG deadline = GetTickCount64() + kPipeReadyWaitMs;
   for (;;) {
     if (WaitNamedPipeW(name, 50)) return true;
-    wd->Heartbeat();
+    // GetLastError FIRST: any intervening call (Heartbeat included) may
+    // reset the thread's last-error before we get to it.
     const DWORD e = GetLastError();
+    wd->Heartbeat();
     if (e != ERROR_FILE_NOT_FOUND && e != ERROR_PIPE_BUSY) {
       XNC_LOG_ERROR("capture pipe wait failed err=%lu", e);
       return false;
@@ -256,9 +238,6 @@ Frame HandleStartCapture(const Frame& req, Watchdog* wd) {
     XNC_LOG_ERROR("start_capture: secret RNG failed status=0x%08lX", (unsigned long)rng);
     return ErrorFrame(kMsgStartCapture, req.request_id, "RNG_FAILED");
   }
-  wchar_t hex[2 * kDesktopSecretLen + 1] = {0};
-  for (size_t i = 0; i < kDesktopSecretLen; i++)
-    swprintf(hex + 2 * i, 3, L"%02x", secret[i]);
 
   wchar_t pipe_name[80];
   swprintf(pipe_name, 80, L"\\\\.\\pipe\\xnc-desktop-rt-%lu", GetCurrentProcessId());
@@ -271,29 +250,72 @@ Frame HandleStartCapture(const Frame& req, Watchdog* wd) {
     return ErrorFrame(kMsgStartCapture, req.request_id, "TOKEN_FAILED");
   }
 
-  // Program-constructed argv only (no user input reaches the command line),
-  // so the BuildChildCommandLine quoting TODO stays a Slice3 must-fix.
-  // Slice2 constraint: the secret rides argv because xnc-desktop --console-rt
-  // (Task 2 contract) takes it there; the cmdline is therefore NEVER logged.
+  // Secret handoff (spec 1.5 red line): the secret NEVER enters argv - the
+  // process list would expose it. It travels over an anonymous pipe the
+  // child consumes as its stdin under xnc-desktop --secret-stdin: the read
+  // end becomes the child's inherited hStdInput (STARTF_USESTDHANDLES),
+  // then the parent writes the 64-hex-char line and closes the write end.
+  // The write end is stripped of the inherit flag so ONLY the read end
+  // crosses the process boundary.
+  HANDLE sec_rd = nullptr, sec_wr = nullptr;
+  SECURITY_ATTRIBUTES inherit_sa{sizeof(inherit_sa), nullptr, TRUE};
+  if (!CreatePipe(&sec_rd, &sec_wr, &inherit_sa, 0) ||
+      !SetHandleInformation(sec_wr, HANDLE_FLAG_INHERIT, 0)) {
+    const DWORD pipe_err = GetLastError();
+    if (sec_rd) CloseHandle(sec_rd);
+    if (sec_wr) CloseHandle(sec_wr);
+    CloseHandle(token);
+    XNC_LOG_ERROR("start_capture: secret stdin pipe failed err=%lu", pipe_err);
+    return ErrorFrame(kMsgStartCapture, req.request_id, "INTERNAL");
+  }
+
+  // Program-constructed argv only - no user input and no secret reach the
+  // command line, so the BuildChildCommandLine quoting TODO stays a Slice3
+  // must-fix; the cmdline carries nothing sensitive either way.
   std::vector<std::wstring> args = {L"--console-rt", L"--pipe", pipe_name,
-                                    L"--secret", hex};
+                                    L"--secret-stdin"};
   std::vector<wchar_t*> av;
   for (auto& a : args) av.push_back(&a[0]);
   std::wstring cmd;
   if (!BuildChildCommandLine(L"xnc-desktop.exe", static_cast<int>(av.size()),
                              av.data(), 0, &cmd)) {
     CloseHandle(token);
+    CloseHandle(sec_rd);
+    CloseHandle(sec_wr);
     return ErrorFrame(kMsgStartCapture, req.request_id, "INTERNAL");
   }
 
   DWORD pid = 0;
   HANDLE child = nullptr;
-  if (!SpawnInSession(token, L"xnc-desktop.exe", cmd.c_str(), &pid, &child, &err)) {
+  if (!SpawnInSession(token, L"xnc-desktop.exe", cmd.c_str(), &pid, &child,
+                      &err, sec_rd)) {
     CloseHandle(token);
+    CloseHandle(sec_rd);
+    CloseHandle(sec_wr);
     XNC_LOG_ERROR("start_capture: spawn failed err=\"%s\"", err.c_str());
     return ErrorFrame(kMsgStartCapture, req.request_id, "SPAWN_FAILED");
   }
   CloseHandle(token);
+  CloseHandle(sec_rd);  // the child's inheritance settled at CreateProcess
+
+  // One line - 64 hex chars + '\n' - then close. Matches xnc-desktop's
+  // --secret-stdin contract exactly. Hex/secret never logged.
+  {
+    char hexline[2 * kDesktopSecretLen + 2] = {0};
+    for (size_t i = 0; i < kDesktopSecretLen; i++)
+      sprintf_s(hexline + 2 * i, 3, "%02x", secret[i]);
+    hexline[2 * kDesktopSecretLen] = '\n';
+    DWORD wrote = 0;
+    if (!WriteFile(sec_wr, hexline, 2 * kDesktopSecretLen + 1, &wrote,
+                   nullptr) ||
+        wrote != 2 * kDesktopSecretLen + 1) {
+      // Without the secret the child cannot serve and exits on its own
+      // stdin error; the pipe wait below times out and reaps any survivor.
+      XNC_LOG_ERROR("start_capture: secret stdin write failed err=%lu",
+                    GetLastError());
+    }
+    CloseHandle(sec_wr);
+  }
 
   wd->Heartbeat();
   if (!WaitPipeReady(pipe_name, wd)) {
@@ -440,6 +462,27 @@ void ServeFrames(TimedIo& io, Watchdog* wd, uint32_t client_pid) {
 }
 
 }  // namespace
+
+// [u32 pid][u16 nameLen][name utf8 bytes][32B secret][u32 gen]; the pipe
+// name is program-constructed ASCII, so the "utf8" pass is a plain copy.
+// Declared in pipe_server.h for the selftest's byte-level layout check.
+Frame EncodeStartCaptureOk(const Frame& req, DWORD pid, const std::wstring& pipe,
+                           const uint8_t* secret, uint32_t gen) {
+  std::string name;
+  for (wchar_t c : pipe) name.push_back(c < 128 ? static_cast<char>(c) : '?');
+  std::vector<uint8_t> p;
+  p.reserve(6 + name.size() + kDesktopSecretLen + 4);
+  auto put32 = [&p](uint32_t v) {
+    for (int i = 0; i < 4; i++) p.push_back(static_cast<uint8_t>(v >> (8 * i)));
+  };
+  put32(pid);
+  p.push_back(static_cast<uint8_t>(name.size()));
+  p.push_back(static_cast<uint8_t>(name.size() >> 8));  // u16 LE nameLen
+  p.insert(p.end(), name.begin(), name.end());
+  p.insert(p.end(), secret, secret + kDesktopSecretLen);
+  put32(gen);
+  return Frame{kFlagResponse, kMsgStartCapture, req.request_id, std::move(p)};
+}
 
 // Serve one already-accepted overlapped pipe instance: the mutual-proof
 // handshake, then the PING/PONG frame loop until the client disconnects.

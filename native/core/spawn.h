@@ -1,8 +1,8 @@
 // spawn.h - CreateProcessAsUserW into the console session, the M1 session
 // bridge (spec 4.2: lpDesktop = "winsta0\default"; the child command line
-// carries no secrets - session ticket and pipe_secret travel via the pipe
-// later, never argv). The spawnable exe is WHITELISTED to the plain
-// relative name xnc-desktop.exe, resolved against xnc-core.exe's own
+// carries no secrets - the pipe_secret travels via the inherited stdin
+// handle, never argv, spec 1.5). The spawnable exe is WHITELISTED to the
+// plain relative name xnc-desktop.exe, resolved against xnc-core.exe's own
 // directory (spec 6.4 spirit: core resolves to fixed executable paths and
 // never accepts path parameters). The string helpers are pure and covered
 // by the selftest; SpawnInSession itself needs the TokenManager token and
@@ -46,11 +46,16 @@ bool BuildChildCommandLine(const wchar_t* exe, int argc, wchar_t** argv,
 // handles (STARTF_USESTDHANDLES) so its XNC_LOG output reaches whatever
 // captured xnc-core - the remote diag gate depends on this; without valid
 // std handles the child gets a hidden console instead (not fatal).
+// child_stdin (optional, default null = no stdin override): an INHERITABLE
+// handle the child receives as its stdin (STARTF_USESTDHANDLES). This is
+// the desktop pipe secret channel - the secret never appears in argv
+// (spec 1.5). Null keeps the diag-spawn behavior untouched.
 // On success *pid is set and, when child_process is non-null, *child_process
 // receives the owned process handle (caller CloseHandle's it; otherwise it
 // is closed here).
 bool SpawnInSession(HANDLE token, const wchar_t* exe, const wchar_t* cmdline,
-                    DWORD* pid, HANDLE* child_process, std::string* err);
+                    DWORD* pid, HANDLE* child_process, std::string* err,
+                    HANDLE child_stdin = nullptr);
 
 }  // namespace xnc
 

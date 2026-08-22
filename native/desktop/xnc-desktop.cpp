@@ -13,10 +13,13 @@
 //       dxgi_access_denied_session0 and exits 1; the Task 6 session bridge
 //       makes that path work. Optional --pipe <name> --secret <hex> also
 //       serves the real-time pipe off the same single pipeline run.
-//   --console-rt --secret <hex> [--pipe <name>] [--max-subs <n>] [--fps <n>]
+//   --console-rt (--secret-stdin | --secret <hex>) [--pipe <name>]
+//       [--max-subs <n>] [--fps <n>]
 //       real-time mode (M1-Slice2): same pipeline, AUs fanned out to pipe
 //       subscribers (ATTACH/DETACH/KEYFRAME_REQ in, HOST_HELLO/FRAME/STATE
-//       out) instead of a file. Runs until Ctrl+C.
+//       out) instead of a file. Runs until Ctrl+C. The secret comes from
+//       stdin (--secret-stdin; the core service path, spec 1.5: never argv)
+//       or from --secret <hex> (interactive diagnostics only).
 // Exit codes: 0 ok; 1 internal error (cannot open --out, capture/encoder
 // init or repeated acquire failure); 2 usage error. These flag names are the
 // Task 6 spawn contract - do not rename.
@@ -49,7 +52,8 @@ void Usage(FILE* out) {
       L"xnc-desktop - XNC desktop capture process (M1)\n"
       L"usage: xnc-desktop.exe --console-diag [--duration <sec>] [--out <file.h264>] [--fps <n>]\n"
       L"                    [--pipe <name> --secret <hex>]\n"
-      L"       xnc-desktop.exe --console-rt --secret <hex> [--pipe <name>] [--max-subs <n>] [--fps <n>]\n"
+      L"       xnc-desktop.exe --console-rt (--secret-stdin | --secret <hex>)\n"
+      L"                    [--pipe <name>] [--max-subs <n>] [--fps <n>]\n"
       L"       xnc-desktop.exe --selftest | --help\n"
       L"  --console-diag  diagnostic capture loop in the console session\n"
       L"  --duration      seconds to run (default 10, must be > 0)\n"
@@ -58,7 +62,13 @@ void Usage(FILE* out) {
       L"  --fps           target fps (default 30, must be > 0)\n"
       L"  --console-rt    real-time pipe server mode: subscribers ATTACH over\n"
       L"                  the M0 handshake and receive FRAME events (until Ctrl+C)\n"
-      L"  --secret        pipe secret as hex (REQUIRED with --console-rt; e.g. 0011ff)\n"
+      L"  --secret-stdin  read the pipe secret from stdin: exactly 64 hex chars\n"
+      L"                  (32 bytes), optional trailing newline. This is the\n"
+      L"                  SERVICE path: xnc-core hands the secret over an\n"
+      L"                  inherited stdin pipe so it never appears in argv\n"
+      L"  --secret        pipe secret as hex (interactive diagnostics only:\n"
+      L"                  argv is visible in the process list; the service\n"
+      L"                  path uses --secret-stdin; e.g. 0011ff)\n"
       L"  --pipe          pipe name (default \\\\.\\pipe\\xnc-desktop-rt)\n"
       L"  --max-subs      max subscribers (default 4, must be 1..4)\n"
       L"  --selftest      arg parsing + FrameBlob/encoder/pipeline/rt selftest\n"
@@ -109,6 +119,70 @@ bool ParseHexSecret(const wchar_t* s, std::vector<uint8_t>* out) {
   return !out->empty();
 }
 
+// --secret-stdin line validator. The stdin format is FIXED (see diag.h):
+// exactly 64 hex chars = the canonical 32-byte pipe secret, with an
+// optional trailing "\n" or "\r\n" (or no newline at all). Everything else
+// is a usage error. Pure - covered by the selftest byte-for-byte.
+bool ParseSecretStdinLine(const char* line, std::vector<uint8_t>* out) {
+  if (out == nullptr || line == nullptr) return false;
+  size_t n = 0;
+  while (line[n] != '\0') ++n;
+  // Strip one optional trailing newline pair: "\r\n", "\n" or "\r".
+  if (n >= 2 && line[n - 2] == '\r' && line[n - 1] == '\n') n -= 2;
+  else if (n >= 1 && (line[n - 1] == '\n' || line[n - 1] == '\r')) n -= 1;
+  if (n != 64) return false;  // 64 hex chars = 32 bytes, no other length
+  std::vector<uint8_t> bytes;
+  bytes.reserve(32);
+  for (size_t i = 0; i < n; i += 2) {  // pairs: n/2 = 32 bytes
+    auto nib = [](char c) -> int {
+      if (c >= '0' && c <= '9') return c - '0';
+      if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+      if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+      return -1;
+    };
+    const int hi = nib(line[i]), lo = nib(line[i + 1]);
+    if (hi < 0 || lo < 0) return false;
+    bytes.push_back(static_cast<uint8_t>((hi << 4) | lo));
+  }
+  *out = std::move(bytes);
+  return true;
+}
+
+// Fills *out with the secret read from stdin when --secret-stdin was given
+// (the parser has already verified a mode wants it). Reads the FIRST line
+// off the real stdin handle - a pipe (core service path) or an interactive
+// console - then delegates to the pure validator. Error text never echoes
+// the input.
+bool ReadSecretFromStdin(std::vector<uint8_t>* out, std::wstring* err) {
+  auto fail = [err](const wchar_t* msg) {
+    if (err) *err = msg;
+    return false;
+  };
+  HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+  if (in == nullptr || in == INVALID_HANDLE_VALUE)
+    return fail(L"--secret-stdin: no usable stdin handle");
+  std::string line;
+  for (;;) {
+    char buf[128];
+    DWORD got = 0;
+    if (!ReadFile(in, buf, sizeof(buf), &got, nullptr)) {
+      const DWORD e = GetLastError();
+      if (e == ERROR_BROKEN_PIPE) break;  // write end closed: EOF
+      return fail(L"--secret-stdin: reading stdin failed");
+    }
+    if (got == 0) break;  // EOF
+    line.append(buf, buf + got);
+    // Stop at the first line's newline (console line input delivers it;
+    // a pipe writer that omits it closes the pipe -> EOF above).
+    if (line.find('\n') != std::string::npos) break;
+    if (line.size() > 256) return fail(L"--secret-stdin: input line too long");
+  }
+  if (!ParseSecretStdinLine(line.c_str(), out))
+    return fail(L"--secret-stdin: expected exactly 64 hex chars (32 bytes), "
+                L"optional trailing newline");
+  return true;
+}
+
 bool ParseDiagArgs(int argc, wchar_t** argv, DiagOptions* opt, std::wstring* err) {
   auto fail = [err](std::wstring msg) {
     if (err) *err = std::move(msg);
@@ -155,6 +229,8 @@ bool ParseDiagArgs(int argc, wchar_t** argv, DiagOptions* opt, std::wstring* err
       if (!v) return false;
       if (!ParseHexSecret(v, &opt->secret))
         return fail(L"--secret must be a non-empty even-length hex string (1..64 bytes)");
+    } else if (std::wcscmp(a, L"--secret-stdin") == 0) {
+      opt->secret_stdin = true;  // value-less flag; the read happens in wmain
     } else if (std::wcscmp(a, L"--max-subs") == 0) {
       const wchar_t* v = value_of(L"--max-subs");
       if (!v) return false;
@@ -173,14 +249,21 @@ bool ParseDiagArgs(int argc, wchar_t** argv, DiagOptions* opt, std::wstring* err
     return fail(L"one of --console-diag, --console-rt, --selftest, --help is required");
   if (opt->console_diag && opt->out_path.empty())
     return fail(L"--console-diag requires --out <file.h264>");
-  if (opt->console_rt && opt->secret.empty())
-    return fail(L"--console-rt requires --secret <hex> (pipe authentication)");
+  // The secret arrives from exactly ONE channel: --secret-stdin (service
+  // path, spec 1.5 - never argv) or --secret <hex> (interactive diag).
+  if (!opt->secret.empty() && opt->secret_stdin)
+    return fail(L"--secret and --secret-stdin are mutually exclusive");
+  if (opt->console_rt && opt->secret.empty() && !opt->secret_stdin)
+    return fail(L"--console-rt requires --secret-stdin (service path) or "
+                L"--secret <hex> (interactive diagnostics)");
   // Optional rt server riding on a diag run (XIAOXIN validation path):
   // --pipe/--secret with --console-diag turns it on; both-or-none.
   const bool diag_rt_extra = opt->console_diag &&
-                             (!opt->secret.empty() || !opt->pipe_name.empty());
-  if (diag_rt_extra && opt->secret.empty())
-    return fail(L"--pipe with --console-diag also requires --secret <hex>");
+                             (!opt->secret.empty() || opt->secret_stdin ||
+                              !opt->pipe_name.empty());
+  if (diag_rt_extra && opt->secret.empty() && !opt->secret_stdin)
+    return fail(L"--pipe with --console-diag also requires --secret <hex> "
+                L"(or --secret-stdin)");
   if (opt->console_rt || diag_rt_extra) {
     if (opt->pipe_name.empty()) opt->pipe_name = kDefaultRtPipe;
   }
@@ -345,6 +428,16 @@ int wmain(int argc, wchar_t** argv) {
     return 0;
   }
   if (opt.selftest) return SelftestMain();
+  if (opt.secret_stdin) {
+    // Service path: the secret enters via stdin, never argv (spec 1.5).
+    // The parser guarantees --secret-stdin only survives when a mode that
+    // needs the secret was selected. A malformed stdin line is a usage
+    // error of the spawning side -> exit 2.
+    if (!xnc::ReadSecretFromStdin(&opt.secret, &err)) {
+      std::fwprintf(stderr, L"xnc-desktop: %s\n", err.c_str());
+      return 2;
+    }
+  }
   if (opt.console_rt) return RunConsoleRt(opt);
   return RunConsoleDiag(opt);
 }
