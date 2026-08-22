@@ -39,6 +39,18 @@ type TestEnv struct {
 
 func NewTestEnv(t *testing.T) *TestEnv {
 	t.Helper()
+	return newTestEnvWithCfg(t, func(c *config.Config) {
+		// desktop 会话需要服务端 TURN 配置（生产读 XNC_TURN_* env；测试注入
+		// 固定值，未配置 → 503 路径经 newTestEnvWithCfg 显式清空）。
+		c.TurnURLs = []string{"turn:test-turn:3478?transport=tcp", "turn:test-turn:3478"}
+		c.TurnUsername = "testuser"
+		c.TurnCredential = "testcred"
+	})
+}
+
+// newTestEnvWithCfg 构造可变异 config 的 TestEnv（desktop TURN 未配置路径等）。
+func newTestEnvWithCfg(t *testing.T, mutate func(*config.Config)) *TestEnv {
+	t.Helper()
 	st := db.OpenTestStore(t)
 	cfg := config.Config{
 		JWTSecret:        []byte("test-secret-test-secret-test!!"),
@@ -47,6 +59,9 @@ func NewTestEnv(t *testing.T) *TestEnv {
 		HeartbeatTimeout: 5 * time.Second,
 		// 零值 TTL 会让 token 立即过期（config.Load 的默认值只在生产路径生效），测试环境须显式给出。
 		EnrollTokenTTL: 30 * time.Minute,
+	}
+	if mutate != nil {
+		mutate(&cfg)
 	}
 	require.NoError(t, bootstrap.EnsureAdmin(context.Background(), st, cfg))
 	reg := registry.New()

@@ -44,5 +44,5 @@ func (h *handlers) tunnelStart(w http.ResponseWriter, r *http.Request) {
 		respondError(w, proto.Err(500, proto.CodeInternal, "encode params"))
 		return
 	}
-	h.startSession(w, r, proto.KindTunnel, params, "rdp.open", "rdp.open")
+	h.startSession(w, r, proto.KindTunnel, params, "rdp.open", "rdp.open", nil)
 }

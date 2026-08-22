@@ -23,6 +23,15 @@ services:
       # loop keeps a long-lived agent whose heartbeat is 30s — anything below
       # ~35s makes node status flap offline between beats.
       XNC_HEARTBEAT_TIMEOUT: ${XNC_HEARTBEAT_TIMEOUT:-45s}
+      # TURN relay config handed to desktop sessions (server-side only; the
+      # REST endpoint and SESSION_OPEN params both source it from here).
+      # Mirrors the coturn static lt-cred user below; URLs must point at the
+      # LAN IP (XNC_DEV_EXTERNAL_IP), not localhost — agents/viewers dial in
+      # from other hosts. Missing/partial config = desktop POST 503
+      # TURN_UNCONFIGURED. TCP URL first (dev posture), plain turn: UDP fallback.
+      XNC_TURN_URLS: "turn:${XNC_DEV_EXTERNAL_IP:?set XNC_DEV_EXTERNAL_IP in deploy/.env}:3478?transport=tcp,turn:${XNC_DEV_EXTERNAL_IP}:3478"
+      XNC_TURN_USERNAME: xncdev
+      XNC_TURN_CREDENTIAL: xncdev-secret
 
   coturn:
     image: coturn/coturn:alpine

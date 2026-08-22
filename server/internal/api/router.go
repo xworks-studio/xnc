@@ -34,6 +34,8 @@ func NewRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		sess.ShellPerNode = cfg.ShellPerNode
 		sess.ShellIdleTimeout = cfg.ShellIdleTimeout
 		sess.ShellMaxLifetime = cfg.ShellMaxLifetime
+		sess.DesktopPerNode = cfg.DesktopPerNode
+		sess.DesktopIdleTimeout = cfg.DesktopIdleTimeout
 	}
 	h := &handlers{st: st, cfg: cfg, reg: reg, sess: sess}
 	r := chi.NewRouter()
@@ -130,6 +132,9 @@ func NewRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		nr.Post("/{id}/tunnel", h.tunnelStart)
 		// screen：桌面流会话，kind=screen（Phase 6，DXGI+H.264），startSession 路径
 		nr.Post("/{id}/screen", h.screenStart)
+		// desktop：实时桌面会话（M1-Slice2，WebRTC relay-only + TURN），startSession
+		// 路径；TURN 未配置 → 503 TURN_UNCONFIGURED，每节点单会话 + idle 治理
+		nr.Post("/{id}/desktop", h.desktopStart)
 		// 管理动作：owner-only（handler 内经 requireMinRoleIgnoreDisabled 判定）
 		nr.Post("/{id}/disable", h.nodeDisable)
 		nr.Post("/{id}/enable", h.nodeEnable)

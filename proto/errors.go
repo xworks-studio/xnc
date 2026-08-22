@@ -21,7 +21,10 @@ const (
 	CodeFileNotFound            = "FILE_NOT_FOUND"
 	CodeFileTooLarge            = "FILE_TOO_LARGE"
 	CodeAgentVersionUnsupported = "AGENT_VERSION_UNSUPPORTED"
-	CodeInternal                = "INTERNAL"
+	// CodeTurnUnconfigured：server 无 TURN 配置时拒绝 desktop 会话
+	// （M1-Slice2：relay-only 无 TURN 不可用，503 优于开一个必死的会话）。
+	CodeTurnUnconfigured = "TURN_UNCONFIGURED"
+	CodeInternal         = "INTERNAL"
 )
 
 // APIError is the REST error envelope body: {"error":{"code","message"}}.

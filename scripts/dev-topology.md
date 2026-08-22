@@ -113,3 +113,9 @@ Notes:
 - Dev-server nodes accumulate (one per dev-agent run): harmless; `down -v` resets.
 - TURN credentials for T4/T5: `turn:<LAN-IP>:3478?transport=tcp`, user
   `xncdev` / `xncdev-secret` (static dev lt-cred; REST-cred is M2).
+- Desktop sessions (T5): the slice2 compose sets the server's
+  `XNC_TURN_URLS/XNC_TURN_USERNAME/XNC_TURN_CREDENTIAL` from the same static
+  user — `POST /api/nodes/{id}/desktop` returns the config in the `turn` field
+  and relays it in SESSION_OPEN params. Without it the endpoint answers
+  503 `TURN_UNCONFIGURED`. One desktop session per node; idle (no signaling
+  frames) for 5 min auto-closes (viewer may simply re-POST).

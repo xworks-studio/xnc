@@ -186,3 +186,99 @@ func TestMaxLifetimeClosesShell(t *testing.T) {
 		t.Fatal("no max-lifetime close")
 	}
 }
+
+// —— M1-Slice2 desktop 会话治理：每节点单会话 + idle 5min janitor ——
+
+func TestDesktopSinglePerNode(t *testing.T) {
+	id, m := onlineMgr(t)
+	defer m.Close()
+	// New 默认 DesktopPerNode=1；显式覆盖证明配置生效。
+	m.DesktopPerNode = 1
+
+	_, apiErr := m.Create(id, uuid.New(), proto.KindDesktop, []byte(`{}`))
+	require.Nil(t, apiErr)
+	_, apiErr = m.Create(id, uuid.New(), proto.KindDesktop, []byte(`{}`))
+	require.NotNil(t, apiErr)
+	assert.Equal(t, 409, apiErr.Status)
+	assert.Equal(t, proto.CodeSessionLimited, apiErr.Code)
+	// 其他 kind 不受限
+	_, apiErr = m.Create(id, uuid.New(), proto.KindExec, []byte(`{}`))
+	assert.Nil(t, apiErr)
+	_, apiErr = m.Create(id, uuid.New(), proto.KindScreen, []byte(`{}`))
+	assert.Nil(t, apiErr)
+	// 关掉唯一 desktop 会话后名额归还
+	d := m.SessionsOf(id, proto.KindDesktop)
+	require.Len(t, d, 1)
+	m.NotifyClose(d[0].ID, "test")
+	_, apiErr = m.Create(id, uuid.New(), proto.KindDesktop, []byte(`{}`))
+	assert.Nil(t, apiErr)
+	// 0 = 不限
+	m.DesktopPerNode = 0
+	_, apiErr = m.Create(id, uuid.New(), proto.KindDesktop, []byte(`{}`))
+	assert.Nil(t, apiErr)
+}
+
+func TestDesktopIdleTimeoutCloses(t *testing.T) {
+	id, m := onlineMgr(t)
+	defer m.Close()
+	m.DesktopIdleTimeout = 100 * time.Millisecond
+	m.setJanitorInterval(30 * time.Millisecond)
+
+	res, apiErr := m.Create(id, uuid.New(), proto.KindDesktop, []byte(`{}`))
+	require.Nil(t, apiErr)
+	closed := make(chan string, 1)
+	m.SetFinishFn(res.Session, func(r string) { closed <- r })
+
+	select {
+	case r := <-closed:
+		assert.Equal(t, "idle-timeout", r)
+	case <-time.After(3 * time.Second):
+		t.Fatal("no idle close for desktop session")
+	}
+}
+
+func TestDesktopActivityPreventsIdleClose(t *testing.T) {
+	id, m := onlineMgr(t)
+	defer m.Close()
+	m.DesktopIdleTimeout = 250 * time.Millisecond
+	m.setJanitorInterval(50 * time.Millisecond)
+
+	res, _ := m.Create(id, uuid.New(), proto.KindDesktop, []byte(`{}`))
+	closed := make(chan string, 1)
+	m.SetFinishFn(res.Session, func(r string) { closed <- r })
+
+	// 信令帧持续流动（pump 每帧刷新 lastActivity；touch 同字段）
+	deadline := time.Now().Add(600 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		m.touch(res.Session, time.Now())
+		time.Sleep(100 * time.Millisecond)
+	}
+	select {
+	case r := <-closed:
+		t.Fatalf("closed early: %s", r)
+	default:
+	}
+	select {
+	case r := <-closed:
+		assert.Equal(t, "idle-timeout", r)
+	case <-time.After(3 * time.Second):
+		t.Fatal("no idle close after activity stopped")
+	}
+}
+
+// TestDesktopNoMaxLifetime：desktop 治理只有 idle——shell 的 maxLifetime
+// 配置不影响 desktop 会话（长时间观看是合法形态，寿命上限属 Slice3+）。
+func TestDesktopNoMaxLifetime(t *testing.T) {
+	id, m := onlineMgr(t)
+	defer m.Close()
+	m.ShellMaxLifetime = 80 * time.Millisecond
+	m.DesktopIdleTimeout = 0 // 只考察寿命字段不生效
+	m.setJanitorInterval(30 * time.Millisecond)
+
+	res, _ := m.Create(id, uuid.New(), proto.KindDesktop, []byte(`{}`))
+	m.touch(res.Session, time.Now().Add(time.Hour)) // 持续活跃，逃过任何 idle
+
+	time.Sleep(300 * time.Millisecond) // 跨越多个 janitor 周期
+	s := m.SessionsOf(id, proto.KindDesktop)
+	require.Len(t, s, 1, "desktop session must not be lifetime-closed by shell governance")
+}

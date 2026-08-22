@@ -501,7 +501,9 @@ func runServer(c *config) (*summary, error) {
 	}
 	defer resp.Body.Close()
 	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+	// T5 端点统一走 startSession 路径 → 202 Accepted（异步会话创建语义）。
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated &&
+		resp.StatusCode != http.StatusAccepted {
 		return nil, fmt.Errorf("desktop open: HTTP %d (endpoint arrives with T5)", resp.StatusCode)
 	}
 	var open desktopOpenResp

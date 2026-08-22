@@ -54,5 +54,5 @@ func (h *handlers) shellStart(w http.ResponseWriter, r *http.Request) {
 		respondError(w, proto.Err(500, proto.CodeInternal, "encode params"))
 		return
 	}
-	h.startSession(w, r, proto.KindShell, params, "shell.open", "shell.close")
+	h.startSession(w, r, proto.KindShell, params, "shell.open", "shell.close", nil)
 }

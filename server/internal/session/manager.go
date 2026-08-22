@@ -41,6 +41,12 @@ type Manager struct {
 	ShellIdleTimeout time.Duration
 	ShellMaxLifetime time.Duration
 
+	// —— desktop 会话治理（M1-Slice2）：每节点单会话（采集源单实例，
+	// agent 引用计数语义见 T4 报告）+ idle 无信令活动关闭（pump 每帧刷新
+	// lastActivity；5min 无任何方向的信令帧 = 视为无订阅者，janitor 关闭）。
+	DesktopPerNode     int
+	DesktopIdleTimeout time.Duration
+
 	janitorInterval time.Duration // mu 保护；janitorLoop 每轮重读
 	stopJanitor     chan struct{}
 	kickJanitor     chan struct{} // interval 变更后立即重臂定时器
@@ -94,6 +100,7 @@ func New(reg *registry.Registry, log *slog.Logger) *Manager {
 	m := &Manager{
 		reg: reg, log: log, sessions: map[string]*session{},
 		ShellPerNode: 10, ShellIdleTimeout: 30 * time.Minute, ShellMaxLifetime: 8 * time.Hour,
+		DesktopPerNode: 1, DesktopIdleTimeout: 5 * time.Minute,
 		janitorInterval: janitorDefaultInterval,
 		stopJanitor:     make(chan struct{}),
 		kickJanitor:     make(chan struct{}, 1),
@@ -122,13 +129,20 @@ func (m *Manager) Create(nodeID, userID uuid.UUID, kind string, params json.RawM
 		Params: params, agentToken: newToken(), clientToken: newToken(),
 		expiresAt: time.Now().Add(openingTTL),
 	}
-	if kind == proto.KindShell {
+	switch kind {
+	case proto.KindShell:
 		// 治理参数创建时快照：janitor 只读会话内副本，免与配置覆写竞争。
 		now := time.Now()
 		s.startedAt = now
 		s.lastActivity.Store(now.UnixNano())
 		s.idleTimeout = m.ShellIdleTimeout
 		s.maxLifetime = m.ShellMaxLifetime
+	case proto.KindDesktop:
+		// desktop 只有 idle 治理（无寿命上限：长时间观看合法，输入 = Slice3）。
+		now := time.Now()
+		s.startedAt = now
+		s.lastActivity.Store(now.UnixNano())
+		s.idleTimeout = m.DesktopIdleTimeout
 	}
 	m.mu.Lock()
 	if kind == proto.KindShell {
@@ -136,6 +150,14 @@ func (m *Manager) Create(nodeID, userID uuid.UUID, kind string, params json.RawM
 		if m.ShellPerNode > 0 && countByNodeLocked(m.sessions, nodeID, proto.KindShell) >= m.ShellPerNode {
 			m.mu.Unlock()
 			return nil, proto.Err(409, proto.CodeSessionLimited, "shell session limit reached")
+		}
+	}
+	if kind == proto.KindDesktop {
+		// 每节点单会话（默认 1）：desktop 采集源是节点侧单实例，并发会话
+		// 只会争抢同一 host 的订阅名额；同样在锁内判定防超发。
+		if m.DesktopPerNode > 0 && countByNodeLocked(m.sessions, nodeID, proto.KindDesktop) >= m.DesktopPerNode {
+			m.mu.Unlock()
+			return nil, proto.Err(409, proto.CodeSessionLimited, "desktop session limit reached")
 		}
 	}
 	m.sessions[s.ID] = s
@@ -348,7 +370,8 @@ func (m *Manager) janitorLoop() {
 }
 
 // sweep 单轮回收：锁内判定到期（idle 优先级低于寿命），锁外 NotifyClose
-// （幂等；避免持锁回调）。
+// （幂等；避免持锁回调）。shell = max-lifetime + idle；desktop 仅 idle
+// （无订阅活动的会话回收，长观看不受寿命约束）。
 func (m *Manager) sweep(now time.Time) {
 	type expiration struct {
 		id     string
@@ -357,15 +380,19 @@ func (m *Manager) sweep(now time.Time) {
 	var expire []expiration
 	m.mu.Lock()
 	for id, s := range m.sessions {
-		if s.Kind != proto.KindShell {
-			continue
-		}
-		if s.maxLifetime > 0 && now.Sub(s.startedAt) > s.maxLifetime {
-			expire = append(expire, expiration{id, "max-lifetime"})
-			continue
-		}
-		if s.idleTimeout > 0 && now.Sub(time.Unix(0, s.lastActivity.Load())) > s.idleTimeout {
-			expire = append(expire, expiration{id, "idle-timeout"})
+		switch s.Kind {
+		case proto.KindShell:
+			if s.maxLifetime > 0 && now.Sub(s.startedAt) > s.maxLifetime {
+				expire = append(expire, expiration{id, "max-lifetime"})
+				continue
+			}
+			if s.idleTimeout > 0 && now.Sub(time.Unix(0, s.lastActivity.Load())) > s.idleTimeout {
+				expire = append(expire, expiration{id, "idle-timeout"})
+			}
+		case proto.KindDesktop:
+			if s.idleTimeout > 0 && now.Sub(time.Unix(0, s.lastActivity.Load())) > s.idleTimeout {
+				expire = append(expire, expiration{id, "idle-timeout"})
+			}
 		}
 	}
 	m.mu.Unlock()
@@ -408,4 +435,3 @@ func (m *Manager) SessionsOf(nodeID uuid.UUID, kind string) []*Session {
 func (m *Manager) touch(s *Session, at time.Time) {
 	(*session)(s).lastActivity.Store(at.UnixNano())
 }
-

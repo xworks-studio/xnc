@@ -38,6 +38,13 @@ type DesktopTurnConfig struct {
 	Credential string   `json:"credential"`
 }
 
+// Configured 报告 TURN 配置是否完整（URLs/username/credential 全非空）。
+// desktop 会话 relay-only：任一缺失即视为未配置（server 侧 503
+// TURN_UNCONFIGURED 的判定；nil 接收者安全）。
+func (t *DesktopTurnConfig) Configured() bool {
+	return t != nil && len(t.URLs) > 0 && t.Username != "" && t.Credential != ""
+}
+
 // DesktopParams 会话 Params 的 desktop 形态（M1-Slice2）。
 type DesktopParams struct {
 	// Signaling 目前仅 "webrtc"；空视同 "webrtc"（本片唯一形态）。
