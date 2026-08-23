@@ -240,10 +240,13 @@ InputManager::Result InputManager::Inject(const InputMsg& m) {
         batch.push_back(KeyInput(kScanCapsLock, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP));
       }
       if (static_cast<bool>(m.num) != num_on) {
-        batch.push_back(KeyInput(kScanNumLock,
-                                 KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY));
+        // Plain 0x45, NOT E0-prefixed: T6 live evidence (slice3 gate 1)
+        // showed E0 0x45 does not toggle VK_NUMLOCK — two full E0 down/up
+        // pairs rode through with the toggle state unchanged. The web /
+        // e2eviewer KEY path already sends plain 0x45 and toggles fine;
+        // lock sync now matches it.
+        batch.push_back(KeyInput(kScanNumLock, KEYEVENTF_SCANCODE));
         batch.push_back(KeyInput(kScanNumLock, KEYEVENTF_SCANCODE |
-                                                   KEYEVENTF_EXTENDEDKEY |
                                                    KEYEVENTF_KEYUP));
       }
       if (batch.empty()) {

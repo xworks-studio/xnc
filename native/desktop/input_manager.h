@@ -74,7 +74,8 @@ inline constexpr uintptr_t kInputExtraInfoMarker = 0x584E4301u;
 // keys/buttons recorded as down for more than 30s.
 inline constexpr uint32_t kJanitorScanMs = 10000;
 inline constexpr uint32_t kStuckReleaseMs = 30000;
-// Lock-sync scan codes (set 1): CapsLock plain, NumLock E0-prefixed.
+// Lock-sync scan codes (set 1): CapsLock and NumLock both plain — T6 live
+// evidence: E0-prefixed NumLock does not toggle VK_NUMLOCK (gate-1 probe).
 inline constexpr uint16_t kScanCapsLock = 0x3A, kScanNumLock = 0x45;
 // Key-table id packs the extended flag above the 16-bit scan code.
 inline constexpr uint32_t kKeyExtendedBit = 0x10000u;

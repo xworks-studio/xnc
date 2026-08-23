@@ -2225,7 +2225,8 @@ int SelftestMain() {
           ok = false;
       CHECK("im-text-surrogate-events", ok);
     }
-    // LOCK:与 fake GetKeyState 差异才注入;CapsLock 0x3A / NumLock E0 0x45
+    // LOCK:与 fake GetKeyState 差异才注入;CapsLock 0x3A / NumLock 0x45
+    // 都为 plain 扫描码(T6 实测:E0 前缀的 NumLock 不翻转 VK_NUMLOCK)。
     rec.Reset();
     g_vk_state[VK_CAPITAL] = 0;
     g_vk_state[VK_NUMLOCK] = 0;
@@ -2237,13 +2238,19 @@ int SelftestMain() {
     lk.num = 1;
     CHECK("im-lock-both",
           im.Inject(lk) == xnc::InputManager::Result::kInjected &&
-                rec.CountKey(KEYEVENTF_SCANCODE) == 1 &&           // caps down
-                rec.CountKey(KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP) == 1);  // caps up
+                rec.CountKey(KEYEVENTF_SCANCODE) == 2 &&           // caps+num down
+                rec.CountKey(KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP) == 2);  // ups
     {
-      const INPUT* nd = rec.FindKey(KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY);
-      CHECK("im-lock-numlock-ext", nd != nullptr && nd->ki.wScan == 0x45);
-      const INPUT* cd = rec.FindKey(KEYEVENTF_SCANCODE);
-      CHECK("im-lock-capslock-scan", cd != nullptr && cd->ki.wScan == 0x3A);
+      bool num_plain = false, caps_plain = false;
+      for (const INPUT& i : rec.sent) {
+        if (i.type != INPUT_KEYBOARD) continue;
+        if (i.ki.dwFlags == KEYEVENTF_SCANCODE && i.ki.wScan == 0x45) num_plain = true;
+        if (i.ki.dwFlags == KEYEVENTF_SCANCODE && i.ki.wScan == 0x3A) caps_plain = true;
+      }
+      CHECK("im-lock-numlock-plain", num_plain);
+      CHECK("im-lock-capslock-plain", caps_plain);
+      CHECK("im-lock-no-extended",
+            rec.CountKey(KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY) == 0);
     }
     rec.Reset();
     lk.seq = 17;
