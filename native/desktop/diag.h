@@ -21,6 +21,10 @@ inline constexpr wchar_t kDefaultRtPipe[] = L"\\\\.\\pipe\\xnc-desktop-rt";
 // Hard subscriber capacity (plan: max 4).
 inline constexpr uint32_t kMaxSubsHardCap = 4;
 
+// Capture backend selector (--backend; M2-Slice1 Task 3). Diagnostic-only:
+// DXGI is the production rung; GDI is the manual/degraded path (spec §7.6).
+enum class DiagBackend : uint8_t { kDxgi = 0, kGdi };
+
 struct DiagOptions {
   bool console_diag = false;  // --console-diag
   bool console_rt = false;    // --console-rt
@@ -29,6 +33,7 @@ struct DiagOptions {
   uint32_t duration_s = 10;   // --duration (seconds, must be > 0)
   uint32_t fps = 30;          // --fps (target fps, must be > 0)
   uint32_t max_subs = 4;      // --max-subs (1..4, rt mode)
+  DiagBackend backend = DiagBackend::kDxgi;  // --backend dxgi|gdi (default dxgi)
   std::wstring out_path;      // --out (required with --console-diag)
   std::wstring pipe_name;     // --pipe (default kDefaultRtPipe in rt mode)
   std::vector<uint8_t> secret;  // --secret <hex> OR --secret-stdin (filled by

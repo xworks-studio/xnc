@@ -23,12 +23,14 @@
 // xnc-desktop.cpp and reachable via `xnc-desktop.exe --selftest` /
 // `build.bat selftest`.
 #include "capture.h"
+#include "backend_ladder.h"
 #include "capture_reset.h"
 #include "cursor_manager.h"
 #include "desktop_watch.h"
 #include "diag.h"
 #include "dxgi_capture.h"
 #include "frame_cache.h"
+#include "gdi_capture.h"
 #include "input_manager.h"
 #include "mf_encoder.h"
 #include "nv12.h"
@@ -826,6 +828,152 @@ struct RecordingSink final : xnc::AuSink {
   };
   std::vector<Disp> displays;
 };
+
+// ---- M2-Slice1 Task 3 fixtures: fake ladder backends + state log ----
+
+// Records EmitBackendChanged callbacks ("backend/reason" pairs, in order).
+struct LadderStateLog {
+  std::vector<std::string> entries;
+  void Record(const char* backend, const char* reason) {
+    std::string e = backend != nullptr ? backend : "?";
+    e += "/";
+    e += reason != nullptr ? reason : "?";
+    entries.push_back(std::move(e));
+  }
+  bool Has(const char* backend, const char* reason) const {
+    std::string want = std::string(backend) + "/" + reason;
+    return std::find(entries.begin(), entries.end(), want) != entries.end();
+  }
+};
+
+// LadderOpts::on_switch thunk.
+void LadderLogThunk(void* ctx, const char* backend, const char* reason) {
+  static_cast<LadderStateLog*>(ctx)->Record(backend, reason);
+}
+
+// Fake DXGI rung: yields `frames` moving frames, then `hard_errors` fatal-
+// family errors, then err_timeout forever. Rebuild() fails
+// `rebuild_fails` times before succeeding. acquire_calls/rebuild_calls
+// observe the ladder's driving.
+class FakeDxgiRung final : public xnc::ICapture {
+ public:
+  FakeDxgiRung(uint32_t w, uint32_t h, uint32_t frames, uint32_t hard_errors,
+               uint32_t rebuild_fails = 0)
+      : buf_((size_t)w * h * 4, 0x11), w_(w), h_(h),
+        frames_(frames), hard_errors_(hard_errors), rebuild_fails_(rebuild_fails) {}
+  bool Acquire(xnc::FrameBlob& blob, std::string* err = nullptr) override {
+    ++acquire_calls_;
+    if (err) err->clear();
+    if (next_ < frames_) {
+      buf_[next_ % buf_.size()] = 0x80 + (next_ & 0x3F);  // moving content
+      blob.bgra = buf_;
+      blob.w = w_;
+      blob.h = h_;
+      blob.mono_us = ++mono_;
+      ++next_;
+      return true;
+    }
+    if (errors_ < hard_errors_) {
+      ++errors_;
+      if (err) *err = "AcquireNextFrame: hr=0x80004005";  // fatal family
+      return false;
+    }
+    if (err) *err = "err_timeout";
+    return false;
+  }
+  uint32_t Width() const override { return w_; }
+  uint32_t Height() const override { return h_; }
+  uint32_t RebuildCount() const override { return rebuild_oks_; }
+  bool Rebuild(std::string* err = nullptr) override {
+    ++rebuild_calls_;
+    if (fails_left_ > 0) {
+      --fails_left_;
+      if (err) *err = "D3D11CreateDevice: hr=0x80004005";
+      return false;
+    }
+    ++rebuild_oks_;
+    return true;
+  }
+  uint32_t acquire_calls() const { return acquire_calls_; }
+  uint32_t rebuild_calls() const { return rebuild_calls_; }
+
+ private:
+  std::vector<uint8_t> buf_;
+  uint32_t w_, h_, frames_, hard_errors_, rebuild_fails_;
+  uint32_t next_ = 0, errors_ = 0, fails_left_ = rebuild_fails_;
+  uint32_t rebuild_oks_ = 0, acquire_calls_ = 0, rebuild_calls_ = 0;
+  uint64_t mono_ = 0;
+};
+
+// Fake GDI rung: frames forever, never fails (the rung of last resort).
+class FakeGdiRung final : public xnc::ICapture {
+ public:
+  explicit FakeGdiRung(uint32_t w = 96, uint32_t h = 64)
+      : buf_((size_t)w * h * 4, 0x22), w_(w), h_(h) {}
+  bool Acquire(xnc::FrameBlob& blob, std::string* err = nullptr) override {
+    if (err) err->clear();
+    buf_[next_ % buf_.size()] = 0x90 + (next_ & 0xF);
+    ++next_;
+    blob.bgra = buf_;
+    blob.w = w_;
+    blob.h = h_;
+    blob.mono_us = ++mono_;
+    return true;
+  }
+  uint32_t Width() const override { return w_; }
+  uint32_t Height() const override { return h_; }
+  bool Rebuild(std::string* err = nullptr) override {
+    if (err) err->clear();
+    return true;  // the rung of last resort always rebuilds
+  }
+
+ private:
+  std::vector<uint8_t> buf_;
+  uint32_t w_, h_, next_ = 0;
+  uint64_t mono_ = 0;
+};
+
+// Fake factory contexts: the ladder calls make_dxgi from BOTH the probe
+// thread and Rebuild (pipeline thread) - construction counts are atomic and
+// each call returns an independent instance. `fail_after` models DXGI
+// breaking again between the probe and the swap (creation N fails).
+struct FakeDxgiFactory {
+  uint32_t w = 64, h = 48, frames = 1000, hard_errors = 0, rebuild_fails = 0;
+  int64_t fail_after = -1;  // <0 = never; else creations > fail_after fail
+  std::atomic<uint32_t> created{0};
+  std::string fail_err = "D3D11CreateDevice: hr=0x887A0007";
+  std::unique_ptr<xnc::ICapture> Make(std::string* err) {
+    const uint32_t n = ++created;
+    if (fail_after >= 0 && static_cast<int64_t>(n) > fail_after) {
+      if (err) *err = fail_err;
+      return nullptr;
+    }
+    return std::make_unique<FakeDxgiRung>(w, h, frames, hard_errors, rebuild_fails);
+  }
+};
+
+struct FakeGdiFactory {
+  uint32_t w = 96, h = 64;
+  std::atomic<uint32_t> created{0};
+  std::unique_ptr<xnc::ICapture> Make(std::string* err) {
+    ++created;
+    if (err) err->clear();
+    return std::make_unique<FakeGdiRung>(w, h);
+  }
+};
+
+// Thunks bridging the fn-pointer factories to file-scope fixture pointers
+// (each test points them at its own fixture BEFORE constructing the ladder;
+// the probe thread is joined in ~LadderCapture, so the pointers never
+// dangle while a ladder is alive).
+FakeDxgiFactory* g_ld_dxgi = nullptr;
+FakeGdiFactory* g_ld_gdi = nullptr;
+std::unique_ptr<xnc::ICapture> LdMakeDxgi(std::string* err) {
+  return g_ld_dxgi != nullptr ? g_ld_dxgi->Make(err) : nullptr;
+}
+std::unique_ptr<xnc::ICapture> LdMakeGdi(std::string* err) {
+  return g_ld_gdi != nullptr ? g_ld_gdi->Make(err) : nullptr;
+}
 
 }  // namespace
 
@@ -3333,6 +3481,577 @@ int SelftestMain() {
                   (unsigned long long)a.keys_, (unsigned long long)b.keys_, res.resets,
                   a.displays_.empty() ? 0 : a.displays_[0].gen);
     }
+  }
+  // ---- M2-Slice1 Task 3:GDI 采样 CRC 变化检测(纯函数,合成行) ----
+  {
+    // 64x16,rows=8 → 采样行中点 = 1,3,5,...,15(偶数行 0,2,4.. 不采样)
+    constexpr uint32_t kW = 64, kH = 16;
+    std::vector<uint8_t> a((size_t)kW * kH * 4, 0);
+    for (size_t i = 0; i + 3 < a.size(); i += 4) a[i + 3] = 0xFF;
+    // 行中点表:h=16 rows=8 → 1..15 奇数;h=1 → 0;单调不减
+    bool rows_ok = true;
+    for (uint32_t i = 0; i < 8; ++i)
+      rows_ok = rows_ok && xnc::GdiSampledRowY(kH, i, 8) == 1 + 2 * i;
+    CHECK("gdi-crc-row-y-midpoints", rows_ok);
+    CHECK("gdi-crc-row-y-clamp", xnc::GdiSampledRowY(1, 0, 8) == 0 &&
+                                    xnc::GdiSampledRowY(0, 0, 8) == 0 &&
+                                    xnc::GdiSampledRowY(5, 0, 0) == 0);
+    // 同图同 CRC;采样行上 1 字节变化 → 检出
+    const uint64_t crc0 = xnc::GdiSampledCrc(a.data(), kW, kH);
+    CHECK("gdi-crc-identical",
+          xnc::GdiSampledCrc(a.data(), kW, kH) == crc0 && crc0 != 0);
+    std::vector<uint8_t> b = a;
+    b[(size_t)3 * kW * 4 + 8] = 0xAB;  // row 3 = sampled
+    CHECK("gdi-crc-sampled-row-change", xnc::GdiSampledCrc(b.data(), kW, kH) != crc0);
+    // 未采样行(row 2)的变化被漏掉 —— 记录在案的近似(文档化限制)
+    std::vector<uint8_t> c = a;
+    c[(size_t)2 * kW * 4 + 8] = 0xCD;  // row 2 = between sampled rows 1/3
+    CHECK("gdi-crc-between-rows-miss-documented",
+          xnc::GdiSampledCrc(c.data(), kW, kH) == crc0);
+    // 尺寸混入:同像素流不同 w → 不同 CRC(模式变化不可能与同像素碰撞)
+    CHECK("gdi-crc-dims-mixed-in",
+          xnc::GdiSampledCrc(a.data(), 32, 32) != xnc::GdiSampledCrc(a.data(), 64, 16));
+    // 退化输入:0 值安全
+    CHECK("gdi-crc-degenerate-safe",
+          xnc::GdiSampledCrc(nullptr, 64, 16) == 0 &&
+              xnc::GdiSampledCrc(a.data(), 0, 16) == 0 &&
+              xnc::GdiSampledCrc(a.data(), 64, 0) == 0 &&
+              xnc::GdiSampledCrc(a.data(), 64, 16, 0) == 0);
+    // FNV 链式:update(d1)+update(d2) == 一次哈希 d1||d2
+    const uint8_t d1[4] = {1, 2, 3, 4}, d2[3] = {9, 8, 7};
+    uint8_t both[7];
+    for (int i = 0; i < 4; ++i) both[i] = d1[i];
+    for (int i = 0; i < 3; ++i) both[4 + i] = d2[i];
+    CHECK("gdi-crc-fnv-chaining",
+          xnc::Fnv1a64Update(xnc::Fnv1a64(d1, 4), d2, 3) == xnc::Fnv1a64(both, 7));
+    // 采样密度提高 → 之前漏掉的 row 2 变化被检出(rows=16 → 每行都采样)
+    CHECK("gdi-crc-more-rows-catches",
+          xnc::GdiSampledCrc(c.data(), kW, kH, 16) != crc0);
+  }
+  // ---- M2-Slice1 Task 3:DXGI 健康分决策表(spec §7.6 映射;纯表驱动) ----
+  {
+    CHECK("hs-delta-frame", xnc::DxgiHealthDelta(xnc::DxgiHealthEvent::kFrame) == 0);
+    CHECK("hs-delta-timeout", xnc::DxgiHealthDelta(xnc::DxgiHealthEvent::kTimeout) == 0);
+    CHECK("hs-delta-access-lost",
+          xnc::DxgiHealthDelta(xnc::DxgiHealthEvent::kAccessLost) == 0);
+    CHECK("hs-delta-create-fail",
+          xnc::DxgiHealthDelta(xnc::DxgiHealthEvent::kCreateFail) == -40);
+    CHECK("hs-delta-gpu-removed",
+          xnc::DxgiHealthDelta(xnc::DxgiHealthEvent::kGpuRemoved) == -50);
+    CHECK("hs-delta-no-useful",
+          xnc::DxgiHealthDelta(xnc::DxgiHealthEvent::kNoUsefulFrame) == -10);
+    CHECK("hs-apply-clamp-zero",
+          xnc::ApplyDxgiHealthEvent(20, xnc::DxgiHealthEvent::kGpuRemoved) == 0);
+    CHECK("hs-apply-exact",
+          xnc::ApplyDxgiHealthEvent(100, xnc::DxgiHealthEvent::kCreateFail) == 60 &&
+              xnc::ApplyDxgiHealthEvent(60, xnc::DxgiHealthEvent::kNoUsefulFrame) == 50);
+    CHECK("hs-apply-no-recovery",
+          xnc::ApplyDxgiHealthEvent(50, xnc::DxgiHealthEvent::kFrame) == 50 &&
+              xnc::ApplyDxgiHealthEvent(50, xnc::DxgiHealthEvent::kTimeout) == 50 &&
+              xnc::ApplyDxgiHealthEvent(50, xnc::DxgiHealthEvent::kAccessLost) == 50);
+    // acquire 结果分类表
+    CHECK("hs-classify-ok",
+          xnc::ClassifyAcquireOutcome(true, nullptr) == xnc::DxgiHealthEvent::kFrame);
+    CHECK("hs-classify-timeout",
+          xnc::ClassifyAcquireOutcome(false, "err_timeout") ==
+              xnc::DxgiHealthEvent::kTimeout);
+    CHECK("hs-classify-rebuilt-is-frame",
+          xnc::ClassifyAcquireOutcome(false, "err_rebuilt") ==
+              xnc::DxgiHealthEvent::kFrame);
+    CHECK("hs-classify-access-lost",
+          xnc::ClassifyAcquireOutcome(false, "err_access_lost") ==
+              xnc::DxgiHealthEvent::kAccessLost);
+    CHECK("hs-classify-fatal-family",
+          xnc::ClassifyAcquireOutcome(false, "AcquireNextFrame: hr=0x80004005") ==
+              xnc::DxgiHealthEvent::kNoUsefulFrame);
+    CHECK("hs-classify-null-empty",
+          xnc::ClassifyAcquireOutcome(false, nullptr) ==
+                  xnc::DxgiHealthEvent::kNoUsefulFrame &&
+              xnc::ClassifyAcquireOutcome(false, "") ==
+                  xnc::DxgiHealthEvent::kNoUsefulFrame);
+    // 梯子决策表:<60 降级(59 降,60 留);GDI 仅 probe 成功才回升
+    CHECK("hs-decision-stay-healthy",
+          xnc::LadderDecision(xnc::BackendKind::kDxgi, 100, 60, false) ==
+              xnc::LadderAction::kStay);
+    CHECK("hs-decision-downgrade-59",
+          xnc::LadderDecision(xnc::BackendKind::kDxgi, 59, 60, false) ==
+              xnc::LadderAction::kDowngrade);
+    CHECK("hs-decision-stay-60-boundary",
+          xnc::LadderDecision(xnc::BackendKind::kDxgi, 60, 60, false) ==
+              xnc::LadderAction::kStay);
+    CHECK("hs-decision-threshold-configurable",
+          xnc::LadderDecision(xnc::BackendKind::kDxgi, 49, 50, false) ==
+              xnc::LadderAction::kDowngrade);
+    CHECK("hs-decision-gdi-no-probe-stays",
+          xnc::LadderDecision(xnc::BackendKind::kGdi, 0, 60, false) ==
+              xnc::LadderAction::kStay);
+    CHECK("hs-decision-gdi-probe-upgrades",
+          xnc::LadderDecision(xnc::BackendKind::kGdi, 0, 60, true) ==
+              xnc::LadderAction::kUpgrade);
+    CHECK("hs-backend-names",
+          xnc::BackendKindName(xnc::BackendKind::kDxgi) != nullptr &&
+              std::strcmp(xnc::BackendKindName(xnc::BackendKind::kDxgi), "dxgi") == 0 &&
+              std::strcmp(xnc::BackendKindName(xnc::BackendKind::kGdi), "gdi") == 0);
+    // env 诊断钩子解析
+    int32_t fh = -1;
+    CHECK("hs-env-force-health-valid",
+          xnc::ParseForceHealthEnv("50", &fh) && fh == 50 &&
+              xnc::ParseForceHealthEnv("0", &fh) && fh == 0 &&
+              xnc::ParseForceHealthEnv("100", &fh) && fh == 100 &&
+              xnc::ParseForceHealthEnv("007", &fh) && fh == 7);
+    CHECK("hs-env-force-health-invalid",
+          !xnc::ParseForceHealthEnv("101", &fh) && !xnc::ParseForceHealthEnv("-1", &fh) &&
+              !xnc::ParseForceHealthEnv("abc", &fh) && !xnc::ParseForceHealthEnv("", &fh) &&
+              !xnc::ParseForceHealthEnv("5x", &fh) && !xnc::ParseForceHealthEnv(nullptr, &fh));
+    CHECK("hs-env-force-backend",
+          xnc::ParseForceBackendEnv("gdi") && xnc::ParseForceBackendEnv("GDI") &&
+              !xnc::ParseForceBackendEnv("dxgi") &&
+              !xnc::ParseForceBackendEnv("bogus") && !xnc::ParseForceBackendEnv("") &&
+              !xnc::ParseForceBackendEnv(nullptr));
+  }
+  // ---- M2-Slice1 Task 3:CLI --backend(参数矩阵) ----
+  {
+    CHECK("args-backend-default-dxgi",
+          Parse({L"--console-diag", L"--out", L"t.h264"}).opt.backend ==
+              xnc::DiagBackend::kDxgi);
+    CHECK("args-backend-gdi",
+          Parse({L"--console-diag", L"--out", L"t.h264", L"--backend", L"gdi"}).ok &&
+              Parse({L"--console-diag", L"--out", L"t.h264", L"--backend", L"gdi"})
+                      .opt.backend == xnc::DiagBackend::kGdi);
+    CHECK("args-backend-dxgi-explicit",
+          Parse({L"--console-diag", L"--out", L"t.h264", L"--backend", L"dxgi"}).ok);
+    CHECK("args-backend-invalid", !Parse({L"--console-diag", L"--out", L"t",
+                                          L"--backend", L"wgc"})
+                                         .ok);
+    CHECK("args-backend-missing-value",
+          !Parse({L"--console-diag", L"--out", L"t", L"--backend"}).ok);
+  }
+  // ---- M2-Slice1 Task 3:梯子运行时(fake 后端;无管线直驱) ----
+  {
+    // 初始:DXGI,健康 100
+    {
+      FakeDxgiFactory dxgi;
+      FakeGdiFactory gdi;
+      g_ld_dxgi = &dxgi;
+      g_ld_gdi = &gdi;
+      xnc::LadderOpts lo;
+      lo.make_dxgi = &LdMakeDxgi;
+      lo.make_gdi = &LdMakeGdi;
+      lo.probe_interval_ms = 0;  // no probe in this unit block
+      xnc::LadderCapture ladder(lo);
+      std::string err;
+      CHECK("ld-init-dxgi-default", ladder.Init(&err) &&
+                                        ladder.active() == xnc::BackendKind::kDxgi &&
+                                        ladder.dxgi_health() == 100);
+      xnc::FrameBlob blob;
+      CHECK("ld-init-dxgi-yields-frames",
+            ladder.Acquire(blob, &err) && blob.w == dxgi.w && ladder.Width() == dxgi.w);
+      CHECK("ld-init-gdi-not-created", gdi.created.load() == 0);
+    }
+    // force_gdi:直接从 GDI 起,DXGI 工厂不被调用
+    {
+      FakeDxgiFactory dxgi;
+      FakeGdiFactory gdi;
+      g_ld_dxgi = &dxgi;
+      g_ld_gdi = &gdi;
+      xnc::LadderOpts lo;
+      lo.make_dxgi = &LdMakeDxgi;
+      lo.make_gdi = &LdMakeGdi;
+      lo.force_gdi = true;
+      lo.probe_interval_ms = 0;
+      xnc::LadderCapture ladder(lo);
+      std::string err;
+      CHECK("ld-init-force-gdi", ladder.Init(&err) &&
+                                     ladder.active() == xnc::BackendKind::kGdi);
+      xnc::FrameBlob blob;
+      CHECK("ld-init-force-gdi-frames", ladder.Acquire(blob, &err) && blob.w == gdi.w);
+      CHECK("ld-init-force-gdi-no-dxgi", dxgi.created.load() == 0);
+    }
+    // session-0 类拒绝(E_ACCESSDENIED 语义)不得静默落到 GDI(会采到错误桌面)
+    {
+      FakeDxgiFactory dxgi;
+      dxgi.fail_after = 0;  // first creation fails, access-denied-shaped err
+      dxgi.fail_err = "EnumOutputs: hr=0x80070005";
+      FakeGdiFactory gdi;
+      g_ld_dxgi = &dxgi;
+      g_ld_gdi = &gdi;
+      xnc::LadderOpts lo;
+      lo.make_dxgi = &LdMakeDxgi;
+      lo.make_gdi = &LdMakeGdi;
+      lo.probe_interval_ms = 0;
+      xnc::LadderCapture ladder(lo);
+      std::string err;
+      CHECK("ld-init-session0-denied-fails", !ladder.Init(&err));
+      CHECK("ld-init-session0-err-preserved", err.find("0x80070005") != std::string::npos);
+      CHECK("ld-init-session0-no-gdi-fallback", gdi.created.load() == 0);
+    }
+    // 真 DXGI 创建失败(非拒绝)→ GDI 兜底
+    {
+      FakeDxgiFactory dxgi;
+      dxgi.fail_after = 0;
+      dxgi.fail_err = "D3D11CreateDevice: hr=0x80004005";
+      FakeGdiFactory gdi;
+      LadderStateLog log;
+      g_ld_dxgi = &dxgi;
+      g_ld_gdi = &gdi;
+      xnc::LadderOpts lo;
+      lo.make_dxgi = &LdMakeDxgi;
+      lo.make_gdi = &LdMakeGdi;
+      lo.on_switch = &LadderLogThunk;
+      lo.on_switch_ctx = &log;
+      lo.probe_interval_ms = 0;
+      xnc::LadderCapture ladder(lo);
+      std::string err;
+      CHECK("ld-init-dxgi-fail-gdi-fallback",
+            ladder.Init(&err) && ladder.active() == xnc::BackendKind::kGdi);
+      CHECK("ld-init-gdi-fallback-state", log.Has("gdi", "dxgi_init_failed"));
+      xnc::FrameBlob blob;
+      CHECK("ld-init-gdi-fallback-frames", ladder.Acquire(blob, &err));
+    }
+    // 降级(无协调器):硬错 → 健康分跌穿 → 原地换 GDI(err_rebuilt),帧恢复
+    {
+      FakeDxgiFactory dxgi;
+      dxgi.frames = 1;
+      dxgi.hard_errors = 100;
+      FakeGdiFactory gdi;
+      LadderStateLog log;
+      g_ld_dxgi = &dxgi;
+      g_ld_gdi = &gdi;
+      xnc::LadderOpts lo;
+      lo.make_dxgi = &LdMakeDxgi;
+      lo.make_gdi = &LdMakeGdi;
+      lo.on_switch = &LadderLogThunk;
+      lo.on_switch_ctx = &log;
+      lo.probe_interval_ms = 0;  // coordinator absent: inline swap path
+      xnc::LadderCapture ladder(lo);
+      std::string err;
+      CHECK("ld-down-nocoord-init", ladder.Init(&err));
+      xnc::FrameBlob blob;
+      CHECK("ld-down-nocoord-first-frame", ladder.Acquire(blob, &err));
+      // 之后每个硬错 −10:90,80,70,60,50 → 50 <60 → 原地切换
+      bool saw_rebuilt = false;
+      int gdi_frames = 0;
+      for (int i = 0; i < 20; ++i) {
+        std::string e;
+        if (ladder.Acquire(blob, &e)) {
+          if (ladder.active() == xnc::BackendKind::kGdi) ++gdi_frames;
+        } else if (e == "err_rebuilt") {
+          saw_rebuilt = true;
+        }
+      }
+      CHECK("ld-down-nocoord-switched",
+            ladder.active() == xnc::BackendKind::kGdi && ladder.switches() == 1);
+      CHECK("ld-down-nocoord-err-rebuilt", saw_rebuilt);
+      CHECK("ld-down-nocoord-gdi-frames", gdi_frames >= 5);
+      CHECK("ld-down-nocoord-state", log.Has("gdi", "health"));
+      CHECK("ld-down-nocoord-health-recorded", ladder.dxgi_health() == 50);
+    }
+    // 降级(有协调器):健康分跌穿 → RequestReset(change_backend);Rebuild 换 GDI
+    {
+      FakeDxgiFactory dxgi;
+      dxgi.frames = 0;  // every acquire a hard error from the start
+      dxgi.hard_errors = 100;
+      FakeGdiFactory gdi;
+      LadderStateLog log;
+      g_ld_dxgi = &dxgi;
+      g_ld_gdi = &gdi;
+      xnc::CaptureReset reset;  // no clock: immediate take
+      xnc::LadderOpts lo;
+      lo.make_dxgi = &LdMakeDxgi;
+      lo.make_gdi = &LdMakeGdi;
+      lo.on_switch = &LadderLogThunk;
+      lo.on_switch_ctx = &log;
+      lo.reset = &reset;
+      lo.probe_interval_ms = 0;
+      xnc::LadderCapture ladder(lo);
+      std::string err;
+      CHECK("ld-down-coord-init", ladder.Init(&err));
+      xnc::FrameBlob blob;
+      std::string e;
+      // 首个硬错即被换算为 err_access_lost 交给 T2(fatal 家族被梯子收容)
+      CHECK("ld-down-coord-first-error-contained",
+            !ladder.Acquire(blob, &e) && e == "err_access_lost");
+      // 健康分随硬错继续跌:100-10×k;跌穿后梯子请求 change_backend reset
+      for (int i = 0; i < 8 && ladder.dxgi_health() >= 60; ++i) ladder.Acquire(blob, &e);
+      CHECK("ld-down-coord-health-below", ladder.dxgi_health() < 60);
+      CHECK("ld-down-coord-reset-requested",
+            reset.requests() >= 1 && reset.executed() == 0);
+      char reason[xnc::kResetReasonMax] = {0};
+      CHECK("ld-down-coord-reset-reason",
+            reset.TakeReset(reason, sizeof(reason)) &&
+                std::strcmp(reason, "change_backend") == 0);
+      std::string rerr;
+      CHECK("ld-down-coord-rebuild-swaps",
+            ladder.Rebuild(&rerr) && ladder.active() == xnc::BackendKind::kGdi);
+      CHECK("ld-down-coord-state", log.Has("gdi", "health"));
+      CHECK("ld-down-coord-gdi-frames", ladder.Acquire(blob, &e) && e.empty());
+    }
+    // Rebuild 委托失败(桌面 DEFAULT)→ kCreateFail −40;门非默认(安全桌面)不扣
+    {
+      FakeDxgiFactory dxgi;
+      dxgi.rebuild_fails = 3;  // 3 次 Rebuild 失败后成功
+      FakeGdiFactory gdi;
+      g_ld_dxgi = &dxgi;
+      g_ld_gdi = &gdi;
+      g_cr_gate.store(xnc::ResetDesktop::kDefault);
+      xnc::CaptureReset reset;
+      xnc::LadderOpts lo;
+      lo.make_dxgi = &LdMakeDxgi;
+      lo.make_gdi = &LdMakeGdi;
+      lo.reset = &reset;
+      lo.force_health = 100;  // 屏蔽降级分支,专测计分
+      lo.probe_interval_ms = 0;
+      xnc::LadderCapture ladder(lo);
+      std::string err;
+      CHECK("ld-score-init", ladder.Init(&err) && ladder.dxgi_health() == 100);
+      xnc::FrameBlob blob;
+      ladder.Acquire(blob, &err);  // frame: stays 100
+      std::string rerr;
+      CHECK("ld-score-rebuild-fail-1", !ladder.Rebuild(&rerr) && ladder.dxgi_health() == 60);
+      CHECK("ld-score-rebuild-fail-2", !ladder.Rebuild(&rerr) && ladder.dxgi_health() == 20);
+      // 20 < 60 → 第 3 次 Rebuild 变成换 GDI(不再是委托)
+      CHECK("ld-score-below-threshold-swaps",
+            ladder.Rebuild(&rerr) && ladder.active() == xnc::BackendKind::kGdi);
+      // 门非默认时 Rebuild 失败不扣分:重建一个梯子验证
+      FakeDxgiFactory dxgi2;
+      dxgi2.rebuild_fails = 1;
+      g_ld_dxgi = &dxgi2;
+      xnc::CaptureReset::Opts co2;
+      co2.desktop_fn = &CrUnitGate;  // gate-observable coordinator
+      xnc::CaptureReset reset2(co2);
+      xnc::LadderOpts lo2;
+      lo2.make_dxgi = &LdMakeDxgi;
+      lo2.make_gdi = &LdMakeGdi;
+      lo2.reset = &reset2;
+      lo2.force_health = 100;
+      lo2.probe_interval_ms = 0;
+      xnc::LadderCapture ladder2(lo2);
+      CHECK("ld-score-init-2", ladder2.Init(&err) && ladder2.dxgi_health() == 100);
+      g_cr_gate.store(xnc::ResetDesktop::kNonDefault);  // secure desktop up
+      CHECK("ld-score-gate-blocked-no-penalty",
+            !ladder2.Rebuild(&rerr) && ladder2.dxgi_health() == 100);
+      g_cr_gate.store(xnc::ResetDesktop::kDefault);
+    }
+    // XNC_FORCE_DXGI_HEALTH=50:首个 acquire 后即降级请求
+    {
+      FakeDxgiFactory dxgi;
+      FakeGdiFactory gdi;
+      g_ld_dxgi = &dxgi;
+      g_ld_gdi = &gdi;
+      xnc::CaptureReset reset;
+      xnc::LadderOpts lo;
+      lo.make_dxgi = &LdMakeDxgi;
+      lo.make_gdi = &LdMakeGdi;
+      lo.reset = &reset;
+      lo.force_health = 50;
+      lo.probe_interval_ms = 0;
+      xnc::LadderCapture ladder(lo);
+      std::string err;
+      CHECK("ld-force-health-init", ladder.Init(&err) && ladder.dxgi_health() == 50);
+      xnc::FrameBlob blob;
+      std::string e;
+      CHECK("ld-force-health-frame-keeps-50", ladder.Acquire(blob, &e) &&
+                                                   ladder.dxgi_health() == 50);
+      CHECK("ld-force-health-reset-requested", reset.requests() == 1);
+      char reason[xnc::kResetReasonMax] = {0};
+      reset.TakeReset(reason, sizeof(reason));
+      CHECK("ld-force-health-reason", std::strcmp(reason, "change_backend") == 0);
+    }
+    // probe 回升:force_gdi + 协调器 + 可用 DXGI → probe 成功 → reset(change_backend)
+    // → Rebuild 换回 DXGI
+    {
+      FakeDxgiFactory dxgi;
+      FakeGdiFactory gdi;
+      LadderStateLog log;
+      g_ld_dxgi = &dxgi;
+      g_ld_gdi = &gdi;
+      xnc::CaptureReset reset;
+      xnc::LadderOpts lo;
+      lo.make_dxgi = &LdMakeDxgi;
+      lo.make_gdi = &LdMakeGdi;
+      lo.on_switch = &LadderLogThunk;
+      lo.on_switch_ctx = &log;
+      lo.reset = &reset;
+      lo.force_gdi = true;
+      lo.probe_interval_ms = 80;  // fast probe for the test
+      xnc::LadderCapture ladder(lo);
+      std::string err;
+      CHECK("ld-up-init-gdi", ladder.Init(&err) && ladder.active() == xnc::BackendKind::kGdi);
+      xnc::FrameBlob blob;
+      std::string e;
+      CHECK("ld-up-gdi-frames-first", ladder.Acquire(blob, &e));
+      bool probed = false;
+      for (int i = 0; i < 100 && !probed; ++i) {  // ≤ ~2s wall
+        Sleep(20);
+        probed = ladder.probe_ok() && reset.requests() >= 1;
+      }
+      CHECK("ld-up-probe-ok-reset-requested", probed);
+      char reason[xnc::kResetReasonMax] = {0};
+      CHECK("ld-up-reason", reset.TakeReset(reason, sizeof(reason)) &&
+                                std::strcmp(reason, "change_backend") == 0);
+      std::string rerr;
+      CHECK("ld-up-rebuild-swaps-dxgi",
+            ladder.Rebuild(&rerr) && ladder.active() == xnc::BackendKind::kDxgi &&
+                ladder.dxgi_health() == 100 && !ladder.probe_ok());
+      CHECK("ld-up-state", log.Has("dxgi", "probe"));
+      CHECK("ld-up-dxgi-frames", ladder.Acquire(blob, &e) && e.empty());
+    }
+    // probe 成功后创建再失败(两次创建之间 DXGI 又坏)→ 不搁浅 reset:留在 GDI,
+    // Rebuild 仍成功(GDI 重建),probe_ok 清零待下次 probe
+    {
+      FakeDxgiFactory dxgi;
+      dxgi.fail_after = 1;  // creation #1 (probe) ok, #2 (swap) fails
+      FakeGdiFactory gdi;
+      g_ld_dxgi = &dxgi;
+      g_ld_gdi = &gdi;
+      xnc::CaptureReset reset;
+      xnc::LadderOpts lo;
+      lo.make_dxgi = &LdMakeDxgi;
+      lo.make_gdi = &LdMakeGdi;
+      lo.reset = &reset;
+      lo.force_gdi = true;
+      lo.probe_interval_ms = 80;
+      xnc::LadderCapture ladder(lo);
+      std::string err;
+      CHECK("ld-up2-init-gdi", ladder.Init(&err) && ladder.active() == xnc::BackendKind::kGdi);
+      bool probed = false;
+      for (int i = 0; i < 100 && !probed; ++i) {
+        Sleep(20);
+        probed = ladder.probe_ok();
+      }
+      CHECK("ld-up2-probe-ok", probed);
+      char reason[xnc::kResetReasonMax] = {0};
+      reset.TakeReset(reason, sizeof(reason));
+      std::string rerr;
+      CHECK("ld-up2-swap-fail-stays-gdi",
+            ladder.Rebuild(&rerr) && ladder.active() == xnc::BackendKind::kGdi &&
+                !ladder.probe_ok());
+      xnc::FrameBlob blob;
+      std::string e;
+      CHECK("ld-up2-gdi-frames-still", ladder.Acquire(blob, &e) && e.empty());
+    }
+    g_ld_dxgi = nullptr;
+    g_ld_gdi = nullptr;
+  }
+  // ---- M2-Slice1 Task 3:梯子 × 管线(真 MF 编码器;rsE 降级 / rsF 回升) ----
+  const uint32_t kLdW = 64, kLdH = 48, kLdFps = 15, kLdBitrate = 500000;
+  { // rsE:DXGI 帧后硬错 → 健康分跌穿 → GDI,流不断,STATE 序列完整
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(kLdW, kLdH, kLdFps, kLdBitrate, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: rsE-init err=%s\n", err.c_str());
+    CHECK("rsE-init", init_ok);
+    if (init_ok) {
+      FakeDxgiFactory dxgi;  // 12 帧后永久硬错(分辨率同 64x48 → 无 encoder re-init)
+      dxgi.w = kLdW;
+      dxgi.h = kLdH;
+      dxgi.frames = 12;
+      dxgi.hard_errors = 1000000;
+      FakeGdiFactory gdi;
+      gdi.w = kLdW;
+      gdi.h = kLdH;
+      LadderStateLog log;
+      g_ld_dxgi = &dxgi;
+      g_ld_gdi = &gdi;
+      g_cr_gate.store(xnc::ResetDesktop::kDefault);
+      xnc::CaptureReset::Opts co;
+      co.clock_ms = &CrRealClock;
+      co.desktop_fn = &CrUnitGate;
+      xnc::CaptureReset reset(co);
+      xnc::LadderOpts lo;
+      lo.make_dxgi = &LdMakeDxgi;
+      lo.make_gdi = &LdMakeGdi;
+      lo.on_switch = &LadderLogThunk;
+      lo.on_switch_ctx = &log;
+      lo.reset = &reset;
+      lo.probe_interval_ms = 0;  // rsF covers the probe; here: stay degraded
+      xnc::LadderCapture ladder(lo);
+      CHECK("rsE-ladder-init", ladder.Init(&err));
+      ladder.SetStateSink(nullptr);  // diag mode family: log-only
+      RecordingSink sink;
+      xnc::PipelineOpts po;
+      po.duration_s = 8;
+      po.fps = kLdFps;
+      po.target_bitrate_bps = kLdBitrate;
+      po.reset = &reset;
+      xnc::PipelineResult res;
+      std::thread pipe_th([&] { res = xnc::Pipeline::Run(ladder, enc, sink, po); });
+      const bool switched = WaitUntil([&ladder] {
+        return ladder.active() == xnc::BackendKind::kGdi;
+      }, 6000);
+      pipe_th.join();
+      CHECK("rsE-switched-to-gdi", switched && ladder.switches() == 1);
+      CHECK("rsE-pipeline-ok", res.ok);
+      CHECK("rsE-frames-continue", sink.aus >= 20 && res.counters.captured > 12);
+      CHECK("rsE-state-sequence", sink.Saw("recovering") && sink.Saw("capture_rebuilt") &&
+                                     !sink.Saw("capture_fatal"));
+      CHECK("rsE-backend-state", log.Has("gdi", "health"));
+      CHECK("rsE-resets", res.resets >= 1);
+      std::printf("SELFTEST NOTE: rsE switches=%u resets=%u aus=%llu captured=%llu\n",
+                  ladder.switches(), res.resets,
+                  (unsigned long long)sink.aus,
+                  (unsigned long long)res.counters.captured);
+    }
+  }
+  { // rsF:GDI 起(force_gdi)→ probe(80ms)成功 → 回升 DXGI,STATE backend_changed
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(kLdW, kLdH, kLdFps, kLdBitrate, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: rsF-init err=%s\n", err.c_str());
+    CHECK("rsF-init", init_ok);
+    if (init_ok) {
+      FakeDxgiFactory dxgi;
+      dxgi.w = kLdW;
+      dxgi.h = kLdH;
+      FakeGdiFactory gdi;
+      gdi.w = kLdW;
+      gdi.h = kLdH;
+      LadderStateLog log;
+      g_ld_dxgi = &dxgi;
+      g_ld_gdi = &gdi;
+      g_cr_gate.store(xnc::ResetDesktop::kDefault);
+      xnc::CaptureReset::Opts co;
+      co.clock_ms = &CrRealClock;
+      co.desktop_fn = &CrUnitGate;
+      xnc::CaptureReset reset(co);
+      xnc::LadderOpts lo;
+      lo.make_dxgi = &LdMakeDxgi;
+      lo.make_gdi = &LdMakeGdi;
+      lo.on_switch = &LadderLogThunk;
+      lo.on_switch_ctx = &log;
+      lo.reset = &reset;
+      lo.force_gdi = true;
+      lo.probe_interval_ms = 80;
+      xnc::LadderCapture ladder(lo);
+      CHECK("rsF-ladder-init-gdi", ladder.Init(&err) &&
+                                       ladder.active() == xnc::BackendKind::kGdi);
+      RecordingSink sink;
+      ladder.SetStateSink(&sink);  // rt mode family: backend_changed STATE
+      xnc::PipelineOpts po;
+      po.duration_s = 8;
+      po.fps = kLdFps;
+      po.target_bitrate_bps = kLdBitrate;
+      po.reset = &reset;
+      xnc::PipelineResult res;
+      std::thread pipe_th([&] { res = xnc::Pipeline::Run(ladder, enc, sink, po); });
+      const bool upgraded = WaitUntil([&ladder, &sink] {
+        return ladder.active() == xnc::BackendKind::kDxgi && sink.Saw("backend_changed");
+      }, 6000);
+      pipe_th.join();
+      CHECK("rsF-upgraded-to-dxgi", upgraded && ladder.switches() == 1);
+      CHECK("rsF-pipeline-ok", res.ok);
+      CHECK("rsF-frames-continue", sink.aus >= 20);
+      CHECK("rsF-backend-changed-state", sink.Saw("backend_changed") &&
+                                             sink.SawRecoverable("backend_changed"));
+      CHECK("rsF-ladder-state", log.Has("dxgi", "probe"));
+      CHECK("rsF-two-idrs", sink.keys >= 2);  // 初始 + 回升 rebuild IDR
+      CHECK("rsF-health-restored", ladder.dxgi_health() == 100);
+      std::printf("SELFTEST NOTE: rsF switches=%u resets=%u aus=%llu keys=%llu\n",
+                  ladder.switches(), res.resets,
+                  (unsigned long long)sink.aus, (unsigned long long)sink.keys);
+    }
+    g_ld_dxgi = nullptr;
+    g_ld_gdi = nullptr;
   }
   if (fails == 0) std::printf("selftest ok\n");
   return fails == 0 ? 0 : 1;

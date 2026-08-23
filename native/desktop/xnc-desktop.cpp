@@ -36,12 +36,13 @@
 #include <vector>
 
 #include "../common/log.h"
+#include "backend_ladder.h"  // LadderCapture (M2-Slice1 Task 3)
 #include "capture.h"       // capture contract (ICapture/FrameBlob)
 #include "capture_reset.h"  // CaptureReset (M2-Slice1 Task 2)
 #include "cursor_manager.h"  // CursorManager (M1-Slice3)
 #include "desktop_watch.h"  // DesktopWatch (M2-Slice1 Task 1/2)
 #include "diag.h"
-#include "dxgi_capture.h"  // TryCreateDxgiCapture, DxgiErrIsDesktopAccessDenied
+#include "dxgi_capture.h"  // DxgiErrIsDesktopAccessDenied
 #include "input_manager.h"  // InputManager (M1-Slice3)
 #include "mf_encoder.h"    // MfSoftEncoder
 #include "pipeline.h"      // Pipeline::Run + stats.json sidecar
@@ -80,6 +81,33 @@ xnc::ResetDesktop ResetGateThunk(void* ctx) {
 
 uint64_t ResetClockThunk() { return GetTickCount64(); }
 
+// M2-Slice1 Task 3: backend-ladder opts from the CLI --backend selector and
+// the diagnostic env hooks (XNC_FORCE_DXGI_HEALTH / XNC_FORCE_BACKEND, both
+// documented in --help; CLI wins over env). Reads the environment ONCE at
+// startup - the flags exist to force ladder transitions for live diagnosis.
+xnc::LadderOpts LadderOptsFor(const xnc::DiagOptions& opt) {
+  xnc::LadderOpts lo;
+  char buf[32];
+  if (GetEnvironmentVariableA("XNC_FORCE_DXGI_HEALTH", buf, sizeof(buf)) > 0) {
+    int32_t v = -1;
+    if (xnc::ParseForceHealthEnv(buf, &v)) {
+      lo.force_health = v;
+      XNC_LOG_INFO("backend_env_override force_health=%d", v);
+    } else {
+      XNC_LOG_ERROR("backend_env_override invalid XNC_FORCE_DXGI_HEALTH=\"%s\" "
+                    "(want 0..100; ignored)", buf);
+    }
+  }
+  if (GetEnvironmentVariableA("XNC_FORCE_BACKEND", buf, sizeof(buf)) > 0) {
+    if (xnc::ParseForceBackendEnv(buf)) {
+      lo.force_gdi = true;
+      XNC_LOG_INFO("backend_env_override force_backend=gdi");
+    }
+  }
+  if (opt.backend == xnc::DiagBackend::kGdi) lo.force_gdi = true;  // CLI wins
+  return lo;
+}
+
 // Watch opts: every transition INTO a non-default desktop requests a
 // unified reset (any entry into the secure desktop revokes the duplication
 // - T1 evidence); the reset's debounce merges this with the ACCESS_LOST
@@ -108,15 +136,21 @@ void Usage(FILE* out) {
   std::fwprintf(out,
       L"xnc-desktop - XNC desktop capture process (M1)\n"
       L"usage: xnc-desktop.exe --console-diag [--duration <sec>] [--out <file.h264>] [--fps <n>]\n"
-      L"                    [--pipe <name> --secret <hex>]\n"
+      L"                    [--pipe <name> --secret <hex>] [--backend dxgi|gdi]\n"
       L"       xnc-desktop.exe --console-rt (--secret-stdin | --secret <hex>)\n"
-      L"                    [--pipe <name>] [--max-subs <n>] [--fps <n>]\n"
+      L"                    [--pipe <name>] [--max-subs <n>] [--fps <n>] [--backend dxgi|gdi]\n"
       L"       xnc-desktop.exe --selftest | --help\n"
       L"  --console-diag  diagnostic capture loop in the console session\n"
       L"  --duration      seconds to run (default 10, must be > 0)\n"
       L"  --out           output H.264 path (required with --console-diag);\n"
       L"                  a stats.json sidecar is written next to it\n"
       L"  --fps           target fps (default 30, must be > 0)\n"
+      L"  --backend       capture backend selector (default dxgi; diagnostic-only).\n"
+      L"                  gdi = GetDC/BitBlt fallback capped at 15 fps (spec 7.6).\n"
+      L"                  Both backends sit on the health-score ladder: DXGI health\n"
+      L"                  < 60 switches to GDI mid-run, a 30 s DXGI probe switches\n"
+      L"                  back; every swap forces one IDR and emits STATE\n"
+      L"                  backend_changed\n"
       L"  --console-rt    real-time pipe server mode: subscribers ATTACH over\n"
       L"                  the M0 handshake and receive FRAME events (until Ctrl+C)\n"
       L"  --secret-stdin  read the pipe secret from stdin: exactly 64 hex chars\n"
@@ -130,7 +164,11 @@ void Usage(FILE* out) {
       L"  --max-subs      max subscribers (default 4, must be 1..4)\n"
       L"  --selftest      arg parsing + FrameBlob/encoder/pipeline/rt selftest\n"
       L"  --help          this usage text\n"
-      L"console-diag runs DXGI capture -> FrameCache -> MF H.264 encode and\n"
+      L"diagnostic env hooks (diag-only, no production effect):\n"
+      L"  XNC_FORCE_DXGI_HEALTH=N  initial DXGI health score (0..100); N<60\n"
+      L"                           forces the GDI downgrade on the first frame\n"
+      L"  XNC_FORCE_BACKEND=gdi    start on the GDI backend (--backend wins)\n"
+      L"console-diag runs capture -> FrameCache -> MF H.264 encode and\n"
       L"writes shaped Annex-B AUs to --out (SPS/PPS before IDR, 4-byte start\n"
       L"codes, no AUD) plus per-second counters and a stats.json sidecar;\n"
       L"with --pipe/--secret the same run also serves the rt subscribers\n");
@@ -294,6 +332,16 @@ bool ParseDiagArgs(int argc, wchar_t** argv, DiagOptions* opt, std::wstring* err
       if (!ParseU32(v, &opt->max_subs) || opt->max_subs == 0 ||
           opt->max_subs > kMaxSubsHardCap)
         return fail(L"--max-subs must be an integer in 1..4");
+    } else if (std::wcscmp(a, L"--backend") == 0) {
+      const wchar_t* v = value_of(L"--backend");
+      if (!v) return false;
+      if (std::wcscmp(v, L"dxgi") == 0) {
+        opt->backend = DiagBackend::kDxgi;
+      } else if (std::wcscmp(v, L"gdi") == 0) {
+        opt->backend = DiagBackend::kGdi;
+      } else {
+        return fail(L"--backend must be dxgi or gdi (diagnostic-only selector)");
+      }
     } else {
       return fail(std::wstring(L"unknown argument: ") + a);
     }
@@ -381,13 +429,17 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
     return r;
   };
 
-  // Task 3: real DXGI capture. Init failure paths:
-  //   - desktop access denied (session 0 SYSTEM direct run) is EXPECTED
-  //     until the Task 6 session bridge: log a clear marker, exit 1;
-  //   - anything else is a genuine backend failure, exit 1.
+  // M2-Slice1 Task 3: the backend ladder IS the capture. DXGI is the
+  // default rung; GDI joins via --backend gdi / XNC_FORCE_BACKEND=gdi, a
+  // health drop below 60, or a genuine DXGI create failure (NOT a
+  // session-0 desktop denial - that keeps the historical exit below).
+  // Mid-run swaps ride the unified CaptureReset wired above; a 30s DXGI
+  // probe upgrades back once DXGI works again (STATE backend_changed).
+  xnc::LadderOpts lopt = LadderOptsFor(opt);
+  lopt.reset = &capture_reset;
+  xnc::LadderCapture capture(lopt);
   std::string cap_err;
-  std::unique_ptr<xnc::ICapture> capture = xnc::TryCreateDxgiCapture(&cap_err);
-  if (!capture) {
+  if (!capture.Init(&cap_err)) {
     if (xnc::DxgiErrIsDesktopAccessDenied(cap_err)) {
       XNC_LOG_ERROR("dxgi_access_denied_session0 err=\"%s\"", cap_err.c_str());
       write_stats(fail_result("dxgi_access_denied_session0"));
@@ -398,13 +450,13 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
     std::fclose(out);
     return 1;
   }
-  XNC_LOG_INFO("capture_init w=%u h=%u", capture->Width(), capture->Height());
+  XNC_LOG_INFO("capture_init w=%u h=%u", capture.Width(), capture.Height());
 
   // Task 5: capture -> FrameCache -> MF software encode -> shaped Annex-B
   // AUs into --out; encoder at the capture's dimensions, fps from args.
   xnc::MfSoftEncoder encoder;
   std::string enc_err;
-  if (!encoder.Init(capture->Width(), capture->Height(), opt.fps, kDiagBitrateBps,
+  if (!encoder.Init(capture.Width(), capture.Height(), opt.fps, kDiagBitrateBps,
                     &enc_err)) {
     XNC_LOG_ERROR("encoder_init_failed err=\"%s\"", enc_err.c_str());
     write_stats(fail_result("encoder_init_failed"));
@@ -423,12 +475,12 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
   const bool rt_extra = !opt.secret.empty() && !opt.pipe_name.empty();
   if (rt_extra) {
     xnc::InputManager::Opts iopt;
-    iopt.hello_w = capture->Width();  // MOVE coords are HOST_HELLO-space
-    iopt.hello_h = capture->Height();
+    iopt.hello_w = capture.Width();  // MOVE coords are HOST_HELLO-space
+    iopt.hello_h = capture.Height();
     input = std::make_unique<xnc::InputManager>(iopt);
     xnc::CursorManager::Opts copt;
-    copt.hello_w = capture->Width();
-    copt.hello_h = capture->Height();
+    copt.hello_w = capture.Width();
+    copt.hello_h = capture.Height();
     cursor = std::make_unique<xnc::CursorManager>(copt);
     xnc::RtServer::Opts ro;
     ro.pipe_name = opt.pipe_name;
@@ -440,7 +492,7 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
     ro.input = input.get();
     ro.cursor = cursor.get();
     input->StartJanitor();
-    if (!rt.Start(ro, capture->Width(), capture->Height())) {
+    if (!rt.Start(ro, capture.Width(), capture.Height())) {
       write_stats(fail_result("rt_server_start_failed"));
       std::fclose(out);
       return 1;
@@ -448,8 +500,8 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
   }
 
   const xnc::PipelineResult res = rt_extra
-      ? xnc::Pipeline::Run(*capture, encoder, out, rt, popt)
-      : xnc::Pipeline::Run(*capture, encoder, out, popt);
+      ? xnc::Pipeline::Run(capture, encoder, out, rt, popt)
+      : xnc::Pipeline::Run(capture, encoder, out, popt);
   if (rt_extra) {
     rt.Shutdown();  // drain: stops the cursor poller, ReleaseAll on inputs
     input->StopJanitor();
@@ -475,9 +527,20 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
 int RunConsoleRt(const xnc::DiagOptions& opt) {
   XNC_LOG_INFO("console_rt_boot pipe=%ls max_subs=%u fps=%u bitrate=%u",
                opt.pipe_name.c_str(), opt.max_subs, opt.fps, kDiagBitrateBps);
+  // M2-Slice1 Task 1/2 + 3: desktop watch + unified reset + backend ladder
+  // (same wiring as the diag mode; the ladder's swaps ride the reset and
+  // surface STATE backend_changed to the subscribers via SetStateSink).
+  ResetWiring wiring;
+  xnc::DesktopWatch watch(WatchOptsFor(&wiring));
+  xnc::CaptureReset capture_reset(ResetOptsFor(&wiring));
+  wiring.watch = &watch;
+  wiring.reset = &capture_reset;
+
+  xnc::LadderOpts lopt = LadderOptsFor(opt);
+  lopt.reset = &capture_reset;
+  xnc::LadderCapture capture(lopt);
   std::string cap_err;
-  std::unique_ptr<xnc::ICapture> capture = xnc::TryCreateDxgiCapture(&cap_err);
-  if (!capture) {
+  if (!capture.Init(&cap_err)) {
     if (xnc::DxgiErrIsDesktopAccessDenied(cap_err)) {
       XNC_LOG_ERROR("dxgi_access_denied_session0 err=\"%s\"", cap_err.c_str());
     } else {
@@ -485,24 +548,24 @@ int RunConsoleRt(const xnc::DiagOptions& opt) {
     }
     return 1;
   }
-  XNC_LOG_INFO("capture_init w=%u h=%u", capture->Width(), capture->Height());
+  XNC_LOG_INFO("capture_init w=%u h=%u", capture.Width(), capture.Height());
 
   xnc::MfSoftEncoder encoder;
   std::string enc_err;
-  if (!encoder.Init(capture->Width(), capture->Height(), opt.fps, kDiagBitrateBps,
+  if (!encoder.Init(capture.Width(), capture.Height(), opt.fps, kDiagBitrateBps,
                     &enc_err)) {
     XNC_LOG_ERROR("encoder_init_failed err=\"%s\"", enc_err.c_str());
     return 1;
   }
 
   xnc::InputManager::Opts iopt;
-  iopt.hello_w = capture->Width();  // MOVE coords are HOST_HELLO-space px
-  iopt.hello_h = capture->Height();
+  iopt.hello_w = capture.Width();  // MOVE coords are HOST_HELLO-space px
+  iopt.hello_h = capture.Height();
   xnc::InputManager input(iopt);
   input.StartJanitor();
   xnc::CursorManager::Opts copt;
-  copt.hello_w = capture->Width();
-  copt.hello_h = capture->Height();
+  copt.hello_w = capture.Width();
+  copt.hello_h = capture.Height();
   xnc::CursorManager cursor(copt);
 
   xnc::RtServer::Opts ro;
@@ -514,19 +577,16 @@ int RunConsoleRt(const xnc::DiagOptions& opt) {
   ro.bitrate_bps = kDiagBitrateBps;
   ro.input = &input;
   ro.cursor = &cursor;
-  // M2-Slice1 Task 1/2: desktop watch + unified capture reset (same as the
-  // diag mode wiring; RtServer::Serve forwards both into PipelineOpts).
-  ResetWiring wiring;
-  xnc::DesktopWatch watch(WatchOptsFor(&wiring));
-  xnc::CaptureReset capture_reset(ResetOptsFor(&wiring));
-  wiring.watch = &watch;
-  wiring.reset = &capture_reset;
+  // M2-Slice1 Task 1/2: DesktopWatch + unified CaptureReset (RtServer::Serve
+  // forwards both into PipelineOpts; the wiring pair was built above so the
+  // ladder could bind the same coordinator).
   watch.Start();
   ro.desktop_name_fn = &DesktopNameThunk;
   ro.desktop_name_ctx = &watch;
   ro.reset = &capture_reset;
   xnc::RtServer server;
-  const int rc = server.Serve(*capture, encoder, ro);
+  capture.SetStateSink(&server);  // backend swaps -> STATE backend_changed
+  const int rc = server.Serve(capture, encoder, ro);
   watch.Stop();
   input.StopJanitor();  // ReleaseAll already ran in RtServer::Shutdown
   return rc;
