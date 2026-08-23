@@ -251,14 +251,20 @@ if [ -z "$NODE_ID" ]; then
 fi
 echo "dev node: $DEV_NODE_NAME ($NODE_ID)"
 
-# Geometry (moves are stream-logical = physical px, DPI-aware query).
-GEOMPS='Add-Type -AssemblyName System.Windows.Forms; Add-Type -Namespace X -Name D -MemberDefinition "[DllImport(\"user32.dll\")] public static extern bool SetProcessDPIAware();"; [void][X.D]::SetProcessDPIAware(); $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; "GEOM {0} {1}" -f $b.Width,$b.Height; exit 0'
-SCREEN=$("$XNC" exec "$NODE" "$GEOMPS" 2>/dev/null | tr -d '\r' || true)
-SW=$(printf '%s' "$SCREEN" | grep -oE 'GEOM [0-9]+ [0-9]+' | grep -oE '[0-9]+' | head -1)
-SH=$(printf '%s' "$SCREEN" | grep -oE 'GEOM [0-9]+ [0-9]+' | grep -oE '[0-9]+' | tail -1)
+# Geometry ground truth via setres.ps1 query mode (EnumDisplaySettings -
+# the REAL mode). A Forms.Screen query is WRONG on scaled boxes even with a
+# SetProcessDPIAware call from PowerShell (SystemInformation initializes at
+# Forms load, before the call takes effect): it reported the 1024x768
+# non-DPI virtual size on the 2880x1800@200% node, and run-3 "restored" the
+# panel to that. Moves are stream-logical px = the real mode's px.
+run_task "$SETRES_TASK" "-File C:\xnc-dev\setres.ps1"
+sleep 3; fetch setres.log || true
+SCREEN=$(grep -a "query w=" "$ART/setres.log" 2>/dev/null | tail -1 | grep -oE "w=[0-9]+ h=[0-9]+" || true)
+SW=$(printf '%s' "$SCREEN" | grep -oE '[0-9]+' | head -1)
+SH=$(printf '%s' "$SCREEN" | grep -oE '[0-9]+' | tail -1)
 SW="${SW:-1920}"; SH="${SH:-1080}"
 ORIG_W="$SW"; ORIG_H="$SH"
-echo "primary screen: $SCREEN (moves in stream-logical px)"
+echo "primary mode: ${SW}x${SH} (EnumDisplaySettings ground truth; moves in stream-logical px)"
 
 # Clock skew XIAOXIN vs THIS box (probe CSV alignment, gate 6).
 L1=$(date +%s%3N)
@@ -591,9 +597,11 @@ G3_RESUME=$(node -e 'const a=require(process.argv[1]);console.log(a.resumeOk&&a.
 gate "3-new-frame-le-2000ms" "$G3_RESUME" "resume after each event: $(node -e 'const a=require(process.argv[1]);console.log(a.resumeMs.join(",")+"ms")' "$ART/g3-analysis.json" 2>/dev/null)"
 
 # Geometry sanity: back at the original mode (else restore again before gen3).
-SCREEN2=$("$XNC" exec "$NODE" "$GEOMPS" 2>/dev/null | tr -d '\r' || true)
-SW2=$(printf '%s' "$SCREEN2" | grep -oE 'GEOM [0-9]+ [0-9]+' | grep -oE '[0-9]+' | head -1)
-SH2=$(printf '%s' "$SCREEN2" | grep -oE 'GEOM [0-9]+ [0-9]+' | grep -oE '[0-9]+' | tail -1)
+run_task "$SETRES_TASK" "-File C:\xnc-dev\setres.ps1"
+sleep 3; fetch setres.log || true
+SCREEN2=$(grep -a "query w=" "$ART/setres.log" 2>/dev/null | tail -1 | grep -oE "w=[0-9]+ h=[0-9]+" || true)
+SW2=$(printf '%s' "$SCREEN2" | grep -oE '[0-9]+' | head -1)
+SH2=$(printf '%s' "$SCREEN2" | grep -oE '[0-9]+' | tail -1)
 if [ -n "$SW2" ] && { [ "$SW2" != "$ORIG_W" ] || [ "$SH2" != "$ORIG_H" ]; }; then
   echo "NOTE: geometry ${SW2}x${SH2} != original ${ORIG_W}x${ORIG_H} — restoring again"
   switch_res "$ORIG_W" "$ORIG_H"; sleep 4
