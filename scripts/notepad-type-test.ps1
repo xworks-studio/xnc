@@ -24,7 +24,10 @@ param(
   [int]$WaitSec = 120,
   [string]$ExpectPath = '',
   [switch]$CloseNotepad,
-  [string]$SaveDir = 'C:\xnc-diag'
+  [string]$SaveDir = 'C:\xnc-diag',
+  # T6 robustness: open notepad WITH this file (created empty) so the
+  # viewer's Ctrl+S saves in place — no SaveAs dialog round-trip.
+  [string]$FilePath = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -41,7 +44,15 @@ public static class XncNotepadFocus {
 
 # 1) Launch Notepad (works for both classic notepad.exe and the Win11
 #    Store app resolution via App Paths) and wait for its main window.
-$proc = Start-Process -FilePath 'notepad.exe' -PassThru
+#    With -FilePath the file is created first so Ctrl+S saves in place.
+if ($FilePath -ne '' -and -not (Test-Path $FilePath)) {
+  New-Item -ItemType File -Path $FilePath -Force | Out-Null
+}
+$proc = if ($FilePath -ne '') {
+  Start-Process -FilePath 'notepad.exe' -ArgumentList $FilePath -PassThru
+} else {
+  Start-Process -FilePath 'notepad.exe' -PassThru
+}
 $mainHwnd = [IntPtr]::Zero
 for ($i = 0; $i -lt 300; $i++) {   # up to ~30s for first-run app activation
   if ($proc.HasExited) { Write-Error "notepad exited immediately"; exit 2 }

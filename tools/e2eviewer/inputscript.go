@@ -9,6 +9,7 @@
 //	 {"op":"wheel","dx":0,"dy":2},                    // input 通道(notch;正 dy=向下滚)
 //	 {"op":"key","code":"KeyA","down":true},          // input 通道(code 经 keymap.go)
 //	 {"op":"text","s":"hello"},                       // input 通道(UTF-16 ≤512 unit)
+//	 {"op":"lock","caps":false,"num":true},          // input 通道 LOCK(native 差异才注入)
 //	 {"op":"wait","ms":500}]                          // 本地等待
 //
 // lease_drop 刻意不支持:T3 词汇没有主动释放(撤销 = WS 断连/idle 30s),
@@ -24,6 +25,7 @@
 //	               WHEEL  3 [s32 dx][s32 dy][u8 trackpad=0]          18B
 //	               KEY    4 [u16 scan][u8 down][u8 ext]              13B
 //	               TEXT   5 [u16 len][utf16le units]              11+2n B
+//	               LOCK   6 [u8 caps][u8 num]                       11B
 //
 // 首个 seq = 1(先加后发,web 同款)。步骤在连接 + 首关键帧后开始执行;
 // 任何一步出错即中止(余步不执行),结果进 summary JSON(input 字段),
@@ -53,6 +55,8 @@ type scriptStep struct {
 	Code    *string `json:"code"`
 	S       *string `json:"s"`
 	Ms      *int    `json:"ms"`
+	Caps    *bool   `json:"caps"`
+	Num     *bool   `json:"num"`
 
 	// scan 在解析期由 Code 查 keymap.go 得出(未知 code = 解析错误)。
 	scan scanCode
@@ -140,6 +144,8 @@ func validateStep(i int, s *scriptStep) error {
 		}
 		return req(len(s.units) <= maxScriptTextUnits,
 			fmt.Sprintf("text is %d UTF-16 units, max %d", len(s.units), maxScriptTextUnits))
+	case "lock":
+		return req(s.Caps != nil || s.Num != nil, "lock needs caps and/or num (desired lock state; native injects only on diff)")
 	case "wait":
 		if err := req(s.Ms != nil, "wait needs ms"); err != nil {
 			return err
@@ -149,7 +155,7 @@ func validateStep(i int, s *scriptStep) error {
 	case "lease_drop":
 		return fmt.Errorf("%s: lease_drop not supported — T3 lease vocabulary has no voluntary release (disconnect or 30s idle revokes); drop the step or end the viewer", at)
 	default:
-		return fmt.Errorf("%s: unknown op %q (want lease/move/button/wheel/key/text/wait)", at, s.Op)
+		return fmt.Errorf("%s: unknown op %q (want lease/move/button/wheel/key/text/lock/wait)", at, s.Op)
 	}
 }
 
@@ -160,6 +166,7 @@ const (
 	wireTypeWheel  uint8 = 3
 	wireTypeKey    uint8 = 4
 	wireTypeText   uint8 = 5
+	wireTypeLock   uint8 = 6
 )
 
 // buildMouseMove 编 mouse 通道 18B:[u64 seq][s32 x][s32 y][u16 buttons]。
@@ -214,6 +221,17 @@ func buildText(seq uint64, units []uint16) []byte {
 	for i, u := range units {
 		binary.LittleEndian.PutUint16(b[11+2*i:], u)
 	}
+	return b
+}
+
+// buildLock 编 input 通道 11B:[u64 seq][u8 6][u8 caps][u8 num](缺省字段
+// 按 0 发——native 只对与 GetKeyState 不同的位注入)。
+func buildLock(seq uint64, caps, num bool) []byte {
+	b := make([]byte, 11)
+	binary.LittleEndian.PutUint64(b, seq)
+	b[8] = wireTypeLock
+	b[9] = boolByte(caps)
+	b[10] = boolByte(num)
 	return b
 }
 
@@ -305,6 +323,17 @@ func runInputSteps(ctx context.Context, steps []scriptStep, env stepEnv) *script
 				seq++
 				r.Seq = seq
 				return env.sendInput(buildText(seq, s.units))
+			case "lock":
+				seq++
+				r.Seq = seq
+				var caps, num bool
+				if s.Caps != nil {
+					caps = *s.Caps
+				}
+				if s.Num != nil {
+					num = *s.Num
+				}
+				return env.sendInput(buildLock(seq, caps, num))
 			case "wait":
 				env.wait(ctx, time.Duration(*s.Ms)*time.Millisecond)
 				return ctx.Err()

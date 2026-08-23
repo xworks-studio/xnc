@@ -31,10 +31,12 @@ func TestParseInputScriptValid(t *testing.T) {
 		{"op":"key","code":"KeyA","down":true},
 		{"op":"key","code":"ControlRight","down":false},
 		{"op":"text","s":"xnc\nslice3"},
+		{"op":"lock","num":true},
+		{"op":"lock","caps":false,"num":false},
 		{"op":"wait","ms":1}
 	]`)
 	wantOps := []string{"lease", "wait", "move", "move", "button", "button",
-		"wheel", "key", "key", "text", "wait"}
+		"wheel", "key", "key", "text", "lock", "lock", "wait"}
 	if len(steps) != len(wantOps) {
 		t.Fatalf("steps = %d, want %d", len(steps), len(wantOps))
 	}
@@ -72,6 +74,7 @@ func TestParseInputScriptErrors(t *testing.T) {
 		{`{}`, "bad json"}, // 非数组形态
 		{`[{"op":"lease"},{"op":"text","s":""}]`, "text must be non-empty"},
 		{`[{"op":"text"}]`, "text needs s"},
+		{`[{"op":"lock"}]`, "lock needs caps and/or num"},
 		{`[{"op":"wait","ms":0}]`, "wait ms must be 1..60000"},
 		{`[{"op":"wait","ms":60001}]`, "wait ms must be 1..60000"},
 		{`[{"op":"wait"}]`, "wait needs ms"},
@@ -125,9 +128,14 @@ func TestBuildersGolden(t *testing.T) {
 	if got, want := buildText(5, []uint16{0x41, 0x42}), "050000000000000005020041004200"; hex.EncodeToString(got) != want {
 		t.Errorf("text = %s, want %s", hex.EncodeToString(got), want)
 	}
+	// LOCK:seq=6 caps=1 num=0。
+	if got, want := buildLock(6, true, false), "0600000000000000060100"; hex.EncodeToString(got) != want {
+		t.Errorf("lock = %s, want %s", hex.EncodeToString(got), want)
+	}
 	// 长度自检(契约值)。
 	if len(buildMouseMove(0, 0, 0, 0)) != 18 || len(buildWheel(0, 0, 0)) != 18 ||
 		len(buildKey(0, scanCode{}, false)) != 13 || len(buildButton(0, 1, false)) != 11 ||
+		len(buildLock(0, false, false)) != 11 ||
 		len(buildText(0, make([]uint16, 512))) != 11+1024 {
 		t.Errorf("builder lengths drifted from contract")
 	}
