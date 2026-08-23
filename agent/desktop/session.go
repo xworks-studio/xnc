@@ -14,6 +14,10 @@
 //	    usernameFragment});candidate 为空串 "" 表示候选收集完成。
 //	{"type":"state","code":"capture_rebuilt","recoverable":true}
 //	    desktop pipe STATE 事件透传。
+//	{"type":"display_changed","generation":3,"w":1920,"h":1080,
+//	 "reason":"resolution"}
+//	    desktop pipe 0x010A DISPLAY_CHANGED 透传(M2-Slice1 Task 2):统一
+//	    CaptureReset 改变了流几何;viewer 用新 w/h 重映射输入坐标。
 //	{"type":"error","code":"start_failed","message":"..."}
 //	    会话早夭原因(start_failed / webrtc_failed / bad_params);此后
 //	    agent 收线,viewer 应重开会话。
@@ -60,17 +64,18 @@ import (
 
 // 信令帧 type 词汇(与文件头注释一一对应;T5/T6 契约)。
 const (
-	vocabReady        = "ready"
-	vocabOffer        = "offer"
-	vocabAnswer       = "answer"
-	vocabICE          = "ice"
-	vocabState        = "state"
-	vocabError        = "error"
-	vocabKeyframeReq  = "keyframe-req"
-	vocabLeaseRequest = "lease_request"
-	vocabLeaseGranted = "lease_granted"
-	vocabLeaseDenied  = "lease_denied"
-	vocabLeaseRevoked = "lease_revoked"
+	vocabReady          = "ready"
+	vocabOffer          = "offer"
+	vocabAnswer         = "answer"
+	vocabICE            = "ice"
+	vocabState          = "state"
+	vocabDisplayChanged = "display_changed"
+	vocabError          = "error"
+	vocabKeyframeReq    = "keyframe-req"
+	vocabLeaseRequest   = "lease_request"
+	vocabLeaseGranted   = "lease_granted"
+	vocabLeaseDenied    = "lease_denied"
+	vocabLeaseRevoked   = "lease_revoked"
 )
 
 const (
@@ -191,7 +196,8 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 		w.write(ctx, readyFrame{Type: vocabReady})
 	}
 
-	// ③ 状态事件泵:STATE → {"type":"state"}。
+	// ③ 状态事件泵:STATE → {"type":"state"};0x010A →
+	// {"type":"display_changed"}(M2-Slice1 Task 2;几何/代际变化)。
 	go func() {
 		for {
 			ev, ok := src.RecvState(ctx)
@@ -199,6 +205,16 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 				return
 			}
 			w.write(ctx, stateFrame{Type: vocabState, Code: ev.Code, Recoverable: ev.Recoverable})
+		}
+	}()
+	go func() {
+		for {
+			ev, ok := src.RecvDisplay(ctx)
+			if !ok {
+				return
+			}
+			w.write(ctx, displayChangedFrame{
+				Type: vocabDisplayChanged, Generation: ev.Gen, W: ev.W, H: ev.H, Reason: ev.Reason})
 		}
 	}()
 
@@ -382,6 +398,16 @@ type stateFrame struct {
 	Type        string `json:"type"`
 	Code        string `json:"code"`
 	Recoverable bool   `json:"recoverable"`
+}
+
+// displayChangedFrame 是 0x010A 的信令形态(M2-Slice1 Task 2 契约:
+// {generation,w,h,reason})。
+type displayChangedFrame struct {
+	Type       string `json:"type"`
+	Generation uint32 `json:"generation"`
+	W          uint32 `json:"w"`
+	H          uint32 `json:"h"`
+	Reason     string `json:"reason"`
 }
 
 type errorFrame struct {

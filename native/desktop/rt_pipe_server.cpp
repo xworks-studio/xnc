@@ -277,6 +277,7 @@ int RtServer::Serve(ICapture& cap, MfSoftEncoder& enc, const Opts& o) {
   popt.stop = &stop_;
   popt.desktop_name_fn = o.desktop_name_fn;      // DesktopWatch beat (M2-S1 T1)
   popt.desktop_name_ctx = o.desktop_name_ctx;
+  popt.reset = o.reset;                          // unified CaptureReset (M2-S1 T2)
   const PipelineResult res = Pipeline::Run(cap, enc, *this, popt);
 
   SetConsoleCtrlHandler(OnRtCtrlEvent, FALSE);
@@ -706,6 +707,32 @@ void RtServer::OnState(const char* code, bool recoverable) {
   }
   XNC_LOG_INFO("rt_state code=%s recoverable=%d subs=%zu", code, recoverable ? 1 : 0,
                conns_.size());
+}
+
+// DISPLAY_CHANGED 0x010A (M2-S1 Task 2): the pipeline completed a unified
+// reset that changed the stream geometry. Updates the HOST_HELLO geometry
+// for future subscribers and broadcasts the event (with the CURRENT gen -
+// the preceding "capture_rebuilt" OnState already incremented it) to every
+// attached connection as a control frame (never dropped by video policy).
+void RtServer::OnDisplayChanged(uint32_t w, uint32_t h, const char* reason) {
+  if (w == 0 || h == 0) return;
+  std::lock_guard<std::mutex> lk(mu_);
+  src_w_ = w;
+  src_h_ = h;
+  DisplayChangedPayload d;
+  d.gen = gen_.load();
+  d.w = w;
+  d.h = h;
+  CopyReason(d.reason, sizeof(d.reason), reason != nullptr ? reason : "?");
+  const Frame ev{kFlagEvent, kMsgDisplayChanged, 0, EncodeDisplayChanged(d)};
+  for (auto& kv : conns_) {
+    std::lock_guard<std::mutex> clk(kv.second->mu);
+    kv.second->q->PushControl(ev);
+    kv.second->cv.notify_all();
+  }
+  stats_.display_changes++;
+  XNC_LOG_INFO("rt_display_changed gen=%u w=%u h=%u reason=%s subs=%zu", d.gen, w, h,
+               d.reason, conns_.size());
 }
 
 // ---- helpers / accessors ----

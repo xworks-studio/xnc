@@ -22,12 +22,16 @@ struct FrameBlob {
   uint64_t mono_us = 0;
 };
 
-// Capture backend. Acquire semantics (pinned for Task 3/5): true = FrameBlob
-// filled in; false + *err == "err_timeout" = no change (screen static, retry
-// silently, no blob); false + *err == "err_rebuilt" = access lost and the
-// backend rebuilt its duplication in place (no frame this call, retry);
-// any other *err = fatal (repeated rebuild failure etc.).
-// ACCESS_LOST/DEVICE_REMOVED are rebuilt internally by the backend.
+// Capture backend. Acquire semantics (pinned for Task 3/5, M2-S1 T2 adds
+// the err_access_lost family): true = FrameBlob filled in; false +
+// *err == "err_timeout" = no change (screen static, retry silently, no
+// blob); false + *err == "err_rebuilt" = access lost and the backend
+// rebuilt its duplication in place (no frame this call, retry); false +
+// *err == "err_access_lost" = access lost and the internal rebuild was
+// REFUSED (secure desktop up: re-duplication is denied 0x80070005 even as
+// SYSTEM - T1 evidence) or no duplication exists - the pipeline routes
+// this into the unified CaptureReset instead of treating it fatal; any
+// other *err = fatal (repeated hard failures etc.).
 class ICapture {
  public:
   virtual ~ICapture() = default;
@@ -37,6 +41,14 @@ class ICapture {
   // Total in-place rebuilds so far (ACCESS_LOST/DEVICE_REMOVED) - diag
   // observability only; default 0 for backends that never rebuild.
   virtual uint32_t RebuildCount() const { return 0; }
+  // Full out-of-band rebuild (device + duplication re-creation) driven by
+  // the unified CaptureReset path (M2-S1 Task 2). Default: unsupported
+  // (fakes/backends with nothing to rebuild); DxgiCapture maps this to a
+  // fresh Init. Called on the pipeline thread only.
+  virtual bool Rebuild(std::string* err) {
+    if (err) *err = "rebuild unsupported";
+    return false;
+  }
 };
 
 // Task 3 implements this (DXGI CPU readback). Returns null and sets *err

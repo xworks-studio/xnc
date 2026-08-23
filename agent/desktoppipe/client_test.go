@@ -23,8 +23,9 @@ import (
 // ---- 测试侧编码器(布局 = C++ rt_pipe_server.h)----
 
 func tPut32(p []byte, off int, v uint32) { binary.LittleEndian.PutUint32(p[off:], v) }
+
 // s32u:负常量直接转 uint32 是编译错(常量溢出),经变量转即可。
-func s32u(v int32) uint32 { return uint32(v) }
+func s32u(v int32) uint32                { return uint32(v) }
 func tPut64(p []byte, off int, v uint64) { binary.LittleEndian.PutUint64(p[off:], v) }
 
 func tEncHostHello(gen, w, h, fps, maxSubs uint32) []byte {
@@ -107,6 +108,27 @@ func (h *fakeHost) pushCursor(x, y int32, visible bool) {
 		return
 	}
 	_ = ipc.WriteFrame(h.conn, &ipc.Frame{Flags: ipc.FlagEvent, MessageType: msgCursor, Payload: p})
+}
+
+// tEncDisplayChanged 编码 0x010A [u32 gen][u32 w][u32 h][reason 24B NUL 填充]。
+func tEncDisplayChanged(gen, w, h uint32, reason string) []byte {
+	p := make([]byte, 12+24)
+	tPut32(p, 0, gen)
+	tPut32(p, 4, w)
+	tPut32(p, 8, h)
+	copy(p[12:], reason)
+	return p
+}
+
+// pushDisplay 下发一条 0x010A 事件(M2-Slice1 Task 2)。
+func (h *fakeHost) pushDisplay(gen, w, ht uint32, reason string) {
+	h.wmu.Lock()
+	defer h.wmu.Unlock()
+	if h.conn == nil {
+		return
+	}
+	_ = ipc.WriteFrame(h.conn, &ipc.Frame{Flags: ipc.FlagEvent, MessageType: msgDisplayChg,
+		Payload: tEncDisplayChanged(gen, w, ht, reason)})
 }
 
 // serve 走生产时序:握手 → ATTACH → HOST_HELLO → 两帧(key+delta)+ STATE
@@ -267,6 +289,56 @@ func TestDialAndPump(t *testing.T) {
 	}
 }
 
+// TestDisplayChangedPump:0x010A → DisplayCh 交付结构化事件 + Hello() 更新
+// (gen/w/h;fps/max_subs 继承旧值)+ HelloCh 推送(M2-Slice1 Task 2)。
+func TestDisplayChangedPump(t *testing.T) {
+	h := startFakeHost(t, "desktop-pipe-secret", false)
+	sub, err := Dial(h.name(), "desktop-pipe-secret", 8, SubOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close() //nolint:errcheck // teardown best-effort
+
+	h.pushDisplay(4, 2560, 1440, "resolution")
+
+	ev := recvOrFatal[DisplayChanged](t, sub.DisplayCh(), "display_changed event")
+	if ev.Gen != 4 || ev.W != 2560 || ev.H != 1440 || ev.Reason != "resolution" {
+		t.Fatalf("display event = %+v", ev)
+	}
+	hello := sub.Hello()
+	if hello == nil || hello.Gen != 4 || hello.W != 2560 || hello.H != 1440 {
+		t.Fatalf("Hello() after 0x010A = %+v", hello)
+	}
+	if hello.Fps != 30 || hello.MaxSubs != 4 {
+		t.Fatalf("Hello() must inherit fps/max_subs, got %+v", hello)
+	}
+	hh := recvOrFatal[HelloInfo](t, sub.HelloCh(), "hello update push")
+	if hh.Gen != 4 || hh.W != 2560 || hh.H != 1440 {
+		t.Fatalf("HelloCh push = %+v", hh)
+	}
+}
+
+// TestDisplayChangedBadPayload:畸形 0x010A(35 字节)→ 泵按协议错误下线。
+func TestDisplayChangedBadPayload(t *testing.T) {
+	h := startFakeHost(t, "desktop-pipe-secret", false)
+	sub, err := Dial(h.name(), "desktop-pipe-secret", 9, SubOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.wmu.Lock()
+	_ = ipc.WriteFrame(h.conn, &ipc.Frame{Flags: ipc.FlagEvent, MessageType: msgDisplayChg,
+		Payload: make([]byte, 35)})
+	h.wmu.Unlock()
+	select {
+	case <-sub.Done():
+		if sub.Err() == nil {
+			t.Fatal("Err() must carry the decode failure")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("pump must tear down on malformed 0x010A")
+	}
+}
+
 // TestDialRejectsWrongSecret:握手证明失败必须断连报错。
 func TestDialRejectsWrongSecret(t *testing.T) {
 	h := startFakeHost(t, "server-secret", false)
@@ -413,7 +485,7 @@ func (h *overflowHost) serve() {
 		return
 	}
 	var wmu sync.Mutex // 串行化 burst 写与 key 帧应答写
-	go func() { // 控制帧读取:KEYFRAME_REQ → 记 reason → 回 key
+	go func() {        // 控制帧读取:KEYFRAME_REQ → 记 reason → 回 key
 		for {
 			f, err := ipc.ReadFrame(conn)
 			if err != nil {

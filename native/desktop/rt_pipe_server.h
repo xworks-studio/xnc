@@ -18,6 +18,10 @@
 //                               payload' layouts MOVE/BUTTON/WHEEL/KEY/TEXT/LOCK)
 //   MSG_CURSOR      0x0109 event [s32 x][s32 y][u8 visible]
 //                               (M1-Slice3; HOST_HELLO-space logical px)
+//   MSG_DISPLAY_CHANGED 0x010A event [u32 gen][u32 w][u32 h][char reason[24]]
+//                               (M2-Slice1 Task 2; broadcast when a unified
+//                               capture reset changed the stream geometry;
+//                               subscribers treat it as HOST_HELLO update)
 //
 // sub_ids are client-chosen (non-zero, unique per server). IDR semantics
 // (spec §7.5 + Slice1 carry-over): attach/queue-overflow/explicit requests
@@ -58,9 +62,10 @@
 #include <vector>
 
 #include "../common/frame.h"
-#include "capture.h"     // ICapture
-#include "mf_encoder.h"  // MfSoftEncoder
-#include "pipeline.h"    // AuSink, PipelineOpts
+#include "capture.h"       // ICapture
+#include "capture_reset.h"  // kResetReasonMax, CopyReason (0x010A reason field)
+#include "mf_encoder.h"    // MfSoftEncoder
+#include "pipeline.h"      // AuSink, PipelineOpts
 #include "subscribers.h"
 
 namespace xnc {
@@ -71,7 +76,8 @@ class CursorManager;  // cursor_manager.h
 // ---- message types (plan Task 2; 0x0100/0x0101 are core's capture RPCs) ----
 constexpr uint16_t kMsgAttach = 0x0102, kMsgDetach = 0x0103, kMsgKeyframeReq = 0x0104,
                    kMsgFrame = 0x0105, kMsgHostHello = 0x0106, kMsgState = 0x0107,
-                   kMsgInput = 0x0108, kMsgCursor = 0x0109;
+                   kMsgInput = 0x0108, kMsgCursor = 0x0109,
+                   kMsgDisplayChanged = 0x010A;
 
 // AU payload bound (proto.MaxSessionFrameBytes).
 inline constexpr size_t kMaxAuBytes = size_t(8) << 20;
@@ -131,6 +137,10 @@ struct StateEventPayload {
 struct KeyframeReqPayload {
   uint32_t sub_id = 0;
   char reason[32] = {0};  // NUL-padded fixed field (client accounting)
+};
+struct DisplayChangedPayload {
+  uint32_t gen = 0, w = 0, h = 0;
+  char reason[kResetReasonMax] = {0};  // NUL-padded fixed field (24 bytes)
 };
 
 // Bounded NUL-padded copy of `src` into dst[n-1可见] (strncpy-free: /W3
@@ -234,6 +244,29 @@ inline bool DecodeStateEvent(const Frame& f, StateEventPayload* out) {
   std::memcpy(out->code, f.payload.data(), 32);
   out->code[31] = '\0';
   out->recoverable = f.payload[32];
+  return true;
+}
+
+// ---- 0x010A MSG_DISPLAY_CHANGED event: [u32 gen][u32 w][u32 h]
+// [char reason[24]] (M2-Slice1 Task 2). gen is the server's current
+// generation (already incremented by the capture_rebuilt STATE that
+// precedes this event); w/h the new stream geometry. ----
+
+inline std::vector<uint8_t> EncodeDisplayChanged(const DisplayChangedPayload& d) {
+  std::vector<uint8_t> p(12 + kResetReasonMax, 0);
+  rt_detail::PutU32(p.data(), d.gen);
+  rt_detail::PutU32(p.data() + 4, d.w);
+  rt_detail::PutU32(p.data() + 8, d.h);
+  CopyReason(reinterpret_cast<char*>(p.data()) + 12, kResetReasonMax, d.reason);
+  return p;
+}
+inline bool DecodeDisplayChanged(const Frame& f, DisplayChangedPayload* out) {
+  if (out == nullptr || f.payload.size() != 12 + kResetReasonMax) return false;
+  out->gen = rt_detail::GetU32(f.payload.data());
+  out->w = rt_detail::GetU32(f.payload.data() + 4);
+  out->h = rt_detail::GetU32(f.payload.data() + 8);
+  std::memcpy(out->reason, f.payload.data() + 12, kResetReasonMax);
+  out->reason[kResetReasonMax - 1] = '\0';
   return true;
 }
 
@@ -426,6 +459,11 @@ class RtServer : public AuSink {
     // pure observation, no behavior change.
     const char* (*desktop_name_fn)(void*) = nullptr;
     void* desktop_name_ctx = nullptr;
+    // M2-Slice1 Task 2: unified capture reset coordinator forwarded into
+    // PipelineOpts (ACCESS_LOST / desktop-switch / resolution self-healing
+    // with DISPLAY_CHANGED broadcasts). Optional - null keeps the legacy
+    // fatal-on-error behavior.
+    CaptureReset* reset = nullptr;
   };
 
   struct Stats {
@@ -444,6 +482,7 @@ class RtServer : public AuSink {
     uint64_t input_rejected = 0;  // decode/shape/sub_id-mismatch rejects
     uint64_t input_dropped = 0;   // stale seq or injection failure (Inject != ok)
     uint64_t cursor_events = 0;   // 0x0109 events broadcast
+    uint64_t display_changes = 0; // 0x010A events broadcast (M2-S1 T2)
   };
 
   RtServer() = default;
@@ -473,6 +512,7 @@ class RtServer : public AuSink {
   const char* PendingIdrReason() override;
   void ConsumePendingIdr(const char* reason) override;
   void OnState(const char* code, bool recoverable) override;
+  void OnDisplayChanged(uint32_t w, uint32_t h, const char* reason) override;
 
   Stats stats();
   size_t SubscriberCount();

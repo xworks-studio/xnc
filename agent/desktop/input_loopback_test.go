@@ -197,7 +197,20 @@ func (s *inputFakeSource) RecvCursor(ctx context.Context) (CursorEvent, bool) {
 	}
 }
 
-func (s *inputFakeSource) Hello() *HelloInfo { return &HelloInfo{Gen: 1, W: 1920, H: 1080, Fps: 30, MaxSubs: 4} }
+// RecvDisplay:0x010A 镜像(M2-Slice1 Task 2);输入用例不驱动显示变化,
+// 恒阻塞到源终结(接口完整性实现)。
+func (s *inputFakeSource) RecvDisplay(ctx context.Context) (DisplayChangedEvent, bool) {
+	select {
+	case <-ctx.Done():
+		return DisplayChangedEvent{}, false
+	case <-s.done:
+		return DisplayChangedEvent{}, false
+	}
+}
+
+func (s *inputFakeSource) Hello() *HelloInfo {
+	return &HelloInfo{Gen: 1, W: 1920, H: 1080, Fps: 30, MaxSubs: 4}
+}
 
 func (s *inputFakeSource) RequestKeyframe(reason string) error {
 	s.mu.Lock()

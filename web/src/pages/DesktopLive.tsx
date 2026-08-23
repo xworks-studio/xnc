@@ -57,10 +57,15 @@ interface SignalingFrame {
   width?: number;
   height?: number;
   fps?: number;
+  /** display_changed generation */
+  generation?: number;
+  /** display_changed geometry */
+  w?: number;
+  h?: number;
+  /** display_changed reset reason / lease_denied / lease_revoked */
+  reason?: string;
   /** lease_granted */
   leaseId?: string;
-  /** lease_denied / lease_revoked */
-  reason?: string;
 }
 
 type LiveState =
@@ -652,6 +657,17 @@ export default function DesktopLive() {
               break;
             case "state":
               setAgentState(f.code ?? null);
+              break;
+            case "display_changed":
+              // Unified CaptureReset changed the stream geometry
+              // (M2-Slice1 Task 2): remap input coords to the new space
+              // and surface a toast.
+              if (f.w && f.h) applyDims(f.w, f.h);
+              setNotice(
+                `display changed: ${f.w}x${f.h}` +
+                  (f.reason ? ` (${f.reason})` : "") +
+                  (f.generation ? ` gen ${f.generation}` : ""),
+              );
               break;
             case "lease_granted":
               ioRef.current.lease = true;

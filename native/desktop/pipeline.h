@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "capture.h"       // ICapture, FrameBlob
+#include "capture_reset.h"  // CaptureReset (M2-S1 Task 2)
 #include "frame_cache.h"   // FrameCache, FrameCacheCounters
 #include "mf_encoder.h"    // MfSoftEncoder
 
@@ -54,6 +55,12 @@ struct PipelineOpts {
   // keeps the historical log format byte-identical.
   const char* (*desktop_name_fn)(void*) = nullptr;
   void* desktop_name_ctx = nullptr;
+  // Unified capture reset coordinator (M2-Slice1 Task 2): when set, the
+  // pipeline routes ACCESS_LOST-class acquire errors and frame-size changes
+  // here instead of dying (suspend -> wait-desktop -> rebuild -> new base
+  // -> ForceIDR; STATE recovering/capture_rebuilt; DISPLAY_CHANGED on
+  // dimension change). Null = legacy behavior (those errors stay fatal).
+  CaptureReset* reset = nullptr;
 };
 
 struct PipelineResult {
@@ -63,6 +70,8 @@ struct PipelineResult {
   uint32_t width = 0, height = 0;
   uint64_t aus_written = 0;        // shaped AUs fwrite'd to out
   uint64_t bytes_written = 0;      // total bytes fwrite'd
+  uint32_t resets = 0;             // unified CaptureReset executions (M2-S1 T2)
+  char last_reset_reason[kResetReasonMax] = {0};  // reason of the last reset
 };
 
 // Measured lookahead window of CMSH264EncoderMFT on the dev/target machines
@@ -165,10 +174,22 @@ class AuSink {
 
   // State transitions worth surfacing to subscribers (STATE events):
   // "capture_rebuilt" (recoverable), "capture_fatal"/"encoder_fatal"
-  // (fatal) - raised where the per-second log raises the matching marker.
+  // (fatal), "recovering" (unified reset in progress - M2-S1 T2),
+  // "capture_failed" (reset rebuild failing hard, still retrying).
   virtual void OnState(const char* code, bool recoverable) {
     (void)code;
     (void)recoverable;
+  }
+
+  // Display topology change observed by a completed reset (M2-S1 Task 2):
+  // the stream now carries w x h; reason is the reset reason string
+  // ("resolution" / "desktop_switch" / ...). Sinks broadcast DISPLAY_CHANGED
+  // (0x010A) and update their HOST_HELLO geometry; called on the pipeline
+  // thread right after the matching "capture_rebuilt" state event.
+  virtual void OnDisplayChanged(uint32_t w, uint32_t h, const char* reason) {
+    (void)w;
+    (void)h;
+    (void)reason;
   }
 };
 
@@ -198,6 +219,10 @@ class TeeAuSink final : public AuSink {
   void OnState(const char* code, bool recoverable) override {
     if (a_ != nullptr) a_->OnState(code, recoverable);
     if (b_ != nullptr) b_->OnState(code, recoverable);
+  }
+  void OnDisplayChanged(uint32_t w, uint32_t h, const char* reason) override {
+    if (a_ != nullptr) a_->OnDisplayChanged(w, h, reason);
+    if (b_ != nullptr) b_->OnDisplayChanged(w, h, reason);
   }
 
  private:

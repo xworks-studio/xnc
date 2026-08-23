@@ -46,6 +46,15 @@ constexpr DWORD kIdleSleepMs = 15;
 // IDR re-feed window (same rule, spec §7.5 carry-over).
 constexpr uint64_t kWarmupWallBoundMs = 2000ull;
 
+// ---- unified capture reset (M2-Slice1 Task 2, spec §7.5) ----
+// Wait-desktop poll cadence; rebuild retry backoffs (task ruling: retryable
+// failure -> 500 ms backoff; a hard streak emits STATE capture_failed once
+// and slows the cadence to 1 s - the run keeps retrying, never fatal).
+constexpr uint32_t kResetPollMs = 100;
+constexpr uint32_t kResetBackoffMs = 500;
+constexpr uint32_t kResetHardBackoffMs = 1000;
+constexpr uint32_t kResetHardFailStreak = 3;
+
 // On-demand (subscriber-initiated) IDR state. "Armed" spans from the
 // ForceNextIdr call to the IDR AU actually emerging: while armed no new
 // request is honored (one in flight) and the timeout path re-feeds the
@@ -151,6 +160,125 @@ const char* SubmitFrame(MfSoftEncoder& enc, AuSink& sink, const uint8_t* bgra,
   return nullptr;
 }
 
+// ---- unified capture reset execution (M2-Slice1 Task 2, spec §7.5) ----
+//
+// One reset sequence, run entirely on the pipeline thread (the acquire loop
+// IS the suspension - nothing calls Acquire while this runs):
+//   1. STATE "recovering" (recoverable): the pipe stays alive and the
+//      cursor/input threads (RtServer-owned) keep serving;
+//   2. while the desktop gate is non-DEFAULT (secure desktop up - T1
+//      evidence: re-duplication/init are DENIED 0x80070005 even as SYSTEM)
+//      poll every kResetPollMs; aborts on stop/duration;
+//   3. single rebuild path: ICapture::Rebuild, then encoder re-Init when
+//      the dimensions changed. Retryable failures back off 500 ms; a
+//      kResetHardFailStreak streak emits STATE "capture_failed" once and
+//      slows the retry cadence to 1 s. If the desktop leaves again
+//      mid-retry, re-enter the wait;
+//   4. on success the stream rewinds exactly like an err_rebuilt
+//      (FrameCache::OnRebuild -> next frame is the new base frame + the
+//      one-shot "rebuild" ForceIDR), PipelineResult gains the new dims and
+//      reset accounting, STATE "capture_rebuilt" fires (RtServer:
+//      generation++), and a dimension change surfaces via OnDisplayChanged
+//      (0x010A broadcast).
+struct ResetSequence {
+  ICapture* cap;
+  MfSoftEncoder* enc;
+  AuSink* sink;
+  FrameCache* cache;
+  PipelineResult* res;
+  const PipelineOpts* opt;
+  uint32_t* enc_w;
+  uint32_t* enc_h;
+  std::vector<uint8_t>* base;
+  uint64_t* warmup_started_ms;
+  uint32_t* warmup_gen_feeds;
+  bool* warmup_phase_logged;
+  uint64_t run_t0;       // RunCore start (duration deadline anchor)
+  uint64_t duration_ms;
+  const char* reason;
+};
+
+// Returns true when the RUN must end (stop flag / duration), false when the
+// reset completed and the acquire loop should resume.
+bool RunResetSequence(ResetSequence& s) {
+  const auto abort = [&s] {
+    return (s.opt->stop != nullptr && s.opt->stop->load()) ||
+           NowMs() - s.run_t0 >= s.duration_ms;
+  };
+  const auto gate_away = [&s] {
+    return s.opt->reset != nullptr &&
+           s.opt->reset->Desktop() == ResetDesktop::kNonDefault;
+  };
+
+  const uint64_t t_start = NowMs();
+  XNC_LOG_INFO("capture_reset_start reason=%s desktop_away=%d", s.reason,
+               gate_away() ? 1 : 0);
+  s.sink->OnState("recovering", true);
+
+  // Phase 2: wait for the desktop to come back (immediate rebuilds are
+  // provably futile while the secure desktop holds the output).
+  while (gate_away()) {
+    if (abort()) return true;
+    Sleep(kResetPollMs);
+  }
+
+  // Phase 3: single rebuild path with retry/backoff.
+  uint32_t streak = 0;
+  bool failed_state_sent = false;
+  uint32_t new_w = 0, new_h = 0;
+  for (;;) {
+    if (abort()) return true;
+    std::string rerr;
+    bool ok = s.cap->Rebuild(&rerr);
+    if (ok) {
+      new_w = s.cap->Width();
+      new_h = s.cap->Height();
+      if (new_w != *s.enc_w || new_h != *s.enc_h) {
+        ok = s.enc->Init(new_w, new_h, s.opt->fps, s.opt->target_bitrate_bps, &rerr);
+        if (ok)
+          XNC_LOG_INFO("capture_reset encoder re-init w=%u h=%u", new_w, new_h);
+      }
+    }
+    if (ok) break;
+    ++streak;
+    XNC_LOG_ERROR("capture_reset_rebuild_failed streak=%u err=\"%s\"", streak,
+                  rerr.c_str());
+    if (streak >= kResetHardFailStreak && !failed_state_sent) {
+      failed_state_sent = true;
+      s.sink->OnState("capture_failed", true);  // still retrying - not fatal
+    }
+    const uint32_t backoff = failed_state_sent ? kResetHardBackoffMs : kResetBackoffMs;
+    for (uint32_t slept = 0; slept < backoff; slept += kResetPollMs) {
+      if (abort()) return true;
+      Sleep(kResetPollMs);
+      while (gate_away()) {  // desktop left again mid-retry: wait it out
+        if (abort()) return true;
+        Sleep(kResetPollMs);
+      }
+    }
+  }
+
+  // Phase 4: rewind the stream state to the new generation.
+  const bool dims_changed = new_w != *s.enc_w || new_h != *s.enc_h;
+  *s.enc_w = new_w;
+  *s.enc_h = new_h;
+  s.res->width = new_w;
+  s.res->height = new_h;
+  s.res->resets++;
+  CopyReason(s.res->last_reset_reason, sizeof(s.res->last_reset_reason), s.reason);
+  s.cache->OnRebuild();  // WAIT_BASE_FRAME + one-shot "rebuild" IDR
+  s.base->clear();
+  *s.warmup_started_ms = 0;
+  *s.warmup_gen_feeds = 0;
+  *s.warmup_phase_logged = false;
+  s.sink->OnState("capture_rebuilt", true);  // RtServer: generation++
+  if (dims_changed) s.sink->OnDisplayChanged(new_w, new_h, s.reason);
+  XNC_LOG_INFO("capture_reset_done reason=%s w=%u h=%u dims_changed=%d elapsed_ms=%llu",
+               s.reason, new_w, new_h, dims_changed ? 1 : 0,
+               static_cast<unsigned long long>(NowMs() - t_start));
+  return false;
+}
+
 PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
                        const PipelineOpts& opt) {
   PipelineResult res;
@@ -184,11 +312,30 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
   uint32_t warmup_gen_feeds = 0;   // re-feeds this generation (rebuild resets)
   bool warmup_phase_logged = false;  // one warmup_done/exhausted log per gen
   bool first_frame_logged = false;
+  uint32_t enc_w = cap.Width(), enc_h = cap.Height();  // encoder's dims
   OnDemandIdr ondemand;
 
   for (;;) {
     if (NowMs() - t0 >= duration_ms) break;
     if (opt.stop != nullptr && opt.stop->load()) break;
+
+    // Unified capture reset (M2-Slice1 Task 2): consume a merged/debounced
+    // request and run suspend -> wait-desktop -> rebuild -> resume.
+    if (opt.reset != nullptr) {
+      char reset_reason[kResetReasonMax];
+      if (opt.reset->TakeReset(reset_reason, sizeof(reset_reason))) {
+        ResetSequence seq{&cap,           &enc,
+                          &sink,          &cache,
+                          &res,           &opt,
+                          &enc_w,         &enc_h,
+                          &base,          &warmup_started_ms,
+                          &warmup_gen_feeds, &warmup_phase_logged,
+                          t0,             duration_ms,
+                          reset_reason};
+        if (RunResetSequence(seq)) break;
+        continue;  // re-poll stop/duration/pending resets before acquiring
+      }
+    }
 
     // Merged IDR request (spec §7.5): arm at most once per 500 ms, only
     // after the stream's first keyframe (an in-progress initial warm-up
@@ -206,6 +353,14 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
 
     acq_err.clear();
     if (cap.Acquire(blob, &acq_err)) {
+      // Frame-size change (M2-S1 Task 2): the backend adopted a new mode
+      // but the encoder is still at the old size - route to the unified
+      // reset (resolution) instead of feeding a wrong-sized frame in.
+      if (opt.reset != nullptr && (blob.w != enc_w || blob.h != enc_h)) {
+        opt.reset->RequestReset(kResetReasonResolution);
+        Sleep(kIdleSleepMs);  // ride the debounce window
+        continue;
+      }
       const bool is_base = cache.OnCapturedFrame();  // captured++ inside
       if (is_base) {
         base = blob.bgra;  // full frame: warm-up re-feed source
@@ -295,6 +450,22 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
       sink.OnState("capture_rebuilt", true);
       XNC_LOG_INFO("capture_rebuild handled rebuilds=%u state=%s",
                    cache.counters().rebuilds, cache.StateName());
+    } else if (acq_err == "err_access_lost") {
+      // M2-Slice1 Task 2: the internal rebuild was refused (secure desktop
+      // holds the output) or no duplication exists. Route into the unified
+      // reset; callers that never wired a coordinator keep the legacy
+      // fatal behavior.
+      if (opt.reset == nullptr) {
+        res.ok = false;
+        res.err = acq_err;
+        sink.OnState("capture_fatal", false);
+        XNC_LOG_ERROR("acquire_failed err=\"%s\"", res.err.c_str());
+        break;
+      }
+      const bool away = opt.reset->Desktop() == ResetDesktop::kNonDefault;
+      opt.reset->RequestReset(
+          away ? kResetReasonDesktopSwitch : kResetReasonAccessLost);
+      Sleep(kIdleSleepMs);  // debounce window: repeated errors merge
     } else {
       res.ok = false;
       res.err = acq_err.empty() ? "acquire failed" : acq_err;
@@ -362,13 +533,14 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
 
   res.counters = cache.counters();
   const FrameCacheCounters& c = res.counters;
-  XNC_LOG_INFO("pipeline_stop elapsed=%llums captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu rebuilds=%u aus=%llu bytes=%llu ok=%d",
+  XNC_LOG_INFO("pipeline_stop elapsed=%llums captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu rebuilds=%u resets=%u w=%u h=%u aus=%llu bytes=%llu ok=%d",
                static_cast<unsigned long long>(NowMs() - t0),
                static_cast<unsigned long long>(c.captured),
                static_cast<unsigned long long>(c.encoded),
                static_cast<unsigned long long>(c.keyframes),
                static_cast<unsigned long long>(c.timeouts),
                static_cast<unsigned long long>(c.warmup_feeds), c.rebuilds,
+               res.resets, res.width, res.height,
                static_cast<unsigned long long>(res.aus_written),
                static_cast<unsigned long long>(res.bytes_written), res.ok ? 1 : 0);
   return res;
@@ -421,6 +593,7 @@ std::string FormatStatsJson(const PipelineResult& r, const PipelineOpts& o) {
                 "  \"timeouts\": %llu,\n"
                 "  \"warmup_feeds\": %llu,\n"
                 "  \"rebuilds\": %u,\n"
+                "  \"resets\": %u,\n"
                 "  \"aus_written\": %llu,\n"
                 "  \"bytes_written\": %llu,\n"
                 "  \"ok\": %d\n"
@@ -431,7 +604,7 @@ std::string FormatStatsJson(const PipelineResult& r, const PipelineOpts& o) {
                 static_cast<unsigned long long>(r.counters.keyframes),
                 static_cast<unsigned long long>(r.counters.timeouts),
                 static_cast<unsigned long long>(r.counters.warmup_feeds),
-                r.counters.rebuilds, static_cast<unsigned long long>(r.aus_written),
+                r.counters.rebuilds, r.resets, static_cast<unsigned long long>(r.aus_written),
                 static_cast<unsigned long long>(r.bytes_written), r.ok ? 1 : 0);
   return std::string(buf);
 }

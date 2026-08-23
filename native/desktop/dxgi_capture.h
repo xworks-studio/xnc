@@ -85,14 +85,27 @@ class DxgiCapture final : public ICapture {
   DxgiCapture& operator=(const DxgiCapture&) = delete;
 
   // ICapture - see capture.h for the err contract ("err_timeout" /
-  // "err_rebuilt" retryables, anything else fatal). Task 3 CPU path: every
-  // content frame is a full CopyResource→staging→Map readback; dirty-rect
-  // incremental frames are a Task 5/M4 concern and never applied before the
-  // base frame exists.
+  // "err_rebuilt" / "err_access_lost" retryables, anything else fatal).
+  // Task 3 CPU path: every content frame is a full CopyResource→staging→Map
+  // readback; dirty-rect incremental frames are a Task 5/M4 concern and
+  // never applied before the base frame exists.
   bool Acquire(FrameBlob& blob, std::string* err = nullptr) override;
   uint32_t Width() const override { return w_; }
   uint32_t Height() const override { return h_; }
   uint32_t RebuildCount() const override { return rebuilds_; }
+
+  // Unified CaptureReset entry (M2-Slice1 Task 2): full re-creation
+  // (device + output enumeration + duplication + staging). Resets the
+  // refused-rebuild streak; on success the next content frame is the new
+  // base frame.
+  bool Rebuild(std::string* err) override {
+    const bool ok = Init(err);
+    if (ok) {
+      consecutive_rebuild_failures_ = 0;
+      have_base_frame_ = false;
+    }
+    return ok;
+  }
 
   // Full (re)creation: device + output enumeration + duplication + staging.
   // Public for the TryCreateDxgiCapture factory; also the DEVICE_REMOVED
@@ -103,8 +116,9 @@ class DxgiCapture final : public ICapture {
   // Cheap rebuild: re-DuplicateOutput on the existing device/output and
   // resize staging if the mode changed. Falls back to Init on hard errors.
   bool Reduplicate(std::string* err);
-  // ACCESS_LOST / DEVICE_REMOVED handler: one in-place rebuild, counted;
-  // repeated consecutive failures surface a fatal error via *err.
+  // ACCESS_LOST / DEVICE_REMOVED handler: one in-place rebuild attempt,
+  // counted. Success -> "err_rebuilt"; a refusal (secure desktop up, T1
+  // evidence) -> "err_access_lost" for the unified reset - never fatal.
   // (hr param is HRESULT, kept as long so this header needs no windows.h)
   bool HandleAccessLost(std::string* err, long hr);
   // (Re)creates the CPU-readable staging texture for current w_/h_.

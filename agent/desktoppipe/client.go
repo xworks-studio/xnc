@@ -17,6 +17,9 @@
 //	                            (M1-Slice3 出站;payload' 布局见 InputMsg)
 //	MSG_CURSOR       0x0109 event [s32 x][s32 y][u8 visible]
 //	                            (M1-Slice3 入站;HOST_HELLO 流空间逻辑 px)
+//	MSG_DISPLAY_CHANGED 0x010A event [u32 gen][u32 w][u32 h][char reason[24]]
+//	                            (M2-Slice1 Task 2 入站;统一 CaptureReset 改变
+//	                            流几何时广播;消费侧视作 HOST_HELLO 更新)
 //
 // sub_id 由调用方选定(非 0、每 host 唯一——core 侧 StartCapture 每次会话
 // 一连接,随机 u32 即可)。ATTACH 成功无显式响应:HOST_HELLO 即确认
@@ -41,7 +44,7 @@ import (
 	"xnc/proto/ipc"
 )
 
-// 消息类型(0x0102-0x0109;native/desktop/rt_pipe_server.h 镜像)。
+// 消息类型(0x0102-0x010A;native/desktop/rt_pipe_server.h 镜像)。
 const (
 	msgAttach      uint16 = 0x0102
 	msgDetach      uint16 = 0x0103
@@ -51,6 +54,7 @@ const (
 	msgState       uint16 = 0x0107
 	msgInput       uint16 = 0x0108
 	msgCursor      uint16 = 0x0109
+	msgDisplayChg  uint16 = 0x010A
 )
 
 // 0x0108 type 值(C++ kInput* 镜像)。
@@ -80,8 +84,14 @@ const (
 	// cursorChDepth 覆盖 8ms 轮询突发;满时丢弃(不可靠通道语义,
 	// 下一事件最多 8ms 后到)。
 	cursorChDepth = 8
+	// helloChDepth 覆盖 HOST_HELLO / 0x010A 更新(稀疏;满丢)。
+	helloChDepth = 4
+	// displayChDepth 覆盖分辨率/拓扑变化事件(极稀疏)。
+	displayChDepth = 4
 	// reasonLen 是 KEYFRAME_REQ reason 字段宽度(NUL 填充,有效 31)。
 	reasonLen = 32
+	// displayReasonLen 是 0x010A reason 字段宽度(NUL 填充,有效 23)。
+	displayReasonLen = 24
 )
 
 // SubOpts 是 ATTACH 携带的整形参数(0 = 未指定,由 host 用默认)。
@@ -110,6 +120,15 @@ type HelloInfo struct {
 type StateEvent struct {
 	Code        string
 	Recoverable bool
+}
+
+// DisplayChanged 是 0x010A 事件:统一 CaptureReset 改变了流几何
+// (M2-Slice1 Task 2)。Gen 与随后 HOST_HELLO 的 gen 一致;Reason 为
+// reset reason 稳定串(resolution / desktop_switch / change_backend…)。
+type DisplayChanged struct {
+	Gen    uint32
+	W, H   uint32
+	Reason string
 }
 
 // InputMsg 是 0x0108 消息的解码形态(payload' 字段逐 type 复用,镜像
@@ -152,11 +171,13 @@ type Sub struct {
 	closeOne sync.Once
 	closeErr error
 
-	frameCh  chan Frame
-	stateCh  chan StateEvent
-	cursorCh chan CursorEvent
-	done     chan struct{}
-	doneOnce sync.Once
+	frameCh   chan Frame
+	stateCh   chan StateEvent
+	cursorCh  chan CursorEvent
+	helloCh   chan HelloInfo // HOST_HELLO + 0x010A 更新流
+	displayCh chan DisplayChanged
+	done      chan struct{}
+	doneOnce  sync.Once
 }
 
 // Dial 连接 xnc-desktop 实时 pipe,完成握手与 ATTACH,等待 HOST_HELLO
@@ -188,10 +209,12 @@ func Dial(pipe, secret string, subID uint32, opts SubOpts) (*Sub, error) {
 
 	s := &Sub{
 		conn: conn, subID: subID,
-		frameCh:  make(chan Frame, frameChDepth),
-		stateCh:  make(chan StateEvent, stateChDepth),
-		cursorCh: make(chan CursorEvent, cursorChDepth),
-		done:     make(chan struct{}),
+		frameCh:   make(chan Frame, frameChDepth),
+		stateCh:   make(chan StateEvent, stateChDepth),
+		cursorCh:  make(chan CursorEvent, cursorChDepth),
+		helloCh:   make(chan HelloInfo, helloChDepth),
+		displayCh: make(chan DisplayChanged, displayChDepth),
+		done:      make(chan struct{}),
 	}
 	// ATTACH 窗口内同步等待 HOST_HELLO;期间到达的 STATE 先入通道
 	// (too_many_subs 升格为 Dial 错误)。
@@ -234,6 +257,23 @@ func Dial(pipe, secret string, subID uint32, opts SubOpts) (*Sub, error) {
 				return nil, fmt.Errorf("desktoppipe: attach rejected: %s", respText(f))
 			}
 			// ATTACH 无成功响应帧;FlagResponse 且无错误 = 协议噪声,忽略。
+		case msgDisplayChg:
+			// ATTACH 窗口内到达的 0x010A(挂起期 attach 的恢复竞态):按
+			// hello 更新处理,事件也走非阻塞投递。
+			if ev, err := decodeDisplayChanged(f.Payload); err == nil {
+				s.mu.Lock()
+				s.hello = displayAsHello(ev, s.hello)
+				h := *s.hello
+				s.mu.Unlock()
+				select {
+				case s.helloCh <- h:
+				default:
+				}
+				select {
+				case s.displayCh <- ev:
+				default:
+				}
+			}
 		default:
 			// FRAME 先于 HOST_HELLO 属非常序;丢弃等待 hello。
 		}
@@ -250,6 +290,14 @@ func (s *Sub) StateCh() <-chan StateEvent { return s.stateCh }
 // CursorCh 交付 0x0109 光标事件;连接终结后关闭。满时丢弃(位置语义
 // 最新即准;host 仅在变化时发送)。
 func (s *Sub) CursorCh() <-chan CursorEvent { return s.cursorCh }
+
+// HelloCh 交付 HOST_HELLO / 0x010A 合成的 hello 更新(副本);连接终结后
+// 关闭。满时丢弃(Hello() 恒有最新值;本通道是"想要推送"的消费侧便利)。
+func (s *Sub) HelloCh() <-chan HelloInfo { return s.helloCh }
+
+// DisplayCh 交付 0x010A DISPLAY_CHANGED 事件;连接终结后关闭。满时丢弃
+// (事件稀疏;Hello()/HelloCh 承载最新几何)。
+func (s *Sub) DisplayCh() <-chan DisplayChanged { return s.displayCh }
 
 // SendInput 发送一条 0x0108 输入消息(SubID 自动填充本订阅 id;预校验
 // 由调用方——agent/desktop——负责,本层只编码)。写失败/已关返回错误。
@@ -396,32 +444,60 @@ func (s *Sub) pump() {
 			s.mu.Lock()
 			s.hello = h
 			s.mu.Unlock()
+			select {
+			case s.helloCh <- *h:
+			case <-s.done:
+				s.teardown(nil)
+				return
+			default: // 满则丢弃(Hello() 恒有最新值)
+			}
+		case msgDisplayChg:
+			ev, err := decodeDisplayChanged(f.Payload)
+			if err != nil {
+				s.teardown(err)
+				return
+			}
+			s.mu.Lock()
+			h := displayAsHello(ev, s.hello) // fps/max_subs 继承旧值
+			s.hello = h
+			s.mu.Unlock()
+			select {
+			case s.displayCh <- ev:
+			case <-s.done:
+				s.teardown(nil)
+				return
+			default: // 满则丢弃(极稀疏;hello 已更新)
+			}
+			select {
+			case s.helloCh <- *h:
+			default:
+			}
 		case msgState:
 			ev, err := decodeState(f.Payload)
 			if err != nil {
 				s.teardown(err)
 				return
 			}
-		select {
-		case s.stateCh <- ev:
-		case <-s.done:
-			s.teardown(nil)
-			return
-		default: // 满则丢弃(见 StateCh 注释)
-		}
-	case msgCursor:
-		ev, err := decodeCursor(f.Payload)
-		if err != nil {
-			s.teardown(err)
-			return
-		}
-		select {
-		case s.cursorCh <- ev:
-		case <-s.done:
-			s.teardown(nil)
-			return
-		default: // 满则丢弃(见 CursorCh 注释)
-		}
+			select {
+			case s.stateCh <- ev:
+			case <-s.done:
+				s.teardown(nil)
+				return
+			default: // 满则丢弃(见 StateCh 注释)
+			}
+		case msgCursor:
+			ev, err := decodeCursor(f.Payload)
+			if err != nil {
+				s.teardown(err)
+				return
+			}
+			select {
+			case s.cursorCh <- ev:
+			case <-s.done:
+				s.teardown(nil)
+				return
+			default: // 满则丢弃(见 CursorCh 注释)
+			}
 		default:
 			// PONG / 迟到的 ATTACH 应答等:忽略。
 		}
@@ -442,6 +518,8 @@ func (s *Sub) teardown(err error) {
 	close(s.frameCh)
 	close(s.stateCh)
 	close(s.cursorCh)
+	close(s.helloCh)
+	close(s.displayCh)
 }
 
 // ---- 握手与 payload 编解码 ----
@@ -553,6 +631,36 @@ func decodeCursor(p []byte) (CursorEvent, error) {
 		Y:       int32(binary.LittleEndian.Uint32(p[4:])),
 		Visible: p[8] != 0,
 	}, nil
+}
+
+// decodeDisplayChanged 解码 0x010A 事件
+// [u32 gen][u32 w][u32 h][char reason[24]](M2-Slice1 Task 2)。
+func decodeDisplayChanged(p []byte) (DisplayChanged, error) {
+	if len(p) != 12+displayReasonLen {
+		return DisplayChanged{}, fmt.Errorf("desktoppipe: display_changed payload %d bytes, want %d",
+			len(p), 12+displayReasonLen)
+	}
+	reason := p[12 : 12+displayReasonLen]
+	if i := bytes.IndexByte(reason, 0); i >= 0 {
+		reason = reason[:i]
+	}
+	return DisplayChanged{
+		Gen:    binary.LittleEndian.Uint32(p),
+		W:      binary.LittleEndian.Uint32(p[4:]),
+		H:      binary.LittleEndian.Uint32(p[8:]),
+		Reason: string(reason),
+	}, nil
+}
+
+// displayAsHello 把一条 0x010A 合成 hello 视图(gen/w/h;事件不携带
+// fps/max_subs,从 prev 继承,prev 为 nil 时留 0)。
+func displayAsHello(ev DisplayChanged, prev *HelloInfo) *HelloInfo {
+	h := &HelloInfo{Gen: ev.Gen, W: ev.W, H: ev.H}
+	if prev != nil {
+		h.Fps = prev.Fps
+		h.MaxSubs = prev.MaxSubs
+	}
+	return h
 }
 
 // EncodeInputMsg 编码 0x0108 payload `[u32 sub_id][u64 seq][u8 type]

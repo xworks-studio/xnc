@@ -217,6 +217,22 @@ func (p *pipeSource) RecvCursor(ctx context.Context) (CursorEvent, bool) {
 	}
 }
 
+// RecvDisplay 取 0x010A 显示变化事件(M2-Slice1 Task 2);desktoppipe 侧
+// 同步更新 Hello()(gen/w/h)。
+func (p *pipeSource) RecvDisplay(ctx context.Context) (DisplayChangedEvent, bool) {
+	select {
+	case ev, ok := <-p.sub.DisplayCh():
+		if !ok {
+			return DisplayChangedEvent{}, false
+		}
+		return DisplayChangedEvent{Gen: ev.Gen, W: ev.W, H: ev.H, Reason: ev.Reason}, true
+	case <-ctx.Done():
+		return DisplayChangedEvent{}, false
+	case <-p.sub.Done():
+		return DisplayChangedEvent{}, false
+	}
+}
+
 // SubID 返回 ATTACH 时选定的订阅 id(0x0108 消息必须携带)。
 func (p *pipeSource) SubID() uint32 { return p.sub.SubID() }
 

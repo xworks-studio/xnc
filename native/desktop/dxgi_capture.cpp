@@ -43,7 +43,6 @@ namespace {
 using Microsoft::WRL::ComPtr;
 
 constexpr UINT kAcquireTimeoutMs = 100;  // plan: ~100ms per Acquire
-constexpr uint32_t kMaxConsecutiveRebuildFailures = 2;  // "rebuild once, repeated failure = fatal"
 
 // Error strings are "<step>: hr=0x%08lX" so DxgiErrIsDesktopAccessDenied can
 // parse the HRESULT back out.
@@ -211,6 +210,10 @@ bool DxgiCapture::Init(std::string* err) {
 
 // Returns false always (retryable or fatal - see capture.h err contract);
 // shapes *err accordingly.
+// M2-Slice1 Task 2: a refused rebuild is NO LONGER fatal. T1 evidence
+// (XIAOXIN): while the secure desktop is up, Reduplicate AND Init are
+// denied 0x80070005 even as SYSTEM - the error becomes "err_access_lost"
+// and the pipeline's unified CaptureReset owns waiting + retrying.
 bool DxgiCapture::HandleAccessLost(std::string* err, long hr_long) {
   const HRESULT hr = static_cast<HRESULT>(hr_long);
   rebuilds_++;
@@ -230,19 +233,18 @@ bool DxgiCapture::HandleAccessLost(std::string* err, long hr_long) {
     return false;
   }
   consecutive_rebuild_failures_++;
-  XNC_LOG_ERROR("dxgi rebuild failed streak=%u err=\"%s\"",
+  XNC_LOG_ERROR("dxgi rebuild refused streak=%u err=\"%s\" (routing to unified reset)",
                 consecutive_rebuild_failures_, rerr.c_str());
-  if (consecutive_rebuild_failures_ >= kMaxConsecutiveRebuildFailures) {
-    if (err) *err = "rebuild failed repeatedly: " + rerr;  // fatal
-  } else {
-    if (err) *err = "err_rebuilt";  // one transient failure stays retryable
-  }
+  if (err) *err = "err_access_lost";  // unified CaptureReset takes over
   return false;
 }
 
 bool DxgiCapture::Acquire(FrameBlob& blob, std::string* err) {
   if (!impl_->dupl) {
-    if (err) *err = "err_not_initialized";
+    // M2-S1 T2: no duplication = access lost. The old "err_not_initialized"
+    // fatal artifact (the T1 probe's child-killer) is gone; re-creation is
+    // the unified reset's job.
+    if (err) *err = "err_access_lost";
     return false;
   }
   DXGI_OUTDUPL_FRAME_INFO info{};

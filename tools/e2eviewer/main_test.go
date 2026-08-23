@@ -111,7 +111,7 @@ func TestPliRetryDecision(t *testing.T) {
 		attempts int
 		want     bool
 	}{
-		{since: 0, attempts: 1, want: false},                    // 刚发完
+		{since: 0, attempts: 1, want: false},                       // 刚发完
 		{since: 1499 * time.Millisecond, attempts: 1, want: false}, // 未到 1.5s
 		{since: 1500 * time.Millisecond, attempts: 1, want: true},  // 到点,首轮
 		{since: 10 * time.Second, attempts: 1, want: true},         // 迟到仍可重发
@@ -158,5 +158,31 @@ func TestCursorRecording(t *testing.T) {
 	samples[0].X = 9999
 	if _, again := v.cursorStats(); again[0].X == 9999 {
 		t.Errorf("cursorStats must return a copy")
+	}
+}
+
+// TestDisplayRecording:display_changed 事件全量计数 + 样本截 cap + 副本语义
+// (M2-Slice1 Task 2)。
+func TestDisplayRecording(t *testing.T) {
+	v := &viewer{start: time.Now()}
+	for i := 0; i < displaySampleCap+50; i++ {
+		v.recordDisplay(uint32(i), uint32(i*10), uint32(i*5), "resolution")
+	}
+	n, samples := v.displayStats()
+	if n != displaySampleCap+50 {
+		t.Errorf("displayEvents = %d, want %d", n, displaySampleCap+50)
+	}
+	if len(samples) != displaySampleCap {
+		t.Fatalf("samples = %d, want %d", len(samples), displaySampleCap)
+	}
+	if samples[0].Gen != 0 || samples[1].W != 10 || samples[0].Reason != "resolution" {
+		t.Errorf("sample[0:1] = %+v %+v", samples[0], samples[1])
+	}
+	if samples[len(samples)-1].Gen != displaySampleCap-1 {
+		t.Errorf("overflow samples should be dropped, not appended")
+	}
+	samples[0].Gen = 9999
+	if _, again := v.displayStats(); again[0].Gen == 9999 {
+		t.Errorf("displayStats must return a copy")
 	}
 }

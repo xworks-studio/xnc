@@ -46,16 +46,18 @@ type fakeSource struct {
 	closed    bool
 	closeOnce sync.Once
 
-	frameCh chan Frame
-	stateCh chan StateEvent
-	done    chan struct{}
+	frameCh   chan Frame
+	stateCh   chan StateEvent
+	displayCh chan DisplayChangedEvent
+	done      chan struct{}
 }
 
 func newFakeSource() *fakeSource {
 	return &fakeSource{
-		frameCh: make(chan Frame, 32),
-		stateCh: make(chan StateEvent, 4),
-		done:    make(chan struct{}),
+		frameCh:   make(chan Frame, 32),
+		stateCh:   make(chan StateEvent, 4),
+		displayCh: make(chan DisplayChangedEvent, 4),
+		done:      make(chan struct{}),
 	}
 }
 
@@ -118,6 +120,26 @@ func (s *fakeSource) RecvCursor(ctx context.Context) (CursorEvent, bool) {
 		return CursorEvent{}, false
 	case <-s.done:
 		return CursorEvent{}, false
+	}
+}
+
+// RecvDisplay:0x010A 镜像(M2-Slice1 Task 2);pushDisplay 注入事件。
+func (s *fakeSource) RecvDisplay(ctx context.Context) (DisplayChangedEvent, bool) {
+	select {
+	case ev, ok := <-s.displayCh:
+		return ev, ok
+	case <-ctx.Done():
+		return DisplayChangedEvent{}, false
+	case <-s.done:
+		return DisplayChangedEvent{}, false
+	}
+}
+
+// pushDisplay 注入一条显示变化事件(非阻塞;会话泵消费)。
+func (s *fakeSource) pushDisplay(ev DisplayChangedEvent) {
+	select {
+	case s.displayCh <- ev:
+	default:
 	}
 }
 
@@ -415,6 +437,17 @@ func TestSessionLoopbackVideoAndPLI(t *testing.T) {
 	got := drainUntil(t, ctx, vws, 10*time.Second, func(m map[string]any) bool { return m["type"] == vocabReady })
 	if got["width"].(float64) != 1920 || got["fps"].(float64) != 30 {
 		t.Fatalf("ready dims = %v", got)
+	}
+
+	// ①b display_changed 信令帧(M2-Slice1 Task 2):源 0x010A →
+	// {"type":"display_changed",generation,w,h,reason} 原样透传。
+	src.pushDisplay(DisplayChangedEvent{Gen: 3, W: 1280, H: 720, Reason: "resolution"})
+	dc := drainUntil(t, ctx, vws, 5*time.Second, func(m map[string]any) bool {
+		return m["type"] == vocabDisplayChanged
+	})
+	if dc["generation"].(float64) != 3 || dc["w"].(float64) != 1280 ||
+		dc["h"].(float64) != 720 || dc["reason"] != "resolution" {
+		t.Fatalf("display_changed frame = %v", dc)
 	}
 
 	// ② viewer 发 offer → agent 回 answer(信令词汇闭环)。

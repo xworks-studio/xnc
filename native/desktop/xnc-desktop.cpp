@@ -37,8 +37,9 @@
 
 #include "../common/log.h"
 #include "capture.h"       // capture contract (ICapture/FrameBlob)
+#include "capture_reset.h"  // CaptureReset (M2-Slice1 Task 2)
 #include "cursor_manager.h"  // CursorManager (M1-Slice3)
-#include "desktop_watch.h"  // DesktopWatch (M2-Slice1 Task 1, observation)
+#include "desktop_watch.h"  // DesktopWatch (M2-Slice1 Task 1/2)
 #include "diag.h"
 #include "dxgi_capture.h"  // TryCreateDxgiCapture, DxgiErrIsDesktopAccessDenied
 #include "input_manager.h"  // InputManager (M1-Slice3)
@@ -57,6 +58,50 @@ const char* DesktopNameThunk(void* ctx) {
   static char buf[xnc::kDesktopNameMax];
   static_cast<xnc::DesktopWatch*>(ctx)->CurrentName(buf, sizeof(buf));
   return buf;
+}
+
+// M2-Slice1 Task 2 wiring (both console modes): DesktopWatch transitions
+// request unified resets, and the reset's desktop gate (watch snapshot)
+// suspends rebuild attempts while the secure desktop is up. The holder is
+// filled after both objects are constructed and before Start() - nothing
+// reads it earlier.
+struct ResetWiring {
+  xnc::DesktopWatch* watch = nullptr;
+  xnc::CaptureReset* reset = nullptr;
+};
+
+xnc::ResetDesktop ResetGateThunk(void* ctx) {
+  const auto* w = static_cast<const ResetWiring*>(ctx);
+  if (w == nullptr || w->watch == nullptr) return xnc::ResetDesktop::kDefault;
+  return w->watch->Snapshot().state == xnc::DesktopState::kDefault
+             ? xnc::ResetDesktop::kDefault
+             : xnc::ResetDesktop::kNonDefault;
+}
+
+uint64_t ResetClockThunk() { return GetTickCount64(); }
+
+// Watch opts: every transition INTO a non-default desktop requests a
+// unified reset (any entry into the secure desktop revokes the duplication
+// - T1 evidence); the reset's debounce merges this with the ACCESS_LOST
+// error that follows within ~100ms.
+xnc::DesktopWatch::Opts WatchOptsFor(ResetWiring* wiring) {
+  xnc::DesktopWatch::Opts o;
+  o.on_transition = [wiring](const xnc::DesktopTransition& t) {
+    // Any entry into the secure desktop (TRANSITION/WINLOGON) revokes the
+    // duplication (T1 evidence) - suspend via the unified reset.
+    if (wiring != nullptr && wiring->reset != nullptr &&
+        t.to != xnc::DesktopState::kDefault)
+      wiring->reset->RequestReset(xnc::kResetReasonDesktopSwitch);
+  };
+  return o;
+}
+
+xnc::CaptureReset::Opts ResetOptsFor(ResetWiring* wiring) {
+  xnc::CaptureReset::Opts o;
+  o.clock_ms = &ResetClockThunk;
+  o.desktop_fn = &ResetGateThunk;
+  o.desktop_ctx = wiring;
+  return o;
 }
 
 void Usage(FILE* out) {
@@ -304,14 +349,21 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
   popt.fps = opt.fps;
   popt.target_bitrate_bps = kDiagBitrateBps;
 
-  // M2-Slice1 Task 1: pure-observation desktop watch (OpenInputDesktop 500ms
-  // poll, DEFAULT/TRANSITION/WINLOGON machine). Started in BOTH console
-  // modes; transitions log desktop_transition, the per-second beat gains
-  // desktop=<name>. No capture behavior change - reset logic is Task 2.
-  xnc::DesktopWatch watch;
+  // M2-Slice1 Task 1/2: DesktopWatch (OpenInputDesktop 500ms poll,
+  // DEFAULT/TRANSITION/WINLOGON machine) + the unified CaptureReset it
+  // drives. Watch transitions request resets; ACCESS_LOST-class acquire
+  // errors and frame-size changes route through the same coordinator
+  // (suspend -> wait-desktop -> rebuild -> new base -> ForceIDR; STATE
+  // recovering/capture_rebuilt; DISPLAY_CHANGED on dimension change).
+  ResetWiring wiring;
+  xnc::DesktopWatch watch(WatchOptsFor(&wiring));
+  xnc::CaptureReset capture_reset(ResetOptsFor(&wiring));
+  wiring.watch = &watch;
+  wiring.reset = &capture_reset;
   watch.Start();
   popt.desktop_name_fn = &DesktopNameThunk;
   popt.desktop_name_ctx = &watch;
+  popt.reset = &capture_reset;
 
   // Every diag run leaves a stats.json sidecar next to --out - including the
   // init-failure paths below (zeroed counters, ok=false + the reason), so a
@@ -462,11 +514,17 @@ int RunConsoleRt(const xnc::DiagOptions& opt) {
   ro.bitrate_bps = kDiagBitrateBps;
   ro.input = &input;
   ro.cursor = &cursor;
-  // M2-Slice1 Task 1: observation-only desktop watch (same as diag mode).
-  xnc::DesktopWatch watch;
+  // M2-Slice1 Task 1/2: desktop watch + unified capture reset (same as the
+  // diag mode wiring; RtServer::Serve forwards both into PipelineOpts).
+  ResetWiring wiring;
+  xnc::DesktopWatch watch(WatchOptsFor(&wiring));
+  xnc::CaptureReset capture_reset(ResetOptsFor(&wiring));
+  wiring.watch = &watch;
+  wiring.reset = &capture_reset;
   watch.Start();
   ro.desktop_name_fn = &DesktopNameThunk;
   ro.desktop_name_ctx = &watch;
+  ro.reset = &capture_reset;
   xnc::RtServer server;
   const int rc = server.Serve(*capture, encoder, ro);
   watch.Stop();

@@ -41,6 +41,14 @@ type CursorEvent struct {
 	Visible bool
 }
 
+// DisplayChangedEvent 是 0x010A 事件镜像:统一 CaptureReset 改变了流几何
+// (M2-Slice1 Task 2)。Gen 与随后 HOST_HELLO 的 gen 一致。
+type DisplayChangedEvent struct {
+	Gen    uint32
+	W, H   uint32
+	Reason string
+}
+
 // Source 是一条已 ATTACH 的桌面帧订阅(见 desktoppipe.Sub)。
 type Source interface {
 	// RecvFrame 阻塞取下一视频帧;ok=false = 源终结(关闭/断连/ctx 取消)。
@@ -49,6 +57,9 @@ type Source interface {
 	RecvState(ctx context.Context) (StateEvent, bool)
 	// RecvCursor 阻塞取下一光标事件(0x0109);ok=false 同上。
 	RecvCursor(ctx context.Context) (CursorEvent, bool)
+	// RecvDisplay 阻塞取下一显示变化事件(0x010A;M2-Slice1 Task 2);
+	// ok=false 同上。
+	RecvDisplay(ctx context.Context) (DisplayChangedEvent, bool)
 	// Hello 返回最近一次 HOST_HELLO(可为 nil——测试 fake 允许)。
 	Hello() *HelloInfo
 	// RequestKeyframe 请求 host 立即产新 IDR(reason 进 host 记账)。

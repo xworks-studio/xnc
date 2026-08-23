@@ -190,6 +190,12 @@ type viewer struct {
 	cursorMu      sync.Mutex
 	cursorEvents  uint64
 	cursorSamples []cursorSample
+
+	// display_changed 记录(M2-Slice1 Task 2;server 模式信令帧 + direct
+	// 模式 0x010A 通道,两路共用)。计数全量,样本截 cap。
+	displayMu      sync.Mutex
+	displayEvents  uint64
+	displaySamples []displaySample
 }
 
 // cursorSample 是一条 cursor 通道事件(summary.cursorSamples 元素)。
@@ -200,8 +206,41 @@ type cursorSample struct {
 	Visible uint8 `json:"visible"`
 }
 
+// displaySample 是一条 display_changed 事件(summary.displaySamples 元素;
+// M2-Slice1 Task 2 验收:gen 递增、新 w/h、reason 稳定串)。
+type displaySample struct {
+	TMs    int64  `json:"tMs"`
+	Gen    uint32 `json:"gen"`
+	W      uint32 `json:"w"`
+	H      uint32 `json:"h"`
+	Reason string `json:"reason"`
+}
+
 // cursorSampleCap 限制 summary 体积;超出后样本丢弃(计数仍全量)。
 const cursorSampleCap = 4096
+
+// displaySampleCap 同上(display_changed 事件极稀疏,防御性上限)。
+const displaySampleCap = 1024
+
+// recordDisplay 记一条 display_changed 事件(server 信令帧 / direct 0x010A)。
+func (v *viewer) recordDisplay(gen, w, h uint32, reason string) {
+	v.displayMu.Lock()
+	defer v.displayMu.Unlock()
+	v.displayEvents++
+	if len(v.displaySamples) < displaySampleCap {
+		v.displaySamples = append(v.displaySamples, displaySample{
+			TMs: time.Since(v.start).Milliseconds(), Gen: gen, W: w, H: h, Reason: reason})
+	}
+}
+
+// displayStats 返回(累计事件数,样本副本)。
+func (v *viewer) displayStats() (uint64, []displaySample) {
+	v.displayMu.Lock()
+	defer v.displayMu.Unlock()
+	out := make([]displaySample, len(v.displaySamples))
+	copy(out, v.displaySamples)
+	return v.displayEvents, out
+}
 
 // recordCursor 记一条 cursor 通道事件(server 模式 OnDataChannel 调用)。
 func (v *viewer) recordCursor(x, y int32, visible bool) {
@@ -359,39 +398,43 @@ func pliRetryDecision(since time.Duration, attempts, maxSends int, retryAfter ti
 
 // summary 是断言输入与 --json 输出形态(T6 脚本契约)。
 type summary struct {
-	Mode             string         `json:"mode"`
-	StartUnixMs      int64          `json:"startUnixMs"` // viewer 起点绝对时刻(cursorSamples.tMs 的零点)
-	Connected        bool           `json:"connected"`
-	FirstFrameMs     int64          `json:"firstFrameMs"`
-	FirstKey         bool           `json:"firstKey"`
-	RtpPackets       uint64         `json:"rtpPackets"`
-	Frames           uint64         `json:"frames"`
-	Keyframes        uint64         `json:"keyframes"`
-	Bytes            uint64         `json:"bytes"`
-	DumpFile         string         `json:"dumpFile,omitempty"`
-	Relay            bool           `json:"relay"`
-	PlisSent         uint64         `json:"plisSent"`
-	PliRetries       uint64         `json:"pliRetries"`
-	KeyframeReqs     uint64         `json:"keyframeReqs"`
-	PliToIdrMaxMs    int64          `json:"pliToIdrMaxMs"`
-	CursorEvents     uint64         `json:"cursorEvents"`
-	CursorSamples    []cursorSample `json:"cursorSamples,omitempty"`
-	Input            *scriptResult  `json:"input,omitempty"`
-	DurationMs       int64          `json:"durationMs"`
-	AssertionsPassed bool           `json:"assertionsPassed"`
-	Failures         []string       `json:"failures,omitempty"`
+	Mode             string          `json:"mode"`
+	StartUnixMs      int64           `json:"startUnixMs"` // viewer 起点绝对时刻(cursorSamples.tMs 的零点)
+	Connected        bool            `json:"connected"`
+	FirstFrameMs     int64           `json:"firstFrameMs"`
+	FirstKey         bool            `json:"firstKey"`
+	RtpPackets       uint64          `json:"rtpPackets"`
+	Frames           uint64          `json:"frames"`
+	Keyframes        uint64          `json:"keyframes"`
+	Bytes            uint64          `json:"bytes"`
+	DumpFile         string          `json:"dumpFile,omitempty"`
+	Relay            bool            `json:"relay"`
+	PlisSent         uint64          `json:"plisSent"`
+	PliRetries       uint64          `json:"pliRetries"`
+	KeyframeReqs     uint64          `json:"keyframeReqs"`
+	PliToIdrMaxMs    int64           `json:"pliToIdrMaxMs"`
+	CursorEvents     uint64          `json:"cursorEvents"`
+	CursorSamples    []cursorSample  `json:"cursorSamples,omitempty"`
+	DisplayEvents    uint64          `json:"displayEvents"`
+	DisplaySamples   []displaySample `json:"displaySamples,omitempty"`
+	Input            *scriptResult   `json:"input,omitempty"`
+	DurationMs       int64           `json:"durationMs"`
+	AssertionsPassed bool            `json:"assertionsPassed"`
+	Failures         []string        `json:"failures,omitempty"`
 }
 
 func (v *viewer) collect(mode, dump string, ran time.Duration) *summary {
 	cur, samples := v.cursorStats()
+	dEvents, dSamples := v.displayStats()
 	s := &summary{
 		Mode: mode, Relay: v.relay, DumpFile: dump,
 		StartUnixMs: v.start.UnixMilli(),
-		RtpPackets: v.rtpPkts.Load(), Frames: v.frames.Load(),
+		RtpPackets:  v.rtpPkts.Load(), Frames: v.frames.Load(),
 		Keyframes: v.keyframes.Load(), Bytes: v.bytes.Load(),
 		PlisSent: v.plisSent.Load(), PliRetries: v.pliRetries.Load(),
 		KeyframeReqs: v.keyframeReqs.Load(), PliToIdrMaxMs: v.pliIDRMax.Load(),
 		CursorEvents: cur, CursorSamples: samples,
+		DisplayEvents: dEvents, DisplaySamples: dSamples,
 		DurationMs: ran.Milliseconds(),
 	}
 	if t := v.firstAt.Load(); t != 0 {
@@ -597,6 +640,14 @@ func runDirect(c *config) (*summary, error) {
 		}
 	}()
 
+	// 0x010A 泵(direct 模式;M2-Slice1 Task 2):display 事件进 summary。
+	go func() {
+		for ev := range sub.DisplayCh() {
+			log.Info("display changed (direct)", "gen", ev.Gen, "w", ev.W, "h", ev.H, "reason", ev.Reason)
+			v.recordDisplay(ev.Gen, ev.W, ev.H, ev.Reason)
+		}
+	}()
+
 	if err := v.waitConnected(25 * time.Second); err != nil {
 		return v.collect("direct", c.out, time.Since(v.start)), err
 	}
@@ -767,12 +818,15 @@ func runServer(c *config) (*summary, error) {
 				return
 			}
 			var f struct {
-				Type      string                   `json:"type"`
-				SDP       string                   `json:"sdp"`
-				Candidate *webrtc.ICECandidateInit `json:"candidate"`
-				Code      string                   `json:"code"`
-				LeaseID   string                   `json:"leaseId"`
-				Reason    string                   `json:"reason"`
+				Type       string                   `json:"type"`
+				SDP        string                   `json:"sdp"`
+				Candidate  *webrtc.ICECandidateInit `json:"candidate"`
+				Code       string                   `json:"code"`
+				LeaseID    string                   `json:"leaseId"`
+				Reason     string                   `json:"reason"`
+				Generation uint32                   `json:"generation"`
+				W          uint32                   `json:"w"`
+				H          uint32                   `json:"h"`
 			}
 			if json.Unmarshal(b, &f) != nil {
 				continue
@@ -794,6 +848,10 @@ func runServer(c *config) (*summary, error) {
 				}
 			case "state":
 				log.Info("agent state", "code", f.Code)
+			case "display_changed":
+				// M2-Slice1 Task 2:0x010A 透传帧 {generation,w,h,reason}。
+				log.Info("display changed", "gen", f.Generation, "w", f.W, "h", f.H, "reason", f.Reason)
+				v.recordDisplay(f.Generation, f.W, f.H, f.Reason)
 			case "lease_granted", "lease_denied", "lease_revoked":
 				// T3 lease 词汇(inputlive.go stepEnv 消费;revoked 另记
 				// 原因进 input 脚本结果)。

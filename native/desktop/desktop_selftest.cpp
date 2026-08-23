@@ -23,6 +23,7 @@
 // xnc-desktop.cpp and reachable via `xnc-desktop.exe --selftest` /
 // `build.bat selftest`.
 #include "capture.h"
+#include "capture_reset.h"
 #include "cursor_manager.h"
 #include "desktop_watch.h"
 #include "diag.h"
@@ -45,6 +46,7 @@
 #include <cstddef>  // offsetof
 #include <cstdio>
 #include <algorithm>  // std::find
+#include <atomic>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -443,11 +445,16 @@ class RtTestClient {
       }
     } else if (f.message_type == xnc::kMsgState) {
       xnc::StateEventPayload st;
-      if (xnc::DecodeStateEvent(f, &st) && std::strcmp(st.code, "stream_end") == 0)
-        saw_stream_end_ = true;
+      if (xnc::DecodeStateEvent(f, &st)) {
+        if (std::strcmp(st.code, "stream_end") == 0) saw_stream_end_ = true;
+        state_codes_.emplace_back(st.code);
+      }
     } else if (f.message_type == xnc::kMsgCursor) {
       if (xnc::DecodeCursorEvent(f, &cursor_x_, &cursor_y_, &cursor_visible_))
         cursors_++;
+    } else if (f.message_type == xnc::kMsgDisplayChanged) {
+      xnc::DisplayChangedPayload dc;
+      if (xnc::DecodeDisplayChanged(f, &dc)) displays_.push_back(dc);
     }
   }
 
@@ -458,8 +465,15 @@ class RtTestClient {
   uint64_t cursors_ = 0;
   int32_t cursor_x_ = -1, cursor_y_ = -1;
   uint8_t cursor_visible_ = 0xFF;
+  std::vector<xnc::DisplayChangedPayload> displays_;
+  std::vector<std::string> state_codes_;
   xnc::HostHelloPayload hello_{};
   bool hello_ok_ = false, saw_stream_end_ = false, frame_before_hello_ = false;
+
+  bool SawState(const char* code) const {
+    return std::find(state_codes_.begin(), state_codes_.end(), std::string(code)) !=
+           state_codes_.end();
+  }
 
  private:
   HANDLE h_ = INVALID_HANDLE_VALUE;
@@ -689,6 +703,129 @@ void ResetWatchSeams(std::vector<std::string> names) {
   g_dw_bad_closes = 0;
   g_dw_open_fail = false;
 }
+
+// ---- M2-Slice1 Task 2 fixtures: CaptureReset fake clock/gate, scripted
+// resettable capture, recording sink ----
+
+// Deterministic clock for the CaptureReset unit table (g_cr_unit_now is the
+// ONLY time source; tests advance it by hand).
+uint64_t g_cr_unit_now = 1000;
+uint64_t CrUnitClock() { return g_cr_unit_now; }
+// Shared gate for the pipeline-driven reset scenarios (main thread flips it
+// while the pipeline thread runs; ResetDesktop is a plain enum so reads are
+// atomic enough for a test lever).
+std::atomic<xnc::ResetDesktop> g_cr_gate{xnc::ResetDesktop::kDefault};
+xnc::ResetDesktop CrUnitGate(void*) { return g_cr_gate.load(); }
+uint64_t CrRealClock() { return GetTickCount64(); }
+
+// Scripted capture for the reset scenarios (real-encoder pipeline drives
+// it). Levers mirror the DXGI behaviors T1 measured on XIAOXIN:
+//   LoseAccess()    every Acquire returns "err_access_lost" (secure desktop
+//                   revoked the duplication; re-duplication denied)
+//   SetResolution() the NEXT yielded frame carries the new size (backend
+//                   adopted the mode; the encoder did not)
+//   FailRebuilds(n) Rebuild() fails n times before succeeding (denied while
+//                   the secure desktop is up / transient failures)
+class ResetCapture final : public xnc::ICapture {
+ public:
+  ResetCapture(uint32_t w, uint32_t h, uint32_t total)
+      : buf_((size_t)w * h * 4), w_(w), h_(h), total_(total) {}
+  bool Acquire(xnc::FrameBlob& blob, std::string* err = nullptr) override {
+    if (err) err->clear();
+    if (access_lost_) {
+      if (err) *err = "err_access_lost";
+      return false;
+    }
+    if (next_ < total_) {
+      Fill(next_);
+      blob.bgra = buf_;
+      blob.w = w_;
+      blob.h = h_;
+      blob.mono_us = ++mono_;
+      ++next_;
+      return true;
+    }
+    if (err) *err = "err_timeout";
+    return false;
+  }
+  uint32_t Width() const override { return w_; }
+  uint32_t Height() const override { return h_; }
+  uint32_t RebuildCount() const override { return rebuilds_; }
+  bool Rebuild(std::string* err = nullptr) override {
+    ++rebuilds_;
+    if (fails_left_ > 0) {
+      --fails_left_;
+      if (err) *err = "scripted rebuild failure";
+      return false;
+    }
+    access_lost_ = false;  // fresh duplication works again
+    return true;
+  }
+  void LoseAccess() { access_lost_ = true; }
+  void SetResolution(uint32_t w, uint32_t h) { pending_w_ = w; pending_h_ = h; }
+  void FailRebuilds(uint32_t n) { fails_left_ = n; }
+  void MoreFrames(uint32_t n) { total_ += n; }
+  uint32_t yielded() const { return next_ < total_ ? next_ : total_; }
+
+ private:
+  void Fill(uint32_t frame) {
+    if (pending_w_ != 0 && (pending_w_ != w_ || pending_h_ != h_)) {
+      w_ = pending_w_;
+      h_ = pending_h_;
+      buf_.assign((size_t)w_ * h_ * 4, 0);
+    }
+    const uint8_t base[4] = {0x20, 0x40, 0x60, 0xFF};
+    for (size_t i = 0; i + 3 < buf_.size(); i += 4)
+      for (int k = 0; k < 4; ++k) buf_[i + k] = base[k];
+    if (!buf_.empty()) {  // moving pixel so P frames flow
+      const size_t px = (frame * 137) % (buf_.size() / 4);
+      buf_[px * 4] = 0xF0;
+      buf_[px * 4 + 2] = 0x90;
+    }
+  }
+  std::vector<uint8_t> buf_;
+  uint32_t w_, h_, total_, next_ = 0, rebuilds_ = 0;
+  uint32_t pending_w_ = 0, pending_h_ = 0, fails_left_ = 0;
+  bool access_lost_ = false;
+  uint64_t mono_ = 0;
+};
+
+// AuSink recorder for the pipeline reset scenarios: counts AUs, records
+// STATE codes (+recoverable flag) and DISPLAY_CHANGED events in order.
+struct RecordingSink final : xnc::AuSink {
+  const char* OnAu(bool is_idr, uint64_t, const uint8_t*, size_t) override {
+    aus++;
+    if (is_idr) keys++;
+    return nullptr;
+  }
+  void OnState(const char* code, bool recoverable) override {
+    states.emplace_back(code != nullptr ? code : "?");
+    states_recoverable.push_back(recoverable);
+  }
+  void OnDisplayChanged(uint32_t w, uint32_t h, const char* reason) override {
+    Disp d;
+    d.w = w;
+    d.h = h;
+    d.reason = reason != nullptr ? reason : "?";
+    displays.push_back(d);
+  }
+  bool Saw(const char* code) const {
+    return std::find(states.begin(), states.end(), std::string(code)) != states.end();
+  }
+  bool SawRecoverable(const char* code) const {
+    for (size_t i = 0; i < states.size() && i < states_recoverable.size(); ++i)
+      if (states[i] == code) return states_recoverable[i];
+    return false;
+  }
+  uint64_t aus = 0, keys = 0;
+  std::vector<std::string> states;
+  std::vector<bool> states_recoverable;
+  struct Disp {
+    uint32_t w, h;
+    std::string reason;
+  };
+  std::vector<Disp> displays;
+};
 
 }  // namespace
 
@@ -1174,6 +1311,7 @@ int SelftestMain() {
     r.height = 48;
     r.aus_written = 6;
     r.bytes_written = 1234;
+    r.resets = 2;
     xnc::PipelineOpts o;
     o.duration_s = 2;
     o.fps = 15;
@@ -1191,6 +1329,7 @@ int SelftestMain() {
                                     j.find("\"rebuilds\": 1") != std::string::npos);
     CHECK("statsjson-aus-bytes", j.find("\"aus_written\": 6") != std::string::npos &&
                                      j.find("\"bytes_written\": 1234") != std::string::npos);
+    CHECK("statsjson-resets", j.find("\"resets\": 2") != std::string::npos);
     // 文件系统路径(也是捕获/编码器初始化失败分支写零计数 sidecar 的路径):
     // sidecar 落在 h264 路径同目录、名字固定 stats.json,内容可回读
     wchar_t dir[MAX_PATH] = L"";
@@ -1568,6 +1707,49 @@ int SelftestMain() {
     std::vector<uint8_t> ok_au(1000, 0xAB);
     CHECK("codec-frame-normal-nonempty",
           !xnc::EncodeFrameEvent(1, false, ok_au.data(), ok_au.size()).empty());
+  }
+  { // M2-Slice1 Task 2:0x010A DISPLAY_CHANGED codec(精确字节向量)
+    const xnc::DisplayChangedPayload dc{3, 1920, 1080, "resolution"};
+    const std::vector<uint8_t> w = xnc::EncodeDisplayChanged(dc);
+    const uint8_t want_dc[36] = {3, 0, 0, 0,                         // gen
+                                 0x80, 0x07, 0, 0,                   // w = 1920
+                                 0x38, 0x04, 0, 0,                   // h = 1080
+                                 'r', 'e', 's', 'o', 'l', 'u', 't', 'i', 'o', 'n',
+                                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};  // pad 24
+    CHECK("codec-dc-bytes",
+          w.size() == 36 && std::equal(w.begin(), w.end(), want_dc));
+    xnc::DisplayChangedPayload rt;
+    CHECK("codec-dc-roundtrip",
+          xnc::DecodeDisplayChanged(xnc::Frame{0, xnc::kMsgDisplayChanged, 0, w}, &rt) &&
+                rt.gen == 3 && rt.w == 1920 && rt.h == 1080 &&
+                std::strcmp(rt.reason, "resolution") == 0);
+    CHECK("codec-dc-bad-len-35",
+          !xnc::DecodeDisplayChanged(
+              xnc::Frame{0, xnc::kMsgDisplayChanged, 0, std::vector<uint8_t>(35, 0)}, &rt));
+    CHECK("codec-dc-bad-len-37",
+          !xnc::DecodeDisplayChanged(
+              xnc::Frame{0, xnc::kMsgDisplayChanged, 0, std::vector<uint8_t>(37, 0)}, &rt));
+    CHECK("codec-dc-null-out",
+          !xnc::DecodeDisplayChanged(xnc::Frame{0, xnc::kMsgDisplayChanged, 0, w}, nullptr));
+    // reason 截断到 23 字符 + NUL 填充(desktop_switch 恰 14 字符全保留)
+    const xnc::DisplayChangedPayload ds{7, 64, 48, "desktop_switch"};
+    const std::vector<uint8_t> ws = xnc::EncodeDisplayChanged(ds);
+    CHECK("codec-dc-reason-fits",
+          ws.size() == 36 && ws[12 + 14] == 0 && ws[35] == 0 &&
+                std::memcmp(ws.data() + 12, "desktop_switch", 14) == 0);
+    char long_reason[40];
+    std::memset(long_reason, 'x', sizeof(long_reason) - 1);
+    long_reason[sizeof(long_reason) - 1] = '\0';
+    xnc::DisplayChangedPayload lr;
+    lr.gen = 1;
+    lr.w = 8;
+    lr.h = 6;
+    xnc::CopyReason(lr.reason, sizeof(lr.reason), long_reason);
+    const std::vector<uint8_t> wl = xnc::EncodeDisplayChanged(lr);
+    xnc::DisplayChangedPayload rl;
+    CHECK("codec-dc-reason-truncated",
+          xnc::DecodeDisplayChanged(xnc::Frame{0, xnc::kMsgDisplayChanged, 0, wl}, &rl) &&
+                std::strlen(rl.reason) == 23);
   }
   // ---- M1-Slice2 Task 2:订阅者丢弃/合并策略(纯逻辑) ----
   {
@@ -2823,6 +3005,334 @@ int SelftestMain() {
     CHECK("dw-fail-counted", w.polls() >= 2 && w.poll_failures() == w.polls());
     CHECK("dw-fail-no-close", g_dw_closes == 0 && g_dw_bad_closes == 0);
     CHECK("dw-fail-state", w.Snapshot().state == xnc::DesktopState::kWinlogon);
+  }
+  // ---- M2-Slice1 Task 2:CaptureReset 合并/去抖(纯逻辑,假时钟表驱动) ----
+  {
+    xnc::CaptureReset::Opts o;
+    o.clock_ms = &CrUnitClock;
+    o.desktop_fn = &CrUnitGate;
+    // 去抖合并:t=1000 首请求,t=1050 第二请求 → t=1099 不可取,t=1100 可取
+    // (一次 reset,merged=1);取后再取 = false
+    {
+      xnc::CaptureReset r(o);
+      r.RequestReset("access_lost");
+      g_cr_unit_now = 1050;
+      r.RequestReset("access_lost");
+      char reason[xnc::kResetReasonMax] = {0};
+      g_cr_unit_now = 1099;
+      CHECK("cr-window-not-elapsed", !r.TakeReset(reason, sizeof(reason)));
+      g_cr_unit_now = 1100;
+      CHECK("cr-window-elapsed", r.TakeReset(reason, sizeof(reason)) &&
+                                     std::strcmp(reason, "access_lost") == 0);
+      CHECK("cr-one-reset-for-two-requests",
+            r.executed() == 1 && r.merged() == 1 && r.requests() == 2);
+      CHECK("cr-consumed-empty", !r.TakeReset(reason, sizeof(reason)));
+    }
+    // 优先级覆盖:去抖窗口内 access_lost → desktop_switch(高优先级胜出);
+    // 反向 desktop_switch → resolution 不降级
+    {
+      g_cr_unit_now = 1000;
+      xnc::CaptureReset r(o);
+      r.RequestReset("access_lost");
+      g_cr_unit_now = 1050;
+      r.RequestReset("desktop_switch");
+      g_cr_unit_now = 1100;
+      char reason[xnc::kResetReasonMax] = {0};
+      CHECK("cr-priority-upgrade", r.TakeReset(reason, sizeof(reason)) &&
+                                      std::strcmp(reason, "desktop_switch") == 0);
+    }
+    {
+      g_cr_unit_now = 1000;
+      xnc::CaptureReset r(o);
+      r.RequestReset("desktop_switch");
+      g_cr_unit_now = 1050;
+      r.RequestReset("resolution");
+      g_cr_unit_now = 1100;
+      char reason[xnc::kResetReasonMax] = {0};
+      CHECK("cr-priority-no-downgrade", r.TakeReset(reason, sizeof(reason)) &&
+                                            std::strcmp(reason, "desktop_switch") == 0);
+    }
+    // 消费后新窗口:新请求重新去抖,executed 累计 2
+    {
+      g_cr_unit_now = 1000;
+      xnc::CaptureReset r(o);
+      r.RequestReset("resolution");
+      g_cr_unit_now = 1100;
+      char reason[xnc::kResetReasonMax] = {0};
+      CHECK("cr-first-taken", r.TakeReset(reason, sizeof(reason)));
+      r.RequestReset("access_lost");
+      g_cr_unit_now = 1150;
+      CHECK("cr-new-window-waits", !r.TakeReset(reason, sizeof(reason)));
+      g_cr_unit_now = 1200;
+      CHECK("cr-new-window-elapsed", r.TakeReset(reason, sizeof(reason)));
+      CHECK("cr-executed-total", r.executed() == 2);
+      char last[xnc::kResetReasonMax] = {0};
+      r.LastReason(last, sizeof(last));
+      CHECK("cr-last-reason", std::strcmp(last, "access_lost") == 0);
+    }
+    // reason 边界:null → "?";超长截断 23;门状态透传
+    {
+      g_cr_unit_now = 1000;
+      xnc::CaptureReset r(o);
+      r.RequestReset(nullptr);
+      g_cr_unit_now = 1100;
+      char reason[64] = {0};
+      CHECK("cr-null-reason-default", r.TakeReset(reason, sizeof(reason)) &&
+                                         std::strcmp(reason, "?") == 0);
+      char long_reason[40];
+      std::memset(long_reason, 'y', sizeof(long_reason) - 1);
+      long_reason[sizeof(long_reason) - 1] = '\0';
+      r.RequestReset(long_reason);
+      g_cr_unit_now = 1200;
+      char out[64] = {0};
+      CHECK("cr-long-reason-taken", r.TakeReset(out, sizeof(out)));
+      CHECK("cr-long-reason-bounded", std::strlen(out) == xnc::kResetReasonMax - 1);
+      g_cr_gate.store(xnc::ResetDesktop::kNonDefault);
+      CHECK("cr-gate-nondefault", r.Desktop() == xnc::ResetDesktop::kNonDefault);
+      g_cr_gate.store(xnc::ResetDesktop::kDefault);
+      CHECK("cr-gate-default", r.Desktop() == xnc::ResetDesktop::kDefault);
+    }
+    // 无时钟 = 立即可取(遗留行为族;文档化)
+    {
+      xnc::CaptureReset r;  // clock_ms == nullptr
+      r.RequestReset("change_backend");
+      char reason[xnc::kResetReasonMax] = {0};
+      CHECK("cr-no-clock-immediate", r.TakeReset(reason, sizeof(reason)) &&
+                                        std::strcmp(reason, "change_backend") == 0);
+    }
+  }
+  // ---- M2-Slice1 Task 2:管线 reset 编排(真 MF 编码器 + ResetCapture) ----
+  const uint32_t kRsW = 64, kRsH = 48, kRsFps = 15, kRsBitrate = 500000;
+  { // 场景 A:desktop switch 挂起/恢复 —— gate 翻非默认 + access_lost →
+    // STATE recovering → 等 desktop 回来 → 重建 → capture_rebuilt → 帧恢复;
+    // 期间几十次 err_access_lost 请求全部并入一次 reset
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(kRsW, kRsH, kRsFps, kRsBitrate, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: rsA-init err=%s\n", err.c_str());
+    CHECK("rsA-init", init_ok);
+    if (init_ok) {
+      ResetCapture cap(kRsW, kRsH, 60);
+      g_cr_gate.store(xnc::ResetDesktop::kDefault);
+      xnc::CaptureReset::Opts co;
+      co.clock_ms = &CrRealClock;
+      co.desktop_fn = &CrUnitGate;
+      xnc::CaptureReset reset(co);
+      RecordingSink sink;
+      xnc::PipelineOpts po;
+      po.duration_s = 8;
+      po.fps = kRsFps;
+      po.target_bitrate_bps = kRsBitrate;
+      po.reset = &reset;
+      xnc::PipelineResult res;
+      std::thread pipe_th([&] { res = xnc::Pipeline::Run(cap, enc, sink, po); });
+      Sleep(800);  // healthy frames first
+      const uint32_t before = cap.yielded();
+      g_cr_gate.store(xnc::ResetDesktop::kNonDefault);  // secure desktop up
+      cap.LoseAccess();
+      Sleep(800);                                       // suspended, waiting
+      g_cr_gate.store(xnc::ResetDesktop::kDefault);     // desktop returned
+      cap.MoreFrames(120);
+      pipe_th.join();
+      CHECK("rsA-ok", res.ok);
+      CHECK("rsA-frames-before-loss", before >= 5);
+      CHECK("rsA-recovering-state", sink.Saw("recovering") && sink.SawRecoverable("recovering"));
+      CHECK("rsA-rebuilt-state", sink.Saw("capture_rebuilt"));
+      CHECK("rsA-no-fatal", !sink.Saw("capture_fatal") && !sink.Saw("capture_failed"));
+      CHECK("rsA-single-reset", res.resets == 1 && reset.executed() == 1);
+      CHECK("rsA-requests-merged", reset.requests() >= 3 && reset.merged() >= 2);
+      CHECK("rsA-reason", std::strcmp(res.last_reset_reason, "desktop_switch") == 0);
+      CHECK("rsA-single-rebuild", cap.RebuildCount() == 1);
+      CHECK("rsA-frames-resumed", res.counters.captured > before + 5);
+      CHECK("rsA-rebuild-idr", sink.keys >= 2);
+      std::printf("SELFTEST NOTE: rsA captured=%llu keys=%llu resets=%u requests=%u merged=%u\n",
+                  (unsigned long long)res.counters.captured, (unsigned long long)sink.keys,
+                  res.resets, reset.requests(), reset.merged());
+    }
+  }
+  { // 场景 B:ACCESS_LOST 且 watch=DEFAULT → 后端内部重建(err_rebuilt)
+    // 不走统一 reset(resets==0, FrameCache.rebuilds==1, 无 recovering 态)
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(kRsW, kRsH, kRsFps, kRsBitrate, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: rsB-init err=%s\n", err.c_str());
+    CHECK("rsB-init", init_ok);
+    if (init_ok) {
+      ScriptedCapture cap(kRsW, kRsH, 40, 10);  // Acquire#10 → err_rebuilt
+      g_cr_gate.store(xnc::ResetDesktop::kDefault);
+      xnc::CaptureReset::Opts co;
+      co.clock_ms = &CrRealClock;
+      co.desktop_fn = &CrUnitGate;
+      xnc::CaptureReset reset(co);
+      RecordingSink sink;
+      xnc::PipelineOpts po;
+      po.duration_s = 4;
+      po.fps = kRsFps;
+      po.target_bitrate_bps = kRsBitrate;
+      po.reset = &reset;
+      const xnc::PipelineResult res = xnc::Pipeline::Run(cap, enc, sink, po);
+      CHECK("rsB-ok", res.ok);
+      CHECK("rsB-internal-rebuild", res.counters.rebuilds == 1);
+      CHECK("rsB-no-unified-reset", res.resets == 0 && reset.executed() == 0);
+      CHECK("rsB-no-recovering", !sink.Saw("recovering"));
+      CHECK("rsB-rebuilt-state", sink.Saw("capture_rebuilt"));
+      CHECK("rsB-rebuild-idr", sink.keys >= 1);
+    }
+  }
+  { // 场景 C:分辨率变化 → reset("resolution") → 编码器按新尺寸重 Init →
+    // DISPLAY_CHANGED(w=96,h=64,reason=resolution)+ capture_rebuilt + gen++
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(kRsW, kRsH, kRsFps, kRsBitrate, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: rsC-init err=%s\n", err.c_str());
+    CHECK("rsC-init", init_ok);
+    if (init_ok) {
+      ResetCapture cap(kRsW, kRsH, 60);
+      g_cr_gate.store(xnc::ResetDesktop::kDefault);
+      xnc::CaptureReset::Opts co;
+      co.clock_ms = &CrRealClock;
+      co.desktop_fn = &CrUnitGate;
+      xnc::CaptureReset reset(co);
+      RecordingSink sink;
+      xnc::PipelineOpts po;
+      po.duration_s = 8;
+      po.fps = kRsFps;
+      po.target_bitrate_bps = kRsBitrate;
+      po.reset = &reset;
+      xnc::PipelineResult res;
+      std::thread pipe_th([&] { res = xnc::Pipeline::Run(cap, enc, sink, po); });
+      Sleep(800);
+      cap.SetResolution(96, 64);  // next frame arrives at the new size
+      cap.MoreFrames(120);
+      pipe_th.join();
+      CHECK("rsC-ok", res.ok);
+      CHECK("rsC-single-reset", res.resets == 1);
+      CHECK("rsC-reason", std::strcmp(res.last_reset_reason, "resolution") == 0);
+      CHECK("rsC-display-event", sink.displays.size() == 1 &&
+                                     sink.displays[0].w == 96 && sink.displays[0].h == 64 &&
+                                     sink.displays[0].reason == "resolution");
+      CHECK("rsC-display-after-rebuilt",
+            sink.Saw("capture_rebuilt") && sink.Saw("recovering"));
+      CHECK("rsC-new-dims", res.width == 96 && res.height == 64);
+      CHECK("rsC-frames-after", res.counters.captured >= 20);
+      CHECK("rsC-idr-after-reset", sink.keys >= 2);
+      std::printf("SELFTEST NOTE: rsC captured=%llu keys=%llu resets=%u w=%u h=%u\n",
+                  (unsigned long long)res.counters.captured, (unsigned long long)sink.keys,
+                  res.resets, res.width, res.height);
+    }
+  }
+  { // 场景 D:重建连续失败(3 次)→ STATE capture_failed(可恢复,1s 档
+    // 重试)→ 第 6 次成功 → capture_rebuilt → 帧恢复
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(kRsW, kRsH, kRsFps, kRsBitrate, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: rsD-init err=%s\n", err.c_str());
+    CHECK("rsD-init", init_ok);
+    if (init_ok) {
+      ResetCapture cap(kRsW, kRsH, 30);
+      cap.FailRebuilds(5);  // 3 次进入 hard 档,第 6 次成功
+      g_cr_gate.store(xnc::ResetDesktop::kDefault);
+      xnc::CaptureReset::Opts co;
+      co.clock_ms = &CrRealClock;
+      co.desktop_fn = &CrUnitGate;
+      xnc::CaptureReset reset(co);
+      RecordingSink sink;
+      xnc::PipelineOpts po;
+      po.duration_s = 10;
+      po.fps = kRsFps;
+      po.target_bitrate_bps = kRsBitrate;
+      po.reset = &reset;
+      xnc::PipelineResult res;
+      std::thread pipe_th([&] { res = xnc::Pipeline::Run(cap, enc, sink, po); });
+      Sleep(500);
+      cap.LoseAccess();
+      cap.MoreFrames(90);
+      pipe_th.join();
+      CHECK("rsD-ok", res.ok);
+      CHECK("rsD-failed-state", sink.Saw("capture_failed") && sink.SawRecoverable("capture_failed"));
+      CHECK("rsD-recovered-state", sink.Saw("capture_rebuilt"));
+      CHECK("rsD-single-reset", res.resets == 1);
+      CHECK("rsD-rebuild-attempts", cap.RebuildCount() == 6);
+      CHECK("rsD-no-fatal", !sink.Saw("capture_fatal"));
+      std::printf("SELFTEST NOTE: rsD rebuilds=%u states=%zu\n", cap.RebuildCount(),
+                  sink.states.size());
+    }
+  }
+  { // 场景 rt6(rt pipe 回环,slot 4):挂起期订阅者加入 → 恢复后拿到 IDR;
+    // 分辨率变化 → 0x010A DISPLAY_CHANGED(gen=3, w=96, h=64, reason=resolution)
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(kRsW, kRsH, kRsFps, kRsBitrate, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: rt6-init err=%s\n", err.c_str());
+    CHECK("rt6-init", init_ok);
+    if (init_ok) {
+      xnc::RtServer rt;
+      const xnc::RtServer::Opts ro = rt_opts(4);
+      CHECK("rt6-start", rt.Start(ro, kRsW, kRsH));
+      ResetCapture cap(kRsW, kRsH, 60);
+      g_cr_gate.store(xnc::ResetDesktop::kDefault);
+      xnc::CaptureReset::Opts co;
+      co.clock_ms = &CrRealClock;
+      co.desktop_fn = &CrUnitGate;
+      xnc::CaptureReset reset(co);
+      xnc::PipelineOpts po;
+      po.duration_s = 12;
+      po.fps = kRsFps;
+      po.target_bitrate_bps = kRsBitrate;
+      po.reset = &reset;
+      xnc::PipelineResult res;
+      std::thread pipe_th([&] { res = xnc::Pipeline::Run(cap, enc, rt, po); });
+      RtTestClient a;
+      CHECK("rt6-a-connect", a.Connect(ro.pipe_name.c_str(), kRtSecret, sizeof(kRtSecret)));
+      CHECK("rt6-a-attach", a.Attach(7));
+      a.Pump(2500, [&a] { return a.keys_ >= 1; });  // initial warm-up IDR
+      CHECK("rt6-a-first-key", a.keys_ >= 1);
+      // 挂起:secure desktop 上来
+      g_cr_gate.store(xnc::ResetDesktop::kNonDefault);
+      cap.LoseAccess();
+      Sleep(300);
+      // 恢复期订阅者 B 加入(join-while-recovering)
+      RtTestClient b;
+      CHECK("rt6-b-connect", b.Connect(ro.pipe_name.c_str(), kRtSecret, sizeof(kRtSecret)));
+      CHECK("rt6-b-attach", b.Attach(9));
+      CHECK("rt6-b-hello-gen-1", b.hello_ok_ && b.hello_.gen == 1);
+      Sleep(600);
+      g_cr_gate.store(xnc::ResetDesktop::kDefault);
+      cap.MoreFrames(240);
+      const bool recovered = WaitUntil([&a, &b] {
+        a.Pump(60);
+        b.Pump(60);
+        return a.keys_ >= 2 && b.keys_ >= 1;
+      }, 6000);
+      // 分辨率变化 → 0x010A
+      cap.SetResolution(96, 64);
+      const bool display_seen = WaitUntil([&a, &b] {
+        a.Pump(60);
+        b.Pump(60);
+        return !a.displays_.empty() && !b.displays_.empty();
+      }, 6000);
+      pipe_th.join();
+      a.Pump(400);
+      b.Pump(400);
+      rt.Shutdown();
+      CHECK("rt6-recovered", recovered);
+      CHECK("rt6-recovering-state", a.SawState("recovering"));
+      CHECK("rt6-join-during-recovery-gets-idr", b.keys_ >= 1 && b.frames_ >= 1);
+      CHECK("rt6-display-seen", display_seen);
+      CHECK("rt6-display-payload",
+            !a.displays_.empty() && a.displays_[0].gen == 3 && a.displays_[0].w == 96 &&
+                a.displays_[0].h == 64 &&
+                std::strcmp(a.displays_[0].reason, "resolution") == 0);
+      CHECK("rt6-display-both-subs",
+            !b.displays_.empty() && b.displays_[0].gen == 3 && b.displays_[0].w == 96);
+      CHECK("rt6-pipeline-ok", res.ok);
+      CHECK("rt6-two-resets", res.resets == 2);
+      const xnc::RtServer::Stats st = rt.stats();
+      CHECK("rt6-two-attaches", st.attaches == 2);
+      std::printf("SELFTEST NOTE: rt6 a_keys=%llu b_keys=%llu resets=%u gen=%u\n",
+                  (unsigned long long)a.keys_, (unsigned long long)b.keys_, res.resets,
+                  a.displays_.empty() ? 0 : a.displays_[0].gen);
+    }
   }
   if (fails == 0) std::printf("selftest ok\n");
   return fails == 0 ? 0 : 1;
