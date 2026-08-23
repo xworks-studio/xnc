@@ -287,8 +287,9 @@ func TestRunInputStepsLeaseDeniedAborts(t *testing.T) {
 
 func TestScriptWaitBudget(t *testing.T) {
 	steps := parse(t, `[{"op":"lease"},{"op":"sas"},{"op":"wait","ms":1000},{"op":"move","x":0,"y":0}]`)
-	// 25s(首关键帧)+ 6s(lease)+ 12s(sas)+ 1s(wait)+ 2s(move)= 46s。
-	if got, want := scriptWaitBudget(steps), 46*time.Second; got != want {
+	// 25s(首关键帧)+ 6s(lease)+ 19s(sas = sasResultWait 17s + 2s 余量,
+	// Task 6 对齐 agent 界)+ 1s(wait)+ 2s(move)= 53s。
+	if got, want := scriptWaitBudget(steps), 53*time.Second; got != want {
 		t.Errorf("budget = %v, want %v", got, want)
 	}
 }

@@ -3279,6 +3279,11 @@ int SelftestMain() {
       g_cr_gate.store(xnc::ResetDesktop::kNonDefault);  // secure desktop up
       cap.LoseAccess();
       Sleep(800);                                       // suspended, waiting
+      // Task 6 (T2 deferred list): while the gate is away the reset sequence
+      // must sit in its wait-desktop phase - ZERO rebuild attempts against
+      // the secure desktop (T1 live evidence: re-duplication there is refused
+      // 0x80070005 even as SYSTEM, so any attempt is wasted churn).
+      CHECK("rsA-no-rebuild-while-away", cap.RebuildCount() == 0);
       g_cr_gate.store(xnc::ResetDesktop::kDefault);     // desktop returned
       cap.MoreFrames(120);
       pipe_th.join();

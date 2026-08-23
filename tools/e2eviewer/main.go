@@ -200,6 +200,13 @@ type viewer struct {
 	displayEvents  uint64
 	displaySamples []displaySample
 
+	// STATE 事件记录(M2-Slice1 Task 6 门证据:② recovering/capture_rebuilt
+	// 悬挂-恢复词汇、④ backend_changed 降级/回升;server 模式信令帧)。
+	// 计数全量,样本截 cap。
+	stateMu      sync.Mutex
+	stateEvents  uint64
+	stateSamples []stateSample
+
 	// --sas(--input-script sas op 同路)结果记录(M2-Slice1 Task 5):
 	// 请求发出时刻 + 回执(ok/hr/code)+ rtt;summary.sas。
 	sasMu     sync.Mutex
@@ -273,6 +280,14 @@ type displaySample struct {
 	Reason string `json:"reason"`
 }
 
+// stateSample 是一条 agent STATE 事件(summary.stateSamples 元素;
+// M2-Slice1 Task 6 门②/④ 证据:recovering/capture_rebuilt/backend_changed)。
+type stateSample struct {
+	TMs         int64  `json:"tMs"`
+	Code        string `json:"code"`
+	Recoverable bool   `json:"recoverable"`
+}
+
 // cursorSampleCap 限制 summary 体积;超出后样本丢弃(计数仍全量)。
 const cursorSampleCap = 4096
 
@@ -297,6 +312,29 @@ func (v *viewer) displayStats() (uint64, []displaySample) {
 	out := make([]displaySample, len(v.displaySamples))
 	copy(out, v.displaySamples)
 	return v.displayEvents, out
+}
+
+// stateSampleCap 同 displaySampleCap(STATE 事件稀疏,防御性上限)。
+const stateSampleCap = 1024
+
+// recordState 记一条 agent STATE 事件(server 信令帧)。
+func (v *viewer) recordState(code string, recoverable bool) {
+	v.stateMu.Lock()
+	defer v.stateMu.Unlock()
+	v.stateEvents++
+	if len(v.stateSamples) < stateSampleCap {
+		v.stateSamples = append(v.stateSamples, stateSample{
+			TMs: time.Since(v.start).Milliseconds(), Code: code, Recoverable: recoverable})
+	}
+}
+
+// stateStats 返回(累计事件数,样本副本)。
+func (v *viewer) stateStats() (uint64, []stateSample) {
+	v.stateMu.Lock()
+	defer v.stateMu.Unlock()
+	out := make([]stateSample, len(v.stateSamples))
+	copy(out, v.stateSamples)
+	return v.stateEvents, out
 }
 
 // recordCursor 记一条 cursor 通道事件(server 模式 OnDataChannel 调用)。
@@ -474,6 +512,8 @@ type summary struct {
 	CursorSamples    []cursorSample  `json:"cursorSamples,omitempty"`
 	DisplayEvents    uint64          `json:"displayEvents"`
 	DisplaySamples   []displaySample `json:"displaySamples,omitempty"`
+	StateEvents      uint64          `json:"stateEvents"`
+	StateSamples     []stateSample   `json:"stateSamples,omitempty"`
 	Sas              *sasOutcome     `json:"sas,omitempty"`
 	Input            *scriptResult   `json:"input,omitempty"`
 	DurationMs       int64           `json:"durationMs"`
@@ -484,6 +524,7 @@ type summary struct {
 func (v *viewer) collect(mode, dump string, ran time.Duration) *summary {
 	cur, samples := v.cursorStats()
 	dEvents, dSamples := v.displayStats()
+	sEvents, sSamples := v.stateStats()
 	s := &summary{
 		Mode: mode, Relay: v.relay, DumpFile: dump,
 		StartUnixMs: v.start.UnixMilli(),
@@ -493,8 +534,9 @@ func (v *viewer) collect(mode, dump string, ran time.Duration) *summary {
 		KeyframeReqs: v.keyframeReqs.Load(), PliToIdrMaxMs: v.pliIDRMax.Load(),
 		CursorEvents: cur, CursorSamples: samples,
 		DisplayEvents: dEvents, DisplaySamples: dSamples,
-		Sas:        v.sasSnapshot(),
-		DurationMs: ran.Milliseconds(),
+		StateEvents: sEvents, StateSamples: sSamples,
+		Sas:         v.sasSnapshot(),
+		DurationMs:  ran.Milliseconds(),
 	}
 	if t := v.firstAt.Load(); t != 0 {
 		s.FirstFrameMs = time.Unix(0, t).Sub(v.start).Milliseconds()
@@ -545,6 +587,33 @@ func (s *summary) report(c *config) {
 	fmt.Printf("--- e2eviewer summary ---%s\n", string(jb))
 	for _, f := range s.Failures {
 		fmt.Printf("FAIL: %s\n", f)
+	}
+}
+
+// sasResultWait bounds the wait for a secure_attention_result frame
+// (M2-Slice1 Task 6 fix): the agent's core RPC bound is 15s
+// (coreclient.rpcTimeout) plus the wsWriter write, so a 10s viewer wait
+// misjudged in-bound replies as timeouts. 15s agent bound + 2s transport
+// slack.
+const sasResultWait = 17 * time.Second
+
+// drainSasReplies discards queued secure_attention_result frames and
+// returns how many (request correlation - Task 6 fix). The control-WS
+// vocabulary carries no request id, so correlation is viewer-side: SAS ops
+// are strictly sequential (--sas completes before the input script runs;
+// script steps run in order) and every op waits the FULL agent bound, so
+// when a new op starts any earlier reply has already arrived (queued here
+// and discarded) or never will - a late reply from an earlier op cannot be
+// claimed by the current one.
+func drainSasReplies(ch <-chan sasReply) int {
+	n := 0
+	for {
+		select {
+		case <-ch:
+			n++
+		default:
+			return n
+		}
 	}
 }
 
@@ -883,17 +952,18 @@ func runServer(c *config) (*summary, error) {
 				return
 			}
 			var f struct {
-				Type       string                   `json:"type"`
-				SDP        string                   `json:"sdp"`
-				Candidate  *webrtc.ICECandidateInit `json:"candidate"`
-				Code       string                   `json:"code"`
-				LeaseID    string                   `json:"leaseId"`
-				Reason     string                   `json:"reason"`
-				Generation uint32                   `json:"generation"`
-				W          uint32                   `json:"w"`
-				H          uint32                   `json:"h"`
-				OK         *bool                    `json:"ok"`
-				HR         uint32                   `json:"hr"`
+				Type        string                   `json:"type"`
+				SDP         string                   `json:"sdp"`
+				Candidate   *webrtc.ICECandidateInit `json:"candidate"`
+				Code        string                   `json:"code"`
+				LeaseID     string                   `json:"leaseId"`
+				Reason      string                   `json:"reason"`
+				Generation  uint32                   `json:"generation"`
+				W           uint32                   `json:"w"`
+				H           uint32                   `json:"h"`
+				OK          *bool                    `json:"ok"`
+				HR          uint32                   `json:"hr"`
+				Recoverable bool                     `json:"recoverable"`
 			}
 			if json.Unmarshal(b, &f) != nil {
 				continue
@@ -915,6 +985,7 @@ func runServer(c *config) (*summary, error) {
 				}
 			case "state":
 				log.Info("agent state", "code", f.Code)
+				v.recordState(f.Code, f.Recoverable)
 			case "display_changed":
 				// M2-Slice1 Task 2:0x010A 透传帧 {generation,w,h,reason}。
 				log.Info("display changed", "gen", f.Generation, "w", f.W, "h", f.H, "reason", f.Reason)
@@ -994,7 +1065,12 @@ func runServer(c *config) (*summary, error) {
 		// --sas(M2-Slice1 Task 5):连接后发一次 secure_attention(core
 		// 0x0110 经 agent 转发),回执 + rtt 进 summary.sas。门控拒绝亦是
 		// 有效观测(T6 门⑤:ok=false code=SAS_DENIED),不构成断言失败。
+		// Task 6 对齐:等待 = agent 界(sasResultWait),发送前清空迟到回执
+		// (关联,见 drainSasReplies)。
 		sendAt := v.beginSas()
+		if stale := drainSasReplies(sasCh); stale > 0 {
+			log.Warn("--sas: discarded stale result frame(s) from an earlier op", "count", stale)
+		}
 		wctx, wcancel := context.WithTimeout(ctx, 10*time.Second)
 		jb, _ := json.Marshal(map[string]any{"type": "secure_attention"})
 		if err := ws.Write(wctx, websocket.MessageText, jb); err != nil {
@@ -1006,9 +1082,9 @@ func runServer(c *config) (*summary, error) {
 			select {
 			case rep := <-sasCh:
 				v.completeSas(rep, sendAt, false)
-			case <-time.After(10 * time.Second):
+			case <-time.After(sasResultWait):
 				v.completeSas(sasReply{code: "timeout"}, sendAt, true)
-				log.Warn("--sas: no secure_attention_result within 10s")
+				log.Warn("--sas: no secure_attention_result within agent bound", "wait", sasResultWait.String())
 			case <-ctx.Done():
 				v.completeSas(sasReply{code: "ctx_done"}, sendAt, true)
 			}

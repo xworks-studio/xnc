@@ -166,9 +166,16 @@ func (e *serverInputEnv) requestLease(ctx context.Context) (string, error) {
 	}
 }
 
-// sendSAS 发 secure_attention 并等 secure_attention_result(10s 上限;
-// M2-Slice1 Task 5)。门控拒绝(ok=false + 稳定码)按观测返回,不算错误。
+// sendSAS 发 secure_attention 并等 secure_attention_result(sasResultWait
+// 上限 = agent core RPC 界 15s + 传输余量;M2-Slice1 Task 6 对齐修复:旧
+// 10s 会把界内回执误判为超时)。关联:词汇无请求 id,SAS op 严格顺序且
+// 各等满 agent 界 → 发送前清空迟到回执(上一 op 残留不被本 op 误领,见
+// main.go drainSasReplies)。门控拒绝(ok=false + 稳定码)按观测返回,
+// 不算错误。
 func (e *serverInputEnv) sendSAS(ctx context.Context) (bool, uint32, string, error) {
+	if stale := drainSasReplies(e.sasCh); stale > 0 {
+		e.v.log.Warn("sas: discarded stale result frame(s) from an earlier op", "count", stale)
+	}
 	wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	jb, _ := json.Marshal(map[string]any{"type": "secure_attention"})
@@ -178,8 +185,8 @@ func (e *serverInputEnv) sendSAS(ctx context.Context) (bool, uint32, string, err
 	select {
 	case rep := <-e.sasCh:
 		return rep.ok, rep.hr, rep.code, nil
-	case <-time.After(10 * time.Second):
-		return false, 0, "", errors.New("secure_attention_result timeout after 10s")
+	case <-time.After(sasResultWait):
+		return false, 0, "", fmt.Errorf("secure_attention_result timeout after %v", sasResultWait)
 	case <-ctx.Done():
 		return false, 0, "", ctx.Err()
 	}

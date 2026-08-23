@@ -87,8 +87,15 @@ uint64_t ResetClockThunk() { return GetTickCount64(); }
 // startup - the flags exist to force ladder transitions for live diagnosis.
 xnc::LadderOpts LadderOptsFor(const xnc::DiagOptions& opt) {
   xnc::LadderOpts lo;
+  // GetEnvironmentVariableA returns the REQUIRED size (incl. NUL) when the
+  // buffer is too small and the buffer contents are then UNDEFINED - a value
+  // >= 32 chars left buf unterminated and the parse/log below overread the
+  // stack (T3 deferred fix, closed in Task 6). Only a strictly-shorter copy
+  // is NUL-terminated and safe to touch; oversized values log truncated-safe.
   char buf[32];
-  if (GetEnvironmentVariableA("XNC_FORCE_DXGI_HEALTH", buf, sizeof(buf)) > 0) {
+  const DWORD health_len = GetEnvironmentVariableA("XNC_FORCE_DXGI_HEALTH", buf,
+                                                   sizeof(buf));
+  if (health_len > 0 && health_len < sizeof(buf)) {
     int32_t v = -1;
     if (xnc::ParseForceHealthEnv(buf, &v)) {
       lo.force_health = v;
@@ -97,8 +104,13 @@ xnc::LadderOpts LadderOptsFor(const xnc::DiagOptions& opt) {
       XNC_LOG_ERROR("backend_env_override invalid XNC_FORCE_DXGI_HEALTH=\"%s\" "
                     "(want 0..100; ignored)", buf);
     }
+  } else if (health_len > 0) {
+    XNC_LOG_ERROR("backend_env_override XNC_FORCE_DXGI_HEALTH too long "
+                  "(len=%lu, max 31; ignored)", health_len);
   }
-  if (GetEnvironmentVariableA("XNC_FORCE_BACKEND", buf, sizeof(buf)) > 0) {
+  const DWORD backend_len = GetEnvironmentVariableA("XNC_FORCE_BACKEND", buf,
+                                                    sizeof(buf));
+  if (backend_len > 0 && backend_len < sizeof(buf)) {
     if (xnc::ParseForceBackendEnv(buf)) {
       lo.force_gdi = true;
       XNC_LOG_INFO("backend_env_override force_backend=gdi");

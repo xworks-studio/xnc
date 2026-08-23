@@ -466,8 +466,8 @@ Frame HandleStartCapture(const Frame& req, Watchdog* wd) {
     return ErrorFrame(kMsgStartCapture, req.request_id, "BAD_PAYLOAD");
   }
   wts = GetU32(req.payload.data());
-  const uint32_t active = CoreWts().console_session();
-  if (!SessionTargetAllowed(wts, active)) {
+  const uint32_t active_pre = CoreWts().console_session();
+  if (!SessionTargetAllowed(wts, active_pre)) {
     return ErrorFrame(kMsgStartCapture, req.request_id, "SESSION_MISMATCH");
   }
 
@@ -483,6 +483,17 @@ Frame HandleStartCapture(const Frame& req, Watchdog* wd) {
   swprintf(pipe_name, 80, L"\\\\.\\pipe\\xnc-desktop-rt-%lu", GetCurrentProcessId());
 
   std::lock_guard<std::mutex> lk(g_capture.mu);
+  // TOCTOU fix (Task 6 deferred list): the active console session is
+  // re-read INSIDE the lock and re-validated - a console switch landing in
+  // the window between the unlocked pre-check above and this critical
+  // section must not reuse/respawn against the stale snapshot (the WTS
+  // monitor callback takes this same mutex, so post-lock reads are the
+  // coherent view; a moved console now fails SESSION_MISMATCH and the next
+  // StartCapture spawns into the current session).
+  const uint32_t active = CoreWts().console_session();
+  if (!SessionTargetAllowed(wts, active)) {
+    return ErrorFrame(kMsgStartCapture, req.request_id, "SESSION_MISMATCH");
+  }
   const bool alive = g_capture.valid && g_capture.child != nullptr &&
                      WaitForSingleObject(g_capture.child, 0) == WAIT_TIMEOUT;
   switch (DecideCaptureReuse(g_capture.valid, alive, g_capture.session,

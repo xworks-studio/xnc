@@ -186,3 +186,46 @@ func TestDisplayRecording(t *testing.T) {
 		t.Errorf("displayStats must return a copy")
 	}
 }
+
+// TestStateRecording:STATE 事件全量计数 + 样本截 cap + 副本语义
+// (M2-Slice1 Task 6 门②/④ 证据)。
+func TestStateRecording(t *testing.T) {
+	v := &viewer{start: time.Now()}
+	for i := 0; i < stateSampleCap+10; i++ {
+		v.recordState("backend_changed", true)
+	}
+	v.recordState("capture_rebuilt", true)
+	n, samples := v.stateStats()
+	if n != stateSampleCap+11 {
+		t.Errorf("stateEvents = %d, want %d", n, stateSampleCap+11)
+	}
+	if len(samples) != stateSampleCap {
+		t.Fatalf("samples = %d, want %d", len(samples), stateSampleCap)
+	}
+	if samples[0].Code != "backend_changed" || !samples[0].Recoverable {
+		t.Errorf("sample[0] = %+v", samples[0])
+	}
+	samples[0].Code = "mutated"
+	if _, again := v.stateStats(); again[0].Code == "mutated" {
+		t.Errorf("stateStats must return a copy")
+	}
+}
+
+// TestDrainSasReplies(Task 6 关联):清空丢弃排队的迟到
+// secure_attention_result(FIFO,空即止),后续等待只见新回执。
+func TestDrainSasReplies(t *testing.T) {
+	ch := make(chan sasReply, 8)
+	if n := drainSasReplies(ch); n != 0 {
+		t.Fatalf("empty drain = %d, want 0", n)
+	}
+	ch <- sasReply{ok: true}
+	ch <- sasReply{ok: false, code: "SAS_DENIED"}
+	if n := drainSasReplies(ch); n != 2 {
+		t.Fatalf("drain = %d, want 2", n)
+	}
+	select {
+	case <-ch:
+		t.Fatal("channel should be empty after drain")
+	default:
+	}
+}

@@ -390,7 +390,7 @@ func scriptWaitBudget(steps []scriptStep) time.Duration {
 		case "lease":
 			total += 6 * time.Second // requestLease 超时 5s + 余量
 		case "sas":
-			total += 12 * time.Second // sendSAS 回执等待 10s + 余量
+			total += sasResultWait + 2*time.Second // 回执等待(agent 界对齐)+ 余量
 		default:
 			total += 2 * time.Second
 		}
