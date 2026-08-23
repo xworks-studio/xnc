@@ -36,7 +36,7 @@ func main() {
 
 // newRootCmd 构建命令树（抽出供测试直接驱动 flag 解析路径）。
 func newRootCmd() *cobra.Command {
-	var server, token, stateDir string
+	var server, token, stateDir, serviceName, corePipe, coreSecretHex string
 	var devName, devLogFile, devCorePipe, devCoreSecretHex string
 	root := &cobra.Command{
 		Use:          "xnc-agent",
@@ -47,7 +47,7 @@ func newRootCmd() *cobra.Command {
 		Use:   "run",
 		Short: "run the agent (foreground debug entry; service mode when launched by the SCM)",
 		RunE: func(_ *cobra.Command, _ []string) error {
-			return runAgent(server, token, stateDir)
+			return runAgent(server, token, stateDir, serviceName, corePipe, coreSecretHex)
 		},
 	}
 	// run-dev-console：一次性开发拓扑宿主——不起 SCM、状态全在
@@ -63,22 +63,32 @@ func newRootCmd() *cobra.Command {
 		Use:   "install",
 		Short: "install and start the XNCAgent Windows service",
 		RunE: func(_ *cobra.Command, _ []string) error {
-			return installService(server, token, stateDir)
+			return installService(server, token, stateDir, serviceName, corePipe, coreSecretHex)
 		},
 	}
 	uninstall := &cobra.Command{
 		Use:   "uninstall",
 		Short: "stop and remove the XNCAgent Windows service",
 		RunE: func(_ *cobra.Command, _ []string) error {
-			return uninstallService()
+			return uninstallService(serviceName)
 		},
 	}
 	for _, c := range []*cobra.Command{run, install} {
 		c.Flags().StringVar(&server, "server", "", "control server URL (required)")
 		c.Flags().StringVar(&token, "token", "", "enrollment token (first run)")
 		c.Flags().StringVar(&stateDir, "state-dir", defaultStateDir(), "state directory")
+		// M2-Slice3 Task 2: dev 服务化 —— 服务名参数化（XNCAgentDev）+
+		// dev desktop core pipe 凭据入服务 argv（SCM 无交互环境；与 core
+		// --smoke-secret 同一 dev-only plaintext 先例）。默认值 = 生产行为
+		// 完全不变。
+		c.Flags().StringVar(&serviceName, "service-name", "", "Windows service name (default XNCAgent)")
+		c.Flags().StringVar(&corePipe, "desktop-core-pipe", "",
+			"desktop sessions: core XNIP pipe (full \\\\.\\pipe\\name)")
+		c.Flags().StringVar(&coreSecretHex, "desktop-core-secret-hex", "",
+			"desktop sessions: core pipe secret (64 hex chars; never logged)")
 		_ = c.MarkFlagRequired("server")
 	}
+	uninstall.Flags().StringVar(&serviceName, "service-name", "", "Windows service name (default XNCAgent)")
 	runDev.Flags().StringVar(&server, "server", "", "control server URL (required)")
 	runDev.Flags().StringVar(&token, "token", "", "enrollment token (required; fresh identity every run)")
 	runDev.Flags().StringVar(&devName, "name", "", "node name override (default <hostname>-DEV)")

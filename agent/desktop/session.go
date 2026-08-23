@@ -96,6 +96,10 @@ const (
 	// M2-Slice1 Task 5:secure attention(viewer SAS 按钮 ↔ core 0x0110)。
 	vocabSecureAttention       = "secure_attention"
 	vocabSecureAttentionResult = "secure_attention_result"
+	// M2-Slice3 Task 2:意图自愈通知(经既有 state 帧形态;未知 code 的
+	// 旧 viewer 按未知 state 忽略,向后兼容)。
+	vocabStateReattached  = "reattached"
+	vocabStateCaptureLost = "capture_lost"
 )
 
 const (
@@ -178,27 +182,24 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 	}
 
 	// ① 启动采集 + ATTACH(pipe host 就绪才有 HOST_HELLO 维度信息)。
+	// 采集意图(M2-Slice3 Task 2):源死亡(logoff/pipe 断/core 掉线)→
+	// 退避 re-StartCapture,新源透明替换 —— close 时结清最终 Start/Stop
+	// 配对(旧源由 reportDead 即时结清)。
+	it := newCaptureIntent(ctx, h.Starter, p.WTSSession, log)
 	src, err := h.Starter.Start(ctx, p.WTSSession)
 	if err != nil {
 		log.Warn("desktop start failed", "err", err)
 		h.failFast(ctx, ws, "start_failed", err.Error())
 		return
 	}
-	var closeOnce sync.Once
-	closeAll := func() {
-		closeOnce.Do(func() {
-			_ = src.Close()
-			if err := h.Starter.Stop(); err != nil {
-				log.Warn("desktop stop capture failed", "err", err)
-			}
-		})
-	}
-	defer closeAll()
+	it.adopt(src)
+	defer it.close() // 成功 ATTACH 之后才登记(失败路径无配对可结清)
+	dyn := it.source()
 
 	// ①b 输入/lease 控制器(本会话一条;close 合成卡键释放并释放 lease,
 	// defer LIFO:在 pub.Close 之后、src/closeAll 之前运行——键释放需要
-	// pipe 仍开)。
-	ictl := newInputController(src, h.leaseTable(), log)
+	// pipe 仍开)。源 = 意图动态源:重挂后输入/光标自动走新 sub。
+	ictl := newInputController(dyn, h.leaseTable(), log)
 	defer ictl.close()
 
 	// ② ready(HOST_HELLO 维度 + fps→默认帧时长)。
@@ -216,11 +217,27 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 		w.write(ctx, readyFrame{Type: vocabReady})
 	}
 
+	// ①c 意图自愈的 viewer 通知(M2-Slice3 Task 2):重挂成功 → state
+	// 帧 code=reattached(几何有变则补 display_changed reason=reattach,
+	// viewer 重映射输入坐标);放弃 → state 帧 code=capture_lost。PC 不
+	// 重建,帧流经同一 track 续传(viewer 无需重新协商)。
+	it.onPublish = func(newSrc Source) {
+		w.write(ctx, stateFrame{Type: vocabState, Code: vocabStateReattached, Recoverable: true})
+		nh := newSrc.Hello()
+		if nh != nil && hello != nil && (nh.W != hello.W || nh.H != hello.H) {
+			w.write(ctx, displayChangedFrame{Type: vocabDisplayChanged,
+				Generation: nh.Gen, W: nh.W, H: nh.H, Reason: "reattach"})
+		}
+	}
+	it.onGiveUp = func() {
+		w.write(ctx, stateFrame{Type: vocabState, Code: vocabStateCaptureLost, Recoverable: false})
+	}
+
 	// ③ 状态事件泵:STATE → {"type":"state"};0x010A →
 	// {"type":"display_changed"}(M2-Slice1 Task 2;几何/代际变化)。
 	go func() {
 		for {
-			ev, ok := src.RecvState(ctx)
+			ev, ok := dyn.RecvState(ctx)
 			if !ok {
 				return
 			}
@@ -229,7 +246,7 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 	}()
 	go func() {
 		for {
-			ev, ok := src.RecvDisplay(ctx)
+			ev, ok := dyn.RecvDisplay(ctx)
 			if !ok {
 				return
 			}
@@ -276,7 +293,7 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 			if pub != nil {
 				continue // 重复 offer:忽略(已应答)
 			}
-			pub, err = h.setupPublisher(ctx, w, src, &p, f.SDP, defDur, ictl, log)
+			pub, err = h.setupPublisher(ctx, w, dyn, &p, f.SDP, defDur, ictl, log)
 			if err != nil {
 				log.Warn("desktop webrtc setup failed", "err", err)
 				w.write(ctx, errorFrame{Type: vocabError, Code: "webrtc_failed", Message: err.Error()})

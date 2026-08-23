@@ -29,12 +29,38 @@ powershell -File C:\xnc-dev\install-dev-services.ps1 -Uninstall   # stop + sc de
   DRAIN handshake exists, so the desktop child's input ReleaseAll-at-exit
   does not run on a service stop (Slice-3 follow-up ledger note).
 
-## Agent: XNCAgentDev (Task 2, landed separately)
+## Agent: XNCAgentDev (Task 2)
 
-Not in this script; see Task 2. XNCCoreDev picks up the `depend=
-XNCAgentDev` ordering automatically when the agent dev service exists at
-install time (re-run -Install-time config, or `sc config XNCCoreDev
-depend= XNCAgentDev` by hand).
+```powershell
+# on XIAOXIN, elevated (xnc exec runs SYSTEM):
+# 1) put the new build at C:\xnc-dev\xnc-agent.exe (xnc put)
+# 2) install (server/token/enrollment flags ride the service argv):
+powershell -File C:\xnc-dev\install-dev-agent.ps1 -Install -Server http://<dev-server>:8080 -Token <enroll-token>
+#   -> xnc-agent.exe install --server … --state-dir C:\ProgramData\XNCAgentDev
+#        --service-name XNCAgentDev --desktop-core-pipe \\.\pipe\xnc-core-dev
+#        --desktop-core-secret-hex <dev hex> [--token …]
+#      LocalSystem, Automatic (Go mgr installer), auto-started; also re-points
+#      XNCCoreDev's depend= at XNCAgentDev.
+powershell -File C:\xnc-dev\install-dev-agent.ps1 -Uninstall   # stop + delete
+```
+
+- Isolation: distinct service NAME (`XNCAgentDev`), distinct STATE DIR
+  (`C:\ProgramData\XNCAgentDev` — own identity.json/agent-service.log), dev
+  binary path `C:\xnc-dev\`. Production `XNCAgent` service, `C:\xnc\` and
+  `C:\ProgramData\XNCAgent` are never touched (verify block below).
+- Desktop credentials: `--desktop-core-pipe`/`--desktop-core-secret-hex` in
+  the service argv map to `XNC_DESKTOP_CORE_PIPE`/`…_SECRET_HEX` inside the
+  service process (SCM has no interactive env) — the same dev-only plaintext
+  binPath precedent as XNCCoreDev's `--smoke-secret`. Secret never logged.
+- Session-intent self-healing (Task 2): while a desktop session's server-side
+  logical session is alive, capture loss (desktoppipe Done, core RPC failure,
+  logoff killing the desktop child) is auto-healed — re-StartCapture with
+  backoff 1s/2s/4s…cap 30s within a 90s window; viewer gets
+  `{"type":"state","code":"reattached"}` and the stream resumes on the same
+  WebRTC connection (no renegotiation). Give-up: session closed or window
+  expired → `{"type":"state","code":"capture_lost"}`.
+- Default install (no `--service-name`) remains `XNCAgent`/`ProgramData\XNCAgent`
+  — production behavior unchanged.
 
 ## Verify / isolate (XIAOXIN, via prod xnc)
 
@@ -44,4 +70,8 @@ $XNC exec $NODE 'Get-Service XNCCoreDev'                 # Running
 $XNC exec $NODE 'C:\xnc-dev\xnc-shell-probe.exe --core-pipe xnc-core-dev --secret 746573742d706970652d736563726574 --token user --profile CMD --command "echo svc-ok"'   # pipe connectable
 $XNC exec $NODE 'Stop-Service XNCCoreDev; Start-Sleep 3; Get-Service XNCCoreDev'  # Stopped; drain lines in xnc-core-service.log
 $XNC exec $NODE 'Get-Service XNCAgent'                  # prod untouched, Running
+$XNC exec $NODE 'Get-Service XNCAgentDev'               # Task 2: Running (dev agent)
+$XNC exec $NODE 'Stop-Service XNCAgentDev; Start-Sleep 5; Start-Service XNCAgentDev; Get-Service XNCAgentDev'  # survives Stop/Start; node back online
+$XNC exec $NODE 'Get-Item C:\ProgramData\XNCAgent\identity.json | Select LastWriteTime'  # prod state untouched
+$XNC exec $NODE 'Get-ChildItem C:\ProgramData\XNCAgentDev'  # dev state isolated
 ```
