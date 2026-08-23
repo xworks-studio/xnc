@@ -2,9 +2,10 @@
 
 // Package coreclient 实现 agent 侧 XNIP named pipe 客户端(spec §9):
 // winio 拨号 + 双向认证握手(§9.3)+ 保活 Ping + START/STOP_CAPTURE
-// RPC(M1-Slice2,固定二进制 payload,protobuf 迁移 Slice3)。帧编解码
-// 与证明计算复用 xnc/proto/ipc;PID/映像路径校验(OpenProcess +
-// Authenticode)属连接层,由 xnc-core 侧(M1)补全,本包不感知。
+// RPC(M1-Slice2)+ SendSAS(M2-Slice1 Task 4/5;固定二进制 payload,
+// protobuf 迁移 Slice3)。帧编解码与证明计算复用 xnc/proto/ipc;
+// PID/映像路径校验(OpenProcess + Authenticode)属连接层,由 xnc-core
+// 侧(M1)补全,本包不感知。
 //
 // 仅 Windows 构建(named pipe);与 agent/session 的 windows-only 测试
 // 同风格。
@@ -46,7 +47,14 @@ const (
 const (
 	MsgStartCapture uint16 = 0x0100
 	MsgStopCapture  uint16 = 0x0101
+	// MsgSas 是 SendSAS 请求(M2-Slice1 Task 4:capability 门控的
+	// secure attention;Task 5 = 本侧调用方)。
+	MsgSas uint16 = 0x0110
 )
+
+// sasReasonLen 镜像 native/core pipe_server.h kSasReasonLen:0x0110 请求
+// payload 是 NUL 填充的定长 [char reason[24]] 字段(>23 字节截断)。
+const sasReasonLen = 24
 
 // Client 是一条已完成握手的 pipe 连接。请求经 roundTrip 走后台读泵;
 // conn 的读侧仅由泵访问,写侧由 writeMu 串行。
@@ -157,6 +165,21 @@ func (c *Client) StopCapture() error {
 	return err
 }
 
+// SendSAS 请求核心触发 secure attention 序列(0x0110,M2-Slice1
+// Task 4/5)。请求 payload 为 NUL 填充的 [char reason[24]](reason 截断
+// 到 23 字节);成功响应 payload [u32 hr] —— 合成 HRESULT:sas.dll 的
+// SendSAS 返回 VOID,hr=0 只表示「调用未抛异常」,非 SAS 已送达的证明
+// (T6 验收以安全桌面出现为准)。拒绝走 FlagError,稳定码
+// SAS_DENIED(--allow-sas 门关)/ SAS_UNAVAILABLE(sas.dll 不可载)/
+// BAD_PAYLOAD,以 RejectedError 形态返回(码可编程判别)。
+func (c *Client) SendSAS(reason string) (hr uint32, err error) {
+	f, err := c.roundTrip(rpcTimeout, MsgSas, encodeSasReason(reason))
+	if err != nil {
+		return 0, err
+	}
+	return decodeSasResp(f.Payload)
+}
+
 // roundTrip 写一条请求帧并等待同 RequestID 的 FlagResponse(时限
 // timeout)。FlagError 响应转为携带 payload 文本的错误。goroutine
 // 安全:并发调用各自挂入 pending map,由单一读泵配对交付。
@@ -201,7 +224,7 @@ func (c *Client) roundTrip(timeout time.Duration, mt uint16, payload []byte) (*i
 			return nil, fmt.Errorf("coreclient: %s: %w", msgName(mt), r.err)
 		}
 		if r.f.Flags&ipc.FlagError != 0 {
-			return nil, fmt.Errorf("coreclient: %s rejected: %s", msgName(mt), respText(r.f))
+			return nil, &RejectedError{RPC: msgName(mt), Code: respText(r.f)}
 		}
 		return r.f, nil
 	case <-timer.C:
@@ -273,6 +296,18 @@ func (c *Client) Close() error {
 
 // ---- 0x0100/0x0101 payload 编解码(布局见方法注释;小端) ----
 
+// RejectedError 标记一条 FlagError 响应(payload = 核心侧稳定 ASCII 码,
+// 如 SAS_DENIED / SPAWN_FAILED / SESSION_MISMATCH)。错误文本与旧
+// fmt.Errorf 形态一致;类型化让调用方(如 SAS 路径)能按码编程分派。
+type RejectedError struct {
+	RPC  string // 请求名(msgName)
+	Code string // 核心侧稳定码
+}
+
+func (e *RejectedError) Error() string {
+	return fmt.Sprintf("coreclient: %s rejected: %s", e.RPC, e.Code)
+}
+
 // encodeStartCaptureReq 编码请求 `[u32 wts][u32 pad=0]`。
 func encodeStartCaptureReq(wts uint32) []byte {
 	p := make([]byte, 8)
@@ -305,6 +340,26 @@ func decodeStartCaptureResp(p []byte) (pid uint32, name string, secret []byte, g
 	return pid, name, secret, gen, nil
 }
 
+// encodeSasReason 编码 0x0110 请求 [char reason[24]]:NUL 填充定长,
+// reason 超过 23 字节截断(核心侧按定长字段读,不另行协商长度)。
+func encodeSasReason(reason string) []byte {
+	b := make([]byte, sasReasonLen)
+	r := []byte(reason)
+	if len(r) > sasReasonLen-1 {
+		r = r[:sasReasonLen-1]
+	}
+	copy(b, r)
+	return b
+}
+
+// decodeSasResp 解码 ok 响应 [u32 hr];长度 != 4 即协议错误。
+func decodeSasResp(p []byte) (uint32, error) {
+	if len(p) != 4 {
+		return 0, fmt.Errorf("coreclient: sas response %d bytes, want 4", len(p))
+	}
+	return binary.LittleEndian.Uint32(p), nil
+}
+
 func msgName(mt uint16) string {
 	switch mt {
 	case ipc.MsgPing:
@@ -313,6 +368,8 @@ func msgName(mt uint16) string {
 		return "start_capture"
 	case MsgStopCapture:
 		return "stop_capture"
+	case MsgSas:
+		return "sas"
 	}
 	return fmt.Sprintf("msg %#04x", mt)
 }

@@ -13,7 +13,8 @@
 //	    RTCIceCandidateInit 形态:{candidate,sdpMid,sdpMLineIndex,
 //	    usernameFragment});candidate 为空串 "" 表示候选收集完成。
 //	{"type":"state","code":"capture_rebuilt","recoverable":true}
-//	    desktop pipe STATE 事件透传。
+//	    desktop pipe STATE 事件透传(稳定码 + 可恢复性;M2-Slice1 Task 2
+//	    追加 recovering / capture_rebuilt / backend_changed,同一形态)。
 //	{"type":"display_changed","generation":3,"w":1920,"h":1080,
 //	 "reason":"resolution"}
 //	    desktop pipe 0x010A DISPLAY_CHANGED 透传(M2-Slice1 Task 2):统一
@@ -28,10 +29,24 @@
 //	{"type":"ice","candidate":{...}|null}       trickle 候选;null(浏览器
 //	end-of-candidates)忽略——pion 自行完成收集。
 //	{"type":"keyframe-req"}                     显式关键帧请求(T6 加:浏览器无
-//	法从 JS 发 RTCP PLI,实验页 PLI 按钮走此帧;映射到与真 PLI 同一条
-//	RequestKeyframe 路径,reason="viewer-pli")。
+//	                                            法从 JS 发 RTCP PLI,实验页 PLI 按钮走此帧;映射到与真 PLI 同一条
+//	                                            RequestKeyframe 路径,reason="viewer-pli")。
 //	{"type":"lease_request"}                    输入控制权请求(M1-Slice3;
 //	                                            见 input.go 头注释)。
+//	{"type":"secure_attention"}                 SAS 触发(M2-Slice1 Task 5):
+//	                                            → Starter(SasCaller) → core
+//	                                            0x0110(reason="viewer";
+//	                                            门控 = core 侧 --allow-sas)。
+//
+// agent → viewer(SAS 结果帧,M2-Slice1 Task 5):
+//
+//	{"type":"secure_attention_result","ok":true,"hr":0}
+//	    ok = 核心受理并调用 SendSAS;hr = 合成 HRESULT(0 = sas.dll 调用
+//	    未抛异常,非「SAS 已送达」证明——验收以安全桌面出现为准,T6)。
+//	{"type":"secure_attention_result","ok":false,"hr":0,"code":"SAS_DENIED"}
+//	    稳定码:核心侧 SAS_DENIED(门控关)/ SAS_UNAVAILABLE(sas.dll
+//	    不可载)/ BAD_PAYLOAD;agent 侧 unsupported(Starter 无能力)/
+//	    core_unavailable / core_error。viewer 对 SAS_DENIED 禁用按钮。
 //
 // agent → viewer(Slice3 追加 lease 三帧,词汇见 input.go):
 //
@@ -76,6 +91,9 @@ const (
 	vocabLeaseGranted   = "lease_granted"
 	vocabLeaseDenied    = "lease_denied"
 	vocabLeaseRevoked   = "lease_revoked"
+	// M2-Slice1 Task 5:secure attention(viewer SAS 按钮 ↔ core 0x0110)。
+	vocabSecureAttention       = "secure_attention"
+	vocabSecureAttentionResult = "secure_attention_result"
 )
 
 const (
@@ -284,6 +302,20 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 			} else {
 				w.write(ctx, leaseDeniedFrame{Type: vocabLeaseDenied, Reason: "held"})
 			}
+		case vocabSecureAttention:
+			// M2-Slice1 Task 5:viewer SAS 按钮 → Starter(SasCaller)→
+			// core 0x0110(门控 = core 侧 --allow-sas,票据 = Slice3)。
+			// 异步执行:core RPC 上限 15s,不阻塞信令循环(晚到的 offer/
+			// ice 不受牵连);回复帧经 wsWriter 串行写出,时序无约束。
+			go func() {
+				res := SasResult{OK: false, Code: "unsupported"}
+				if sc, ok := h.Starter.(SasCaller); ok {
+					res = sc.SendSAS("viewer")
+				}
+				log.Info("secure attention", "ok", res.OK, "hr", fmt.Sprintf("%#x", res.HR), "code", res.Code)
+				w.write(ctx, secureAttentionResultFrame{
+					Type: vocabSecureAttentionResult, OK: res.OK, HR: res.HR, Code: res.Code})
+			}()
 		default:
 			// 未知 type:忽略(向后兼容词汇演进)。
 		}
@@ -430,4 +462,13 @@ type leaseDeniedFrame struct {
 type leaseRevokedFrame struct {
 	Type   string `json:"type"`
 	Reason string `json:"reason"`
+}
+
+// secureAttentionResultFrame 是 SAS 请求的回执(M2-Slice1 Task 5 契约:
+// {ok,hr[,code]};hr 恒在——0 语义见文件头,code 仅 ok=false 时非空)。
+type secureAttentionResultFrame struct {
+	Type string `json:"type"`
+	OK   bool   `json:"ok"`
+	HR   uint32 `json:"hr"`
+	Code string `json:"code,omitempty"`
 }

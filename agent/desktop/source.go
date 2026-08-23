@@ -79,3 +79,22 @@ type Starter interface {
 	Start(ctx context.Context, wts uint32) (Source, error)
 	Stop() error
 }
+
+// SasResult 是一次 SendSAS(core 0x0110)的结果镜像(M2-Slice1 Task 5)。
+// OK=true 表示核心受理并调用了 SendSAS —— HR 是合成 HRESULT(0 = sas.dll
+// 调用未抛异常,非「SAS 已送达」证明;验收以安全桌面出现为准,T6)。
+// OK=false 时 Code 为稳定码:核心侧 SAS_DENIED(门控关)/ SAS_UNAVAILABLE
+// (sas.dll 不可载)/ BAD_PAYLOAD;agent 侧 unsupported(Starter 无该
+// 能力)/ core_unavailable(拨号失败)/ core_error(超时等传输错)。
+type SasResult struct {
+	OK   bool
+	HR   uint32
+	Code string
+}
+
+// SasCaller 是 Starter 的可选能力:经共享 core 连接触发 secure attention
+// (0x0110;能力门控在 core 侧 --allow-sas)。未实现者(非 Windows 桩、
+// 无 core 拓扑)收到 secure_attention 请求时按 unsupported 应答。
+type SasCaller interface {
+	SendSAS(reason string) SasResult
+}

@@ -10,6 +10,7 @@ package coreclient
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"net"
 	"strings"
 	"sync"
@@ -205,6 +206,146 @@ func TestConcurrentRequests(t *testing.T) {
 	for err := range errs {
 		t.Error(err)
 	}
+}
+
+// startSasFakeCore answers Ping + MsgSas(0x0110;M2-Slice1 Task 4/5 镜像):
+// 断言 payload 恰为 24 字节 NUL 填充 reason 字段,按 sasErr 空/非空回
+// ok [u32 hr] / FlagError(稳定 ASCII 码)。收到的 reason 原样记录。
+func startSasFakeCore(t *testing.T, ln net.Listener, secret []byte, hr uint32, sasErr string,
+	reasons *[]string) {
+	t.Helper()
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if err := ServerHandshake(conn, secret); err != nil {
+			t.Errorf("fake core handshake: %v", err)
+			return
+		}
+		for {
+			f, err := ipc.ReadFrame(conn)
+			if err != nil {
+				return
+			}
+			switch f.MessageType {
+			case ipc.MsgPing:
+				_ = ipc.WriteFrame(conn, &ipc.Frame{
+					Flags: ipc.FlagResponse, MessageType: ipc.MsgPong, RequestID: f.RequestID,
+				})
+			case MsgSas:
+				if len(f.Payload) != sasReasonLen {
+					t.Errorf("sas payload %d bytes, want %d", len(f.Payload), sasReasonLen)
+					return
+				}
+				if i := bytes.IndexByte(f.Payload, 0); i >= 0 {
+					for _, b := range f.Payload[i:] {
+						if b != 0 {
+							t.Errorf("sas payload not NUL-padded: %x", f.Payload)
+							return
+						}
+					}
+				}
+				*reasons = append(*reasons, strings.TrimRight(string(f.Payload), "\x00"))
+				if sasErr != "" {
+					_ = ipc.WriteFrame(conn, &ipc.Frame{
+						Flags: ipc.FlagResponse | ipc.FlagError, MessageType: MsgSas,
+						RequestID: f.RequestID, Payload: []byte(sasErr),
+					})
+					continue
+				}
+				p := make([]byte, 4)
+				binary.LittleEndian.PutUint32(p, hr)
+				_ = ipc.WriteFrame(conn, &ipc.Frame{
+					Flags: ipc.FlagResponse, MessageType: MsgSas,
+					RequestID: f.RequestID, Payload: p,
+				})
+			default:
+				t.Errorf("sas fake core: unexpected message type %#x", f.MessageType)
+				return
+			}
+		}
+	}()
+}
+
+// TestSasRoundTrip:请求布局([char reason[24]] NUL 填充,长 reason 截断
+// 到 23)、ok 响应解码 [u32 hr](非零 hr 亦是成功——合成 HRESULT 语义)、
+// 门控拒绝的稳定码进错误。
+func TestSasRoundTrip(t *testing.T) {
+	const secret = "test-pipe-secret"
+	var reasons []string
+	// 长 reason(>23 字节)验证截断:编码侧必须保证 24 字节定长。
+	long := strings.Repeat("v", 40)
+	hrSent := uint32(0xC0000022)
+
+	t.Run("ok", func(t *testing.T) {
+		name, ln := listen(t)
+		startSasFakeCore(t, ln, []byte(secret), hrSent, "", &reasons)
+		c, err := Dial(name, []byte(secret))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		hr, err := c.SendSAS(long)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hr != hrSent {
+			t.Fatalf("SendSAS hr = %#x, want %#x", hr, hrSent)
+		}
+		want := strings.Repeat("v", sasReasonLen-1)
+		if len(reasons) != 1 || reasons[0] != want {
+			t.Fatalf("core saw reason %q (len %d), want %d-byte truncation", reasons, len(reasons), sasReasonLen-1)
+		}
+	})
+	t.Run("denied", func(t *testing.T) {
+		name, ln := listen(t)
+		startSasFakeCore(t, ln, []byte(secret), 0, "SAS_DENIED", &reasons)
+		c, err := Dial(name, []byte(secret))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		_, err = c.SendSAS("viewer")
+		if err == nil || !strings.Contains(err.Error(), "SAS_DENIED") {
+			t.Fatalf("want SAS_DENIED error, got %v", err)
+		}
+		var rej *RejectedError
+		if !errors.As(err, &rej) || rej.Code != "SAS_DENIED" {
+			t.Fatalf("error not a RejectedError with the stable code: %v", err)
+		}
+	})
+	t.Run("bad-response-len", func(t *testing.T) {
+		name, ln := listen(t)
+		// 服务端手写一条长度不符的 ok 响应,验证解码拒绝。
+		go func() {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			if err := ServerHandshake(conn, []byte(secret)); err != nil {
+				return
+			}
+			f, err := ipc.ReadFrame(conn)
+			if err != nil {
+				return
+			}
+			_ = ipc.WriteFrame(conn, &ipc.Frame{
+				Flags: ipc.FlagResponse, MessageType: MsgSas,
+				RequestID: f.RequestID, Payload: []byte{1, 2},
+			})
+		}()
+		c, err := Dial(name, []byte(secret))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		if _, err := c.SendSAS("viewer"); err == nil {
+			t.Fatal("2-byte sas response must decode-fail")
+		}
+	})
 }
 
 var errBadValues = &badValuesError{}

@@ -143,6 +143,14 @@ func (s *fakeSource) pushDisplay(ev DisplayChangedEvent) {
 	}
 }
 
+// pushState 注入一条 STATE 事件(非阻塞;M2-Slice1 Task 5 词汇覆盖用)。
+func (s *fakeSource) pushState(ev StateEvent) {
+	select {
+	case s.stateCh <- ev:
+	default:
+	}
+}
+
 func (s *fakeSource) Close() error {
 	s.closeOnce.Do(func() {
 		s.mu.Lock()
@@ -215,11 +223,16 @@ func synthAU(key bool, mono uint64) []byte {
 	return au
 }
 
-// fakeStarter 记录 Start/Stop 生命周期。
+// fakeStarter 记录 Start/Stop 生命周期;SendSAS(Task 5)记录 reason 并
+// 返回预设结果(默认 ok/hr=0),驱动 secure_attention 回环两分支。
 type fakeStarter struct {
 	src    *fakeSource
 	stops  atomic.Int32
 	starts atomic.Int32
+
+	sasMu      sync.Mutex
+	sasReasons []string
+	sasResult  SasResult
 }
 
 func (st *fakeStarter) Start(_ context.Context, _ uint32) (Source, error) {
@@ -230,6 +243,21 @@ func (st *fakeStarter) Start(_ context.Context, _ uint32) (Source, error) {
 func (st *fakeStarter) Stop() error {
 	st.stops.Add(1)
 	return nil
+}
+
+// SendSAS 实现 SasCaller(Task 5):记录 reason 快照,回 canned 结果。
+func (st *fakeStarter) SendSAS(reason string) SasResult {
+	st.sasMu.Lock()
+	defer st.sasMu.Unlock()
+	st.sasReasons = append(st.sasReasons, reason)
+	return st.sasResult
+}
+
+// sasCalls 返回已收 reason 快照。
+func (st *fakeStarter) sasCalls() []string {
+	st.sasMu.Lock()
+	defer st.sasMu.Unlock()
+	return append([]string(nil), st.sasReasons...)
 }
 
 // ---- viewer 侧 ----
@@ -582,3 +610,137 @@ func TestSessionLoopbackVideoAndPLI(t *testing.T) {
 		t.Fatalf("source not closed after session end")
 	}
 }
+
+// TestSessionSecureAttentionAndStateVocab — M2-Slice1 Task 5 回环门:
+//
+//  1. viewer → {"type":"secure_attention"} → Handler 经 Starter(SasCaller)
+//     以 reason="viewer" 调 SendSAS → 回 {"type":"secure_attention_result",
+//     ok,hr[,code]}(ok 与 denied 两分支,hr 原样透传);
+//  2. Starter 无 SasCaller 能力 → 回 ok=false code="unsupported"(向后
+//     兼容:旧拓扑 agent 不断连);
+//  3. T2 状态词汇覆盖:STATE{recovering/capture_rebuilt/backend_changed}
+//     → {"type":"state",code,recoverable} 原样透传(与 display_changed
+//     同一条泵路径,词汇统一)。
+func TestSessionSecureAttentionAndStateVocab(t *testing.T) {
+	src := newFakeSource()
+	st := &fakeStarter{src: src, sasResult: SasResult{OK: true, HR: 0x80070005}}
+	h := &Handler{Log: slog.Default(), Starter: st}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	handlerDone := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		c.SetReadLimit(1 << 20)
+		h.Handle(ctx, c, "sess-sas", json.RawMessage(`{"signaling":"webrtc","iceTransportPolicy":"all"}`))
+		close(handlerDone)
+	}))
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	vws, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("viewer dial: %v", err)
+	}
+	vws.SetReadLimit(1 << 20)
+	defer vws.CloseNow()
+
+	drainUntil(t, ctx, vws, 10*time.Second, func(m map[string]any) bool { return m["type"] == vocabReady })
+
+	// ① ok 分支:reason="viewer" 到达 Starter;hr 原样透传。
+	sendJSON(t, ctx, vws, map[string]any{"type": vocabSecureAttention})
+	res := drainUntil(t, ctx, vws, 5*time.Second, func(m map[string]any) bool {
+		return m["type"] == vocabSecureAttentionResult
+	})
+	if res["ok"] != true || res["hr"].(float64) != 0x80070005 {
+		t.Fatalf("secure_attention_result(ok) = %v", res)
+	}
+	if calls := st.sasCalls(); len(calls) != 1 || calls[0] != "viewer" {
+		t.Fatalf("SendSAS calls = %v, want [viewer]", calls)
+	}
+
+	// ② denied 分支:ok=false + 稳定码(门控拒绝的透传面)。
+	st.sasMu.Lock()
+	st.sasResult = SasResult{OK: false, HR: 0, Code: "SAS_DENIED"}
+	st.sasMu.Unlock()
+	sendJSON(t, ctx, vws, map[string]any{"type": vocabSecureAttention})
+	res = drainUntil(t, ctx, vws, 5*time.Second, func(m map[string]any) bool {
+		return m["type"] == vocabSecureAttentionResult
+	})
+	if res["ok"] != false || res["code"] != "SAS_DENIED" {
+		t.Fatalf("secure_attention_result(denied) = %v", res)
+	}
+	if calls := st.sasCalls(); len(calls) != 2 {
+		t.Fatalf("SendSAS calls = %d after second request", len(calls))
+	}
+
+	// ③ 状态词汇:STATE 新稳定码经同一泵路径透传(字段逐一对账)。
+	for _, code := range []string{"recovering", "capture_rebuilt", "backend_changed"} {
+		src.pushState(StateEvent{Code: code, Recoverable: true})
+		got := drainUntil(t, ctx, vws, 5*time.Second, func(m map[string]any) bool {
+			return m["type"] == vocabState && m["code"] == code
+		})
+		if got["recoverable"] != true {
+			t.Fatalf("state %s frame = %v (recoverable must ride along)", code, got)
+		}
+	}
+	// 非可恢复事件同样透传(recoverable=false 不被吞)。
+	src.pushState(StateEvent{Code: "backend_changed", Recoverable: false})
+	got := drainUntil(t, ctx, vws, 5*time.Second, func(m map[string]any) bool {
+		return m["type"] == vocabState && m["recoverable"] == false
+	})
+	if got["code"] != "backend_changed" {
+		t.Fatalf("state(recoverable=false) frame = %v", got)
+	}
+
+	cancel()
+	select {
+	case <-handlerDone:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("Handler did not return after ctx cancel")
+	}
+}
+
+// TestSessionSecureAttentionUnsupported — Starter 不实现 SasCaller(非
+// Windows 桩 / 无 core 拓扑):回 ok=false code="unsupported",会话不断。
+func TestSessionSecureAttentionUnsupported(t *testing.T) {
+	src := newFakeSource()
+	h := &Handler{Log: slog.Default(), Starter: &bareStarter{src: src}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		c.SetReadLimit(1 << 20)
+		h.Handle(ctx, c, "sess-sas2", json.RawMessage(`{"signaling":"webrtc"}`))
+	}))
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	vws, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("viewer dial: %v", err)
+	}
+	vws.SetReadLimit(1 << 20)
+	defer vws.CloseNow()
+
+	drainUntil(t, ctx, vws, 10*time.Second, func(m map[string]any) bool { return m["type"] == vocabReady })
+	sendJSON(t, ctx, vws, map[string]any{"type": vocabSecureAttention})
+	res := drainUntil(t, ctx, vws, 5*time.Second, func(m map[string]any) bool {
+		return m["type"] == vocabSecureAttentionResult
+	})
+	if res["ok"] != false || res["code"] != "unsupported" {
+		t.Fatalf("secure_attention_result(unsupported) = %v", res)
+	}
+	cancel()
+}
+
+// bareStarter 只有 Start/Stop(无 SasCaller):unsupported 分支的注入面。
+type bareStarter struct{ src *fakeSource }
+
+func (st *bareStarter) Start(_ context.Context, _ uint32) (Source, error) { return st.src, nil }
+func (st *bareStarter) Stop() error                                      { return nil }

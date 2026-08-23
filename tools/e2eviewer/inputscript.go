@@ -4,6 +4,7 @@
 // == 脚本形态(文件 = JSON 数组;未知字段拒绝,错误带步骤下标)==
 //
 //	[{"op":"lease"},                                 // control WS: lease_request
+//	 {"op":"sas"},                                   // control WS: secure_attention(M2-Slice1 Task 5)
 //	 {"op":"move","x":640,"y":360,"buttons":0},      // mouse 通道(x/y = 流逻辑 px)
 //	 {"op":"button","btn":1,"down":true},            // input 通道(btn∈1/2/4/8/16)
 //	 {"op":"wheel","dx":0,"dy":2},                    // input 通道(notch;正 dy=向下滚)
@@ -104,6 +105,9 @@ func validateStep(i int, s *scriptStep) error {
 	switch s.Op {
 	case "lease":
 		return nil
+	case "sas":
+		// 无字段;控制面 op(不发 DataChannel,不占 seq)。
+		return nil
 	case "move":
 		if err := req(s.X != nil && s.Y != nil, "move needs x and y"); err != nil {
 			return err
@@ -155,7 +159,7 @@ func validateStep(i int, s *scriptStep) error {
 	case "lease_drop":
 		return fmt.Errorf("%s: lease_drop not supported — T3 lease vocabulary has no voluntary release (disconnect or 30s idle revokes); drop the step or end the viewer", at)
 	default:
-		return fmt.Errorf("%s: unknown op %q (want lease/move/button/wheel/key/text/lock/wait)", at, s.Op)
+		return fmt.Errorf("%s: unknown op %q (want lease/sas/move/button/wheel/key/text/lock/wait)", at, s.Op)
 	}
 }
 
@@ -272,6 +276,10 @@ type stepEnv interface {
 	sendInput(b []byte) error
 	// requestLease 发 lease_request 并等待 granted/denied(自带超时)。
 	requestLease(ctx context.Context) (leaseID string, err error)
+	// sendSAS 发 secure_attention 并等 secure_attention_result(自带
+	// 超时;M2-Slice1 Task 5)。门控拒绝(ok=false + 稳定码)不算错误
+	// —— 场景期望由 e2e 脚本对 detail 自行判定。
+	sendSAS(ctx context.Context) (ok bool, hr uint32, code string, err error)
 	wait(ctx context.Context, d time.Duration) // 可中断等待
 	cursorCount() uint64                        // cursor 通道累计消息数
 }
@@ -297,6 +305,19 @@ func runInputSteps(ctx context.Context, steps []scriptStep, env stepEnv) *script
 					r.Detail = id[:8]
 				} else {
 					r.Detail = id
+				}
+				return nil
+			case "sas":
+				// 控制面 op:round-trip 成功即步骤成功(拒绝码进 detail,
+				// 不占 seq——不发 DataChannel)。
+				ok, hr, code, err := env.sendSAS(ctx)
+				if err != nil {
+					return err
+				}
+				if ok {
+					r.Detail = fmt.Sprintf("ok hr=0x%x", hr)
+				} else {
+					r.Detail = "denied:" + code
 				}
 				return nil
 			case "move":
@@ -368,6 +389,8 @@ func scriptWaitBudget(steps []scriptStep) time.Duration {
 			total += time.Duration(*steps[i].Ms) * time.Millisecond
 		case "lease":
 			total += 6 * time.Second // requestLease 超时 5s + 余量
+		case "sas":
+			total += 12 * time.Second // sendSAS 回执等待 10s + 余量
 		default:
 			total += 2 * time.Second
 		}

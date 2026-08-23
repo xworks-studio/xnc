@@ -66,6 +66,9 @@ interface SignalingFrame {
   reason?: string;
   /** lease_granted */
   leaseId?: string;
+  /** secure_attention_result */
+  ok?: boolean;
+  hr?: number;
 }
 
 type LiveState =
@@ -93,6 +96,23 @@ const LEASE_NOTICES: Record<string, string> = {
   held: "input lease held by another viewer — retry later",
   idle: "input lease revoked: 30s without input",
   disconnect: "input lease revoked",
+};
+
+/** M2-Slice1 Task 2/3 desktop STATE codes worth a toast (uniform with the
+ * display_changed notice; the code also stays in the status bar). */
+const STATE_NOTICES: Record<string, string> = {
+  recovering: "capture resetting — stream recovering",
+  capture_rebuilt: "capture rebuilt — stream restored",
+  backend_changed: "capture backend changed (DXGI/GDI ladder)",
+};
+
+/** secure_attention_result stable codes worth more than a generic line. */
+const SAS_NOTICES: Record<string, string> = {
+  SAS_DENIED: "secure attention denied by the host core (--allow-sas gate)",
+  SAS_UNAVAILABLE: "secure attention unavailable on the host (sas.dll)",
+  unsupported: "secure attention unsupported by this agent",
+  core_unavailable: "secure attention failed: agent cannot reach xnc-core",
+  core_error: "secure attention failed: xnc-core error",
 };
 
 /** Relative websocketUrl → absolute against the current origin (as
@@ -148,6 +168,9 @@ interface DesktopIo {
 }
 const freshIo = (): DesktopIo => ({ seq: 0, lease: false, wheelX: 0, wheelY: 0 });
 
+/** Secure-attention (Ctrl+Alt+Del) button state (M2-Slice1 Task 5). */
+type SasState = { pending: boolean; denied: boolean };
+
 export default function DesktopLive() {
   const { nodeId } = useParams<{ nodeId: string }>();
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -168,6 +191,9 @@ export default function DesktopLive() {
   // Slice3: lease / cursor dot / stream dims / text injection.
   const [lease, setLease] = useState<LeaseState>({ status: "none" });
   const [notice, setNotice] = useState<string | null>(null);
+  /** Ctrl+Alt+Del button state: pending while a round-trip is in flight,
+   * denied (permanently disabled for this session) after SAS_DENIED. */
+  const [sas, setSas] = useState<SasState>({ pending: false, denied: false });
   /** Dot style computed in the cursor-channel handler (event context, not
    * render) — refs must not be read during render. */
   const [cursorDot, setCursorDot] = useState<CSSProperties | null>(null);
@@ -565,6 +591,7 @@ export default function DesktopLive() {
       ioRef.current = freshIo();
       setLease({ status: "none" });
       setCursorDot(null);
+      setSas({ pending: false, denied: false });
     };
 
     api<DesktopStartResponse>(`/api/nodes/${nodeId}/desktop`, {
@@ -657,6 +684,9 @@ export default function DesktopLive() {
               break;
             case "state":
               setAgentState(f.code ?? null);
+              // M2-Slice1 Task 2/3 vocabulary: toast the recovery ladder
+              // transitions (uniform with the display_changed notice).
+              if (f.code && STATE_NOTICES[f.code]) setNotice(STATE_NOTICES[f.code]);
               break;
             case "display_changed":
               // Unified CaptureReset changed the stream geometry
@@ -690,6 +720,18 @@ export default function DesktopLive() {
               ioRef.current.lease = false;
               setLease({ status: "revoked", reason: f.reason });
               setNotice(LEASE_NOTICES[f.reason ?? ""] ?? `input lease revoked: ${f.reason ?? "unknown"}`);
+              break;
+            case "secure_attention_result":
+              // M2-Slice1 Task 5: ok means the core accepted and invoked
+              // SendSAS (hr is a synthesized HRESULT; 0 = the call returned
+              // without raising, not proof a SAS was delivered). SAS_DENIED
+              // latches the button off for this session.
+              setSas((s) => ({ ...s, pending: false, denied: f.code === "SAS_DENIED" }));
+              if (f.ok) {
+                setNotice(`secure attention sent${f.hr ? ` (hr 0x${f.hr.toString(16)})` : ""}`);
+              } else {
+                setNotice(SAS_NOTICES[f.code ?? ""] ?? `secure attention failed: ${f.code ?? "unknown"}`);
+              }
               break;
             case "error":
               setState("error");
@@ -738,6 +780,24 @@ export default function DesktopLive() {
     }
   };
 
+  const sendSas = () => {
+    // Ctrl+Alt+Del via the core-side SendSAS path (M2-Slice1 Task 5) —
+    // never a synthesized keyboard sequence. The result arrives as
+    // secure_attention_result (handled in the session effect). The pending
+    // latch also self-clears after 20s: an older agent that ignores the
+    // unknown frame type would never answer.
+    try {
+      wsHandle.__xncDesktopWs?.send(JSON.stringify({ type: "secure_attention" }));
+      setSas((s) => ({ ...s, pending: true }));
+      window.setTimeout(
+        () => setSas((s) => (s.pending ? { ...s, pending: false } : s)),
+        20000,
+      );
+    } catch {
+      /* session dead */
+    }
+  };
+
   const leaseLabel =
     lease.status === "granted"
       ? "input held"
@@ -756,6 +816,19 @@ export default function DesktopLive() {
         {agentState && <span className="dim mono">{agentState}</span>}
         <button onClick={sendPli} className="desktop-pli" type="button">
           PLI
+        </button>
+        <button
+          onClick={sendSas}
+          className="desktop-pli"
+          type="button"
+          disabled={sas.pending || sas.denied}
+          title={
+            sas.denied
+              ? "secure attention denied by the host core (--allow-sas gate)"
+              : "send Ctrl+Alt+Del (secure attention) to the remote desktop via xnc-core SendSAS"
+          }
+        >
+          {sas.pending ? "SAS…" : "Ctrl+Alt+Del"}
         </button>
         <button
           onClick={requestLease}

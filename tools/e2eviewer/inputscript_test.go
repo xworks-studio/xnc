@@ -22,6 +22,7 @@ func parse(t *testing.T, s string) []scriptStep {
 func TestParseInputScriptValid(t *testing.T) {
 	steps := parse(t, `[
 		{"op":"lease"},
+		{"op":"sas"},
 		{"op":"wait","ms":500},
 		{"op":"move","x":640,"y":360},
 		{"op":"move","x":0,"y":0,"buttons":31},
@@ -35,7 +36,7 @@ func TestParseInputScriptValid(t *testing.T) {
 		{"op":"lock","caps":false,"num":false},
 		{"op":"wait","ms":1}
 	]`)
-	wantOps := []string{"lease", "wait", "move", "move", "button", "button",
+	wantOps := []string{"lease", "sas", "wait", "move", "move", "button", "button",
 		"wheel", "key", "key", "text", "lock", "lock", "wait"}
 	if len(steps) != len(wantOps) {
 		t.Fatalf("steps = %d, want %d", len(steps), len(wantOps))
@@ -46,14 +47,14 @@ func TestParseInputScriptValid(t *testing.T) {
 		}
 	}
 	// key 步骤的 keymap 解析在 parse 期完成。
-	if steps[7].scan != (scanCode{scan: 0x1e, ext: false}) {
-		t.Errorf("KeyA scan = %+v", steps[7].scan)
+	if steps[8].scan != (scanCode{scan: 0x1e, ext: false}) {
+		t.Errorf("KeyA scan = %+v", steps[8].scan)
 	}
-	if steps[8].scan != (scanCode{scan: 0x1d, ext: true}) {
-		t.Errorf("ControlRight scan = %+v", steps[8].scan)
+	if steps[9].scan != (scanCode{scan: 0x1d, ext: true}) {
+		t.Errorf("ControlRight scan = %+v", steps[9].scan)
 	}
 	// 换行 = 1 UTF-16 unit("xnc\nslice3" = 10 unit)。
-	if got := len(steps[9].units); got != 10 {
+	if got := len(steps[10].units); got != 10 {
 		t.Errorf("text units = %d, want 10", got)
 	}
 }
@@ -153,12 +154,19 @@ type fakeEnv struct {
 	leaseErr     error
 	cursors      uint64
 	waits        []time.Duration
+	sasOK        bool
+	sasHR        uint32
+	sasCode      string
+	sasErr       error
 }
 
 func (f *fakeEnv) sendMouse(b []byte) error { f.mouse = append(f.mouse, b); return nil }
 func (f *fakeEnv) sendInput(b []byte) error { f.input = append(f.input, b); return nil }
 func (f *fakeEnv) requestLease(ctx context.Context) (string, error) {
 	return f.leaseID, f.leaseErr
+}
+func (f *fakeEnv) sendSAS(ctx context.Context) (bool, uint32, string, error) {
+	return f.sasOK, f.sasHR, f.sasCode, f.sasErr
 }
 func (f *fakeEnv) wait(ctx context.Context, d time.Duration) { f.waits = append(f.waits, d) }
 func (f *fakeEnv) cursorCount() uint64                       { return f.cursors }
@@ -278,9 +286,48 @@ func TestRunInputStepsLeaseDeniedAborts(t *testing.T) {
 }
 
 func TestScriptWaitBudget(t *testing.T) {
-	steps := parse(t, `[{"op":"lease"},{"op":"wait","ms":1000},{"op":"move","x":0,"y":0}]`)
-	// 25s(首关键帧)+ 6s(lease)+ 1s(wait)+ 2s(move)= 34s。
-	if got, want := scriptWaitBudget(steps), 34*time.Second; got != want {
+	steps := parse(t, `[{"op":"lease"},{"op":"sas"},{"op":"wait","ms":1000},{"op":"move","x":0,"y":0}]`)
+	// 25s(首关键帧)+ 6s(lease)+ 12s(sas)+ 1s(wait)+ 2s(move)= 46s。
+	if got, want := scriptWaitBudget(steps), 46*time.Second; got != want {
 		t.Errorf("budget = %v, want %v", got, want)
 	}
+}
+
+// TestRunInputStepsSasOp(M2-Slice1 Task 5):sas 是控制面 op —— 门控
+// 拒绝(ok=false + 稳定码)round-trip 成功即步骤成功(码进 detail),
+// 不占 seq;传输错误(超时/断连)照常中止脚本。
+func TestRunInputStepsSasOp(t *testing.T) {
+	t.Run("denied-is-observation", func(t *testing.T) {
+		steps := parse(t, `[{"op":"sas"},{"op":"move","x":1,"y":1}]`)
+		env := &fakeEnv{sasOK: false, sasCode: "SAS_DENIED"}
+		res := runInputSteps(context.Background(), steps, env)
+		if !res.OK || res.Err != "" {
+			t.Fatalf("denied SAS should not abort: %+v", res)
+		}
+		if res.Steps[0].OK != true || res.Steps[0].Detail != "denied:SAS_DENIED" {
+			t.Errorf("sas step = %+v", res.Steps[0])
+		}
+		if res.LastSeq != 1 { // 只有 move 占 seq
+			t.Errorf("LastSeq = %d, want 1 (sas is control-plane)", res.LastSeq)
+		}
+	})
+	t.Run("ok-carries-hr", func(t *testing.T) {
+		steps := parse(t, `[{"op":"sas"}]`)
+		env := &fakeEnv{sasOK: true, sasHR: 0x80070005}
+		res := runInputSteps(context.Background(), steps, env)
+		if !res.OK || res.Steps[0].Detail != "ok hr=0x80070005" {
+			t.Errorf("sas(ok) step = %+v", res.Steps[0])
+		}
+	})
+	t.Run("timeout-aborts", func(t *testing.T) {
+		steps := parse(t, `[{"op":"sas"},{"op":"move","x":1,"y":1}]`)
+		env := &fakeEnv{sasErr: errors.New("secure_attention_result timeout after 10s")}
+		res := runInputSteps(context.Background(), steps, env)
+		if res.OK {
+			t.Fatalf("timeout must abort: %+v", res)
+		}
+		if len(env.mouse) != 0 {
+			t.Errorf("no input should follow a SAS timeout")
+		}
+	})
 }

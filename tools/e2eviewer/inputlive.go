@@ -118,6 +118,7 @@ type serverInputEnv struct {
 	chs     *channelSet
 	ws      *websocket.Conn
 	leaseCh chan leaseEvent
+	sasCh   chan sasReply // secure_attention_result 交接(main.go 信令泵产出)
 	v       *viewer
 }
 
@@ -165,13 +166,32 @@ func (e *serverInputEnv) requestLease(ctx context.Context) (string, error) {
 	}
 }
 
+// sendSAS 发 secure_attention 并等 secure_attention_result(10s 上限;
+// M2-Slice1 Task 5)。门控拒绝(ok=false + 稳定码)按观测返回,不算错误。
+func (e *serverInputEnv) sendSAS(ctx context.Context) (bool, uint32, string, error) {
+	wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	jb, _ := json.Marshal(map[string]any{"type": "secure_attention"})
+	if err := e.ws.Write(wctx, websocket.MessageText, jb); err != nil {
+		return false, 0, "", fmt.Errorf("send secure_attention: %w", err)
+	}
+	select {
+	case rep := <-e.sasCh:
+		return rep.ok, rep.hr, rep.code, nil
+	case <-time.After(10 * time.Second):
+		return false, 0, "", errors.New("secure_attention_result timeout after 10s")
+	case <-ctx.Done():
+		return false, 0, "", ctx.Err()
+	}
+}
+
 // runServerScript:等首关键帧 → 预算内执行脚本 → 附带 revoke 记录。
 // noKeyframeGate(诊断 --input-before-keyframe,如 M2-Slice1 锁屏探针:
 // 静止锁屏在现行 warmup 界内不出首 IDR,注入本身不依赖解码帧)跳过
 // 该等待 —— 仅探针用,常规门保持"看得见桌面才注入"。
 func runServerScript(ctx context.Context, steps []scriptStep, v *viewer,
 	chs *channelSet, leaseCh chan leaseEvent, note *leaseNote,
-	ws *websocket.Conn, log *slog.Logger, noKeyframeGate bool) *scriptResult {
+	ws *websocket.Conn, sasCh chan sasReply, log *slog.Logger, noKeyframeGate bool) *scriptResult {
 	if !noKeyframeGate {
 		if err := waitFirstKeyframe(v, 25*time.Second); err != nil {
 			return &scriptResult{Err: err.Error()}
@@ -179,7 +199,7 @@ func runServerScript(ctx context.Context, steps []scriptStep, v *viewer,
 	}
 	sctx, cancel := context.WithTimeout(ctx, scriptWaitBudget(steps))
 	defer cancel()
-	env := &serverInputEnv{sctx: sctx, chs: chs, ws: ws, leaseCh: leaseCh, v: v}
+	env := &serverInputEnv{sctx: sctx, chs: chs, ws: ws, leaseCh: leaseCh, sasCh: sasCh, v: v}
 	res := runInputSteps(sctx, steps, env)
 	res.LeaseRevokedAs = note.revocation()
 	log.Info("input script done", "ok", res.OK, "steps", len(res.Steps), "err", res.Err)

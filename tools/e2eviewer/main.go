@@ -77,6 +77,7 @@ type config struct {
 	pliRetryAfter       time.Duration // 0=off;待验证 PLI 超时重发(frames>0 亦触发,上限 3 发/轮)
 	inputScript         string        // server 模式:连接+首关键帧后按 JSON 步骤注入输入
 	inputBeforeKeyframe bool          // 探针:跳过首关键帧门(锁屏静止场景注入)
+	sas                 bool          // server 模式:连接后发一次 secure_attention,结果+计时进 summary
 	jsonOnly            bool
 }
 
@@ -106,6 +107,8 @@ func parseFlags() *config {
 		"server mode: JSON step file (lease/move/button/wheel/key/text/wait) run after connect + first keyframe; results land in the summary JSON (schema: inputscript.go)")
 	flag.BoolVar(&c.inputBeforeKeyframe, "input-before-keyframe", false,
 		"probe only: run the input script without waiting for the first decoded keyframe (e.g. static locked-screen scenarios where no IDR ever emerges)")
+	flag.BoolVar(&c.sas, "sas", false,
+		"server mode: after connect, send one {secure_attention} control frame (core 0x0110) and record the result + timing in the summary JSON (sas field)")
 	flag.BoolVar(&c.jsonOnly, "json", false, "print only the JSON summary")
 	flag.Parse()
 	return c
@@ -196,6 +199,60 @@ type viewer struct {
 	displayMu      sync.Mutex
 	displayEvents  uint64
 	displaySamples []displaySample
+
+	// --sas(--input-script sas op 同路)结果记录(M2-Slice1 Task 5):
+	// 请求发出时刻 + 回执(ok/hr/code)+ rtt;summary.sas。
+	sasMu     sync.Mutex
+	sasResult *sasOutcome
+}
+
+// sasReply 是一条 secure_attention_result 帧的解析形态。
+type sasReply struct {
+	ok   bool
+	hr   uint32
+	code string
+}
+
+// sasOutcome 是 --sas 的 summary 记录:请求 + 结果 + 计时(相对 viewer
+// start;StartUnixMs 是绝对零点)。RttMs=0 且 Sent=true = 无回执(超时)。
+type sasOutcome struct {
+	Sent  bool   `json:"sent"`
+	OK    bool   `json:"ok"`
+	HR    uint32 `json:"hr"`
+	Code  string `json:"code,omitempty"`
+	AtMs  int64  `json:"atMs,omitempty"`
+	RttMs int64  `json:"rttMs,omitempty"`
+}
+
+// beginSas 记一次请求发出,返回发出时刻(viewer 相对 ms)。
+func (v *viewer) beginSas() int64 {
+	at := time.Since(v.start).Milliseconds()
+	v.sasMu.Lock()
+	v.sasResult = &sasOutcome{Sent: true, AtMs: at}
+	v.sasMu.Unlock()
+	return at
+}
+
+// completeSas 填入回执(ok=false + code=timeout 为无回执)。
+func (v *viewer) completeSas(r sasReply, sendAtMs int64, timedOut bool) {
+	v.sasMu.Lock()
+	defer v.sasMu.Unlock()
+	o := &sasOutcome{Sent: true, AtMs: sendAtMs, OK: r.ok, HR: r.hr, Code: r.code}
+	if !timedOut {
+		o.RttMs = time.Since(v.start).Milliseconds() - sendAtMs
+	}
+	v.sasResult = o
+}
+
+// sasSnapshot 返回 summary 快照(未发生 = nil)。
+func (v *viewer) sasSnapshot() *sasOutcome {
+	v.sasMu.Lock()
+	defer v.sasMu.Unlock()
+	if v.sasResult == nil {
+		return nil
+	}
+	o := *v.sasResult
+	return &o
 }
 
 // cursorSample 是一条 cursor 通道事件(summary.cursorSamples 元素)。
@@ -417,6 +474,7 @@ type summary struct {
 	CursorSamples    []cursorSample  `json:"cursorSamples,omitempty"`
 	DisplayEvents    uint64          `json:"displayEvents"`
 	DisplaySamples   []displaySample `json:"displaySamples,omitempty"`
+	Sas              *sasOutcome     `json:"sas,omitempty"`
 	Input            *scriptResult   `json:"input,omitempty"`
 	DurationMs       int64           `json:"durationMs"`
 	AssertionsPassed bool            `json:"assertionsPassed"`
@@ -435,6 +493,7 @@ func (v *viewer) collect(mode, dump string, ran time.Duration) *summary {
 		KeyframeReqs: v.keyframeReqs.Load(), PliToIdrMaxMs: v.pliIDRMax.Load(),
 		CursorEvents: cur, CursorSamples: samples,
 		DisplayEvents: dEvents, DisplaySamples: dSamples,
+		Sas:        v.sasSnapshot(),
 		DurationMs: ran.Milliseconds(),
 	}
 	if t := v.firstAt.Load(); t != 0 {
@@ -557,6 +616,9 @@ func runDirect(c *config) (*summary, error) {
 	log := slog.Default()
 	if c.inputScript != "" {
 		return nil, errors.New("--input-script requires server mode (direct-pipe publisher has no input datachannels)")
+	}
+	if c.sas {
+		return nil, errors.New("--sas requires server mode (secure_attention rides the session control WS; direct mode bypasses the agent)")
 	}
 	secret, err := hex.DecodeString(c.directSecretHex)
 	if err != nil || len(secret) == 0 {
@@ -800,8 +862,11 @@ func runServer(c *config) (*summary, error) {
 	// T4 写法里 waitReady 与本泵并发读同一连接,server 模式当时未经 live
 	// 验证,T6 实测暴露:泵死于 concurrent read,answer 永远到不了 viewer
 	// (表现为 PC 恒 new)。ready 经 channel 交给主流程后再发 offer。
+	// sasCh(容量 8,满即丢):--sas 与 input-script sas op 的回执交接
+	// (两者顺序使用,不并发争用)。
 	wsErr := make(chan error, 1)
 	readyCh := make(chan struct{}, 1)
+	sasCh := make(chan sasReply, 8)
 	go func() {
 		for {
 			mt, r, err := ws.Reader(ctx)
@@ -827,6 +892,8 @@ func runServer(c *config) (*summary, error) {
 				Generation uint32                   `json:"generation"`
 				W          uint32                   `json:"w"`
 				H          uint32                   `json:"h"`
+				OK         *bool                    `json:"ok"`
+				HR         uint32                   `json:"hr"`
 			}
 			if json.Unmarshal(b, &f) != nil {
 				continue
@@ -852,6 +919,19 @@ func runServer(c *config) (*summary, error) {
 				// M2-Slice1 Task 2:0x010A 透传帧 {generation,w,h,reason}。
 				log.Info("display changed", "gen", f.Generation, "w", f.W, "h", f.H, "reason", f.Reason)
 				v.recordDisplay(f.Generation, f.W, f.H, f.Reason)
+			case "secure_attention_result":
+				// M2-Slice1 Task 5:SAS 回执 {ok,hr[,code]}——交给等待方
+				// (--sas 主流程 / sas 脚本步),无人等则丢(容量 8)。
+				rep := sasReply{hr: f.HR, code: f.Code}
+				if f.OK != nil {
+					rep.ok = *f.OK
+				}
+				log.Info("secure attention result", "ok", rep.ok,
+					"hr", fmt.Sprintf("%#x", rep.hr), "code", rep.code)
+				select {
+				case sasCh <- rep:
+				default:
+				}
 			case "lease_granted", "lease_denied", "lease_revoked":
 				// T3 lease 词汇(inputlive.go stepEnv 消费;revoked 另记
 				// 原因进 input 脚本结果)。
@@ -910,11 +990,35 @@ func runServer(c *config) (*summary, error) {
 		}
 		return s, err
 	}
+	if c.sas {
+		// --sas(M2-Slice1 Task 5):连接后发一次 secure_attention(core
+		// 0x0110 经 agent 转发),回执 + rtt 进 summary.sas。门控拒绝亦是
+		// 有效观测(T6 门⑤:ok=false code=SAS_DENIED),不构成断言失败。
+		sendAt := v.beginSas()
+		wctx, wcancel := context.WithTimeout(ctx, 10*time.Second)
+		jb, _ := json.Marshal(map[string]any{"type": "secure_attention"})
+		if err := ws.Write(wctx, websocket.MessageText, jb); err != nil {
+			wcancel()
+			v.completeSas(sasReply{code: "send_failed"}, sendAt, true)
+			log.Warn("--sas send failed", "err", err)
+		} else {
+			wcancel()
+			select {
+			case rep := <-sasCh:
+				v.completeSas(rep, sendAt, false)
+			case <-time.After(10 * time.Second):
+				v.completeSas(sasReply{code: "timeout"}, sendAt, true)
+				log.Warn("--sas: no secure_attention_result within 10s")
+			case <-ctx.Done():
+				v.completeSas(sasReply{code: "ctx_done"}, sendAt, true)
+			}
+		}
+	}
 	// 输入脚本(连接 + 首关键帧后跑;结果进 summary.input,不参与
 	// --expect-* 断言 —— 场景期望由 e2e 脚本对 steps 自行判定)。
 	var inputRes *scriptResult
 	if steps != nil {
-		inputRes = runServerScript(ctx, steps, v, chs, leaseCh, leaseState, ws, log,
+		inputRes = runServerScript(ctx, steps, v, chs, leaseCh, leaseState, ws, sasCh, log,
 			c.inputBeforeKeyframe)
 	}
 	// 观察尾段:脚本结束后至少 3s(cursor 事件/PLI-IDR 余波可见),

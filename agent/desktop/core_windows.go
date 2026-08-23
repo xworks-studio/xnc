@@ -22,6 +22,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -164,6 +165,32 @@ func (s *coreStarter) Stop() error {
 		return nil
 	}
 	return nil
+}
+
+// SendSAS 触发 core 侧 secure attention(0x0110;M2-Slice1 Task 4/5)。
+// 复用共享 core 连接(探活失败即重拨);门控(--allow-sas)与审计在
+// core 侧。结果镜像见 SasResult:拒绝码透传(SAS_DENIED 等),传输层
+// 失败归并为 core_unavailable / core_error(进 hr 的合成码无从谈起,
+// viewer 只看 ok 与 code)。
+func (s *coreStarter) SendSAS(reason string) SasResult {
+	s.mu.Lock()
+	c, err := s.ensureClientLocked()
+	s.mu.Unlock()
+	if err != nil {
+		s.log.Warn("desktop: sas: core unavailable", "err", err)
+		return SasResult{Code: "core_unavailable"}
+	}
+	hr, err := c.SendSAS(reason)
+	if err != nil {
+		var rej *coreclient.RejectedError
+		if errors.As(err, &rej) {
+			s.log.Info("desktop: sas rejected", "code", rej.Code, "reason", reason)
+			return SasResult{Code: rej.Code}
+		}
+		s.log.Warn("desktop: sas failed", "err", err)
+		return SasResult{Code: "core_error"}
+	}
+	return SasResult{OK: true, HR: hr}
 }
 
 // pipeSource 适配 desktoppipe.Sub → desktop.Source(就地 select 转换,
