@@ -91,6 +91,8 @@ func TestOneshotEchoHelloOverPipe(t *testing.T) {
 		f, err := ipc.ReadFrame(conn)
 		require.NoError(t, err)
 		switch f.MessageType {
+		case msgShellBegin:
+			// T5:oneshot 也先发 BEGIN(协议契约)
 		case msgShellData:
 			stream, data, err := decodeData(f.Payload)
 			require.NoError(t, err)
@@ -131,7 +133,8 @@ func TestOneshotKillKillsTree(t *testing.T) {
 			payload = f.Payload
 			break
 		}
-		require.Equal(t, msgShellData, f.MessageType, "unexpected message %#04x", f.MessageType)
+		require.True(t, f.MessageType == msgShellData || f.MessageType == msgShellBegin,
+			"unexpected message %#04x", f.MessageType) // T5: oneshot 先发 BEGIN
 	}
 	code, err := decodeExit(payload)
 	require.NoError(t, err)

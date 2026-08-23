@@ -87,7 +87,7 @@ func (sh *Shell) Handle(ctx context.Context, ws *websocket.Conn, sessionID strin
 		if asShellHostError(err, &she) {
 			code = she.Code
 		}
-		sh.logger().Warn("shell create rejected", "session", sessionID, "code", code)
+		sh.logger().Warn("shell create rejected", "session", sessionID, "code", code, "err", err.Error())
 		sh.failStart(ctx, ws, code)
 		return
 	}

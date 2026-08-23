@@ -105,8 +105,10 @@ func validateStep(i int, s *scriptStep) error {
 	switch s.Op {
 	case "lease":
 		return nil
-	case "sas":
-		// 无字段;控制面 op(不发 DataChannel,不占 seq)。
+	case "sas", "sas_async":
+		// 无字段;控制面 op(不发 DataChannel,不占 seq)。sas_async =
+		// 发出不等待(M2-Slice2 T5 门⑥:与随后的 sas op 构成同会话
+		// 并发,后到者应回 busy)。
 		return nil
 	case "move":
 		if err := req(s.X != nil && s.Y != nil, "move needs x and y"); err != nil {
@@ -280,6 +282,9 @@ type stepEnv interface {
 	// 超时;M2-Slice1 Task 5)。门控拒绝(ok=false + 稳定码)不算错误
 	// —— 场景期望由 e2e 脚本对 detail 自行判定。
 	sendSAS(ctx context.Context) (ok bool, hr uint32, code string, err error)
+	// sasAsync 发 secure_attention 不等待回执(M2-Slice2 T5 门⑥:
+	// 并发 SAS busy 证据,回执经主循环 INFO 日志 + 后续 sas op 观测)。
+	sasAsync(ctx context.Context) error
 	wait(ctx context.Context, d time.Duration) // 可中断等待
 	cursorCount() uint64                        // cursor 通道累计消息数
 }
@@ -306,6 +311,13 @@ func runInputSteps(ctx context.Context, steps []scriptStep, env stepEnv) *script
 				} else {
 					r.Detail = id
 				}
+				return nil
+			case "sas_async":
+				// 控制面 op:发出即成功(不等回执;并发 busy 门用)。
+				if err := env.sasAsync(ctx); err != nil {
+					return err
+				}
+				r.Detail = "fired"
 				return nil
 			case "sas":
 				// 控制面 op:round-trip 成功即步骤成功(拒绝码进 detail,
@@ -391,6 +403,8 @@ func scriptWaitBudget(steps []scriptStep) time.Duration {
 			total += 6 * time.Second // requestLease 超时 5s + 余量
 		case "sas":
 			total += sasResultWait + 2*time.Second // 回执等待(agent 界对齐)+ 余量
+		case "sas_async":
+			total += time.Second // 不等回执;余量覆盖写时限
 		default:
 			total += 2 * time.Second
 		}

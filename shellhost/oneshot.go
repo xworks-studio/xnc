@@ -20,6 +20,11 @@ const (
 func runOneshot(conn net.Conn, o *serverOpts) error {
 	defer conn.Close()
 
+	// SHELL_BEGIN 先于任何输出帧(协议契约,镜像 interactive;T5 修:
+	// 此前 oneshot 不发 BEGIN,等 BEGIN 的 agent/shellpipe.Dial 会把
+	// 快命令的 EXIT 误判为「shell exited before begin」)。
+	_ = writeFrame(conn, &ipc.Frame{MessageType: msgShellBegin, Payload: encodeBegin(0, 0, o.profile)})
+
 	cmd, err := buildOneshotCommand(o.profile, o.exe, o.command, o.env)
 	if err != nil {
 		_ = writeFrame(conn, &ipc.Frame{MessageType: msgShellState, Payload: encodeState(stateProfileMissing)})

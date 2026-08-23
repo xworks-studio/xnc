@@ -1397,11 +1397,22 @@ int RunPipeServer(const wchar_t* pipe_name, const uint8_t* secret, size_t secret
   SECURITY_ATTRIBUTES sa{sizeof(sa), sd, FALSE};
 
   int rc = 1;  // 0 on Ctrl+C; 1 stays for fatal errors / watchdog exit(1)
+  // T5: connections are served CONCURRENTLY (thread per accepted instance;
+  // handler state is mutex-guarded). M2-Slice2 gave the agent a second core
+  // client (session shellhost alongside the desktop starter), and external
+  // diagnostics (xnc-shell-probe) need a slot too - the old sequential loop
+  // blocked the second dialer until the first hung up. The FIRST instance
+  // keeps FILE_FLAG_FIRST_PIPE_INSTANCE (rival-server detection); later
+  // instances drop it and the instance cap rises accordingly.
+  bool first_instance = true;
   for (;;) {
+    const DWORD access = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED |
+                         (first_instance ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0);
+    first_instance = false;
     HANDLE pipe = CreateNamedPipeW(
-        pipe_name,
-        PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
-        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, kBufSize, kBufSize,
+        pipe_name, access,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        PIPE_UNLIMITED_INSTANCES, kBufSize, kBufSize,
         0, &sa);
     if (pipe == INVALID_HANDLE_VALUE) {
       XNC_LOG_ERROR("CreateNamedPipe failed err=%lu (name taken by another instance?)",
@@ -1447,14 +1458,16 @@ int RunPipeServer(const wchar_t* pipe_name, const uint8_t* secret, size_t secret
 
     wd->Heartbeat();
     XNC_LOG_INFO("client connected");
-    {
+    // Hand the accepted instance to a detached server thread; the accept
+    // loop immediately creates the next listening instance.
+    std::thread([pipe, wd, secret, secret_len]() {
       uint32_t client_pid = 0;
       ServeConnection(pipe, wd, secret, secret_len, &client_pid);
-    }
-    FlushFileBuffers(pipe);  // best-effort drain before teardown
-    DisconnectNamedPipe(pipe);
-    CloseHandle(pipe);
-    XNC_LOG_INFO("connection closed, accepting next");
+      FlushFileBuffers(pipe);  // best-effort drain before teardown
+      DisconnectNamedPipe(pipe);
+      CloseHandle(pipe);
+      XNC_LOG_INFO("connection closed, accepting next");
+    }).detach();
   }
 
   LocalFree(sd);

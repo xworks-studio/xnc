@@ -172,6 +172,19 @@ func (e *serverInputEnv) requestLease(ctx context.Context) (string, error) {
 // 各等满 agent 界 → 发送前清空迟到回执(上一 op 残留不被本 op 误领,见
 // main.go drainSasReplies)。门控拒绝(ok=false + 稳定码)按观测返回,
 // 不算错误。
+// sasAsync 发 secure_attention 不等待回执(M2-Slice2 T5 门⑥:并发 SAS
+// busy 证据——紧跟的 sas op 应观察到 busy 回执)。不清迟到回执队列:
+// 本 op 自身不领回执。
+func (e *serverInputEnv) sasAsync(ctx context.Context) error {
+	wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	jb, _ := json.Marshal(map[string]any{"type": "secure_attention"})
+	if err := e.ws.Write(wctx, websocket.MessageText, jb); err != nil {
+		return fmt.Errorf("send secure_attention (async): %w", err)
+	}
+	return nil
+}
+
 func (e *serverInputEnv) sendSAS(ctx context.Context) (bool, uint32, string, error) {
 	if stale := drainSasReplies(e.sasCh); stale > 0 {
 		e.v.log.Warn("sas: discarded stale result frame(s) from an earlier op", "count", stale)

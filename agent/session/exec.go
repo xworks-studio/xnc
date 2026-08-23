@@ -135,7 +135,7 @@ func (ex *Exec) Handle(ctx context.Context, ws *websocket.Conn, sessionID string
 		if errors.As(err, &she) {
 			code = she.Code
 		}
-		ex.logger().Warn("exec create shell rejected", "session", sessionID, "code", code)
+		ex.logger().Warn("exec create shell rejected", "session", sessionID, "code", code, "err", err.Error())
 		ex.result(ctx, ws, nil, false, time.Since(start).Milliseconds(), code, false)
 		return
 	}

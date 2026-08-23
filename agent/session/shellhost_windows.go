@@ -96,6 +96,9 @@ func (h *coreShellHost) CreateShell(spec ShellSpec) (ShellProc, error) {
 	}
 	c, err := h.ensureClient()
 	if err != nil {
+		if h.log != nil {
+			h.log.Warn("shellhost: ensure core client failed", "err", err.Error())
+		}
 		return nil, &ShellHostError{Code: CodeCoreUnavailable}
 	}
 	pid, pipeName, shellSecret, err := c.CreateShell(coreclient.ShellCreateReq{
@@ -131,6 +134,9 @@ func (h *coreShellHost) CreateShell(spec ShellSpec) (ShellProc, error) {
 	}
 	conn, err := shellpipe.Dial(pipeName, shellSecret)
 	if err != nil {
+		if h.log != nil {
+			h.log.Warn("shellhost: dial shell pipe failed", "pipe", pipeName, "err", err.Error())
+		}
 		// 孤儿 shell:按存储 handle 让核心收尸(幂等)。
 		if kerr := c.KillShell(pid); kerr != nil && h.log != nil {
 			h.log.Warn("shellhost: orphan kill_shell failed", "pid", pid)

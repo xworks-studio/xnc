@@ -39,6 +39,7 @@ type execOutcome struct {
 	node      string
 	exitCode  *int
 	timedOut  bool
+	truncated bool // EXEC_RESULT.Truncated(T5:输出超预算丢弃)
 	duration  int64
 	gotResult bool
 	stdout    strings.Builder
@@ -245,7 +246,7 @@ func runSession(cl *Client, ref nodeRef, body map[string]any, cmd *cobra.Command
 			}
 			var r proto.ExecResult
 			if m.Decode(&r) == nil {
-				out.exitCode, out.timedOut, out.duration = r.ExitCode, r.TimedOut, r.DurationMs
+				out.exitCode, out.timedOut, out.truncated, out.duration = r.ExitCode, r.TimedOut, r.Truncated, r.DurationMs
 				out.gotResult = true
 			}
 		}
@@ -268,7 +269,7 @@ func runSession(cl *Client, ref nodeRef, body map[string]any, cmd *cobra.Command
 		}
 		PrintJSON(true, map[string]any{
 			"node": out.node, "exitCode": ec, "stdout": out.stdout.String(),
-			"stderr": out.stderr.String(), "durationMs": out.duration, "timedOut": out.timedOut,
+			"stderr": out.stderr.String(), "durationMs": out.duration, "timedOut": out.timedOut, "truncated": out.truncated,
 		}, nil)
 	}
 	switch {

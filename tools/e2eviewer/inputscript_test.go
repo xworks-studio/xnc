@@ -168,6 +168,7 @@ func (f *fakeEnv) requestLease(ctx context.Context) (string, error) {
 func (f *fakeEnv) sendSAS(ctx context.Context) (bool, uint32, string, error) {
 	return f.sasOK, f.sasHR, f.sasCode, f.sasErr
 }
+func (f *fakeEnv) sasAsync(ctx context.Context) error { return f.sasErr }
 func (f *fakeEnv) wait(ctx context.Context, d time.Duration) { f.waits = append(f.waits, d) }
 func (f *fakeEnv) cursorCount() uint64                       { return f.cursors }
 
