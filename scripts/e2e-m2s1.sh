@@ -305,9 +305,10 @@ run_gate1() { # sets G1_* vars; one attempt
   cat > "$ART/g1-steps.json" <<EOF
 [ {"op":"lease"},
   {"op":"wait","ms":8000},
-  {"op":"key","code":"Enter","down":true},
-  {"op":"wait","ms":200},
-  {"op":"key","code":"Enter","down":false},
+  {"op":"key","code":"AltLeft","down":true},
+  {"op":"key","code":"KeyY","down":true},
+  {"op":"key","code":"KeyY","down":false},
+  {"op":"key","code":"AltLeft","down":false},
   {"op":"wait","ms":2500} ]
 EOF
   "$E2E" --server "$LAN" --node "$NODE_ID" --token "$JWT" \
@@ -338,7 +339,11 @@ EOF
   fetch m2s1-uac.log || true
 }
 
-say "Gate 1: UAC secure desktop -> viewer reset path -> Enter approves"
+say "Gate 1: UAC secure desktop -> viewer reset path -> Alt+Y approves"
+# Run-1 evidence (kept in the results doc): plain Enter approved the
+# DEFAULT-FOCUSED control, which on this prompt class (unsigned renamed
+# binary) is "No" - the prompt cancelled, no elevation. Alt+Y is the UAC
+# "Yes" keyboard accelerator, independent of which button holds focus.
 run_gate1
 G1_RETRY_NOTE=""
 if ! node -e 'const j=require(process.argv[1]);console.log((j.input&&j.input.steps||[]).every(s=>s.ok)?1:0)' "$ART/g1-uac.json" 2>/dev/null | grep -q 1; then
@@ -481,11 +486,12 @@ if [ -f "$ART/probe-g6.csv" ] && [ -n "$G6_START" ] && [ -n "$G6_FF" ] && [ "$G6
   T_MOVE3=$((STEP0 + 1500 + 1600 + 450))
   node -e '
   const fs = require("fs");
-  const skew = +process.argv[12];
+  // argv: 1=csv 2..4=(xA,yA,tA) 5..7=(xB,yB,tB) 8..10=(xC,yC,tC) 11=skew 12=out
+  const skew = +process.argv[11];
   const csv = fs.readFileSync(process.argv[1], "utf8").trim().split(/\r?\n/).slice(1)
     .map(l => l.split(",")).filter(p => p.length === 8)
     .map(p => ({t: +p[0] - skew, x: +p[1], y: +p[2], a: +p[3]}));
-  const targets = [[+process.argv[3], +process.argv[4], +process.argv[5]], [+process.argv[6], +process.argv[7], +process.argv[8]], [+process.argv[9], +process.argv[10], +process.argv[11]]];
+  const targets = [[+process.argv[2], +process.argv[3], +process.argv[4]], [+process.argv[5], +process.argv[6], +process.argv[7]], [+process.argv[8], +process.argv[9], +process.argv[10]]];
   const moves = targets.map(([x, y, et]) => {
     const hit = csv.find(r => Math.abs(r.x - x) <= 5 && Math.abs(r.y - y) <= 5 && Math.abs(r.t - et) <= 500);
     return {want: [x, y], hit: hit ? {dt: hit.t - et} : null};
@@ -493,7 +499,7 @@ if [ -f "$ART/probe-g6.csv" ] && [ -n "$G6_START" ] && [ -n "$G6_FF" ] && [ "$G6
   const a1 = csv.find(r => r.a === 1);
   let key = null;
   if (a1) { let i = csv.indexOf(a1); while (i + 1 < csv.length && csv[i + 1].a === 1) i++; key = {downAt: a1.t, upAt: csv[i + 1] ? csv[i + 1].t : null}; }
-  fs.writeFileSync(process.argv[13], JSON.stringify({moves, key}, null, 1));
+  fs.writeFileSync(process.argv[12], JSON.stringify({moves, key}, null, 1));
   ' "$ART/probe-g6.csv" "$M1X" "$M1Y" "$T_MOVE1" "$M2X" "$M2Y" "$T_MOVE2" "$M3X" "$M3Y" "$T_MOVE3" "$SKEW" "$ART/g6-analysis.json"
   cat "$ART/g6-analysis.json"
   G6_MOVES=$(node -e 'const a=require(process.argv[1]);console.log(a.moves.every(m=>m.hit)?1:0)' "$ART/g6-analysis.json" 2>/dev/null || echo 0)
