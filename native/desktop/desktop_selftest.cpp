@@ -2444,6 +2444,22 @@ int SelftestMain() {
     cm3.Stop();
     CHECK("cursor-stopped", !cm3.running());
     cm3.Stop();  // 幂等
+    // Slice3 Task 3 顺带修(T1 review carry):并发 Start/Stop 紧循环回归门
+    // —— 旧实现里 Stop 换 running_ 但尚未 join 时 Start 的 th_ move-assign
+    // 落在 joinable 线程上会 std::terminate 带崩进程(≤8ms 交换窗口)。
+    xnc::CursorManager cm4(TestCursorOpts(200, 100));
+    std::atomic<int> hammered{0};
+    auto sink4 = [&hammered](int32_t, int32_t, uint8_t) { hammered++; };
+    std::thread starter([&cm4, &sink4] {
+      for (int i = 0; i < 300; ++i) cm4.Start(sink4);
+    });
+    std::thread stopper([&cm4] {
+      for (int i = 0; i < 300; ++i) cm4.Stop();
+    });
+    starter.join();
+    stopper.join();
+    cm4.Stop();
+    CHECK("cursor-start-stop-race-survived", !cm4.running());
   }
   // ---- M1-Slice3 Task 1:端到端(fake 订阅者 → 0x0108 → InputManager;
   //      CursorManager → 0x0109 → fake 订阅者)----

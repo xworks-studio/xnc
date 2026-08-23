@@ -87,6 +87,11 @@ class CursorManager {
   bool has_last_ = false;
   int32_t last_x_ = 0, last_y_ = 0;
   uint8_t last_visible_ = 0;
+  // join_mu_ serializes th_ lifecycle across Start/Stop: without it the
+  // Start/Stop swap window (Stop swapped running_ but has not joined yet
+  // while Start spawns) move-assigns onto a joinable thread ->
+  // std::terminate (T1 review carry, fixed in Slice3 Task 3).
+  std::mutex join_mu_;
   std::thread th_;
   std::atomic<bool> stop_{false};
   std::atomic<bool> running_{false};

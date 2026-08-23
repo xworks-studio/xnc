@@ -16,6 +16,10 @@ void CursorManager::Start(Sink sink) {
     sink_ = std::move(sink);
     has_last_ = false;  // fresh generation: first poll fires an initial event
   }
+  // join_mu_ keeps th_ hand-off (spawn here / join in Stop) exclusive: the
+  // pre-fix race had Start move-assign th_ while a concurrent Stop was still
+  // between its running_ swap and join -> terminate on a joinable thread.
+  std::lock_guard<std::mutex> lk(join_mu_);
   if (running_.exchange(true)) return;  // already polling
   stop_.store(false);
   th_ = std::thread([this] {
@@ -27,6 +31,7 @@ void CursorManager::Start(Sink sink) {
 }
 
 void CursorManager::Stop() {
+  std::lock_guard<std::mutex> lk(join_mu_);
   if (!running_.exchange(false)) return;
   stop_.store(true);
   if (th_.joinable()) th_.join();
