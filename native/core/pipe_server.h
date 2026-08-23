@@ -63,10 +63,15 @@ Frame EncodeStartCaptureOk(const Frame& req, DWORD pid, const std::wstring& pipe
 //     0=interactive,1=oneshot][u16 cols][u16 rows][u16 cwdLen][cwd utf8]
 //     [u16 envLen][env "K=V\n"-joined utf8][u16 cmdLen][cmd utf8]
 //     [u32 timeoutSec]
+//     wts = target session OR the 0xFFFFFFFF sentinel "live active console"
+//     (the documented agent<->core contract: the agent has no wts context,
+//     core resolves it). env values containing '\n' are unrepresentable -
+//     producers must reject them, and any split segment without '=' is
+//     BAD_PAYLOAD here (no silent splitting-through).
 //     -> ok response [u32 pid][u16 nameLen][pipe name utf8][32B secret]
 //     -> FlagError stable code (BAD_PAYLOAD / SESSION_MISMATCH /
 //        NO_ACTIVE_SESSION / TOKEN_FAILED / RNG_FAILED / SPAWN_FAILED /
-//        PIPE_TIMEOUT / INTERNAL)
+//        PIPE_TIMEOUT)
 //   kMsgKillShell request [u32 pid] -> empty FlagResponse (idempotent;
 //     scoped by the STORED child handle - never by image name).
 constexpr uint16_t kMsgCreateShell = 0x0120, kMsgKillShell = 0x0121;

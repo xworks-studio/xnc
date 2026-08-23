@@ -728,7 +728,7 @@ ShellSpawnResult RealShellSpawn(const ShellCreateReq& req, uint32_t session,
     CloseHandle(sec_wr);
     XNC_LOG_ERROR("create_shell: child cmdline rejected err=\"%s\"",
                   cmd_err.c_str());
-    snprintf(r.err, sizeof(r.err), "%s", "INTERNAL");
+    snprintf(r.err, sizeof(r.err), "%s", "BAD_PAYLOAD");
     return r;
   }
 
@@ -780,18 +780,31 @@ ShellSpawnResult RealShellSpawn(const ShellCreateReq& req, uint32_t session,
 }
 
 // 0x0120: validate + mint token + spawn xnc-shell.exe + answer its pipe
-// descriptor. Error ladder: BAD_PAYLOAD (layout/enum/mode) ->
-// SESSION_MISMATCH (wts not the live console session) -> RNG_FAILED ->
-// NO_ACTIVE_SESSION (user kind, no live user token; never implicit
-// elevation, spec 8.4) / TOKEN_FAILED (system kind) -> SPAWN_FAILED /
-// PIPE_TIMEOUT.
+// descriptor. Error ladder: BAD_PAYLOAD (layout/enum/mode/malformed env) ->
+// SESSION_MISMATCH (wts neither the live console session nor the 0xFFFFFFFF
+// "live active" sentinel) -> RNG_FAILED -> NO_ACTIVE_SESSION (user kind, no
+// live user token; never implicit elevation, spec 8.4) / TOKEN_FAILED
+// (system kind) -> SPAWN_FAILED / PIPE_TIMEOUT.
 Frame HandleCreateShell(const Frame& req, Watchdog* wd) {
   ShellCreateReq sr;
   if (!DecodeShellCreatePayload(req.payload.data(), req.payload.size(), &sr) ||
       !ShellProfileAllowed(sr.profile) || !ShellTokenKindAllowed(sr.token_kind) ||
-      (sr.mode == 1 && sr.cmd.empty()))
+      sr.mode > 1 || (sr.mode == 1 && sr.cmd.empty()))
     return ErrorFrame(kMsgCreateShell, req.request_id, "BAD_PAYLOAD");
-  if (!SessionTargetAllowed(sr.wts, CoreWts().console_session()))
+  // Env blob contract (T3 review): the producer joins "K=V" entries with
+  // '\n' and rejects values containing '\n' itself (a newline inside a
+  // value is unrepresentable). Core-side guard: every split segment must
+  // carry a key - an embedded newline splitting a value yields a bare
+  // segment that must be rejected here, never silently passed through.
+  for (const auto& kv : SplitShellEnv(sr.env)) {
+    if (kv.find('=') == std::string::npos)
+      return ErrorFrame(kMsgCreateShell, req.request_id, "BAD_PAYLOAD");
+  }
+  // 0xFFFFFFFF = "live active console" sentinel (documented agent<->core
+  // contract; the agent cannot know wts from its session context): resolve
+  // to the live console session before the target check.
+  uint32_t wts = sr.wts == 0xFFFFFFFFu ? CoreWts().console_session() : sr.wts;
+  if (!SessionTargetAllowed(wts, CoreWts().console_session()))
     return ErrorFrame(kMsgCreateShell, req.request_id, "SESSION_MISMATCH");
 
   uint8_t secret[kDesktopSecretLen];
@@ -811,13 +824,13 @@ Frame HandleCreateShell(const Frame& req, Watchdog* wd) {
            GetCurrentProcessId(), s_shell_counter.fetch_add(1) + 1);
 
   HANDLE token = nullptr;
-  if (!CurrentShellTokenFn()(sr.wts, sr.token_kind, &token)) {
+  if (!CurrentShellTokenFn()(wts, sr.token_kind, &token)) {
     if (token != nullptr) CloseHandle(token);
     return ErrorFrame(kMsgCreateShell, req.request_id,
                       sr.token_kind == 0 ? "NO_ACTIVE_SESSION" : "TOKEN_FAILED");
   }
   ShellSpawnResult r =
-      CurrentShellSpawnFn()(sr, sr.wts, pipe_name, secret, token, wd);
+      CurrentShellSpawnFn()(sr, wts, pipe_name, secret, token, wd);
   CloseHandle(token);
   if (!r.ok) {
     XNC_LOG_ERROR("create_shell: spawn failed code=%s", r.err);
@@ -1350,9 +1363,13 @@ bool ServeConnection(HANDLE pipe, Watchdog* wd, const uint8_t* secret,
 
 int RunPipeServer(const wchar_t* pipe_name, const uint8_t* secret, size_t secret_len) {
   SetConsoleCtrlHandler(OnCtrlEvent, TRUE);  // best effort; loop polls g_stop
-  Watchdog wd;
-  wd.Start();
-  g_wd = &wd;  // published for the detached desktop-restart threads
+  // Heap on purpose: g_wd is published for the DETACHED desktop-restart
+  // threads, which outlive this frame once RunPipeServer returns (T3 review:
+  // a stack Watchdog here is a use-after-scope). Intentionally leaked - it
+  // lives for the rest of the process.
+  Watchdog* wd = new Watchdog();
+  wd->Start();
+  g_wd = wd;
   XNC_LOG_INFO("console pipe server starting (pipe=%ls)", pipe_name);
 
   // Task 4: WTS monitor (notification + 500ms poll hybrid). On active
@@ -1409,7 +1426,7 @@ int RunPipeServer(const wchar_t* pipe_name, const uint8_t* secret, size_t secret
           break;
         }
         if (w != WAIT_TIMEOUT) break;
-        wd.Heartbeat();
+        wd->Heartbeat();
         if (g_stop.load()) {
           CancelIoEx(pipe, &ov);
           break;
@@ -1428,11 +1445,11 @@ int RunPipeServer(const wchar_t* pipe_name, const uint8_t* secret, size_t secret
       break;
     }
 
-    wd.Heartbeat();
+    wd->Heartbeat();
     XNC_LOG_INFO("client connected");
     {
       uint32_t client_pid = 0;
-      ServeConnection(pipe, &wd, secret, secret_len, &client_pid);
+      ServeConnection(pipe, wd, secret, secret_len, &client_pid);
     }
     FlushFileBuffers(pipe);  // best-effort drain before teardown
     DisconnectNamedPipe(pipe);

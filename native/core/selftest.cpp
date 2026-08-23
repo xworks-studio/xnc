@@ -53,17 +53,16 @@ static std::atomic<bool> s_degraded_last{false};  // last fake capture spawn's d
 // INFINITE wait unblocks exactly when the fake terminate signals it.
 static xnc::CaptureSpawnResult FakeCaptureSpawn(uint32_t, const wchar_t*,
                                                 const uint8_t*,
-                                                xnc::Watchdog*, bool degraded) {
+                                                xnc::Watchdog*, bool) {
   HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   s_spawn_events.push_back(ev);
   s_spawn_count.fetch_add(1);
-  s_degraded_last.store(degraded);  xnc::CaptureSpawnResult r;
+  xnc::CaptureSpawnResult r;
   r.ok = true;
   r.pid = 0x3000 + static_cast<DWORD>(s_spawn_count.load());
   r.child = ev;
   return r;
 }
-static std::atomic<bool> s_desgraded_last{false};
 static BOOL WINAPI FakeTerminateProcess(HANDLE h, UINT) {
   s_terminated_events.push_back(h);
   SetEvent(h);  // "the process exited" -> the watcher reaps + closes
@@ -91,13 +90,15 @@ static bool FakeShellToken(uint32_t, uint8_t kind, HANDLE* out) {
 }
 static std::atomic<int> s_shell_spawns{0};
 static xnc::ShellCreateReq s_shell_req_last{};
+static std::atomic<uint32_t> s_shell_session_last{0};
 static std::wstring s_shell_pipe_last;
 static xnc::ShellSpawnResult FakeShellSpawn(const xnc::ShellCreateReq& req,
-                                            uint32_t, const wchar_t* pipe,
+                                            uint32_t session, const wchar_t* pipe,
                                             const uint8_t*, HANDLE,
                                             xnc::Watchdog*) {
   s_shell_spawns.fetch_add(1);
   s_shell_req_last = req;
+  s_shell_session_last.store(session);
   s_shell_pipe_last = pipe;
   xnc::ShellSpawnResult r;
   r.ok = true;
@@ -766,6 +767,38 @@ int SelftestMain() {
                 (ReadFrame(c, c2) == DecodeResult::Ok &&
                  (c2.flags & kFlagError) != 0 && c2.request_id == 54 &&
                  std::memcmp(c2.payload.data(), "BAD_PAYLOAD", 11) == 0));
+        }
+        // mode >= 2 -> BAD_PAYLOAD (T3 review).
+        CHECK("cs-bad-mode",
+              WriteFrame(c, Frame{0, kMsgCreateShell, 60,
+                                  BuildShellPayload(1, 0, 2, 2, 80, 25, "", "",
+                                                    "whoami", 30)}) &&
+              (ReadFrame(c, c2) == DecodeResult::Ok &&
+               (c2.flags & kFlagError) != 0 && c2.request_id == 60 &&
+               std::memcmp(c2.payload.data(), "BAD_PAYLOAD", 11) == 0));
+        // env segment without '=' (value with embedded '\n' split through)
+        // -> BAD_PAYLOAD, never a silently-split entry (T3 review).
+        CHECK("cs-env-bare-segment",
+              WriteFrame(c, Frame{0, kMsgCreateShell, 61,
+                                  BuildShellPayload(1, 0, 2, 1, 80, 25, "",
+                                                    "A=1\nsmuggled", "whoami",
+                                                    30)}) &&
+              (ReadFrame(c, c2) == DecodeResult::Ok &&
+               (c2.flags & kFlagError) != 0 && c2.request_id == 61 &&
+               std::memcmp(c2.payload.data(), "BAD_PAYLOAD", 11) == 0));
+        // 0xFFFFFFFF sentinel resolves to the live active console (agent
+        // contract) -> success with wts=1 at the spawn seam.
+        {
+          const int spawnsS = s_shell_spawns.load();
+          CHECK("cs-sentinel-ok",
+                WriteFrame(c, Frame{0, kMsgCreateShell, 62,
+                                    BuildShellPayload(0xFFFFFFFFu, 0, 2, 1, 80,
+                                                      25, "", "", "whoami",
+                                                      30)}) &&
+                (ReadFrame(c, c2) == DecodeResult::Ok &&
+                 (c2.flags & kFlagError) == 0 && c2.request_id == 62 &&
+                 s_shell_spawns.load() == spawnsS + 1 &&
+                 s_shell_session_last.load() == 1));
         }
         // success: user token, CMD oneshot -> ok descriptor; request fields
         // reach the spawn seam verbatim.
