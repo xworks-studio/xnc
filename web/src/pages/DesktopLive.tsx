@@ -110,6 +110,7 @@ const STATE_NOTICES: Record<string, string> = {
 const SAS_NOTICES: Record<string, string> = {
   SAS_DENIED: "secure attention denied by the host core (--allow-sas gate)",
   SAS_UNAVAILABLE: "secure attention unavailable on the host (sas.dll)",
+  busy: "secure attention already in flight on this session",
   unsupported: "secure attention unsupported by this agent",
   core_unavailable: "secure attention failed: agent cannot reach xnc-core",
   core_error: "secure attention failed: xnc-core error",
@@ -194,6 +195,8 @@ export default function DesktopLive() {
   /** Ctrl+Alt+Del button state: pending while a round-trip is in flight,
    * denied (permanently disabled for this session) after SAS_DENIED. */
   const [sas, setSas] = useState<SasState>({ pending: false, denied: false });
+  /** 20s self-clear timer for the SAS pending latch (one live at a time). */
+  const sasTimer = useRef<number | undefined>(undefined);
   /** Dot style computed in the cursor-channel handler (event context, not
    * render) — refs must not be read during render. */
   const [cursorDot, setCursorDot] = useState<CSSProperties | null>(null);
@@ -785,11 +788,14 @@ export default function DesktopLive() {
     // never a synthesized keyboard sequence. The result arrives as
     // secure_attention_result (handled in the session effect). The pending
     // latch also self-clears after 20s: an older agent that ignores the
-    // unknown frame type would never answer.
+    // unknown frame type would never answer. A new click cancels the
+    // previous timer first (M2-Slice2 Task 1): a stale 20s timer must not
+    // clear the pending state of a newer request.
     try {
       wsHandle.__xncDesktopWs?.send(JSON.stringify({ type: "secure_attention" }));
       setSas((s) => ({ ...s, pending: true }));
-      window.setTimeout(
+      if (sasTimer.current !== undefined) window.clearTimeout(sasTimer.current);
+      sasTimer.current = window.setTimeout(
         () => setSas((s) => (s.pending ? { ...s, pending: false } : s)),
         20000,
       );

@@ -32,6 +32,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -71,6 +72,7 @@ struct PipelineResult {
   uint64_t aus_written = 0;        // shaped AUs fwrite'd to out
   uint64_t bytes_written = 0;      // total bytes fwrite'd
   uint32_t resets = 0;             // unified CaptureReset executions (M2-S1 T2)
+  uint32_t storm_resets = 0;       // resets delayed by storm backoff (M2-S2 T1)
   char last_reset_reason[kResetReasonMax] = {0};  // reason of the last reset
 };
 
@@ -90,6 +92,71 @@ inline uint32_t WarmupFeedBound(uint32_t fps) {
 // 请求最小间隔 500ms). The natural first IDR and rebuild forces are not
 // pipeline-initiated and are not throttled by this.
 inline constexpr uint64_t kIdrMinIntervalMs = 500;
+
+// ---- rebuild-storm backoff (M2-Slice2 Task 1) ----
+// Same-reason CaptureReset executions >= kStormThreshold within
+// kStormWindowMs are a rebuild storm: every FURTHER reset of that reason
+// waits an exponential backoff first (1 s, 2 s, 4 s ... capped at
+// kStormBackoffCapMs) and the pipeline logs a `reset_storm` line. A reset
+// carrying a DIFFERENT reason restarts the tracking (storms are per-reason).
+// Pure/injectable clock on purpose: the selftest drives the whole backoff
+// sequence with a fake clock.
+class ResetStormTracker {
+ public:
+  static constexpr uint32_t kWindowMs = 10000;
+  static constexpr uint32_t kThreshold = 3;
+  static constexpr uint32_t kBaseMs = 1000;
+  static constexpr uint32_t kBackoffCapMs = 10000;
+  static constexpr size_t kRing = 16;  // recent same-reason executions kept
+
+  // Delay to apply BEFORE executing a reset with this reason (0 = no storm).
+  // count_out (optional) receives the same-reason executions inside the
+  // window (for the reset_storm log line).
+  uint32_t BackoffMs(const char* reason, uint64_t now_ms,
+                     uint32_t* count_out = nullptr) const {
+    if (reason == nullptr || reason[0] == '\0' ||
+        std::strcmp(reason_, reason) != 0) {
+      if (count_out != nullptr) *count_out = 0;
+      return 0;
+    }
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < n_ && i < kRing; ++i)
+      if (now_ms >= times_[i] && now_ms - times_[i] < kWindowMs) ++n;
+    if (count_out != nullptr) *count_out = n;
+    if (n < kThreshold) return 0;
+    // n == 3 -> 1 s, 4 -> 2 s, 5 -> 4 s, ... capped at 10 s.
+    uint64_t ms = kBaseMs;
+    for (uint32_t i = kThreshold; i < n; ++i) {
+      ms <<= 1;
+      if (ms >= kBackoffCapMs) { ms = kBackoffCapMs; break; }
+    }
+    return static_cast<uint32_t>(ms < kBackoffCapMs ? ms : kBackoffCapMs);
+  }
+
+  // Records one reset execution (call when the sequence starts).
+  void RecordExecuted(const char* reason, uint64_t now_ms) {
+    if (reason == nullptr || reason[0] == '\0') reason = "?";
+    if (std::strcmp(reason_, reason) != 0) {
+      CopyReason(reason_, sizeof(reason_), reason);
+      n_ = 0;
+    }
+    if (n_ < kRing) {
+      times_[n_++] = now_ms;
+      return;
+    }
+    for (uint32_t i = 1; i < kRing; ++i) times_[i - 1] = times_[i];
+    times_[kRing - 1] = now_ms;
+  }
+
+  uint32_t storm_resets() const { return storm_count_; }
+  void NoteStorm() { ++storm_count_; }
+
+ private:
+  uint64_t times_[kRing] = {0};
+  char reason_[kResetReasonMax] = {0};
+  uint32_t n_ = 0;
+  uint32_t storm_count_ = 0;
+};
 
 // Appends every NALU of `data` except parameter sets (7/8) and AUD (9),
 // each re-emitted with a 4-byte start code, trailing zero bytes before the

@@ -233,6 +233,9 @@ type fakeStarter struct {
 	sasMu      sync.Mutex
 	sasReasons []string
 	sasResult  SasResult
+	// sasBlock 非 nil 时 SendSAS 阻塞至其被 close(M2-Slice2 Task 1:
+	// blocking fake 钉 in-flight 去重与信令循环不阻塞)。
+	sasBlock chan struct{}
 }
 
 func (st *fakeStarter) Start(_ context.Context, _ uint32) (Source, error) {
@@ -246,11 +249,17 @@ func (st *fakeStarter) Stop() error {
 }
 
 // SendSAS 实现 SasCaller(Task 5):记录 reason 快照,回 canned 结果。
+// sasBlock 置位时阻塞(T1 去重测试的 blocking fake)。
 func (st *fakeStarter) SendSAS(reason string) SasResult {
 	st.sasMu.Lock()
-	defer st.sasMu.Unlock()
 	st.sasReasons = append(st.sasReasons, reason)
-	return st.sasResult
+	res := st.sasResult
+	block := st.sasBlock
+	st.sasMu.Unlock()
+	if block != nil {
+		<-block
+	}
+	return res
 }
 
 // sasCalls 返回已收 reason 快照。
@@ -737,6 +746,97 @@ func TestSessionSecureAttentionUnsupported(t *testing.T) {
 		t.Fatalf("secure_attention_result(unsupported) = %v", res)
 	}
 	cancel()
+}
+
+// TestSessionSecureAttentionDedupBusy — M2-Slice2 Task 1 回环门:
+//
+//  1. blocking fake(SendSAS 阻塞至放行)期间,第二条 secure_attention
+//     立即回 {ok:false,code:"busy"},不触达 Starter;
+//  2. SAS 在途不阻塞信令循环:keyframe-req 仍到达 RequestKeyframe;
+//  3. 放行后第一条回 ok;in-flight 解除后新 SAS 可再发(去重不是熔断)。
+func TestSessionSecureAttentionDedupBusy(t *testing.T) {
+	src := newFakeSource()
+	st := &fakeStarter{src: src, sasResult: SasResult{OK: true, HR: 0x1}}
+	st.sasBlock = make(chan struct{})
+	h := &Handler{Log: slog.Default(), Starter: st}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	handlerDone := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		c.SetReadLimit(1 << 20)
+		h.Handle(ctx, c, "sess-sas3", json.RawMessage(`{"signaling":"webrtc"}`))
+		close(handlerDone)
+	}))
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	vws, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("viewer dial: %v", err)
+	}
+	vws.SetReadLimit(1 << 20)
+	defer vws.CloseNow()
+
+	drainUntil(t, ctx, vws, 10*time.Second, func(m map[string]any) bool { return m["type"] == vocabReady })
+
+	// ① 第一条 SAS 在途(blocking fake 摁住);第二条立即回 busy。
+	sendJSON(t, ctx, vws, map[string]any{"type": vocabSecureAttention})
+	sendJSON(t, ctx, vws, map[string]any{"type": vocabSecureAttention})
+	res := drainUntil(t, ctx, vws, 5*time.Second, func(m map[string]any) bool {
+		return m["type"] == vocabSecureAttentionResult
+	})
+	if res["ok"] != false || res["code"] != "busy" {
+		t.Fatalf("secure_attention_result(busy) = %v", res)
+	}
+	if calls := st.sasCalls(); len(calls) != 1 {
+		t.Fatalf("SendSAS calls = %v, busy must not reach Starter", calls)
+	}
+
+	// ② 信令循环未被 SAS 阻塞:keyframe-req 在阻塞期间仍到达 Source。
+	sendJSON(t, ctx, vws, map[string]any{"type": vocabKeyframeReq})
+	gotViewerPLI := false
+	deadline := time.Now().Add(5 * time.Second)
+	for !gotViewerPLI && time.Now().Before(deadline) {
+		for _, r := range src.KeyRequests() {
+			if r == "viewer-pli" {
+				gotViewerPLI = true
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !gotViewerPLI {
+		t.Fatalf("signaling loop stalled while SAS in flight; reqs=%v", src.KeyRequests())
+	}
+
+	// ③ 放行 → 第一条回 ok;之后新 SAS 立即通过(去重解除)。
+	close(st.sasBlock)
+	res = drainUntil(t, ctx, vws, 5*time.Second, func(m map[string]any) bool {
+		return m["type"] == vocabSecureAttentionResult && m["code"] == nil
+	})
+	if res["ok"] != true || res["hr"].(float64) != 1 {
+		t.Fatalf("secure_attention_result(ok after unblock) = %v", res)
+	}
+	sendJSON(t, ctx, vws, map[string]any{"type": vocabSecureAttention})
+	res = drainUntil(t, ctx, vws, 5*time.Second, func(m map[string]any) bool {
+		return m["type"] == vocabSecureAttentionResult
+	})
+	if res["ok"] != true {
+		t.Fatalf("secure_attention_result(released) = %v", res)
+	}
+	if calls := st.sasCalls(); len(calls) != 2 {
+		t.Fatalf("SendSAS calls = %v, want [viewer viewer]", calls)
+	}
+
+	cancel()
+	select {
+	case <-handlerDone:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("Handler did not return after ctx cancel")
+	}
 }
 
 // bareStarter 只有 Start/Stop(无 SasCaller):unsupported 分支的注入面。

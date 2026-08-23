@@ -3249,6 +3249,121 @@ int SelftestMain() {
                                         std::strcmp(reason, "change_backend") == 0);
     }
   }
+  // ---- M2-Slice2 Task 1:gate 稳定门/健康分回满/GDI away 提示/风暴退避 ----
+  { // 纯逻辑:gate 稳定步进 + 2s 判定表
+    CHECK("gate-step-anchor", xnc::GateDefaultSinceStep(true, 0, 7000) == 7000);
+    CHECK("gate-step-hold", xnc::GateDefaultSinceStep(true, 7000, 8000) == 7000);
+    CHECK("gate-step-clear", xnc::GateDefaultSinceStep(false, 7000, 8000) == 0);
+    CHECK("gate-stable-no", !xnc::GateStableFor(7000, 8999, 2000));
+    CHECK("gate-stable-yes", xnc::GateStableFor(7000, 9000, 2000));
+    CHECK("gate-stable-unset", !xnc::GateStableFor(0, 9000, 2000));
+  }
+  { // Ladder:create-fail −40 仅在 gate DEFAULT 连续 ≥2s 记;重建成功 → 100
+    FakeDxgiFactory dxgi;  // frames 充足,Rebuild 三败一成(away/early/stable/成功)
+    dxgi.rebuild_fails = 3;
+    FakeGdiFactory gdi;
+    g_ld_dxgi = &dxgi;
+    g_ld_gdi = &gdi;
+    xnc::CaptureReset::Opts co;
+    co.clock_ms = &CrUnitClock;
+    co.desktop_fn = &CrUnitGate;
+    xnc::CaptureReset reset(co);
+    xnc::LadderOpts lo;
+    lo.make_dxgi = &LdMakeDxgi;
+    lo.make_gdi = &LdMakeGdi;
+    lo.reset = &reset;
+    lo.clock_ms = &CrUnitClock;
+    lo.probe_interval_ms = 0;  // 无探测线程:纯表驱动
+    g_cr_gate.store(xnc::ResetDesktop::kNonDefault);
+    g_cr_unit_now = 10000;
+    xnc::LadderCapture ladder(lo);
+    std::string err;
+    xnc::FrameBlob blob;
+    CHECK("lcf-init", ladder.Init(&err) &&
+                         ladder.active() == xnc::BackendKind::kDxgi);
+    // away 期 Rebuild 失败:不记分(期望中的安全桌面拒绝尾部)
+    CHECK("lcf-away-fail", !ladder.Rebuild(&err));
+    CHECK("lcf-away-unscored", ladder.dxgi_health() == 100);
+    // 回到 DEFAULT 但未满 2s:仍不记分
+    g_cr_gate.store(xnc::ResetDesktop::kDefault);
+    CHECK("lcf-acquire-anchor", ladder.Acquire(blob, &err));
+    g_cr_unit_now = 11000;
+    CHECK("lcf-acquire-hold", ladder.Acquire(blob, &err));
+    CHECK("lcf-early-fail", !ladder.Rebuild(&err));
+    CHECK("lcf-early-unscored", ladder.dxgi_health() == 100);
+    // ≥2s 稳定:记 −40
+    g_cr_unit_now = 12001;
+    CHECK("lcf-acquire-stable", ladder.Acquire(blob, &err));
+    CHECK("lcf-stable-fail", !ladder.Rebuild(&err));
+    CHECK("lcf-stable-scored", ladder.dxgi_health() == 60);
+    // CaptureReset 成功(rebuild_fails 已耗尽)→ 健康分回满 100
+    CHECK("lcf-recover-ok", ladder.Rebuild(&err));
+    CHECK("lcf-health-restored", ladder.dxgi_health() == 100);
+  }
+  { // Ladder:GDI 在役 + watch 非默认 → gdi_stale_secure_desktop 每 5s 一条
+    FakeDxgiFactory dxgi;
+    FakeGdiFactory gdi;
+    g_ld_dxgi = &dxgi;
+    g_ld_gdi = &gdi;
+    xnc::CaptureReset::Opts co;
+    co.clock_ms = &CrUnitClock;
+    co.desktop_fn = &CrUnitGate;
+    xnc::CaptureReset reset(co);
+    xnc::LadderOpts lo;
+    lo.make_dxgi = &LdMakeDxgi;
+    lo.make_gdi = &LdMakeGdi;
+    lo.reset = &reset;
+    lo.clock_ms = &CrUnitClock;
+    lo.probe_interval_ms = 0;
+    lo.force_gdi = true;
+    g_cr_gate.store(xnc::ResetDesktop::kNonDefault);
+    g_cr_unit_now = 20000;
+    xnc::LadderCapture ladder(lo);
+    std::string err;
+    xnc::FrameBlob blob;
+    CHECK("lgd-init", ladder.Init(&err) &&
+                         ladder.active() == xnc::BackendKind::kGdi);
+    CHECK("lgd-first-notice", ladder.Acquire(blob, &err) &&
+                                 ladder.gdi_away_notices() == 1);
+    for (int i = 0; i < 5; ++i) ladder.Acquire(blob, &err);  // 同一时刻:节流
+    CHECK("lgd-throttled", ladder.gdi_away_notices() == 1);
+    g_cr_unit_now = 25000;  // 满 5s:再一条
+    ladder.Acquire(blob, &err);
+    CHECK("lgd-second-notice", ladder.gdi_away_notices() == 2);
+    g_cr_gate.store(xnc::ResetDesktop::kDefault);  // 回默认:不再发
+    g_cr_unit_now = 40000;
+    ladder.Acquire(blob, &err);
+    ladder.Acquire(blob, &err);
+    CHECK("lgd-silent-when-default", ladder.gdi_away_notices() == 2);
+  }
+  { // 风暴退避序列(注入时钟表驱动):同 reason ≥3/10s → 1s/2s/4s…封顶 10s
+    xnc::ResetStormTracker st;
+    const uint64_t t = 0;
+    CHECK("storm-quiescent", st.BackoffMs("access_lost", t) == 0);
+    st.RecordExecuted("access_lost", t);
+    st.RecordExecuted("access_lost", t + 1000);
+    st.RecordExecuted("access_lost", t + 2000);
+    uint32_t cnt = 99;
+    CHECK("storm-4th-1s",
+          st.BackoffMs("access_lost", t + 3000, &cnt) == 1000 && cnt == 3);
+    st.RecordExecuted("access_lost", t + 4000);
+    CHECK("storm-5th-2s", st.BackoffMs("access_lost", t + 5000) == 2000);
+    st.RecordExecuted("access_lost", t + 7000);
+    CHECK("storm-6th-4s", st.BackoffMs("access_lost", t + 8000) == 4000);
+    // 窗口滑出:10s 后不再风暴
+    st.RecordExecuted("access_lost", t + 30000);
+    CHECK("storm-window-expired", st.BackoffMs("access_lost", t + 31000) == 0);
+    // 异 reason: streak 重置
+    st.RecordExecuted("desktop_switch", t + 32000);
+    CHECK("storm-other-reason", st.BackoffMs("access_lost", t + 33000) == 0);
+    // 密集注入:封顶 10s
+    xnc::ResetStormTracker st2;
+    for (int i = 0; i < 8; ++i) st2.RecordExecuted("access_lost", t + i * 100);
+    CHECK("storm-capped-10s", st2.BackoffMs("access_lost", t + 1000) == 10000);
+    st2.NoteStorm();
+    st2.NoteStorm();
+    CHECK("storm-counted", st2.storm_resets() == 2);
+  }
   // ---- M2-Slice1 Task 2:管线 reset 编排(真 MF 编码器 + ResetCapture) ----
   const uint32_t kRsW = 64, kRsH = 48, kRsFps = 15, kRsBitrate = 500000;
   { // 场景 A:desktop switch 挂起/恢复 —— gate 翻非默认 + access_lost →
@@ -3806,13 +3921,17 @@ int SelftestMain() {
       lo.reset = &reset;
       lo.force_health = 100;  // 屏蔽降级分支,专测计分
       lo.probe_interval_ms = 0;
+      lo.clock_ms = &CrUnitClock;  // M2-S2 T1:计分需 gate 稳定 ≥2s,表驱动
+      g_cr_unit_now = 30000;
       xnc::LadderCapture ladder(lo);
       std::string err;
       CHECK("ld-score-init", ladder.Init(&err) && ladder.dxgi_health() == 100);
       xnc::FrameBlob blob;
-      ladder.Acquire(blob, &err);  // frame: stays 100
+      ladder.Acquire(blob, &err);  // frame: stays 100;gate 稳定锚点 t=30000
       std::string rerr;
+      g_cr_unit_now = 32001;  // 稳定 ≥2s:计分
       CHECK("ld-score-rebuild-fail-1", !ladder.Rebuild(&rerr) && ladder.dxgi_health() == 60);
+      g_cr_unit_now = 34100;
       CHECK("ld-score-rebuild-fail-2", !ladder.Rebuild(&rerr) && ladder.dxgi_health() == 20);
       // 20 < 60 → 第 3 次 Rebuild 变成换 GDI(不再是委托)
       CHECK("ld-score-below-threshold-swaps",

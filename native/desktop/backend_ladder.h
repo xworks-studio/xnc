@@ -16,7 +16,12 @@
 //   removed -50 (pure-table parity: at runtime DxgiCapture re-creates the
 //   device - a failed re-creation folds into Create -40, a successful one
 //   is a self-heal 0); no-useful-frame -10 per acquire in the fatal family.
-//   The score never rises on its own (spec has no recovery rule); <60
+//   M2-Slice2 amendments: a SUCCESSFUL CaptureReset (Rebuild ok - the base
+//   frame follows) restores the score to 100, and Create failure -40 is only
+//   recorded while the desktop gate has been DEFAULT continuously >= 2 s.
+//   While GDI serves and the watch reports a non-DEFAULT desktop, the ladder
+//   emits STATE "gdi_stale_secure_desktop" every 5 s (viewer-facing honesty:
+//   GDI cannot see the secure desktop). <60
 //   (LadderOpts::downgrade_below, configurable per spec) triggers the
 //   DXGI->GDI downgrade.
 //
@@ -109,6 +114,27 @@ inline DxgiHealthEvent ClassifyAcquireOutcome(bool ok, const char* err) {
   return DxgiHealthEvent::kNoUsefulFrame;
 }
 
+// Create-fail gate stability (M2-Slice2 Task 1): the -40 (Create failure)
+// is only real unhealth when the desktop gate has been DEFAULT for >= 2 s
+// CONTINUOUSLY - a create failure right after the secure desktop dropped
+// is the tail of the expected T1 refusal, not DXGI decay.
+inline constexpr uint32_t kGateStableMs = 2000;
+
+// Pure gate-stability step: returns the new "default since" stamp (0 = not
+// default). Call once per observation; the stamp anchors the 2 s window.
+inline uint64_t GateDefaultSinceStep(bool gate_default, uint64_t since_ms,
+                                     uint64_t now_ms) {
+  if (!gate_default) return 0;
+  return since_ms != 0 ? since_ms : now_ms;
+}
+
+// True when the gate has been default for >= min_stable_ms.
+inline bool GateStableFor(uint64_t since_ms, uint64_t now_ms,
+                          uint32_t min_stable_ms) {
+  return since_ms != 0 && now_ms >= since_ms &&
+         now_ms - since_ms >= min_stable_ms;
+}
+
 // Ladder decision (pure): DXGI downgrades when health < threshold; GDI
 // upgrades only after a successful DXGI probe.
 enum class LadderAction : uint8_t { kStay = 0, kDowngrade, kUpgrade };
@@ -199,6 +225,8 @@ class LadderCapture final : public ICapture {
   uint32_t switches() const { return switches_.load(std::memory_order_relaxed); }
   uint32_t probe_successes() const { return probe_ok_count_.load(std::memory_order_relaxed); }
   uint32_t probe_failures() const { return probe_fail_count_.load(std::memory_order_relaxed); }
+  // "gdi_stale_secure_desktop" STATE notices emitted (M2-Slice2 Task 1).
+  uint32_t gdi_away_notices() const { return gdi_notice_count_.load(std::memory_order_relaxed); }
   // True once the probe has blessed DXGI (cleared when the upgrade swap
   // consumes it or a re-creation fails).
   bool probe_ok() const { return probe_ok_.load(std::memory_order_relaxed); }
@@ -213,10 +241,16 @@ class LadderCapture final : public ICapture {
   std::atomic<bool> probe_ok_{false};
   std::atomic<uint32_t> probe_ok_count_{0};
   std::atomic<uint32_t> probe_fail_count_{0};
+  std::atomic<uint32_t> gdi_notice_count_{0};
   bool switch_pending_ = false;  // pipeline thread only
+  uint64_t gate_default_since_ms_ = 0;  // pipeline thread only (create-fail gate)
+  uint64_t gdi_notice_ms_ = 0;          // pipeline thread only (5 s throttle)
 
   bool GateIsDefault() const;
+  // Refreshes gate_default_since_ms_ from one observation (pipeline thread).
+  void UpdateGateStability();
   void EmitBackendChanged(const char* backend, const char* reason);
+  void EmitGdiAwayNotice();
   bool SwapToDxgi(const char* reason);
   bool SwapToGdi(const char* reason);
   void ProbeLoop();

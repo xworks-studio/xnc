@@ -46,7 +46,8 @@
 //	{"type":"secure_attention_result","ok":false,"hr":0,"code":"SAS_DENIED"}
 //	    稳定码:核心侧 SAS_DENIED(门控关)/ SAS_UNAVAILABLE(sas.dll
 //	    不可载)/ BAD_PAYLOAD;agent 侧 unsupported(Starter 无能力)/
-//	    core_unavailable / core_error。viewer 对 SAS_DENIED 禁用按钮。
+//	    core_unavailable / core_error / busy(同会话已有 SAS 在途,M2-Slice2
+//	    Task 1 去重)。viewer 对 SAS_DENIED 禁用按钮。
 //
 // agent → viewer(Slice3 追加 lease 三帧,词汇见 input.go):
 //
@@ -69,6 +70,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -238,8 +240,9 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 
 	// ④ 信令主循环:offer 建联(恰好一次),ice 喂候选。
 	var (
-		pub     *Publisher
-		pubOnce sync.Once
+		pub        *Publisher
+		pubOnce    sync.Once
+		sasInFlight atomic.Bool // 同会话并发 SAS ≤1(M2-Slice2 Task 1)
 	)
 	defer func() {
 		if pub != nil {
@@ -307,7 +310,15 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 			// core 0x0110(门控 = core 侧 --allow-sas,票据 = Slice3)。
 			// 异步执行:core RPC 上限 15s,不阻塞信令循环(晚到的 offer/
 			// ice 不受牵连);回复帧经 wsWriter 串行写出,时序无约束。
+			// M2-Slice2 Task 1:同会话 in-flight 去重——同时至多一条 SAS
+			// RPC;并发请求立即回 {ok:false,code:"busy"}。
+			if !sasInFlight.CompareAndSwap(false, true) {
+				w.write(ctx, secureAttentionResultFrame{
+					Type: vocabSecureAttentionResult, OK: false, HR: 0, Code: "busy"})
+				continue
+			}
 			go func() {
+				defer sasInFlight.Store(false)
 				res := SasResult{OK: false, Code: "unsupported"}
 				if sc, ok := h.Starter.(SasCaller); ok {
 					res = sc.SendSAS("viewer")

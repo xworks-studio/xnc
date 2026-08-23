@@ -314,16 +314,36 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
   bool first_frame_logged = false;
   uint32_t enc_w = cap.Width(), enc_h = cap.Height();  // encoder's dims
   OnDemandIdr ondemand;
+  ResetStormTracker storm;  // same-reason rebuild-storm backoff (M2-S2 T1)
 
   for (;;) {
     if (NowMs() - t0 >= duration_ms) break;
     if (opt.stop != nullptr && opt.stop->load()) break;
 
     // Unified capture reset (M2-Slice1 Task 2): consume a merged/debounced
-    // request and run suspend -> wait-desktop -> rebuild -> resume.
+    // request and run suspend -> wait-desktop -> rebuild -> resume. A
+    // same-reason storm (>= kThreshold inside the window) backs off
+    // exponentially first (M2-Slice2 Task 1).
     if (opt.reset != nullptr) {
       char reset_reason[kResetReasonMax];
       if (opt.reset->TakeReset(reset_reason, sizeof(reset_reason))) {
+        if (uint32_t backoff = storm.BackoffMs(reset_reason, NowMs())) {
+          storm.NoteStorm();
+          XNC_LOG_INFO("reset_storm reason=%s backoff_ms=%u",
+                       reset_reason, backoff);
+          const uint64_t storm_until = NowMs() + backoff;
+          bool storm_abort = false;
+          while (NowMs() < storm_until) {
+            if ((opt.stop != nullptr && opt.stop->load()) ||
+                NowMs() - t0 >= duration_ms) {
+              storm_abort = true;
+              break;
+            }
+            Sleep(kResetPollMs);
+          }
+          if (storm_abort) break;
+        }
+        storm.RecordExecuted(reset_reason, NowMs());
         ResetSequence seq{&cap,           &enc,
                           &sink,          &cache,
                           &res,           &opt,
@@ -532,6 +552,7 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
   sink.OnState("stream_end", res.ok);
 
   res.counters = cache.counters();
+  res.storm_resets = storm.storm_resets();
   const FrameCacheCounters& c = res.counters;
   XNC_LOG_INFO("pipeline_stop elapsed=%llums captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu rebuilds=%u resets=%u w=%u h=%u aus=%llu bytes=%llu ok=%d",
                static_cast<unsigned long long>(NowMs() - t0),

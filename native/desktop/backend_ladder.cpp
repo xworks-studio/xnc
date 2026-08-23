@@ -87,6 +87,27 @@ bool LadderCapture::GateIsDefault() const {
   return o_.reset->Desktop() == ResetDesktop::kDefault;
 }
 
+void LadderCapture::UpdateGateStability() {
+  gate_default_since_ms_ =
+      GateDefaultSinceStep(GateIsDefault(), gate_default_since_ms_, o_.clock_ms());
+}
+
+// GDI away notice (M2-Slice2 Task 1): GDI cannot see the secure desktop -
+// viewers keep getting frames that do NOT include it. Emit the STATE at most
+// every 5 s while that condition holds (pipeline thread only).
+void LadderCapture::EmitGdiAwayNotice() {
+  const uint64_t now = o_.clock_ms();
+  if (gdi_notice_ms_ != 0 && now >= gdi_notice_ms_ &&
+      now - gdi_notice_ms_ < 5000)
+    return;
+  gdi_notice_ms_ = now != 0 ? now : 1;
+  gdi_notice_count_.fetch_add(1, std::memory_order_relaxed);
+  XNC_LOG_INFO("gdi_stale_secure_desktop notices=%u",
+               gdi_notice_count_.load(std::memory_order_relaxed));
+  if (impl_->state_sink != nullptr)
+    impl_->state_sink->OnState("gdi_stale_secure_desktop", true);
+}
+
 void LadderCapture::EmitBackendChanged(const char* backend, const char* reason) {
   XNC_LOG_INFO("backend_changed backend=%s reason=%s switches=%u health=%u probe_ok=%d",
                backend, reason, switches_.load(std::memory_order_relaxed),
@@ -196,6 +217,12 @@ bool LadderCapture::Acquire(FrameBlob& blob, std::string* err) {
     }
     probe_ok_.store(false, std::memory_order_relaxed);  // broken again
   }
+  UpdateGateStability();
+  // Away notice: GDI serving while the watch reports a secure desktop.
+  if (active_.load(std::memory_order_relaxed) == BackendKind::kGdi &&
+      o_.reset != nullptr &&
+      o_.reset->Desktop() == ResetDesktop::kNonDefault)
+    EmitGdiAwayNotice();
   ICapture* cap =
       active_.load(std::memory_order_relaxed) == BackendKind::kDxgi
           ? impl_->dxgi.get()
@@ -290,8 +317,9 @@ bool LadderCapture::Rebuild(std::string* err) {
     if (err) *err = "gdi create failed during downgrade";
     return false;
   }
-  // Normal rebuild: delegate; a failure with the desktop gate DEFAULT
-  // scores kCreateFail (secure-desktop refusals are expected, T1 evidence).
+  // Normal rebuild: delegate; a failure with the desktop gate DEFAULT and
+  // STABLE >= 2 s scores kCreateFail (secure-desktop refusals and their
+  // immediate tail are expected, T1 evidence - M2-Slice2 Task 1 gate).
   ICapture* dxgi = impl_->dxgi.get();
   if (dxgi == nullptr) {
     // No DXGI backend (should not happen on this path): try a fresh create.
@@ -301,12 +329,21 @@ bool LadderCapture::Rebuild(std::string* err) {
   }
   std::string rerr;
   const bool ok = dxgi->Rebuild(&rerr);
-  if (!ok && GateIsDefault()) {
+  UpdateGateStability();
+  if (!ok && GateStableFor(gate_default_since_ms_, o_.clock_ms(), kGateStableMs)) {
     health_.store(ApplyDxgiHealthEvent(health_.load(std::memory_order_relaxed),
                                        DxgiHealthEvent::kCreateFail),
                   std::memory_order_relaxed);
     XNC_LOG_INFO("backend_ladder rebuild failed scored health=%u err=\"%s\"",
                  health_.load(std::memory_order_relaxed), rerr.c_str());
+  } else if (!ok) {
+    XNC_LOG_INFO("backend_ladder rebuild failed unscored (gate not stable >=%ums) err=\"%s\"",
+                 kGateStableMs, rerr.c_str());
+  }
+  if (ok) {
+    // CaptureReset success (base frame follows this rebuild) -> health back
+    // to 100 (M2-Slice2 Task 1).
+    health_.store(100, std::memory_order_relaxed);
   }
   if (err) *err = rerr;
   return ok;
