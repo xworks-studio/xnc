@@ -115,12 +115,12 @@ type Conn struct {
 
 	// 输出背压预算(T5,仅 oneshot/exec 路径启用;interactive VT 流
 	// 保持满丢——见 SetExecBudget 注释):
-	//   budget>0 时,通道满的数据先入 pend 队列(每流字节数 ≤ budget),
-	//   超出才丢弃并计入 dropped;终结时 pend 连同 marker(如有丢弃)
-	//   一并排空进 dataCh。
+	//   budget>0 时每流累计输出(直发+pend)封顶 budget 字节,超出整块
+	//   丢弃并计入 dropped;终结时 pend 连同 marker(如有丢弃)排空。
 	budget    int // 每流字节预算;0 = 未启用(旧行为:通道满即丢)
 	pend      []Data
 	pendBytes [3]int
+	total     [3]uint64 // 每流累计接纳(直发+pend)字节;预算按此封顶
 	dropped   [3]uint64
 }
 
@@ -334,11 +334,21 @@ func (c *Conn) pump() {
 	}
 }
 
-// enqueueData 把一条输出数据交付给消费方:预算启用时通道满先入 pend
-// 队列(每流 ≤ budget 字节),超出丢弃并计数;未启用时保持旧行为
-// (通道满即丢)。返回 false = 泵应终结(done 已关)。
+// enqueueData 把一条输出数据交付给消费方:预算启用时每流累计输出
+// (直发+pend)封顶 budget 字节,超出即整块丢弃并计数(T5 门⑦修正:
+// 仅按积压封顶时消费方够快就全程不触发截断,37MB 全量透传);未启用
+// 时保持旧行为(通道满即丢)。返回 false = 泵应终结(done 已关)。
 func (c *Conn) enqueueData(d Data) bool {
 	c.mu.Lock()
+	if c.budget > 0 {
+		if c.total[d.Stream]+uint64(len(d.Bytes)) > uint64(c.budget) {
+			// 总量封顶:超预算整块丢弃(marker 由 teardown 追加,不占预算)。
+			c.dropped[d.Stream] += uint64(len(d.Bytes))
+			c.mu.Unlock()
+			return true
+		}
+		c.total[d.Stream] += uint64(len(d.Bytes))
+	}
 	// 先排空既有 pend(消费方腾出的空间优先给最老的数据)。
 flush:
 	for len(c.pend) > 0 {
@@ -362,12 +372,9 @@ flush:
 		}
 	}
 	if c.budget > 0 {
-		if c.pendBytes[d.Stream]+len(d.Bytes) <= c.budget {
-			c.pend = append(c.pend, d)
-			c.pendBytes[d.Stream] += len(d.Bytes)
-		} else {
-			c.dropped[d.Stream] += uint64(len(d.Bytes))
-		}
+		// 总量已在上方校验;此处必在预算内。
+		c.pend = append(c.pend, d)
+		c.pendBytes[d.Stream] += len(d.Bytes)
 	} // budget==0: 旧满丢行为(interactive)
 	c.mu.Unlock()
 	return true

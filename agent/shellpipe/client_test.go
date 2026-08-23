@@ -205,3 +205,50 @@ func TestExecBudgetTruncationMarker(t *testing.T) {
 	code := <-c.ExitCh()
 	assert.EqualValues(t, 0, code)
 }
+
+// TestExecBudgetTotalCapFastConsumer(T5 门⑦回归):预算按每流累计输出
+// 封顶——即使消费方全程跟得上(无积压),超预算字节也必须丢弃并带
+// marker(仅积压封顶时快消费方会 37MB 全量透传,e2e run-10 教训)。
+func TestExecBudgetTotalCapFastConsumer(t *testing.T) {
+	const secret = "shell-pipe-secret"
+	f := &fakeShell{secret: []byte(secret), ctrlSeen: make(chan struct{}, 64)}
+	oldDial := dialPipe
+	serverConn, clientConn := net.Pipe()
+	dialPipe = func(_ context.Context, _ string) (net.Conn, error) { return clientConn, nil }
+	t.Cleanup(func() { dialPipe = oldDial })
+
+	go func() {
+		defer serverConn.Close()
+		if err := ServerHandshake(serverConn, f.secret); err != nil {
+			return
+		}
+		_ = ipc.WriteFrame(serverConn, &ipc.Frame{MessageType: msgShellBegin, Payload: EncodeBegin(80, 25, "CMD")})
+		// 100 帧 × 50B = 5000B stdout;预算 200B 必须总量封顶。
+		payload := EncodeData(StreamStdout, bytes.Repeat([]byte("x"), 50))
+		for i := 0; i < 100; i++ {
+			if ipc.WriteFrame(serverConn, &ipc.Frame{MessageType: msgShellData, Payload: payload}) != nil {
+				return
+			}
+		}
+		_ = ipc.WriteFrame(serverConn, &ipc.Frame{MessageType: msgShellExit, Payload: EncodeExit(0)})
+	}()
+
+	c, err := Dial("fake", []byte(secret))
+	require.NoError(t, err)
+	c.SetExecBudget(200)
+
+	// 快消费方:立即读(不制造任何积压)。
+	var stdout, stderr bytes.Buffer
+	for d := range c.DataCh() {
+		if d.Stream == StreamStdout {
+			stdout.Write(d.Bytes)
+		} else {
+			stderr.Write(d.Bytes)
+		}
+	}
+	assert.LessOrEqual(t, stdout.Len(), 200, "delivered stdout must be capped at budget even with a fast consumer")
+	assert.Contains(t, stderr.String(), "[xnc] output truncated:", "marker line must be appended")
+	assert.Equal(t, uint64(5000-stdout.Len()), c.DroppedBytes(), "dropped+delivered must account for all bytes")
+	code := <-c.ExitCh()
+	assert.EqualValues(t, 0, code)
+}
