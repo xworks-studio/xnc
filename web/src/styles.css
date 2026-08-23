@@ -563,3 +563,69 @@ h2 {
   cursor: pointer;
 }
 .desktop-pli:hover { background: #0f3460; }
+.desktop-pli:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* M1-Slice3 input capture / lease UI / cursor overlay */
+
+/* While the input lease is held the local pointer hides (the remote dot
+   represents it) and touch gestures stay on the video element. */
+.desktop-video-wrap.lease-held {
+  cursor: none;
+  touch-action: none;
+}
+
+/* Remote cursor dot (cursor channel); sized by the video letterbox scale. */
+.desktop-cursor {
+  position: absolute;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.92);
+  border: 2px solid #0f3460;
+  box-shadow: 0 0 4px rgba(0, 0, 0, 0.65);
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+  z-index: 2;
+}
+
+.desktop-lease-chip {
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  border: 1px solid #0f3460;
+}
+.desktop-lease-chip.ok {
+  background: #14532d;
+  color: #d1fae5;
+}
+.desktop-lease-chip.bad {
+  background: #5f1d1d;
+  color: #fecaca;
+}
+
+.desktop-notice {
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  background: #3b2f0b;
+  color: #fde68a;
+  border: 1px solid #665826;
+}
+
+/* TEXT injection row (sends only on Enter/Send — IME composition safe). */
+.desktop-textbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 16px;
+  background: #16213e;
+  border-bottom: 1px solid #0f3460;
+}
+.desktop-textbar input {
+  flex: 0 1 380px;
+  min-width: 120px;
+}
+.desktop-textbar input:disabled {
+  opacity: 0.5;
+}
