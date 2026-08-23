@@ -413,25 +413,29 @@ fetch m2s1-sysenter.log || true
 node -e '
 const j = require(process.argv[1]);
 const states = j.stateSamples || [];
-const reb = states.filter(s => s.code === "capture_rebuilt");
 const au = j.auTimesMs || [];
-let lastAuAfterRebuild = -1;
-if (reb.length && au.length) {
-  const t = reb[reb.length-1].tMs;
-  for (const a of au) if (a >= t) lastAuAfterRebuild = a;
-}
+// Stream-survival evidence: the lock window opens at the first recovering
+// state after t+10s (the sas step lands ~t+15); frames must resume after the
+// FIRST capture_rebuilt that follows it. NOT the last rebuilt sample: a late
+// extra desktop bounce leaves the desktop STATIC afterwards and static =
+// zero encoder output BY DESIGN (7.4), so no AU follows it (run-4 finding).
+const lock = states.find(s => s.code === "recovering" && s.tMs >= 10000);
+const reb = states.find(s => s.code === "capture_rebuilt" && (!lock || s.tMs >= lock.tMs));
+let firstAuAfterRebuild = -1;
+if (reb) for (const a of au) if (a >= reb.tMs) { firstAuAfterRebuild = a; break; }
 const sasStep = ((j.input && j.input.steps) || []).find(s => s.op === "sas") || {};
 console.log(JSON.stringify({connected: j.connected, durationMs: j.durationMs, frames: j.frames, keyframes: j.keyframes,
-  recovering: states.filter(s=>s.code==="recovering").length, rebuilt: reb.length,
-  lastAuAfterRebuild, sasDetail: sasStep.detail || "none", sasOk: sasStep.ok === true}));
+  recovering: states.filter(s=>s.code==="recovering").length, rebuilt: states.filter(s=>s.code==="capture_rebuilt").length,
+  lockAtMs: lock ? lock.tMs : null, rebuiltAtMs: reb ? reb.tMs : null, firstAuAfterRebuild,
+  sasDetail: sasStep.detail || "none", sasOk: sasStep.ok === true}));
 ' "$ART/g2-sas.json" > "$ART/g2-analysis.json"
 cat "$ART/g2-analysis.json"
 G2_LOCKOK=$([ "${G2_LOCKED:-0}" -ge 1 ] && echo 1 || echo 0)
 gate "2-secure-screen-up" "$G2_LOCKOK" "LogonUI procs ${G2_LOCKED:-?} after SAS (delivery observed, hr is not proof - T4)"
 G2_UNLOCKOK=$([ "${G2_UNLOCKED:-99}" -eq 0 ] && echo 1 || echo 0)
 gate "2-unlocked" "$G2_UNLOCKOK" "LogonUI procs ${G2_UNLOCKED:-?} after sysenter (see m2s1-sysenter.log)"
-G2_STREAM=$(node -e 'const a=require(process.argv[1]);console.log(a.connected&&a.durationMs>=75000&&a.rebuilt>=1&&a.lastAuAfterRebuild>0?1:0)' "$ART/g2-analysis.json" 2>/dev/null || echo 0)
-gate "2-stream-survives-cycle" "$G2_STREAM" "$(node -e 'const a=require(process.argv[1]);console.log(`connected=${a.connected} duration=${a.durationMs}ms frames=${a.frames} keys=${a.keyframes} recovering=${a.recovering} rebuilt=${a.rebuilt} lastAU+${a.lastAuAfterRebuild}ms`)' "$ART/g2-analysis.json" 2>/dev/null)"
+G2_STREAM=$(node -e 'const a=require(process.argv[1]);console.log(a.connected&&a.durationMs>=75000&&a.keyframes>=2&&a.firstAuAfterRebuild>0?1:0)' "$ART/g2-analysis.json" 2>/dev/null || echo 0)
+gate "2-stream-survives-cycle" "$G2_STREAM" "$(node -e 'const a=require(process.argv[1]);console.log(`connected=${a.connected} duration=${a.durationMs}ms frames=${a.frames} keys=${a.keyframes} recovering=${a.recovering} rebuilt=${a.rebuilt} firstAU+${a.firstAuAfterRebuild}ms after rebuilt@${a.rebuiltAtMs}`)' "$ART/g2-analysis.json" 2>/dev/null)"
 G2_SASSTEP=$(node -e 'const a=require(process.argv[1]);console.log(a.sasOk?1:0)' "$ART/g2-analysis.json" 2>/dev/null || echo 0)
 gate "2-sas-step-ok" "$G2_SASSTEP" "input sas step: $(node -e 'const a=require(process.argv[1]);console.log(a.sasDetail)' "$ART/g2-analysis.json" 2>/dev/null) (hr=0 = call returned, delivery proven by LogonUI)"
 
