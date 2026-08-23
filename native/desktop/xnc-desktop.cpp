@@ -44,6 +44,7 @@
 #include "diag.h"
 #include "dxgi_capture.h"  // DxgiErrIsDesktopAccessDenied
 #include "input_manager.h"  // InputManager (M1-Slice3)
+#include "jpeg_wic.h"      // DownscaleBgra / WicEncodeJpeg (M2-Slice3 T3)
 #include "mf_encoder.h"    // MfSoftEncoder
 #include "pipeline.h"      // Pipeline::Run + stats.json sidecar
 #include "rt_pipe_server.h"  // RtServer (real-time fan-out)
@@ -151,6 +152,7 @@ void Usage(FILE* out) {
       L"                    [--pipe <name> --secret <hex>] [--backend dxgi|gdi]\n"
       L"       xnc-desktop.exe --console-rt (--secret-stdin | --secret <hex>)\n"
       L"                    [--pipe <name>] [--max-subs <n>] [--fps <n>] [--backend dxgi|gdi]\n"
+      L"       xnc-desktop.exe --jpeg-single <out.jpg> [--max-w <n>]\n"
       L"       xnc-desktop.exe --selftest | --help\n"
       L"  --console-diag  diagnostic capture loop in the console session\n"
       L"  --duration      seconds to run (default 10, must be > 0)\n"
@@ -174,6 +176,12 @@ void Usage(FILE* out) {
       L"                  path uses --secret-stdin; e.g. 0011ff)\n"
       L"  --pipe          pipe name (default \\\\.\\pipe\\xnc-desktop-rt)\n"
       L"  --max-subs      max subscribers (default 4, must be 1..4)\n"
+      L"  --jpeg-single   one-shot snapshot (M2-Slice3 Task 3): acquire ONE\n"
+      L"                  full frame (DXGI only), box-filter downscale to\n"
+      L"                  --max-w if given, encode JPEG via WIC (quality\n"
+      L"                  0.85) to <out.jpg>, exit 0; errors exit 1\n"
+      L"  --max-w         snapshot max width in px (0 = no clamp); only valid\n"
+      L"                  with --jpeg-single\n"
       L"  --selftest      arg parsing + FrameBlob/encoder/pipeline/rt selftest\n"
       L"  --help          this usage text\n"
       L"desktop watch: always on - the secure-desktop observer runs in every\n"
@@ -358,6 +366,16 @@ bool ParseDiagArgs(int argc, wchar_t** argv, DiagOptions* opt, std::wstring* err
       } else {
         return fail(L"--backend must be dxgi or gdi (diagnostic-only selector)");
       }
+    } else if (std::wcscmp(a, L"--jpeg-single") == 0) {
+      const wchar_t* v = value_of(L"--jpeg-single");
+      if (!v) return false;
+      opt->jpeg_single = true;
+      opt->jpeg_path = v;
+    } else if (std::wcscmp(a, L"--max-w") == 0) {
+      const wchar_t* v = value_of(L"--max-w");
+      if (!v) return false;
+      if (!ParseU32(v, &opt->max_width))
+        return fail(L"--max-w must be a positive integer (0 = no clamp)");
     } else if (std::wcscmp(a, L"--encoder") == 0) {
       // M2-Slice2 Task 3: crash-loop degraded-restart contract (spec 15.2)
       // passes "--backend gdi --encoder software". The MF software encoder
@@ -377,11 +395,19 @@ bool ParseDiagArgs(int argc, wchar_t** argv, DiagOptions* opt, std::wstring* err
     }
   }
   const int modes = (opt->console_diag ? 1 : 0) + (opt->console_rt ? 1 : 0) +
-                    (opt->selftest ? 1 : 0) + (opt->help ? 1 : 0);
+                    (opt->selftest ? 1 : 0) + (opt->help ? 1 : 0) +
+                    (opt->jpeg_single ? 1 : 0);
   if (modes > 1)
-    return fail(L"--console-diag, --console-rt, --selftest and --help are mutually exclusive");
+    return fail(L"--console-diag, --console-rt, --jpeg-single, --selftest "
+                L"and --help are mutually exclusive");
   if (modes == 0)
-    return fail(L"one of --console-diag, --console-rt, --selftest, --help is required");
+    return fail(L"one of --console-diag, --console-rt, --jpeg-single, "
+                L"--selftest, --help is required");
+  if (opt->jpeg_single && opt->jpeg_path.empty())
+    return fail(L"--jpeg-single requires an output path: --jpeg-single "
+                L"<out.jpg>");
+  if (opt->max_width != 0 && !opt->jpeg_single)
+    return fail(L"--max-w only applies to --jpeg-single");
   if (opt->console_diag && opt->out_path.empty())
     return fail(L"--console-diag requires --out <file.h264>");
   // The secret arrives from exactly ONE channel: --secret-stdin (service
@@ -622,6 +648,64 @@ int RunConsoleRt(const xnc::DiagOptions& opt) {
   return rc;
 }
 
+// M2-Slice3 Task 3: one-shot JPEG snapshot. DXGI-only (clean error when
+// desktop duplication is unavailable - no GDI fallback in this mode; the
+// rt pipeline keeps its backend ladder). Acquire retry loop honors the
+// base-frame semantics (err_timeout = static screen, err_rebuilt = fresh
+// duplication) within a 2s budget; the first real frame is downscaled to
+// --max-w (box filter) and encoded via WIC at quality 0.85.
+int RunJpegSingle(const xnc::DiagOptions& opt) {
+  std::string err;
+  std::unique_ptr<xnc::ICapture> capture = xnc::TryCreateDxgiCapture(&err);
+  if (!capture) {
+    XNC_LOG_ERROR("jpeg_single: capture init failed err=\"%s\"", err.c_str());
+    return 1;
+  }
+  xnc::FrameBlob frame;
+  const ULONGLONG deadline = GetTickCount64() + 2000;
+  for (;;) {
+    if (capture->Acquire(frame, &err)) break;
+    if (err != "err_timeout" && err != "err_rebuilt") {
+      XNC_LOG_ERROR("jpeg_single: acquire failed err=\"%s\"", err.c_str());
+      return 1;
+    }
+    if (GetTickCount64() >= deadline) {
+      XNC_LOG_ERROR("jpeg_single: no frame within 2000ms");
+      return 1;
+    }
+    Sleep(50);
+  }
+  uint32_t w = frame.w, h = frame.h;
+  std::vector<uint8_t> scaled;
+  if (!xnc::DownscaleBgra(frame.bgra.data(), frame.w, frame.h,
+                          opt.max_width, &scaled, &w, &h)) {
+    XNC_LOG_ERROR("jpeg_single: downscale failed w=%u h=%u max_w=%u", frame.w,
+                  frame.h, opt.max_width);
+    return 1;
+  }
+  std::vector<uint8_t> jpeg;
+  if (!xnc::WicEncodeJpeg(scaled.data(), w, h, 0.85f, &jpeg, &err)) {
+    XNC_LOG_ERROR("jpeg_single: encode failed err=\"%s\"", err.c_str());
+    return 1;
+  }
+  FILE* out = nullptr;
+  const errno_t open_err = _wfopen_s(&out, opt.jpeg_path.c_str(), L"wb");
+  if (open_err != 0 || !out) {
+    XNC_LOG_ERROR("jpeg_single: open out failed path=%ls errno=%d",
+                  opt.jpeg_path.c_str(), open_err);
+    return 1;
+  }
+  const size_t wrote = fwrite(jpeg.data(), 1, jpeg.size(), out);
+  std::fclose(out);
+  if (wrote != jpeg.size()) {
+    XNC_LOG_ERROR("jpeg_single: short write %zu/%zu", wrote, jpeg.size());
+    return 1;
+  }
+  XNC_LOG_INFO("jpeg_single ok src=%ux%u out=%ux%u bytes=%zu max_w=%u",
+               frame.w, frame.h, w, h, jpeg.size(), opt.max_width);
+  return 0;
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -649,5 +733,6 @@ int wmain(int argc, wchar_t** argv) {
     }
   }
   if (opt.console_rt) return RunConsoleRt(opt);
+  if (opt.jpeg_single) return RunJpegSingle(opt);
   return RunConsoleDiag(opt);
 }

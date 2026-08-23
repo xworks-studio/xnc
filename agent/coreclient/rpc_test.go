@@ -353,3 +353,25 @@ var errBadValues = &badValuesError{}
 type badValuesError struct{}
 
 func (*badValuesError) Error() string { return "StartCapture returned mismatched values" }
+
+// TestSnapshotRespCodec — 0x0111 响应编解码(布局 [u32 len][jpeg bytes];
+// 长度不自洽即协议错误)。请求侧为纯小端打包,核心侧 golden 覆盖,此处
+// 只测本侧解码契约。
+func TestSnapshotRespCodec(t *testing.T) {
+	jpeg, err := decodeSnapshotResp([]byte{3, 0, 0, 0, 0xFF, 0xD8, 0xFF})
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(jpeg) != 3 || jpeg[0] != 0xFF || jpeg[2] != 0xFF {
+		t.Fatalf("jpeg bytes mismatch: %v", jpeg)
+	}
+	if _, err := decodeSnapshotResp([]byte{4, 0, 0, 0, 1, 2, 3}); err == nil {
+		t.Fatal("length mismatch must fail")
+	}
+	if _, err := decodeSnapshotResp([]byte{3}); err == nil {
+		t.Fatal("short payload must fail")
+	}
+	if _, err := decodeSnapshotResp([]byte{0, 0, 0, 0}); err == nil {
+		t.Fatal("empty jpeg must fail")
+	}
+}

@@ -194,3 +194,39 @@ func (p *coreShellProc) Dropped() uint64 { return p.conn.DroppedBytes() }
 
 var _ ShellProc = (*coreShellProc)(nil)
 var _ ShellHost = (*coreShellHost)(nil)
+
+// Snapshot 经共享 core 连接发 0x0111 快照请求(M2-Slice3 Task 3:screen
+// 退役换轨;wts=活动控制台哨兵,核心解析)。拒绝码透传为 ShellHostError
+// 形态,传输层错误并入 CORE_UNAVAILABLE。
+func (h *coreShellHost) Snapshot(maxWidth uint32) ([]byte, error) {
+	c, err := h.ensureClient()
+	if err != nil {
+		return nil, &ShellHostError{Code: CodeCoreUnavailable}
+	}
+	jpeg, err := c.Snapshot(coreclient.WTSActiveConsole, maxWidth)
+	if err != nil {
+		var rej *coreclient.RejectedError
+		if errors.As(err, &rej) {
+			return nil, &ShellHostError{Code: rej.Code}
+		}
+		return nil, &ShellHostError{Code: CodeCoreUnavailable}
+	}
+	return jpeg, nil
+}
+
+// defaultSnapshotProvider 构造默认快照通路(与 shellhost 同源的共享 core
+// 连接模型);dev 凭据缺失返回 CORE_UNAVAILABLE 拒绝器。
+func defaultSnapshotProvider(log *slog.Logger) SnapshotProvider {
+	if h := DefaultShellHost(log); h != nil {
+		if csh, ok := h.(*coreShellHost); ok {
+			return csh
+		}
+	}
+	return unavailableSnapshot{}
+}
+
+type unavailableSnapshot struct{}
+
+func (unavailableSnapshot) Snapshot(uint32) ([]byte, error) {
+	return nil, &ShellHostError{Code: CodeCoreUnavailable}
+}

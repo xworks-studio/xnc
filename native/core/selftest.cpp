@@ -996,6 +996,37 @@ int SelftestMain() {
                 {now - 1, now - 2, now - 3, now - 4, now - 70000}, now));
       CHECK("cs-crashloop-empty", !CrashLoopReached({}, now));
     }
+    { // M2-Slice3 Task 3: 0x0111 snapshot payload codec + response golden.
+      SnapshotReq sr;
+      const uint8_t req8[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0x80, 0x0B, 0x00, 0x00};
+      CHECK("sn-decode-ok",
+            DecodeSnapshotPayload(req8, sizeof(req8), &sr) &&
+            sr.wts == 0xFFFFFFFFu && sr.max_w == 0x0B80);  // 1920
+      const uint8_t zero8[8] = {0};
+      CHECK("sn-decode-zero",
+            DecodeSnapshotPayload(zero8, sizeof(zero8), &sr) &&
+            sr.wts == 0 && sr.max_w == 0);
+      CHECK("sn-decode-trailing-reject",
+            !DecodeSnapshotPayload(req8, sizeof(req8) + 1, &sr));
+      CHECK("sn-decode-trunc-reject",
+            !DecodeSnapshotPayload(req8, sizeof(req8) - 1, &sr));
+      CHECK("sn-decode-null-reject",
+            !DecodeSnapshotPayload(nullptr, sizeof(req8), &sr) &&
+            !DecodeSnapshotPayload(req8, sizeof(req8), nullptr));
+      // Response golden: [u32 len][bytes], frame meta preserved.
+      const uint8_t jpeg[3] = {0xFF, 0xD8, 0xFF};
+      Frame ok = EncodeSnapshotResp(Frame{0, kMsgSnapshot, 0xABCF, {}}, jpeg, 3);
+      CHECK("sn-resp-meta",
+            ok.message_type == kMsgSnapshot && ok.flags == kFlagResponse &&
+            ok.request_id == 0xABCF);
+      CHECK("sn-resp-bytes",
+            ok.payload.size() == 7 && ok.payload[0] == 3 && ok.payload[1] == 0 &&
+            ok.payload[2] == 0 && ok.payload[3] == 0 &&
+            ok.payload[4] == 0xFF && ok.payload[5] == 0xD8 &&
+            ok.payload[6] == 0xFF);
+      Frame empty = EncodeSnapshotResp(Frame{0, kMsgSnapshot, 1, {}}, nullptr, 0);
+      CHECK("sn-resp-empty", empty.payload.size() == 4);
+    }
     if (fails==0) std::printf("selftest ok\n");
     return fails==0 ? 0 : 1;
 }

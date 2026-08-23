@@ -43,9 +43,13 @@ func newScreenCmd() *cobra.Command {
 				return failUsage(cmd, "--snapshot and --open are mutually exclusive")
 			}
 			if snapshotPath != "" {
-				return runScreenSnapshot(cmd, args[0], snapshotPath)
-			}
-			return runScreenOpen(cmd, args[0])
+					return runScreenSnapshot(cmd, args[0], snapshotPath)
+				}
+				// M2-Slice3 Task 3:screen 流式退役——--open 提示改用
+				// desktop 会话(dashboard/桌面会话观看),不再发起流式会话。
+				return failUsage(cmd,
+					"screen streaming is retired; use a desktop session for live view "+
+						"(xnc screen --snapshot <file.jpg> still works)")
 		},
 	}
 	cmd.Flags().StringVar(&snapshotPath, "snapshot", "",

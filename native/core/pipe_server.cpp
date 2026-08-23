@@ -224,6 +224,14 @@ DesktopSupervisor g_desktop;
 // Seams (selftest injection; null = production default below).
 ShellTokenFn g_shell_token_fn = nullptr;
 ShellSpawnFn g_shell_spawn_fn = nullptr;
+SnapshotSpawnFn g_snapshot_spawn_fn = nullptr;
+
+SnapshotSpawnResult RealSnapshotSpawn(uint32_t session, uint32_t max_w);
+SnapshotSpawnFn CurrentSnapshotSpawnFn() {
+  return g_snapshot_spawn_fn != nullptr ? g_snapshot_spawn_fn
+                                        : &RealSnapshotSpawn;
+}
+
 
 bool RealShellToken(uint32_t session, uint8_t token_kind, HANDLE* out);
 ShellSpawnResult RealShellSpawn(const ShellCreateReq& req, uint32_t session,
@@ -391,6 +399,143 @@ void WatchCaptureChild(HANDLE child, DWORD pid, uint32_t spawn_epoch) {
 Frame ErrorFrame(uint16_t type, uint32_t request_id, const char* code) {
   return Frame{kFlagResponse | kFlagError, type, request_id,
                std::vector<uint8_t>(code, code + std::strlen(code))};
+}
+
+// M2-Slice3 Task 3 production snapshot spawn: SessionSystemToken ->
+// SpawnInSession("xnc-desktop.exe --jpeg-single <tmp> --max-w <w>") ->
+// wait exit (15s) -> read file (<= 8 MiB) -> delete temp. The temp path is
+// program-constructed under core's %TEMP% (SYSTEM context; the child runs
+// under the same SYSTEM token, so both sides can write it).
+SnapshotSpawnResult RealSnapshotSpawn(uint32_t session, uint32_t max_w) {
+  SnapshotSpawnResult r{};
+  auto fail = [&r](const char* code) {
+    snprintf(r.err, sizeof(r.err), "%s", code);
+    return r;
+  };
+
+  wchar_t tmp_dir[MAX_PATH] = {0};
+  const DWORD tl = GetTempPathW(MAX_PATH, tmp_dir);
+  if (tl == 0 || tl >= MAX_PATH) return fail("INTERNAL");
+  wchar_t path[MAX_PATH + 64] = {0};
+  swprintf(path, MAX_PATH + 64, L"%lsxnc-snap-%lu.jpg", tmp_dir,
+           GetCurrentProcessId());
+
+  HANDLE token = nullptr;
+  std::string err;
+  if (!TokenManager::SessionSystemToken(session, &token, &err)) {
+    XNC_LOG_ERROR("snapshot: session token failed err=\"%s\"", err.c_str());
+    return fail("TOKEN_FAILED");
+  }
+
+  wchar_t maxw[16] = {0};
+  swprintf(maxw, 16, L"%u", max_w);
+  std::vector<std::wstring> args = {L"--jpeg-single", path};
+  if (max_w > 0) {
+    args.push_back(L"--max-w");
+    args.push_back(maxw);
+  }
+  std::vector<wchar_t*> av;
+  for (auto& a : args) av.push_back(&a[0]);
+  std::wstring cmd;
+  std::string cmd_err;
+  if (!BuildChildCommandLine(L"xnc-desktop.exe", static_cast<int>(av.size()),
+                             av.data(), 0, &cmd, &cmd_err)) {
+    CloseHandle(token);
+    XNC_LOG_ERROR("snapshot: cmdline rejected err=\"%s\"", cmd_err.c_str());
+    return fail("INTERNAL");
+  }
+
+  DWORD pid = 0;
+  HANDLE child = nullptr;
+  if (!SpawnInSession(token, L"xnc-desktop.exe", cmd.c_str(), &pid, &child,
+                      &err)) {
+    CloseHandle(token);
+    XNC_LOG_ERROR("snapshot: spawn failed err=\"%s\"", err.c_str());
+    return fail("SPAWN_FAILED");
+  }
+  CloseHandle(token);
+
+  // 15s wait budget, sliced for watchdog heartbeats (spec 15 pattern).
+  const ULONGLONG deadline = GetTickCount64() + 15000;
+  bool exited = false;
+  DWORD exit_code = 1;
+  for (;;) {
+    const DWORD w = WaitForSingleObject(child, 1000);
+    if (w == WAIT_OBJECT_0) {
+      exited = true;
+      GetExitCodeProcess(child, &exit_code);
+      break;
+    }
+    if (w != WAIT_TIMEOUT) break;
+    if (g_wd != nullptr) g_wd->Heartbeat();
+    if (GetTickCount64() >= deadline) break;
+  }
+  if (!exited) {
+    TerminateProcess(child, 1);
+    // reap the deliberate kill
+    WaitForSingleObject(child, 3000);
+    CloseHandle(child);
+    DeleteFileW(path);
+    XNC_LOG_ERROR("snapshot: child pid=%lu timed out", pid);
+    return fail("SNAPSHOT_TIMEOUT");
+  }
+  CloseHandle(child);
+  if (exit_code != 0) {
+    DeleteFileW(path);
+    XNC_LOG_ERROR("snapshot: child pid=%lu exit=%lu", pid, exit_code);
+    return fail("SNAPSHOT_FAILED");
+  }
+
+  // Read the JPEG (cap: 8 MiB payload budget inside the 9 MiB frame cap).
+  HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                         OPEN_EXISTING, 0, nullptr);
+  if (f == INVALID_HANDLE_VALUE) {
+    XNC_LOG_ERROR("snapshot: open temp failed err=%lu", GetLastError());
+    DeleteFileW(path);
+    return fail("SNAPSHOT_FAILED");
+  }
+  LARGE_INTEGER sz{};
+  bool too_large = false;
+  if (GetFileSizeEx(f, &sz) && sz.QuadPart > 0 &&
+      sz.QuadPart <= (LONGLONG)8 * 1024 * 1024) {
+    r.jpeg.resize(static_cast<size_t>(sz.QuadPart));
+    DWORD got = 0;
+    if (ReadFile(f, r.jpeg.data(), static_cast<DWORD>(r.jpeg.size()), &got,
+                 nullptr) &&
+        got == r.jpeg.size()) {
+      r.ok = true;
+    }
+  } else {
+    too_large = true;
+  }
+  CloseHandle(f);
+  DeleteFileW(path);
+  if (!r.ok) {
+    r.jpeg.clear();
+    return fail(too_large ? "SNAPSHOT_TOO_LARGE" : "SNAPSHOT_FAILED");
+  }
+  XNC_LOG_INFO("snapshot ok session=%u max_w=%u bytes=%zu", session, max_w,
+               r.jpeg.size());
+  return r;
+}
+
+// 0x0111: decode + session validate + the (injectable) one-shot spawn.
+Frame HandleSnapshot(const Frame& req, Watchdog* wd) {
+  SnapshotReq sr;
+  if (!DecodeSnapshotPayload(req.payload.data(), req.payload.size(), &sr) ||
+      sr.max_w > kSnapshotMaxWCap)
+    return ErrorFrame(kMsgSnapshot, req.request_id, "BAD_PAYLOAD");
+  const uint32_t wts = sr.wts == 0xFFFFFFFFu ? CoreWts().console_session()
+                                             : sr.wts;
+  if (!SessionTargetAllowed(wts, CoreWts().console_session()))
+    return ErrorFrame(kMsgSnapshot, req.request_id, "SESSION_MISMATCH");
+  wd->Heartbeat();
+  const SnapshotSpawnResult r = CurrentSnapshotSpawnFn()(wts, sr.max_w);
+  if (!r.ok) {
+    XNC_LOG_ERROR("snapshot failed code=%s", r.err);
+    return ErrorFrame(kMsgSnapshot, req.request_id, r.err);
+  }
+  return EncodeSnapshotResp(req, r.jpeg.data(), r.jpeg.size());
 }
 
 // Wait until the child's rt pipe has a listenable instance. FILE_NOT_FOUND
@@ -1113,6 +1258,15 @@ void ServeFrames(TimedIo& io, Watchdog* wd, uint32_t client_pid) {
         if (!WriteFrameTimed(io, resp)) return;
         break;
       }
+      case kMsgSnapshot: {
+        // M2-Slice3 Task 3: one-shot --jpeg-single snapshot (screen
+        // retirement lane). Blocking up to ~15s; connections are served
+        // on their own threads.
+        Frame resp = HandleSnapshot(f, wd);
+        wd->Heartbeat();
+        if (!WriteFrameTimed(io, resp)) return;
+        break;
+      }
       case kMsgCreateShell: {
         // M2-Slice2 Task 3: spawn xnc-shell.exe (user or SYSTEM token) and
         // answer its pipe descriptor; same ~2s pipe-wait-under-lock note as
@@ -1206,6 +1360,31 @@ void SetTerminateForTest(BOOL(WINAPI* fn)(HANDLE, UINT)) {
 }
 void SetShellTokenForTest(ShellTokenFn fn) { g_shell_token_fn = fn; }
 void SetShellSpawnForTest(ShellSpawnFn fn) { g_shell_spawn_fn = fn; }
+void SetSnapshotSpawnForTest(SnapshotSpawnFn fn) { g_snapshot_spawn_fn = fn; }
+
+// ---- M2-Slice3 Task 3: 0x0111 payload codecs (selftest golden) ----
+
+// [u32 wts][u32 max_w], exactly 8 bytes; trailing/garbage -> false.
+bool DecodeSnapshotPayload(const uint8_t* p, size_t n, SnapshotReq* out) {
+  if (p == nullptr || out == nullptr || n != 8) return false;
+  out->wts = static_cast<uint32_t>(p[0]) | static_cast<uint32_t>(p[1]) << 8 |
+             static_cast<uint32_t>(p[2]) << 16 |
+             static_cast<uint32_t>(p[3]) << 24;
+  out->max_w = static_cast<uint32_t>(p[4]) | static_cast<uint32_t>(p[5]) << 8 |
+               static_cast<uint32_t>(p[6]) << 16 |
+               static_cast<uint32_t>(p[7]) << 24;
+  return true;
+}
+
+// [u32 len][jpeg bytes] (little-endian length prefix).
+Frame EncodeSnapshotResp(const Frame& req, const uint8_t* jpeg, size_t len) {
+  std::vector<uint8_t> p;
+  p.reserve(4 + len);
+  for (int i = 0; i < 4; i++)
+    p.push_back(static_cast<uint8_t>((static_cast<uint32_t>(len)) >> (8 * i)));
+  if (jpeg != nullptr && len > 0) p.insert(p.end(), jpeg, jpeg + len);
+  return Frame{kFlagResponse, kMsgSnapshot, req.request_id, std::move(p)};
+}
 
 // ---- M2-Slice2 Task 3 public surface (pipe_server.h declarations) ----
 

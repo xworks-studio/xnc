@@ -51,6 +51,9 @@ const (
 	// MsgSas 是 SendSAS 请求(M2-Slice1 Task 4:capability 门控的
 	// secure attention;Task 5 = 本侧调用方)。
 	MsgSas uint16 = 0x0110
+	// MsgSnapshot 是单帧 JPEG 快照请求(M2-Slice3 Task 3:screen 退役,
+	// 快照经 core 一次性 spawn xnc-desktop --jpeg-single 回传 JPEG 字节)。
+	MsgSnapshot uint16 = 0x0111
 	// MsgCreateShell / MsgKillShell(M2-Slice2 Task 3/4:exec/shell 经
 	// xnc-core 的令牌语义进程创建)。
 	MsgCreateShell uint16 = 0x0120
@@ -97,7 +100,7 @@ type Client struct {
 	reqID   uint32
 	pending map[uint32]chan rpcResult
 	readErr error // 置位后连接判死,后续请求立即失败
-	started bool   // 读泵已启动
+	started bool  // 读泵已启动
 	closed  bool
 	wg      sync.WaitGroup
 }
@@ -251,6 +254,43 @@ func (c *Client) KillShell(pid uint32) error {
 	binary.LittleEndian.PutUint32(p, pid)
 	_, err := c.roundTrip(rpcTimeout, MsgKillShell, p)
 	return err
+}
+
+// Snapshot 请求核心单帧 JPEG 快照(0x0111,M2-Slice3 Task 3):请求
+// payload `[u32 wts][u32 max_w]`(wts 可填 WTSActiveConsole 哨兵,
+// max_w 0 = 不降采样);成功响应 `[u32 len][jpeg bytes]`。核心侧 spawn
+// 一次性 xnc-desktop --jpeg-single 并回传 JPEG 字节。拒绝走
+// RejectedError(SESSION_MISMATCH / TOKEN_FAILED / SPAWN_FAILED /
+// SNAPSHOT_TIMEOUT / SNAPSHOT_FAILED / SNAPSHOT_TOO_LARGE)。
+func (c *Client) Snapshot(wtsSession, maxWidth uint32) ([]byte, error) {
+	req := make([]byte, 8)
+	binary.LittleEndian.PutUint32(req, wtsSession)
+	binary.LittleEndian.PutUint32(req[4:], maxWidth)
+	f, err := c.roundTrip(snapshotTimeout, MsgSnapshot, req)
+	if err != nil {
+		return nil, err
+	}
+	return decodeSnapshotResp(f.Payload)
+}
+
+// snapshotTimeout 覆盖 0x0111:核心含子进程 spawn + 采帧 + WIC 编码
+// (核心侧 15s 预算),取上界 30s。
+const snapshotTimeout = 30 * time.Second
+
+// decodeSnapshotResp 解码 `[u32 len][jpeg bytes]`;长度不自洽即协议错误。
+func decodeSnapshotResp(p []byte) ([]byte, error) {
+	if len(p) < 4 {
+		return nil, fmt.Errorf("coreclient: snapshot response %d bytes, want >= 4", len(p))
+	}
+	n := binary.LittleEndian.Uint32(p)
+	if int(n) != len(p)-4 {
+		return nil, fmt.Errorf("coreclient: snapshot response length mismatch: len=%d total=%d", n, len(p))
+	}
+	jpeg := append([]byte(nil), p[4:]...)
+	if len(jpeg) == 0 {
+		return nil, errors.New("coreclient: snapshot response: empty jpeg")
+	}
+	return jpeg, nil
 }
 
 // EncodeShellCreateReq 编码 0x0120 请求(布局见 pipe_server.h;小端):
@@ -523,6 +563,8 @@ func msgName(mt uint16) string {
 		return "stop_capture"
 	case MsgSas:
 		return "sas"
+	case MsgSnapshot:
+		return "snapshot"
 	case MsgCreateShell:
 		return "create_shell"
 	case MsgKillShell:

@@ -14,3 +14,14 @@ type unavailableHost struct{}
 func (unavailableHost) CreateShell(ShellSpec) (ShellProc, error) {
 	return nil, &ShellHostError{Code: CodeCoreUnavailable}
 }
+
+// defaultSnapshotProvider 非 Windows 恒 CORE_UNAVAILABLE。
+func defaultSnapshotProvider(*slog.Logger) SnapshotProvider {
+	return unavailableSnapshot{}
+}
+
+type unavailableSnapshot struct{}
+
+func (unavailableSnapshot) Snapshot(uint32) ([]byte, error) {
+	return nil, &ShellHostError{Code: CodeCoreUnavailable}
+}

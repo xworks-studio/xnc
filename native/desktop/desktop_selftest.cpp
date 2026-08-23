@@ -32,6 +32,7 @@
 #include "frame_cache.h"
 #include "gdi_capture.h"
 #include "input_manager.h"
+#include "jpeg_wic.h"
 #include "mf_encoder.h"
 #include "nv12.h"
 #include "pipeline.h"
@@ -4184,6 +4185,81 @@ int SelftestMain() {
     }
     g_ld_dxgi = nullptr;
     g_ld_gdi = nullptr;
+  }
+  { // M2-Slice3 Task 3: --jpeg-single arg parsing + box-filter downscale
+    // + WIC encode round trip on a synthetic frame.
+    auto js = Parse({L"--jpeg-single", L"snap.jpg"});
+    CHECK("js-mode-ok", js.ok && js.opt.jpeg_single && js.opt.jpeg_path == L"snap.jpg");
+    CHECK("js-default-no-clamp", js.ok && js.opt.max_width == 0);
+    auto jsm = Parse({L"--jpeg-single", L"s.jpg", L"--max-w", L"1280"});
+    CHECK("js-maxw-ok", jsm.ok && jsm.opt.max_width == 1280);
+    CHECK("js-maxw-bad", !Parse({L"--jpeg-single", L"s.jpg", L"--max-w", L"x"}).ok);
+    CHECK("js-maxw-zero-ok", Parse({L"--jpeg-single", L"s.jpg", L"--max-w", L"0"}).ok);
+    CHECK("js-no-path", !Parse({L"--jpeg-single"}).ok);
+    CHECK("js-exclusive-with-diag", !Parse({L"--jpeg-single", L"s.jpg", L"--console-diag", L"--out", L"t"}).ok);
+    CHECK("js-maxw-needs-js", !Parse({L"--console-diag", L"--out", L"t", L"--max-w", L"10"}).ok);
+
+    // Box filter: 4x2 gradient -> 2x1 (each dst cell covers a 2x2 block).
+    const uint32_t sw = 4, sh = 2;
+    std::vector<uint8_t> src((size_t)sw * sh * 4);
+    for (uint32_t i = 0; i < sw * sh; i++) {
+      src[i * 4 + 0] = 0x10;  // B
+      src[i * 4 + 1] = 0x20;  // G
+      src[i * 4 + 2] = 0x30;  // R
+      src[i * 4 + 3] = 0xFF;  // A
+    }
+    src[0 * 4 + 0] = 0x00; src[(sw + 1) * 4 + 0] = 0x40;  // mixed B corners
+    std::vector<uint8_t> dst;
+    uint32_t ow = 0, oh = 0;
+    CHECK("ds-call", xnc::DownscaleBgra(src.data(), sw, sh, 2, &dst, &ow, &oh));
+    CHECK("ds-dims", ow == 2 && oh == 1);
+    CHECK("ds-size", dst.size() == (size_t)2 * 1 * 4);
+    // nh = ceil(2*2/4) = 1: one dst row covers both src rows; the first dst
+    // pixel covers the 2x2 block x=0..2,y=0..2: B = (0+0x10+0x10+0x40)/4 = 0x18.
+    CHECK("ds-box-avg", dst[0] == 0x18 && dst[1] == 0x20 && dst[2] == 0x30 && dst[3] == 0xFF);
+    // Identity pass-through when w <= max_w (and when max_w == 0).
+    std::vector<uint8_t> id;
+    CHECK("ds-identity", xnc::DownscaleBgra(src.data(), sw, sh, sw, &id, &ow, &oh) &&
+          ow == sw && oh == sh && id == src);
+    CHECK("ds-identity-zero-clamp", xnc::DownscaleBgra(src.data(), sw, sh, 0, &id, &ow, &oh) && id == src);
+
+    // WIC round trip: synthetic 64x48 BGRA -> JPEG -> JFIF magic + SOF dims.
+    const uint32_t jw = 64, jh = 48;
+    std::vector<uint8_t> frame((size_t)jw * jh * 4);
+    for (uint32_t y = 0; y < jh; y++)
+      for (uint32_t x = 0; x < jw; x++) {
+        uint8_t* p = &frame[((size_t)y * jw + x) * 4];
+        p[0] = (uint8_t)(x * 4); p[1] = (uint8_t)(y * 5);
+        p[2] = (uint8_t)((x + y) * 2); p[3] = 0xFF;
+      }
+    std::vector<uint8_t> jpeg;
+    std::string jerr;
+    CHECK("wic-encode-ok", xnc::WicEncodeJpeg(frame.data(), jw, jh, 0.85f, &jpeg, &jerr));
+    if (jpeg.size() >= 4) {
+      CHECK("wic-jfif-magic", jpeg[0] == 0xFF && jpeg[1] == 0xD8 && jpeg[2] == 0xFF);
+    } else {
+      CHECK("wic-jfif-magic", false);
+    }
+    // Parseable size: scan markers for SOF0/SOF2 and read the big-endian
+    // height/width fields (offsets +5..+8 inside the SOF segment).
+    uint32_t pw = 0, ph = 0;
+    size_t i = 2;
+    while (i + 8 < jpeg.size()) {
+      if (jpeg[i] != 0xFF) { i++; continue; }
+      const uint8_t m = jpeg[i + 1];
+      if (m == 0xC0 || m == 0xC2) {
+        ph = ((uint32_t)jpeg[i + 5] << 8) | jpeg[i + 6];
+        pw = ((uint32_t)jpeg[i + 7] << 8) | jpeg[i + 8];
+        break;
+      }
+      if (m == 0xD8 || (m >= 0xD0 && m <= 0xD9)) { i += 2; continue; }
+      const size_t seg = ((size_t)jpeg[i + 2] << 8) | jpeg[i + 3];
+      if (seg < 2) break;
+      i += 2 + seg;
+    }
+    CHECK("wic-sof-found", pw != 0 && ph != 0);
+    CHECK("wic-dims", pw == jw && ph == jh);
+    CHECK("wic-nonempty", jpeg.size() > 500);
   }
   if (fails == 0) std::printf("selftest ok\n");
   return fails == 0 ? 0 : 1;

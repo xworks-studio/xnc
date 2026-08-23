@@ -17,7 +17,11 @@ const KindFile = "file"
 // KindTunnel 端口隧道会话（RDP 等，Phase 4）。
 const KindTunnel = "tunnel"
 
-// KindScreen 桌面流会话（DXGI 捕获 + H.264，Phase 6）。
+// KindScreen 单帧快照会话（M2-Slice3 Task 3 换轨）：流式 H.264 管线已
+// 退役（流式观看走 KindDesktop 实时桌面会话）；kind 名与 REST/CLI 语法
+// 保留，snapshot=true 时经 xnc-core 0x0111 一次性 spawn
+// xnc-desktop --jpeg-single 回传 JPEG（0x03 子帧），流式请求由 agent 以
+// 稳定码 SCREEN_STREAM_RETIRED 拒绝。
 const KindScreen = "screen"
 
 // KindDesktop 实时桌面会话（M1-Slice2）：agent 侧 xnc-desktop rt pipe →
@@ -160,13 +164,14 @@ type TunnelParams struct {
 	Target string `json:"target"` // "rdp"
 }
 
-// ScreenParams SESSION_OPEN params：fps 默认 15（上限 30），quality 默认 60，
-// maxWidth 默认 1920；0 值由 server 端补默认后再下发。
+// ScreenParams SESSION_OPEN params（M2-Slice3：快照专用；fps/quality 字段
+// 仅为兼容保留，流式已退役）。maxWidth 默认 1920（核心侧 box-filter 降
+// 采样上限）；0 值由 server 端补默认后再下发。
 type ScreenParams struct {
-	Fps      int  `json:"fps,omitempty"`      // 默认 15，上限 30
-	Quality  int  `json:"quality,omitempty"`  // JPEG/H.264 质量，默认 60
-	MaxWidth int  `json:"maxWidth,omitempty"` // 默认 1920
-	Snapshot bool `json:"snapshot,omitempty"` // 单帧 JPEG 模式（不走 H.264 流）
+	Fps      int  `json:"fps,omitempty"`      // 兼容保留（流式退役，忽略）
+	Quality  int  `json:"quality,omitempty"`  // 兼容保留（JPEG 质量由桌面侧固定 0.85）
+	MaxWidth int  `json:"maxWidth,omitempty"` // 默认 1920（降采样上限）
+	Snapshot bool `json:"snapshot,omitempty"` // 单帧 JPEG 模式（唯一支持的模式）
 }
 
 // ScreenBegin agent → client：流开始（SCREEN_BEGIN text 帧）。
@@ -174,7 +179,7 @@ type ScreenBegin struct {
 	Width  int    `json:"width"`
 	Height int    `json:"height"`
 	State  string `json:"state"` // capturing / locked / no_session
-	Codec  string `json:"codec"` // "h264"
+	Codec  string `json:"codec"` // 快照 "jpeg"（"h264" 为退役流式词汇）
 }
 
 // ScreenState agent → client：捕获状态变化（SCREEN_STATE text 帧）。

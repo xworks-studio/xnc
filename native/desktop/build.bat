@@ -13,6 +13,8 @@ rem d3d11.lib (D3D11CreateDevice), mf_encoder.cpp needs mfplat.lib
 rem (MFCreate*) + mfuuid.lib (MF MediaType GUIDs) + ole32.lib
 rem (CoCreateInstance/CoInitializeEx); rt_pipe_server.cpp needs bcrypt.lib
 rem (handshake HMAC/RNG) + advapi32.lib (SDDL/user SID DACL);
+rem rem jpeg_wic.cpp (M2-Slice3 Task 3: --jpeg-single snapshot) needs
+rem windowscodecs.lib (WIC imaging factory/JPEG encoder); ole32 already linked;
 rem input_manager.cpp/cursor_manager.cpp need user32.lib (SendInput/
 rem GetKeyState/GetSystemMetrics/GetCursorInfo/OpenInputDesktop/
 rem SetThreadDesktop/CloseDesktop); desktop_watch.cpp (M2-Slice1 T1) uses
@@ -34,7 +36,7 @@ if errorlevel 1 (
 cd /d "%~dp0"
 
 if not exist ..\..\bin mkdir ..\..\bin
-cl /nologo /utf-8 /W3 /MT /std:c++17 /EHsc xnc-desktop.cpp desktop_watch.cpp dxgi_capture.cpp gdi_capture.cpp backend_ladder.cpp mf_encoder.cpp nv12.cpp pipeline.cpp rt_pipe_server.cpp input_manager.cpp cursor_manager.cpp desktop_selftest.cpp ..\common\frame.cpp ..\common\handshake.cpp /Fe:..\..\bin\xnc-desktop.exe /Fo:..\..\bin\ /link d3d11.lib mfplat.lib mfuuid.lib ole32.lib bcrypt.lib advapi32.lib user32.lib gdi32.lib
+cl /nologo /utf-8 /W3 /MT /std:c++17 /EHsc xnc-desktop.cpp desktop_watch.cpp dxgi_capture.cpp gdi_capture.cpp backend_ladder.cpp mf_encoder.cpp nv12.cpp pipeline.cpp rt_pipe_server.cpp input_manager.cpp cursor_manager.cpp jpeg_wic.cpp desktop_selftest.cpp ..\common\frame.cpp ..\common\handshake.cpp /Fe:..\..\bin\xnc-desktop.exe /Fo:..\..\bin\ /link d3d11.lib mfplat.lib mfuuid.lib ole32.lib bcrypt.lib advapi32.lib user32.lib gdi32.lib windowscodecs.lib oleaut32.lib
 if errorlevel 1 exit /b 1
 
 echo [desktop] built ..\..\bin\xnc-desktop.exe

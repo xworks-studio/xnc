@@ -50,6 +50,40 @@ constexpr uint16_t kMsgStartCapture = 0x0100, kMsgStopCapture = 0x0101;
 constexpr uint16_t kMsgSas = 0x0110;
 inline constexpr size_t kSasReasonLen = 24;
 
+// ---- M2-Slice3 Task 3: MSG_SNAPSHOT 0x0111 (screen-retirement snapshot
+// lane: `xnc screen --snap` now rides xnc-desktop --jpeg-single instead of
+// the retired xnc-screen-helper stream) ----
+//   request  (LE) [u32 wts][u32 max_w]; wts may be the 0xFFFFFFFF "live
+//             active console" sentinel (same agent<->core contract as
+//             0x0120); max_w 0 = no downscale clamp.
+//     -> ok response [u32 len][jpeg bytes]
+//     -> FlagError stable code (BAD_PAYLOAD / SESSION_MISMATCH /
+//        TOKEN_FAILED / SPAWN_FAILED / SNAPSHOT_TIMEOUT / SNAPSHOT_FAILED /
+//        SNAPSHOT_TOO_LARGE)
+// Core spawns ONE-SHOT "xnc-desktop.exe --jpeg-single <tmp.jpg> --max-w <w>"
+// into the target session (SessionSystemToken + SpawnInSession), waits its
+// exit (15s budget), reads the file (<= 8 MiB, the 9 MiB frame cap minus
+// overhead), deletes the temp, answers the bytes. Program-constructed argv
+// only; the temp path lives under core's %TEMP% (SYSTEM-writable).
+constexpr uint16_t kMsgSnapshot = 0x0111;
+constexpr uint32_t kSnapshotMaxWCap = 7680;  // 8K width sanity cap
+struct SnapshotReq {
+  uint32_t wts = 0;
+  uint32_t max_w = 0;
+};
+bool DecodeSnapshotPayload(const uint8_t* p, size_t n, SnapshotReq* out);
+Frame EncodeSnapshotResp(const Frame& req, const uint8_t* jpeg, size_t len);
+// Injectable spawn+collect seam (selftest only; nullptr = production
+// RealSnapshotSpawn). ok=false + err = stable ASCII code; jpeg filled on ok.
+struct SnapshotSpawnResult {
+  bool ok = false;
+  std::vector<uint8_t> jpeg;
+  char err[24] = {0};
+};
+using SnapshotSpawnFn = SnapshotSpawnResult (*)(uint32_t session,
+                                                uint32_t max_w);
+void SetSnapshotSpawnForTest(SnapshotSpawnFn fn);
+
 // Pure ok-response codec for kMsgStartCapture (little-endian layout above;
 // the pipe name is program-constructed ASCII so the utf8 pass is a plain
 // copy). Exposed so the selftest can assert the success layout byte for

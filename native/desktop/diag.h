@@ -48,7 +48,14 @@ struct DiagOptions {
   std::wstring pipe_name;     // --pipe (default kDefaultRtPipe in rt mode)
   std::vector<uint8_t> secret;  // --secret <hex> OR --secret-stdin (filled by
                                 // the caller from stdin for the latter)
-  bool secret_stdin = false;  // --secret-stdin (read the secret from stdin)
+  bool secret_stdin = false;    // --secret-stdin (read the secret from stdin)
+  bool jpeg_single = false;     // --jpeg-single <out.jpg> (M2-Slice3 Task 3):
+                                // one-shot snapshot mode - acquire ONE frame,
+                                // encode JPEG (WIC, quality 0.85), write file,
+                                // exit 0; errors exit 1
+  std::wstring jpeg_path;       // --jpeg-single output path (required)
+  uint32_t max_width = 0;       // --max-w <n>: box-filter downscale clamp for
+                                // --jpeg-single (0 = no clamp)
 };
 
 // Parses argv[1..] (argv[0] is skipped). Returns true on success; on failure
