@@ -57,6 +57,84 @@ inline constexpr size_t kSasReasonLen = 24;
 Frame EncodeStartCaptureOk(const Frame& req, DWORD pid, const std::wstring& pipe,
                            const uint8_t* secret, uint32_t gen);
 
+// ---- M2-Slice2 Task 3: CreateShell / KillShell + worker supervision ----
+//   kMsgCreateShell request (LE) [u32 wts][u8 token_kind 0=user,1=system]
+//     [u8 profile enum 0=POWERSHELL,1=PWSH,2=CMD,3=BASH][u8 mode
+//     0=interactive,1=oneshot][u16 cols][u16 rows][u16 cwdLen][cwd utf8]
+//     [u16 envLen][env "K=V\n"-joined utf8][u16 cmdLen][cmd utf8]
+//     [u32 timeoutSec]
+//     -> ok response [u32 pid][u16 nameLen][pipe name utf8][32B secret]
+//     -> FlagError stable code (BAD_PAYLOAD / SESSION_MISMATCH /
+//        NO_ACTIVE_SESSION / TOKEN_FAILED / RNG_FAILED / SPAWN_FAILED /
+//        PIPE_TIMEOUT / INTERNAL)
+//   kMsgKillShell request [u32 pid] -> empty FlagResponse (idempotent;
+//     scoped by the STORED child handle - never by image name).
+constexpr uint16_t kMsgCreateShell = 0x0120, kMsgKillShell = 0x0121;
+
+// Profile whitelist (spec 8.2): core validates the ENUM range only and
+// passes the canonical NAME to xnc-shell.exe, which resolves the exe
+// itself - core never accepts or builds shell paths.
+bool ShellProfileAllowed(uint8_t profile);
+const char* ShellProfileName(uint8_t profile);  // "POWERSHELL"|...|"?"
+const wchar_t* ShellProfileWName(uint8_t profile);  // wide argv form
+// Token kind validation: 0 = user, 1 = system.
+bool ShellTokenKindAllowed(uint8_t kind);
+
+// Pure decoder for the 0x0120 request payload (bounds-checked). env stays
+// as the raw "K=V\n"-joined blob; the splitter below turns it into the
+// individual --env argv entries (empty segments skipped).
+struct ShellCreateReq {
+  uint32_t wts = 0;
+  uint8_t token_kind = 0;
+  uint8_t profile = 0;
+  uint8_t mode = 0;  // 0 interactive, 1 oneshot
+  uint16_t cols = 0, rows = 0;
+  std::string cwd, env, cmd;
+  uint32_t timeout_sec = 0;
+};
+bool DecodeShellCreatePayload(const uint8_t* p, size_t n, ShellCreateReq* out);
+std::vector<std::string> SplitShellEnv(const std::string& envJoined);
+
+// Pure ok-response codec for 0x0120 (selftest golden bytes). Pipe name is
+// program-constructed ASCII.
+Frame EncodeCreateShellOk(const Frame& req, DWORD pid, const std::wstring& pipe,
+                          const uint8_t* secret);
+
+// ---- Worker supervision (spec 15.2), pure units (injected clock in the
+// selftest): desktop crash backoff 1s,2s,4s... capped 60s; crash-loop =
+// >= 5 exits inside a rolling 60s window locks the desktop to the degraded
+// args (--backend gdi --encoder software). Shells are NOT restarted
+// (session-scoped; their exit is only logged). ----
+
+// Backoff for the crash_index-th consecutive desktop crash (1-based
+// crash_index; 0 treated as 1): 1000 << (crash_index-1), capped 60000.
+uint32_t WorkerBackoffMs(uint32_t crash_index);
+
+// Crash-loop predicate: how many of the exit timestamps (ms, ascending or
+// unsorted - sorted internally by the caller contract here: pass as recorded)
+// fall inside (now-60000, now]; >= kCrashLoopExits means degraded.
+constexpr size_t kCrashLoopWindowMs = 60000;
+constexpr size_t kCrashLoopExits = 5;
+bool CrashLoopReached(const std::vector<uint64_t>& exit_ms, uint64_t now_ms);
+
+// Injectable seams (selftest only; nullptr restores production default):
+// user-token mint (default WTSQueryUserToken - needs SYSTEM) and the whole
+// shell-spawn step (default = RealShellSpawn). err = stable ASCII code.
+struct ShellSpawnResult {
+  bool ok = false;
+  DWORD pid = 0;
+  HANDLE child = nullptr;  // owned; the watcher thread closes it
+  char err[24] = {0};
+};
+using ShellTokenFn = bool (*)(uint32_t session, uint8_t token_kind, HANDLE* out);
+using ShellSpawnFn = ShellSpawnResult (*)(const ShellCreateReq& req,
+                                          uint32_t session,
+                                          const wchar_t* pipe_name,
+                                          const uint8_t* secret, HANDLE token,
+                                          Watchdog* wd);
+void SetShellTokenForTest(ShellTokenFn fn);
+void SetShellSpawnForTest(ShellSpawnFn fn);
+
 // Serve <pipe_name> with the pipe secret (secret_len bytes). Blocks for the
 // process lifetime; returns the process exit code (0 on Ctrl+C, 1 on fatal).
 int RunPipeServer(const wchar_t* pipe_name, const uint8_t* secret, size_t secret_len);
@@ -127,7 +205,8 @@ struct CaptureSpawnResult {
 using CaptureSpawnFn = CaptureSpawnResult (*)(uint32_t session,
                                               const wchar_t* pipe_name,
                                               const uint8_t* secret,
-                                              Watchdog* wd);
+                                              Watchdog* wd,
+                                              bool degraded);
 void SetCaptureSpawnForTest(CaptureSpawnFn fn);
 
 // Terminate seam (default TerminateProcess); the fake records + signals.

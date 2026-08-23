@@ -19,10 +19,12 @@
 
 namespace xnc {
 
-// Whitelist check (pure): the only accepted forms are "xnc-desktop.exe"
-// and ".\xnc-desktop.exe" (case-insensitive, like the filesystem).
-// Absolute paths, UNC, "..", subdirectories, suffix tricks, embedded or
-// trailing whitespace are all rejected by the exact-name comparison.
+// Whitelist check (pure): the only accepted forms are "xnc-desktop.exe" /
+// "xnc-shell.exe" (each optionally with a ".\" prefix, case-insensitive,
+// like the filesystem). Absolute paths, UNC, "..", subdirectories, suffix
+// tricks, embedded or trailing whitespace are all rejected by the
+// exact-name comparison. M2-Slice2 Task 3 adds xnc-shell.exe for the
+// CreateShell RPC's worker spawn.
 bool SpawnExeArgAllowed(const wchar_t* exe);
 
 // dir + "\" + name, collapsing a single trailing slash on dir (pure; used

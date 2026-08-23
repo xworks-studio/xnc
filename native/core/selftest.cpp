@@ -46,22 +46,24 @@ static std::atomic<int> s_spawn_count{0};
 static std::vector<HANDLE> s_terminated_events;  // terminate order (server thread)
 static std::atomic<int> s_sas_calls{0};
 static std::atomic<int> s_sas_as_user{-1};
+static std::atomic<bool> s_degraded_last{false};  // last fake capture spawn's degraded flag
 
 // Fake child = manual-reset NON-signaled event: WaitForSingleObject(h,0)
 // is WAIT_TIMEOUT (models "running"), and the detached WatchCaptureChild's
 // INFINITE wait unblocks exactly when the fake terminate signals it.
 static xnc::CaptureSpawnResult FakeCaptureSpawn(uint32_t, const wchar_t*,
                                                 const uint8_t*,
-                                                xnc::Watchdog*) {
+                                                xnc::Watchdog*, bool degraded) {
   HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   s_spawn_events.push_back(ev);
   s_spawn_count.fetch_add(1);
-  xnc::CaptureSpawnResult r;
+  s_degraded_last.store(degraded);  xnc::CaptureSpawnResult r;
   r.ok = true;
   r.pid = 0x3000 + static_cast<DWORD>(s_spawn_count.load());
   r.child = ev;
   return r;
 }
+static std::atomic<bool> s_desgraded_last{false};
 static BOOL WINAPI FakeTerminateProcess(HANDLE h, UINT) {
   s_terminated_events.push_back(h);
   SetEvent(h);  // "the process exited" -> the watcher reaps + closes
@@ -72,6 +74,69 @@ static void WINAPI FakeSendSas(BOOL as_user) {
   s_sas_calls.fetch_add(1);
 }
 static xnc::SasSendFn NullResolveSendSas() { return nullptr; }
+
+// ---- M2-Slice2 Task 3 fakes: token mint + shell spawn (loopback block) ----
+static std::atomic<int> s_token_calls{0};
+static bool s_token_succeeds = true;  // false -> NO_ACTIVE_SESSION path
+static uint8_t s_token_kind_last = 0xFF;
+static bool FakeShellToken(uint32_t, uint8_t kind, HANDLE* out) {
+  s_token_calls.fetch_add(1);
+  s_token_kind_last = kind;
+  if (!s_token_succeeds) {
+    *out = nullptr;
+    return false;
+  }
+  *out = CreateEventW(nullptr, TRUE, FALSE, nullptr);  // closed by the handler
+  return *out != nullptr;
+}
+static std::atomic<int> s_shell_spawns{0};
+static xnc::ShellCreateReq s_shell_req_last{};
+static std::wstring s_shell_pipe_last;
+static xnc::ShellSpawnResult FakeShellSpawn(const xnc::ShellCreateReq& req,
+                                            uint32_t, const wchar_t* pipe,
+                                            const uint8_t*, HANDLE,
+                                            xnc::Watchdog*) {
+  s_shell_spawns.fetch_add(1);
+  s_shell_req_last = req;
+  s_shell_pipe_last = pipe;
+  xnc::ShellSpawnResult r;
+  r.ok = true;
+  r.pid = 0x4000 + static_cast<DWORD>(s_shell_spawns.load());
+  r.child = CreateEventW(nullptr, TRUE, FALSE, nullptr);  // fake "process"
+  return r;
+}
+// 0x0120 request payload builder (client-side encoder mirror, LE).
+static std::vector<uint8_t> BuildShellPayload(uint32_t wts, uint8_t kind,
+                                              uint8_t profile, uint8_t mode,
+                                              uint16_t cols, uint16_t rows,
+                                              const char* cwd,
+                                              const char* env, const char* cmd,
+                                              uint32_t timeout) {
+  std::vector<uint8_t> p;
+  auto put16 = [&p](uint16_t v) {
+    p.push_back(static_cast<uint8_t>(v));
+    p.push_back(static_cast<uint8_t>(v >> 8));
+  };
+  auto put32 = [&p](uint32_t v) {
+    for (int i = 0; i < 4; i++) p.push_back(static_cast<uint8_t>(v >> (8 * i)));
+  };
+  auto blob = [&](const char* s) {
+    size_t n = std::strlen(s);
+    put16(static_cast<uint16_t>(n));
+    p.insert(p.end(), s, s + n);
+  };
+  put32(wts);
+  p.push_back(kind);
+  p.push_back(profile);
+  p.push_back(mode);
+  put16(cols);
+  put16(rows);
+  blob(cwd);
+  blob(env);
+  blob(cmd);
+  put32(timeout);
+  return p;
+}
 
 // Loopback server for block 2 (same shape as block 1's inline Loop: real
 // ServeConnection on a permissive TEST-ONLY DACL pipe).
@@ -640,6 +705,139 @@ int SelftestMain() {
               s_terminated_events.size() == 3 &&
               s_terminated_events[2] == s_spawn_events[2]);
 
+        // ---- 0x0120/0x0121 CreateShell / KillShell (fake token + spawn) ----
+        s_script_session.store(1);  // live console = 1 (stubbed wts getter)
+        SetShellTokenForTest(&FakeShellToken);
+        SetShellSpawnForTest(&FakeShellSpawn);
+
+        // user kind, no live user token -> NO_ACTIVE_SESSION (spec 8.4:
+        // never implicit elevation). No spawn may happen.
+        s_token_succeeds = false;
+        s_token_calls.store(0);
+        CHECK("cs-no-session-send",
+              WriteFrame(c, Frame{0, kMsgCreateShell, 50,
+                                  BuildShellPayload(1, 0, 2, 1, 120, 30, "", "",
+                                                    "whoami", 60)}));
+        Frame c1;
+        CHECK("cs-no-session",
+              ReadFrame(c, c1) == DecodeResult::Ok &&
+              c1.message_type == kMsgCreateShell &&
+              (c1.flags & kFlagError) != 0 && c1.request_id == 50 &&
+              c1.payload.size() == 17 &&
+              std::memcmp(c1.payload.data(), "NO_ACTIVE_SESSION", 17) == 0);
+        CHECK("cs-no-session-no-spawn",
+              s_token_calls.load() == 1 && s_shell_spawns.load() == 0);
+
+        s_token_succeeds = true;
+        // profile enum out of whitelist -> BAD_PAYLOAD.
+        CHECK("cs-bad-profile-send",
+              WriteFrame(c, Frame{0, kMsgCreateShell, 51,
+                                  BuildShellPayload(1, 0, 9, 1, 80, 25, "", "",
+                                                    "whoami", 30)}));
+        Frame c2;
+        CHECK("cs-bad-profile",
+              ReadFrame(c, c2) == DecodeResult::Ok &&
+              (c2.flags & kFlagError) != 0 && c2.request_id == 51 &&
+              c2.payload.size() == 11 &&
+              std::memcmp(c2.payload.data(), "BAD_PAYLOAD", 11) == 0);
+        // oneshot without a command -> BAD_PAYLOAD.
+        CHECK("cs-oneshot-no-cmd",
+              WriteFrame(c, Frame{0, kMsgCreateShell, 52,
+                                  BuildShellPayload(1, 0, 0, 1, 80, 25, "", "",
+                                                    "", 30)}) &&
+              (ReadFrame(c, c2) == DecodeResult::Ok &&
+               (c2.flags & kFlagError) != 0 && c2.request_id == 52 &&
+               std::memcmp(c2.payload.data(), "BAD_PAYLOAD", 11) == 0));
+        // wts not the live console session -> SESSION_MISMATCH.
+        CHECK("cs-session-mismatch",
+              WriteFrame(c, Frame{0, kMsgCreateShell, 53,
+                                  BuildShellPayload(5, 0, 2, 1, 80, 25, "", "",
+                                                    "whoami", 30)}) &&
+              (ReadFrame(c, c2) == DecodeResult::Ok &&
+               (c2.flags & kFlagError) != 0 && c2.request_id == 53 &&
+               c2.payload.size() == 16 &&
+               std::memcmp(c2.payload.data(), "SESSION_MISMATCH", 16) == 0));
+        // truncated payload -> BAD_PAYLOAD.
+        {
+          auto trunc = BuildShellPayload(1, 0, 2, 1, 80, 25, "x", "", "y", 1);
+          trunc.resize(trunc.size() - 1);
+          CHECK("cs-truncated",
+                WriteFrame(c, Frame{0, kMsgCreateShell, 54, std::move(trunc)}) &&
+                (ReadFrame(c, c2) == DecodeResult::Ok &&
+                 (c2.flags & kFlagError) != 0 && c2.request_id == 54 &&
+                 std::memcmp(c2.payload.data(), "BAD_PAYLOAD", 11) == 0));
+        }
+        // success: user token, CMD oneshot -> ok descriptor; request fields
+        // reach the spawn seam verbatim.
+        const int spawns0 = s_shell_spawns.load();
+        CHECK("cs-ok-send",
+              WriteFrame(c, Frame{0, kMsgCreateShell, 55,
+                                  BuildShellPayload(1, 0, 2, 1, 120, 30,
+                                                    "C:\\tmp x", "A=1\nB=2\n",
+                                                    "whoami", 60)}));
+        Frame c3;
+        CHECK("cs-ok",
+              ReadFrame(c, c3) == DecodeResult::Ok &&
+              c3.message_type == kMsgCreateShell &&
+              (c3.flags & kFlagError) == 0 && c3.request_id == 55 &&
+              s_shell_spawns.load() == spawns0 + 1);
+        {
+          const uint32_t pid = get32(c3.payload, 0);
+          const uint16_t nlen = static_cast<uint16_t>(
+              c3.payload[4] | static_cast<unsigned>(c3.payload[5]) << 8);
+          CHECK("cs-ok-layout",
+                c3.payload.size() == 6 + nlen + 32 && nlen > 0 &&
+                pid == 0x4000 + static_cast<uint32_t>(spawns0 + 1));
+          std::wstring pipe(c3.payload.begin() + 6,
+                            c3.payload.begin() + 6 + nlen);
+          CHECK("cs-ok-pipe-prefix",
+                pipe.rfind(L"\\\\.\\pipe\\xnc-shell-", 0) == 0);
+          CHECK("cs-ok-req-fields",
+                s_shell_req_last.wts == 1 && s_shell_req_last.token_kind == 0 &&
+                s_shell_req_last.profile == 2 && s_shell_req_last.mode == 1 &&
+                s_shell_req_last.cols == 120 && s_shell_req_last.rows == 30 &&
+                s_shell_req_last.cwd == "C:\\tmp x" &&
+                s_shell_req_last.env == "A=1\nB=2\n" &&
+                s_shell_req_last.cmd == "whoami" &&
+                s_shell_req_last.timeout_sec == 60 &&
+                s_shell_pipe_last == pipe);
+          // kill the shell we created -> empty ok (scoped by stored handle).
+          std::vector<uint8_t> kp(4);
+          for (int i = 0; i < 4; i++)
+            kp[i] = static_cast<uint8_t>(pid >> (8 * i));
+          CHECK("cs-kill-send",
+                WriteFrame(c, Frame{0, kMsgKillShell, 56, kp}));
+          Frame k1;
+          CHECK("cs-kill-ok",
+                ReadFrame(c, k1) == DecodeResult::Ok &&
+                k1.message_type == kMsgKillShell &&
+                (k1.flags & kFlagResponse) != 0 &&
+                (k1.flags & kFlagError) == 0 && k1.request_id == 56 &&
+                k1.payload.empty());
+          // unknown pid: idempotent ok.
+          std::vector<uint8_t> kp2 = {0x99, 0x99, 0, 0};
+          CHECK("cs-kill-unknown-ok",
+                WriteFrame(c, Frame{0, kMsgKillShell, 57, kp2}) &&
+                (ReadFrame(c, k1) == DecodeResult::Ok &&
+                 (k1.flags & kFlagError) == 0 && k1.request_id == 57));
+        }
+        // success: system token -> same ok shape, kind=1 reached the seam.
+        CHECK("cs-system-ok",
+              WriteFrame(c, Frame{0, kMsgCreateShell, 58,
+                                  BuildShellPayload(1, 1, 0, 0, 100, 30, "", "",
+                                                    "", 0)}) &&
+              (ReadFrame(c, c3) == DecodeResult::Ok &&
+               (c3.flags & kFlagError) == 0 && c3.request_id == 58 &&
+               s_token_kind_last == 1 && get32(c3.payload, 0) != 0));
+        // bad KillShell payload -> BAD_PAYLOAD.
+        CHECK("cs-kill-badpayload",
+              WriteFrame(c, Frame{0, kMsgKillShell, 59, {1, 2, 3}}) &&
+              (ReadFrame(c, c3) == DecodeResult::Ok &&
+               (c3.flags & kFlagError) != 0 && c3.request_id == 59 &&
+               std::memcmp(c3.payload.data(), "BAD_PAYLOAD", 11) == 0));
+        SetShellTokenForTest(nullptr);
+        SetShellSpawnForTest(nullptr);
+
         // restore all seams (production defaults)
         SetCaptureSpawnForTest(nullptr);
         SetTerminateForTest(nullptr);
@@ -657,6 +855,113 @@ int SelftestMain() {
         CHECK("loop2-server-handshake", srv.handshake_ok.load());
         CHECK("loop2-server-saw-pid", srv.client_pid == GetCurrentProcessId());
       }
+    }
+    { // M2-Slice2 Task 3 pure units: profile/token-kind whitelist, 0x0120
+      // payload decode round-trip + golden header bytes, env splitter,
+      // EncodeCreateShellOk golden bytes, backoff table, crash-loop window.
+      CHECK("shell-profile-enum",
+            ShellProfileAllowed(0) && ShellProfileAllowed(1) &&
+            ShellProfileAllowed(2) && ShellProfileAllowed(3));
+      CHECK("shell-profile-reject",
+            !ShellProfileAllowed(4) && !ShellProfileAllowed(255));
+      CHECK("shell-profile-names",
+            std::strcmp(ShellProfileName(0), "POWERSHELL") == 0 &&
+            std::strcmp(ShellProfileName(1), "PWSH") == 0 &&
+            std::strcmp(ShellProfileName(2), "CMD") == 0 &&
+            std::strcmp(ShellProfileName(3), "BASH") == 0 &&
+            std::strcmp(ShellProfileName(4), "?") == 0);
+      CHECK("shell-token-kind", ShellTokenKindAllowed(0) &&
+                                ShellTokenKindAllowed(1) &&
+                                !ShellTokenKindAllowed(2));
+
+      // round-trip + golden header (wts=1 user CMD oneshot 120x30).
+      auto p = BuildShellPayload(1, 0, 2, 1, 120, 30, "C:\\tmp x",
+                                 "A=1\nB=2\n", "whoami", 60);
+      const uint8_t head[13] = {0x01, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01,
+                                0x78, 0x00, 0x1E, 0x00, 0x08, 0x00};
+      CHECK("cs-golden-head",
+            p.size() >= 13 && std::memcmp(p.data(), head, 13) == 0);
+      ShellCreateReq sr;
+      CHECK("cs-decode-rt", DecodeShellCreatePayload(p.data(), p.size(), &sr));
+      CHECK("cs-decode-fields",
+            sr.wts == 1 && sr.token_kind == 0 && sr.profile == 2 &&
+            sr.mode == 1 && sr.cols == 120 && sr.rows == 30 &&
+            sr.cwd == "C:\\tmp x" && sr.env == "A=1\nB=2\n" &&
+            sr.cmd == "whoami" && sr.timeout_sec == 60);
+      // minimal all-empty payload = 21 bytes, still decodes.
+      auto mini = BuildShellPayload(7, 1, 0, 0, 0, 0, "", "", "", 0);
+      CHECK("cs-minimal-21", mini.size() == 21 &&
+            DecodeShellCreatePayload(mini.data(), mini.size(), &sr) &&
+            sr.wts == 7 && sr.token_kind == 1 && sr.cwd.empty());
+      // trailing byte / truncation rejected.
+      auto trail = p;
+      trail.push_back(0);
+      CHECK("cs-trailing-reject",
+            !DecodeShellCreatePayload(trail.data(), trail.size(), &sr));
+      CHECK("cs-trunc-reject",
+            !DecodeShellCreatePayload(p.data(), p.size() - 1, &sr));
+      CHECK("cs-null-reject",
+            !DecodeShellCreatePayload(nullptr, p.size(), &sr) &&
+            !DecodeShellCreatePayload(p.data(), p.size(), nullptr));
+
+      // env splitter: "K=V\n"-joined -> entries, empties skipped.
+      {
+        auto v = SplitShellEnv("A=1\nB=2\n");
+        CHECK("cs-env-split-2", v.size() == 2 && v[0] == "A=1" && v[1] == "B=2");
+        v = SplitShellEnv("A=1");
+        CHECK("cs-env-split-1", v.size() == 1 && v[0] == "A=1");
+        v = SplitShellEnv("A=1\nB=2");
+        CHECK("cs-env-split-no-nl", v.size() == 2 && v[1] == "B=2");
+        v = SplitShellEnv("\n\n");
+        CHECK("cs-env-split-empty", v.empty());
+        v = SplitShellEnv("");
+        CHECK("cs-env-split-blank", v.empty());
+      }
+
+      // EncodeCreateShellOk golden bytes: [pid u32][nameLen u16][name][32B].
+      {
+        uint8_t secret[32];
+        for (int i = 0; i < 32; i++) secret[i] = (uint8_t)(i + 1);
+        Frame ok = EncodeCreateShellOk(Frame{0, kMsgCreateShell, 0xABCE, {}},
+                                       0x11223344,
+                                       L"\\\\.\\pipe\\xnc-shell-77-1", secret);
+        const char* name = "\\\\.\\pipe\\xnc-shell-77-1";  // 23 chars
+        std::vector<uint8_t> want;
+        auto put32 = [&want](uint32_t v) {
+          for (int i = 0; i < 4; i++)
+            want.push_back((uint8_t)(v >> (8 * i)));
+        };
+        put32(0x11223344);
+        want.push_back(23);
+        want.push_back(0);
+        for (const char* q = name; *q; ++q) want.push_back((uint8_t)*q);
+        for (int i = 0; i < 32; i++) want.push_back(secret[i]);
+        CHECK("cs-ok-frame-meta",
+              ok.message_type == kMsgCreateShell && ok.flags == kFlagResponse &&
+              ok.request_id == 0xABCE);
+        CHECK("cs-ok-layout-bytes",
+              ok.payload.size() == want.size() &&
+              std::memcmp(ok.payload.data(), want.data(), want.size()) == 0);
+      }
+
+      // backoff table (spec 15.2): 1s,2s,4s,...,cap 60s; index 0 == 1.
+      CHECK("cs-backoff-table",
+            WorkerBackoffMs(0) == 1000 && WorkerBackoffMs(1) == 1000 &&
+            WorkerBackoffMs(2) == 2000 && WorkerBackoffMs(3) == 4000 &&
+            WorkerBackoffMs(4) == 8000 && WorkerBackoffMs(5) == 16000 &&
+            WorkerBackoffMs(6) == 32000 && WorkerBackoffMs(7) == 60000 &&
+            WorkerBackoffMs(8) == 60000 && WorkerBackoffMs(100) == 60000);
+
+      // crash-loop window: >=5 exits inside trailing 60s (injected clock).
+      const uint64_t now = 1000000;
+      CHECK("cs-crashloop-4", !CrashLoopReached(
+            {now - 1, now - 2, now - 3, now - 4, now - 60000}, now));
+      CHECK("cs-crashloop-5", CrashLoopReached(
+            {now - 1, now - 2, now - 3, now - 4, now - 5}, now));
+      CHECK("cs-crashloop-old-out",
+            !CrashLoopReached(
+                {now - 1, now - 2, now - 3, now - 4, now - 70000}, now));
+      CHECK("cs-crashloop-empty", !CrashLoopReached({}, now));
     }
     if (fails==0) std::printf("selftest ok\n");
     return fails==0 ? 0 : 1;

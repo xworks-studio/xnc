@@ -15,8 +15,10 @@ bool SpawnExeArgAllowed(const wchar_t* exe) {
   if (!exe) return false;
   const wchar_t* name = exe;
   if (exe[0] == L'.' && exe[1] == L'\\') name = exe + 2;  // ".\" prefix ok
-  // lstrcmpiW: case-insensitive wide compare (filesystem-like).
-  return lstrcmpiW(name, L"xnc-desktop.exe") == 0;
+  // lstrcmpiW: case-insensitive wide compare (filesystem-like). M2-Slice2
+  // Task 3 adds xnc-shell.exe (CreateShell spawns it next to xnc-core.exe).
+  return lstrcmpiW(name, L"xnc-desktop.exe") == 0 ||
+         lstrcmpiW(name, L"xnc-shell.exe") == 0;
 }
 
 std::wstring JoinSiblingPath(const std::wstring& dir, const std::wstring& name) {
@@ -103,11 +105,16 @@ bool SpawnInSession(HANDLE token, const wchar_t* exe, const wchar_t* cmdline,
 
   if (!SpawnExeArgAllowed(exe)) {
     if (err)
-      *err = "exe rejected by whitelist (only xnc-desktop.exe next to "
-             "xnc-core.exe): " + Narrow(exe);
+      *err = "exe rejected by whitelist (only xnc-desktop.exe / xnc-shell.exe "
+             "next to xnc-core.exe): " + Narrow(exe);
     return false;
   }
-  const std::wstring full = JoinSiblingPath(OwnModuleDir(), L"xnc-desktop.exe");
+  // The whitelisted name (whitespace-free validated) resolves next to
+  // xnc-core.exe's own module dir - never a caller-supplied path.
+  const std::wstring name = exe[0] == L'.' && exe[1] == L'\\'
+                                ? std::wstring(exe + 2)
+                                : std::wstring(exe);
+  const std::wstring full = JoinSiblingPath(OwnModuleDir(), name);
 
   STARTUPINFOW si{};
   si.cb = sizeof(si);

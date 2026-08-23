@@ -28,6 +28,8 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -190,8 +192,58 @@ SasResolveFn g_sas_resolve = nullptr;
 CaptureSpawnFn g_capture_spawn_fn = nullptr;
 BOOL (WINAPI* g_terminate_process)(HANDLE, UINT) = nullptr;
 
+// ---- M2-Slice2 Task 3 state: shell children + desktop supervision ----
+// Shell children (xnc-shell.exe): pid -> owned process handle; one detached
+// watcher per spawn reaps + closes. Shells are session-scoped workers and
+// are NEVER restarted - their exit is logged (worker_exited kind=shell) and
+// the entry dropped; KillShell terminates scoped by the stored handle.
+struct ShellHost {
+  std::mutex mu;
+  std::map<DWORD, HANDLE> children;  // pid -> owned handle
+};
+ShellHost g_shells;
+
+// RunPipeServer's watchdog, published for the detached desktop-restart
+// threads (heartbeat across their backoff sleeps).
+Watchdog* g_wd = nullptr;
+
+// Desktop supervision bookkeeping (spec 15.2; guarded by g_capture.mu):
+// consecutive-crash backoff index, rolling exit timestamps and the
+// crash-loop "degraded" lock. Once degraded, EVERY desktop (re)spawn uses
+// the degraded args (--backend gdi --encoder software).
+struct DesktopSupervisor {
+  uint32_t crash_index = 0;              // consecutive crashes (backoff input)
+  std::deque<uint64_t> exit_ms;          // rolling exit timestamps (GetTickCount64)
+  uint64_t last_spawn_ms = 0;            // uptime anchor for backoff reset
+  uint32_t restart_epoch = 0;            // bumped on every deliberate kill
+  bool degraded = false;                 // crash-loop lock (5 exits / 60s)
+  bool restart_pending = false;          // a backoff restart thread is armed
+};
+DesktopSupervisor g_desktop;
+
+// Seams (selftest injection; null = production default below).
+ShellTokenFn g_shell_token_fn = nullptr;
+ShellSpawnFn g_shell_spawn_fn = nullptr;
+
+bool RealShellToken(uint32_t session, uint8_t token_kind, HANDLE* out);
+ShellSpawnResult RealShellSpawn(const ShellCreateReq& req, uint32_t session,
+                                const wchar_t* pipe_name, const uint8_t* secret,
+                                HANDLE token, Watchdog* wd);
+
+ShellTokenFn CurrentShellTokenFn() {
+  return g_shell_token_fn != nullptr ? g_shell_token_fn : &RealShellToken;
+}
+ShellSpawnFn CurrentShellSpawnFn() {
+  return g_shell_spawn_fn != nullptr ? g_shell_spawn_fn : &RealShellSpawn;
+}
+
 CaptureSpawnResult RealCaptureSpawn(uint32_t session, const wchar_t* pipe_name,
-                                    const uint8_t* secret, Watchdog* wd);
+                                    const uint8_t* secret, Watchdog* wd,
+                                    bool degraded);
+ShellSpawnResult RealShellSpawn(const ShellCreateReq& req, uint32_t session,
+                                const wchar_t* pipe_name, const uint8_t* secret,
+                                HANDLE token, Watchdog* wd);
+bool RealShellToken(uint32_t session, uint8_t token_kind, HANDLE* out);
 
 CaptureSpawnFn CurrentSpawnFn() {
   return g_capture_spawn_fn != nullptr ? g_capture_spawn_fn
@@ -204,6 +256,9 @@ CaptureSpawnFn CurrentSpawnFn() {
 void TerminateCaptureChildLocked(DWORD pid, HANDLE child) {
   XNC_LOG_INFO("capture child terminate pid=%lu (scoped by stored handle)",
                pid);
+  // Deliberate kill: bump the epoch so the watcher does NOT arm a restart
+  // (backoff restarts are for crashes only, spec 15.2).
+  g_desktop.restart_epoch += 1;
   if (g_terminate_process != nullptr)
     g_terminate_process(child, 1);
   else
@@ -261,22 +316,75 @@ SasSendFn RealResolveSendSas() {
   return cached;
 }
 
-// Watcher: waits out the child, logs, clears the shared state if it still
-// describes this spawn, and closes the handle it owns. Detached - one per
-// spawn, outlives the connection that requested it.
-void WatchCaptureChild(HANDLE child, DWORD pid) {
+// Watcher: waits out the child, logs worker_exited, clears the shared
+// state if it still describes this spawn, and closes the handle it owns.
+// Detached - one per spawn, outlives the connection that requested it.
+// Task 3 (M2-Slice2): a NON-deliberate exit (crash; spawn_epoch still
+// current) arms the supervised restart with backoff; crash-loop (5 exits
+// / 60s) locks the desktop to the degraded args. spawn_epoch is the
+// restart epoch captured at spawn time - every deliberate termination
+// (StopCapture / session change / shutdown) bumps g_desktop.restart_epoch
+// first, which is what tells the watcher "do not restart".
+// Supervised desktop restart loop (detached thread): sleep the backoff,
+// re-spawn (degraded args once crash-loop locked), retry on spawn failure.
+void DesktopRestartLoop(uint32_t spawn_epoch, uint32_t session,
+                        std::wstring pipe_name, std::vector<uint8_t> secret);
+void WatchCaptureChild(HANDLE child, DWORD pid, uint32_t spawn_epoch) {
   WaitForSingleObject(child, INFINITE);
   DWORD code = 0;
   if (!GetExitCodeProcess(child, &code)) code = 1;
-  XNC_LOG_INFO("capture child pid=%lu exited code=%lu, clearing state", pid, code);
-  std::lock_guard<std::mutex> lk(g_capture.mu);
-  if (g_capture.child == child) {
-    g_capture.valid = false;
-    g_capture.child = nullptr;
-    g_capture.pid = 0;
-    g_capture.session = 0;
+  XNC_LOG_INFO("worker_exited kind=desktop pid=%lu exit=%lu", pid, code);
+
+  uint32_t session = 0;
+  std::wstring pipe_name;
+  uint8_t secret[kDesktopSecretLen] = {0};
+  bool arm_restart = false;
+  const uint64_t now = GetTickCount64();
+  {
+    std::lock_guard<std::mutex> lk(g_capture.mu);
+    session = g_capture.session;
+    pipe_name = g_capture.pipe_name;
+    std::memcpy(secret, g_capture.secret, kDesktopSecretLen);
+    if (g_capture.child == child) {
+      g_capture.valid = false;
+      g_capture.child = nullptr;
+      g_capture.pid = 0;
+      g_capture.session = 0;
+    }
+    if (spawn_epoch == g_desktop.restart_epoch) {
+      // Genuine crash: rolling crash-loop accounting + backoff index.
+      g_desktop.exit_ms.push_back(now);
+      while (!g_desktop.exit_ms.empty() &&
+             now - g_desktop.exit_ms.front() >= kCrashLoopWindowMs)
+        g_desktop.exit_ms.pop_front();
+      if (!g_desktop.degraded &&
+          CrashLoopReached(
+              std::vector<uint64_t>(g_desktop.exit_ms.begin(),
+                                    g_desktop.exit_ms.end()), now)) {
+        g_desktop.degraded = true;
+        XNC_LOG_INFO(
+            "crash_loop_degraded kind=desktop exits=%zu window_ms=%zu "
+            "(desktop locked to --backend gdi --encoder software)",
+            g_desktop.exit_ms.size(), (size_t)kCrashLoopWindowMs);
+      }
+      // A child that survived longer than the crash-loop window resets the
+      // consecutive-crash backoff (spec 15.2 intent: storms back off,
+      // one-off crashes after stable uptime do not).
+      if (now - g_desktop.last_spawn_ms >= kCrashLoopWindowMs)
+        g_desktop.crash_index = 0;
+      g_desktop.crash_index += 1;
+      if (!g_desktop.restart_pending) {
+        g_desktop.restart_pending = true;
+        arm_restart = true;
+      }
+    }
   }
   CloseHandle(child);
+  if (arm_restart && session != 0xFFFFFFFF && !pipe_name.empty()) {
+    std::thread(DesktopRestartLoop, spawn_epoch, session, pipe_name,
+                std::vector<uint8_t>(secret, secret + kDesktopSecretLen))
+        .detach();
+  }
 }
 
 // ASCII error-frame helper (payload = stable code, mirrors Go respText).
@@ -311,7 +419,8 @@ bool WaitPipeReady(const wchar_t* name, Watchdog* wd) {
 // (never argv, spec 1.5) -> wait for the child's rt pipe. Every failure
 // path closes what it opened; err carries the stable ASCII code.
 CaptureSpawnResult RealCaptureSpawn(uint32_t session, const wchar_t* pipe_name,
-                                    const uint8_t* secret, Watchdog* wd) {
+                                    const uint8_t* secret, Watchdog* wd,
+                                    bool degraded) {
   CaptureSpawnResult r{};
 
   HANDLE token = nullptr;
@@ -350,6 +459,13 @@ CaptureSpawnResult RealCaptureSpawn(uint32_t session, const wchar_t* pipe_name,
   // nothing sensitive either way.
   std::vector<std::wstring> args = {L"--console-rt", L"--pipe", pipe_name,
                                     L"--secret-stdin"};
+  if (degraded) {
+    // Crash-loop lock (spec 15.2): GDI capture + software encoder only.
+    args.push_back(L"--backend");
+    args.push_back(L"gdi");
+    args.push_back(L"--encoder");
+    args.push_back(L"software");
+  }
   std::vector<wchar_t*> av;
   for (auto& a : args) av.push_back(&a[0]);
   std::wstring cmd;
@@ -412,6 +528,332 @@ CaptureSpawnResult RealCaptureSpawn(uint32_t session, const wchar_t* pipe_name,
   r.pid = pid;
   r.child = child;
   return r;
+}
+
+// Supervised desktop restart (spec 15.2): sleep WorkerBackoffMs(crashes),
+// re-spawn via the CURRENT spawn seam (degraded args once locked), retry
+// when the re-spawn itself fails (each failure counts as a crash, so the
+// backoff keeps growing up to the 60s cap). Bails out on Ctrl+C/shutdown,
+// on a deliberate stop (epoch moved on) or when an agent-driven
+// StartCapture re-spawned first (g_capture.valid).
+void DesktopRestartLoop(uint32_t spawn_epoch, uint32_t session,
+                        std::wstring pipe_name, std::vector<uint8_t> secret) {
+  for (;;) {
+    uint32_t delay = 0, idx = 0;
+    bool degraded = false;
+    {
+      std::lock_guard<std::mutex> lk(g_capture.mu);
+      idx = g_desktop.crash_index;
+      degraded = g_desktop.degraded;
+    }
+    delay = WorkerBackoffMs(idx);
+    XNC_LOG_INFO("desktop restart in %lums (crash #%lu%s)",
+                 static_cast<unsigned long>(delay),
+                 static_cast<unsigned long>(idx), degraded ? " degraded" : "");
+    for (uint32_t slept = 0; slept < delay && !g_stop.load(); slept += 200)
+      Sleep(200);
+    if (g_stop.load()) {
+      std::lock_guard<std::mutex> lk(g_capture.mu);
+      g_desktop.restart_pending = false;
+      return;
+    }
+    if (g_wd != nullptr) g_wd->Heartbeat();
+
+    Watchdog* wd = g_wd;  // may predate Start() in the selftest loopback
+    const CaptureSpawnResult r =
+        CurrentSpawnFn()(session, pipe_name.c_str(), secret.data(), wd,
+                         degraded);
+    std::lock_guard<std::mutex> lk(g_capture.mu);
+    if (!r.ok) {
+      XNC_LOG_ERROR("desktop restart spawn failed code=%s", r.err);
+      // counts as another crash: loop back around with a grown backoff
+      const uint64_t now = GetTickCount64();
+      g_desktop.exit_ms.push_back(now);
+      while (!g_desktop.exit_ms.empty() &&
+             now - g_desktop.exit_ms.front() >= kCrashLoopWindowMs)
+        g_desktop.exit_ms.pop_front();
+      if (!g_desktop.degraded &&
+          CrashLoopReached(std::vector<uint64_t>(g_desktop.exit_ms.begin(),
+                                                 g_desktop.exit_ms.end()),
+                           now)) {
+        g_desktop.degraded = true;
+        XNC_LOG_INFO(
+            "crash_loop_degraded kind=desktop exits=%zu window_ms=%zu "
+            "(desktop locked to --backend gdi --encoder software)",
+            g_desktop.exit_ms.size(), (size_t)kCrashLoopWindowMs);
+      }
+      g_desktop.crash_index += 1;
+      continue;  // retry (lock released by loop iteration)
+    }
+    if (g_desktop.restart_epoch != spawn_epoch || g_capture.valid) {
+      // Deliberate stop or a racing StartCapture owns the slot now: drop
+      // the fresh child (no watcher exists yet - terminate + close here).
+      XNC_LOG_INFO("desktop restart superseded, killing fresh pid=%lu", r.pid);
+      TerminateProcess(r.child, 1);
+      CloseHandle(r.child);
+      g_desktop.restart_pending = false;
+      return;
+    }
+    g_capture.valid = true;
+    g_capture.pid = r.pid;
+    g_capture.child = r.child;
+    g_capture.session = session;
+    g_capture.gen += 1;
+    std::memcpy(g_capture.secret, secret.data(), kDesktopSecretLen);
+    g_capture.pipe_name = pipe_name;
+    g_desktop.last_spawn_ms = GetTickCount64();
+    XNC_LOG_INFO("desktop restart spawned pid=%lu pipe=%ls gen=%u session=%u%s",
+                 r.pid, pipe_name.c_str(), g_capture.gen, session,
+                 degraded ? " degraded" : "");
+    g_desktop.restart_pending = false;
+    std::thread(WatchCaptureChild, r.child, r.pid, g_desktop.restart_epoch)
+        .detach();
+    return;
+  }
+}
+
+// ---- 0x0120/0x0121 CreateShell / KillShell (M2-Slice2 Task 3) ----
+
+// Shell watcher: reap + log + drop the registry entry. Shells are
+// session-scoped workers and are NOT restarted (their client observes the
+// exit via the shell pipe dying).
+void WatchShellChild(DWORD pid, HANDLE child) {
+  WaitForSingleObject(child, INFINITE);
+  DWORD code = 0;
+  if (!GetExitCodeProcess(child, &code)) code = 1;
+  XNC_LOG_INFO("worker_exited kind=shell pid=%lu exit=%lu", pid, code);
+  {
+    std::lock_guard<std::mutex> lk(g_shells.mu);
+    auto it = g_shells.children.find(pid);
+    if (it != g_shells.children.end() && it->second == child)
+      g_shells.children.erase(it);
+  }
+  CloseHandle(child);
+}
+
+// UTF-8 (wire payload) -> UTF-16 (argv) conversion; '?' fallback mirrors
+// EncodeStartCaptureOk's narrow pass for unpaired sequences.
+std::wstring WidenUtf8(const std::string& s) {
+  if (s.empty()) return L"";
+  int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()),
+                              nullptr, 0);
+  if (n <= 0) return L"";
+  std::wstring w(static_cast<size_t>(n), L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), &w[0],
+                      n);
+  return w;
+}
+
+// Production token mint (spec 8.4): user kind = WTSQueryUserToken on the
+// LIVE active console session (needs SYSTEM core; no live user logon ->
+// false -> NO_ACTIVE_SESSION, never implicit elevation); system kind =
+// SessionSystemToken, same as the desktop worker.
+bool RealShellToken(uint32_t session, uint8_t token_kind, HANDLE* out) {
+  if (out == nullptr) return false;
+  *out = nullptr;
+  if (token_kind == 0) {
+    if (WTSQueryUserToken(session, out) == FALSE) {
+      XNC_LOG_ERROR("create_shell: WTSQueryUserToken(%u) failed err=%lu",
+                    session, GetLastError());
+      return false;
+    }
+    return true;
+  }
+  std::string err;
+  if (!TokenManager::SessionSystemToken(session, out, &err)) {
+    XNC_LOG_ERROR("create_shell: session token failed err=\"%s\"", err.c_str());
+    return false;
+  }
+  return true;
+}
+
+// Production shell spawn: xnc-shell.exe (whitelisted next to xnc-core.exe)
+// with the secret on inherited stdin (spec 1.5 - never argv). cwd/env/cmd
+// are operator data, not secrets: they ride argv as individual entries via
+// SpawnInSession's arg list (quoting handled by BuildChildCommandLine,
+// which rejects embedded quotes / trailing backslashes - surfacing as
+// INTERNAL here). The shell resolves its own profile exe (core passes the
+// whitelist NAME, never a path).
+ShellSpawnResult RealShellSpawn(const ShellCreateReq& req, uint32_t session,
+                                const wchar_t* pipe_name, const uint8_t* secret,
+                                HANDLE token, Watchdog* wd) {
+  ShellSpawnResult r{};
+
+  HANDLE sec_rd = nullptr, sec_wr = nullptr;
+  SECURITY_ATTRIBUTES inherit_sa{sizeof(inherit_sa), nullptr, TRUE};
+  if (!CreatePipe(&sec_rd, &sec_wr, &inherit_sa, 0) ||
+      !SetHandleInformation(sec_wr, HANDLE_FLAG_INHERIT, 0)) {
+    const DWORD pipe_err = GetLastError();
+    if (sec_rd) CloseHandle(sec_rd);
+    if (sec_wr) CloseHandle(sec_wr);
+    XNC_LOG_ERROR("create_shell: secret stdin pipe failed err=%lu", pipe_err);
+    snprintf(r.err, sizeof(r.err), "%s", "INTERNAL");
+    return r;
+  }
+
+  wchar_t cols[8], rows[8], timeout[12];
+  swprintf(cols, 8, L"%u", req.cols);
+  swprintf(rows, 8, L"%u", req.rows);
+  swprintf(timeout, 12, L"%u", req.timeout_sec);
+  std::vector<std::wstring> args = {L"--pipe",         pipe_name,
+                                    L"--secret-stdin",
+                                    L"--profile",       ShellProfileWName(req.profile),
+                                    L"--mode",          req.mode == 1 ? L"oneshot" : L"interactive",
+                                    L"--cols",          cols,
+                                    L"--rows",          rows};
+  const std::wstring cwd_w = WidenUtf8(req.cwd);
+  const std::wstring cmd_w = WidenUtf8(req.cmd);
+  if (!cwd_w.empty()) {
+    args.push_back(L"--cwd");
+    args.push_back(cwd_w);
+  }
+  for (const auto& kv : SplitShellEnv(req.env)) {
+    args.push_back(L"--env");
+    args.push_back(WidenUtf8(kv));
+  }
+  if (!cmd_w.empty()) {
+    args.push_back(L"--command");
+    args.push_back(cmd_w);
+  }
+  args.push_back(L"--timeout");
+  args.push_back(timeout);
+
+  std::vector<wchar_t*> av;
+  for (auto& a : args) av.push_back(&a[0]);
+  std::wstring cmd;
+  std::string cmd_err;
+  if (!BuildChildCommandLine(L"xnc-shell.exe", static_cast<int>(av.size()),
+                             av.data(), 0, &cmd, &cmd_err)) {
+    CloseHandle(sec_rd);
+    CloseHandle(sec_wr);
+    XNC_LOG_ERROR("create_shell: child cmdline rejected err=\"%s\"",
+                  cmd_err.c_str());
+    snprintf(r.err, sizeof(r.err), "%s", "INTERNAL");
+    return r;
+  }
+
+  DWORD pid = 0;
+  HANDLE child = nullptr;
+  std::string err;
+  if (!SpawnInSession(token, L"xnc-shell.exe", cmd.c_str(), &pid, &child,
+                      &err, sec_rd)) {
+    CloseHandle(sec_rd);
+    CloseHandle(sec_wr);
+    XNC_LOG_ERROR("create_shell: spawn failed err=\"%s\"", err.c_str());
+    snprintf(r.err, sizeof(r.err), "%s", "SPAWN_FAILED");
+    return r;
+  }
+  CloseHandle(sec_rd);  // inheritance settled at CreateProcess
+
+  // One line - 64 hex chars + '\n' (65B) - then close (xnc-shell's
+  // --secret-stdin contract). Hex/secret never logged.
+  {
+    char hexline[2 * kDesktopSecretLen + 2] = {0};
+    for (size_t i = 0; i < kDesktopSecretLen; i++)
+      sprintf_s(hexline + 2 * i, 3, "%02x", secret[i]);
+    hexline[2 * kDesktopSecretLen] = '\n';
+    DWORD wrote = 0;
+    if (!WriteFile(sec_wr, hexline, 2 * kDesktopSecretLen + 1, &wrote,
+                   nullptr) ||
+        wrote != 2 * kDesktopSecretLen + 1) {
+      XNC_LOG_ERROR("create_shell: secret stdin write failed err=%lu",
+                    GetLastError());
+      // the child exits on its stdin error; the pipe wait reaps below
+    }
+    CloseHandle(sec_wr);
+  }
+
+  if (wd != nullptr) wd->Heartbeat();
+  if (!WaitPipeReady(pipe_name, wd)) {
+    XNC_LOG_ERROR("create_shell: shell pipe not ready in %lums, killing pid=%lu",
+                  kPipeReadyWaitMs, pid);
+    TerminateProcess(child, 1);
+    CloseHandle(child);
+    snprintf(r.err, sizeof(r.err), "%s", "PIPE_TIMEOUT");
+    return r;
+  }
+
+  r.ok = true;
+  r.pid = pid;
+  r.child = child;
+  return r;
+}
+
+// 0x0120: validate + mint token + spawn xnc-shell.exe + answer its pipe
+// descriptor. Error ladder: BAD_PAYLOAD (layout/enum/mode) ->
+// SESSION_MISMATCH (wts not the live console session) -> RNG_FAILED ->
+// NO_ACTIVE_SESSION (user kind, no live user token; never implicit
+// elevation, spec 8.4) / TOKEN_FAILED (system kind) -> SPAWN_FAILED /
+// PIPE_TIMEOUT.
+Frame HandleCreateShell(const Frame& req, Watchdog* wd) {
+  ShellCreateReq sr;
+  if (!DecodeShellCreatePayload(req.payload.data(), req.payload.size(), &sr) ||
+      !ShellProfileAllowed(sr.profile) || !ShellTokenKindAllowed(sr.token_kind) ||
+      (sr.mode == 1 && sr.cmd.empty()))
+    return ErrorFrame(kMsgCreateShell, req.request_id, "BAD_PAYLOAD");
+  if (!SessionTargetAllowed(sr.wts, CoreWts().console_session()))
+    return ErrorFrame(kMsgCreateShell, req.request_id, "SESSION_MISMATCH");
+
+  uint8_t secret[kDesktopSecretLen];
+  NTSTATUS rng = BCryptGenRandom(nullptr, secret, sizeof(secret),
+                                 BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+  if (!BCRYPT_SUCCESS(rng)) {
+    XNC_LOG_ERROR("create_shell: secret RNG failed status=0x%08lX",
+                  (unsigned long)rng);
+    return ErrorFrame(kMsgCreateShell, req.request_id, "RNG_FAILED");
+  }
+
+  // Unique pipe per shell: core pid + monotonic counter (the child pid is
+  // not known before CreateProcess, and argv is fixed at spawn time).
+  static std::atomic<uint32_t> s_shell_counter{0};
+  wchar_t pipe_name[96];
+  swprintf(pipe_name, 96, L"\\\\.\\pipe\\xnc-shell-%lu-%u",
+           GetCurrentProcessId(), s_shell_counter.fetch_add(1) + 1);
+
+  HANDLE token = nullptr;
+  if (!CurrentShellTokenFn()(sr.wts, sr.token_kind, &token)) {
+    if (token != nullptr) CloseHandle(token);
+    return ErrorFrame(kMsgCreateShell, req.request_id,
+                      sr.token_kind == 0 ? "NO_ACTIVE_SESSION" : "TOKEN_FAILED");
+  }
+  ShellSpawnResult r =
+      CurrentShellSpawnFn()(sr, sr.wts, pipe_name, secret, token, wd);
+  CloseHandle(token);
+  if (!r.ok) {
+    XNC_LOG_ERROR("create_shell: spawn failed code=%s", r.err);
+    return ErrorFrame(kMsgCreateShell, req.request_id, r.err);
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(g_shells.mu);
+    g_shells.children[r.pid] = r.child;
+  }
+  XNC_LOG_INFO(
+      "shell_spawned kind=%s token=%s pid=%lu pipe=%ls mode=%s",
+      ShellProfileName(sr.profile), sr.token_kind == 0 ? "user" : "system",
+      r.pid, pipe_name, sr.mode == 1 ? "oneshot" : "interactive");
+  std::thread(WatchShellChild, r.pid, r.child).detach();
+  return EncodeCreateShellOk(req, r.pid, pipe_name, secret);
+}
+
+// 0x0121: terminate the shell child scoped by the STORED HANDLE (pid only
+// in the log; never by image name - T2 incident class). Idempotent.
+Frame HandleKillShell(const Frame& req) {
+  if (req.payload.size() != 4)
+    return ErrorFrame(kMsgKillShell, req.request_id, "BAD_PAYLOAD");
+  const uint32_t pid = GetU32(req.payload.data());
+  std::lock_guard<std::mutex> lk(g_shells.mu);
+  auto it = g_shells.children.find(pid);
+  if (it != g_shells.children.end()) {
+    XNC_LOG_INFO("kill_shell pid=%u (scoped by stored handle)", pid);
+    if (g_terminate_process != nullptr)
+      g_terminate_process(it->second, 1);
+    else
+      TerminateProcess(it->second, 1);
+  } else {
+    XNC_LOG_INFO("kill_shell pid=%u unknown (idempotent ok)", pid);
+  }
+  return Frame{kFlagResponse, kMsgKillShell, req.request_id, {}};
 }
 
 // 0x0110 MSG_SAS [char reason[24]] (Task 4). The caller identity IS the
@@ -518,7 +960,8 @@ Frame HandleStartCapture(const Frame& req, Watchdog* wd) {
       break;  // no live child: never spawned / already exited / reaped
   }
 
-  const CaptureSpawnResult r = CurrentSpawnFn()(wts, pipe_name, secret, wd);
+  const CaptureSpawnResult r =
+      CurrentSpawnFn()(wts, pipe_name, secret, wd, g_desktop.degraded);
   if (!r.ok) {
     XNC_LOG_ERROR("start_capture: spawn failed code=%s", r.err);
     return ErrorFrame(kMsgStartCapture, req.request_id, r.err);
@@ -531,10 +974,13 @@ Frame HandleStartCapture(const Frame& req, Watchdog* wd) {
   g_capture.gen += 1;
   std::memcpy(g_capture.secret, secret, kDesktopSecretLen);
   g_capture.pipe_name = pipe_name;
+  g_desktop.last_spawn_ms = GetTickCount64();
   // Secret/hex never logged; pid + pipe name + gen + session only.
-  XNC_LOG_INFO("start_capture: spawned pid=%lu pipe=%ls gen=%u session=%u",
-               r.pid, pipe_name, g_capture.gen, wts);
-  std::thread(WatchCaptureChild, r.child, r.pid).detach();
+  XNC_LOG_INFO("start_capture: spawned pid=%lu pipe=%ls gen=%u session=%u%s",
+               r.pid, pipe_name, g_capture.gen, wts,
+               g_desktop.degraded ? " degraded" : "");
+  std::thread(WatchCaptureChild, r.child, r.pid, g_desktop.restart_epoch)
+      .detach();
   return EncodeStartCaptureOk(req, r.pid, pipe_name, secret, g_capture.gen);
 }
 
@@ -654,6 +1100,20 @@ void ServeFrames(TimedIo& io, Watchdog* wd, uint32_t client_pid) {
         if (!WriteFrameTimed(io, resp)) return;
         break;
       }
+      case kMsgCreateShell: {
+        // M2-Slice2 Task 3: spawn xnc-shell.exe (user or SYSTEM token) and
+        // answer its pipe descriptor; same ~2s pipe-wait-under-lock note as
+        // StartCapture above.
+        Frame resp = HandleCreateShell(f, wd);
+        wd->Heartbeat();
+        if (!WriteFrameTimed(io, resp)) return;
+        break;
+      }
+      case kMsgKillShell: {
+        Frame resp = HandleKillShell(f);
+        if (!WriteFrameTimed(io, resp)) return;
+        break;
+      }
       case kMsgBye:
         XNC_LOG_INFO("client pid=%lu said BYE", client_pid);
         return;
@@ -725,6 +1185,129 @@ void SetCaptureSpawnForTest(CaptureSpawnFn fn) { g_capture_spawn_fn = fn; }
 void SetTerminateForTest(BOOL(WINAPI* fn)(HANDLE, UINT)) {
   g_terminate_process = fn;
 }
+void SetShellTokenForTest(ShellTokenFn fn) { g_shell_token_fn = fn; }
+void SetShellSpawnForTest(ShellSpawnFn fn) { g_shell_spawn_fn = fn; }
+
+// ---- M2-Slice2 Task 3 public surface (pipe_server.h declarations) ----
+
+// Profile whitelist enum (spec 8.2): 0=POWERSHELL 1=PWSH 2=CMD 3=BASH.
+// Core never resolves paths - xnc-shell.exe does (it receives the NAME).
+static const char* const kShellProfileNames[] = {"POWERSHELL", "PWSH", "CMD",
+                                                 "BASH"};
+bool ShellProfileAllowed(uint8_t profile) {
+  return profile < sizeof(kShellProfileNames) / sizeof(kShellProfileNames[0]);
+}
+const char* ShellProfileName(uint8_t profile) {
+  return ShellProfileAllowed(profile) ? kShellProfileNames[profile] : "?";
+}
+const wchar_t* ShellProfileWName(uint8_t profile) {
+  static const wchar_t* const w[] = {L"POWERSHELL", L"PWSH", L"CMD", L"BASH"};
+  return ShellProfileAllowed(profile) ? w[profile] : L"?";
+}
+bool ShellTokenKindAllowed(uint8_t kind) { return kind <= 1; }
+
+// Bounds-checked LE decode of the 0x0120 request payload. Truncation,
+// length overruns or trailing bytes all fail (caller answers BAD_PAYLOAD).
+bool DecodeShellCreatePayload(const uint8_t* p, size_t n, ShellCreateReq* out) {
+  if (p == nullptr || out == nullptr || n < 21) return false;  // 21 = all-empty minimum
+  size_t off = 0;
+  auto u8 = [&]() { return p[off++]; };
+  auto u16 = [&]() {
+    uint16_t v = static_cast<uint16_t>(static_cast<uint16_t>(p[off]) |
+                                       static_cast<uint16_t>(p[off + 1]) << 8);
+    off += 2;
+    return v;
+  };
+  auto u32 = [&]() {
+    uint32_t v = static_cast<uint32_t>(p[off]) |
+                 static_cast<uint32_t>(p[off + 1]) << 8 |
+                 static_cast<uint32_t>(p[off + 2]) << 16 |
+                 static_cast<uint32_t>(p[off + 3]) << 24;
+    off += 4;
+    return v;
+  };
+  auto blob = [&](const char** dst, size_t* dst_len) {
+    const uint16_t len = u16();
+    if (off + len > n) return false;
+    *dst = reinterpret_cast<const char*>(p + off);
+    *dst_len = len;
+    off += len;
+    return true;
+  };
+  out->wts = u32();
+  out->token_kind = u8();
+  out->profile = u8();
+  out->mode = u8();
+  out->cols = u16();
+  out->rows = u16();
+  const char *cwd = nullptr, *env = nullptr, *cmd = nullptr;
+  size_t cwd_len = 0, env_len = 0, cmd_len = 0;
+  if (!blob(&cwd, &cwd_len) || !blob(&env, &env_len) || !blob(&cmd, &cmd_len))
+    return false;
+  out->timeout_sec = u32();
+  if (off != n) return false;  // trailing bytes: reject
+  out->cwd.assign(cwd, cwd_len);
+  out->env.assign(env, env_len);
+  out->cmd.assign(cmd, cmd_len);
+  return true;
+}
+
+// "K=V\n"-joined env blob -> individual entries (empty segments skipped;
+// the last segment may or may not carry a trailing newline).
+std::vector<std::string> SplitShellEnv(const std::string& envJoined) {
+  std::vector<std::string> out;
+  size_t start = 0;
+  while (start <= envJoined.size()) {
+    size_t nl = envJoined.find('\n', start);
+    if (nl == std::string::npos) {
+      if (start < envJoined.size()) out.push_back(envJoined.substr(start));
+      break;
+    }
+    if (nl > start) out.push_back(envJoined.substr(start, nl - start));
+    start = nl + 1;
+  }
+  return out;
+}
+
+// [u32 pid][u16 nameLen][name utf8 bytes][32B secret]; pipe name is
+// program-constructed ASCII (plain copy), mirrors EncodeStartCaptureOk.
+Frame EncodeCreateShellOk(const Frame& req, DWORD pid, const std::wstring& pipe,
+                          const uint8_t* secret) {
+  std::string name;
+  for (wchar_t c : pipe) name.push_back(c < 128 ? static_cast<char>(c) : '?');
+  std::vector<uint8_t> p;
+  p.reserve(6 + name.size() + kDesktopSecretLen);
+  auto put32 = [&p](uint32_t v) {
+    for (int i = 0; i < 4; i++) p.push_back(static_cast<uint8_t>(v >> (8 * i)));
+  };
+  put32(pid);
+  p.push_back(static_cast<uint8_t>(name.size()));
+  p.push_back(static_cast<uint8_t>(name.size() >> 8));  // u16 LE nameLen
+  p.insert(p.end(), name.begin(), name.end());
+  p.insert(p.end(), secret, secret + kDesktopSecretLen);
+  return Frame{kFlagResponse, kMsgCreateShell, req.request_id, std::move(p)};
+}
+
+// Backoff table (spec 15.2): crash #1 -> 1s, #2 -> 2s, #3 -> 4s ... capped
+// at 60s. crash_index 0 is treated as 1 (first crash).
+uint32_t WorkerBackoffMs(uint32_t crash_index) {
+  if (crash_index == 0) crash_index = 1;
+  uint64_t ms = 1000;
+  for (uint32_t i = 1; i < crash_index; i++) {
+    ms <<= 1;
+    if (ms >= 60000) return 60000;
+  }
+  return static_cast<uint32_t>(ms < 60000 ? ms : 60000);
+}
+
+// Crash-loop predicate: exits strictly inside the trailing (now-60s, now]
+// window; kCrashLoopExits or more -> degraded.
+bool CrashLoopReached(const std::vector<uint64_t>& exit_ms, uint64_t now_ms) {
+  size_t in_window = 0;
+  for (uint64_t t : exit_ms)
+    if (t <= now_ms && now_ms - t < kCrashLoopWindowMs) in_window++;
+  return in_window >= kCrashLoopExits;
+}
 
 // [u32 pid][u16 nameLen][name utf8 bytes][32B secret][u32 gen]; the pipe
 // name is program-constructed ASCII, so the "utf8" pass is a plain copy.
@@ -769,6 +1352,7 @@ int RunPipeServer(const wchar_t* pipe_name, const uint8_t* secret, size_t secret
   SetConsoleCtrlHandler(OnCtrlEvent, TRUE);  // best effort; loop polls g_stop
   Watchdog wd;
   wd.Start();
+  g_wd = &wd;  // published for the detached desktop-restart threads
   XNC_LOG_INFO("console pipe server starting (pipe=%ls)", pipe_name);
 
   // Task 4: WTS monitor (notification + 500ms poll hybrid). On active
@@ -868,6 +1452,15 @@ int RunPipeServer(const wchar_t* pipe_name, const uint8_t* secret, size_t secret
       XNC_LOG_INFO("shutdown: terminating capture child pid=%lu", g_capture.pid);
       TerminateCaptureChildLocked(g_capture.pid, g_capture.child);
       g_capture.valid = false;
+    }
+  }
+  // No orphan shell children either: terminate scoped by stored handle
+  // (the per-shell watcher reaps + closes).
+  {
+    std::lock_guard<std::mutex> lk(g_shells.mu);
+    for (auto& e : g_shells.children) {
+      XNC_LOG_INFO("shutdown: terminating shell child pid=%lu", e.first);
+      TerminateProcess(e.second, 1);
     }
   }
   if (rc == 0) XNC_LOG_INFO("shutting down (Ctrl+C)");

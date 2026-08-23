@@ -991,6 +991,14 @@ int SelftestMain() {
     CHECK("args-explicit-ok", p.ok);
     CHECK("args-explicit-values", p.ok && p.opt.duration_s == 3 && p.opt.fps == 15 && p.opt.out_path == L"x.h264");
   }
+  { // --encoder(M2-Slice2 Task 3 crash-loop 降参契约):software 唯一合法
+    // 值(当前唯一编码档,解析+日志不改变行为);其它值拒绝。
+    auto ok = Parse({L"--console-diag", L"--out", L"t", L"--encoder", L"software"});
+    CHECK("args-encoder-software-ok", ok.ok);
+    auto bad = Parse({L"--console-diag", L"--out", L"t", L"--encoder", L"nvenc"});
+    CHECK("args-encoder-only-software", !bad.ok);
+    CHECK("args-encoder-missing-value", !Parse({L"--console-diag", L"--out", L"t", L"--encoder"}).ok);
+  }
   { // out 缺失/空 → 参数错(Task 6 spawn 契约要求显式 --out)
     auto p = Parse({L"--console-diag"});
     CHECK("args-out-missing", !p.ok);

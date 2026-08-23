@@ -358,6 +358,20 @@ bool ParseDiagArgs(int argc, wchar_t** argv, DiagOptions* opt, std::wstring* err
       } else {
         return fail(L"--backend must be dxgi or gdi (diagnostic-only selector)");
       }
+    } else if (std::wcscmp(a, L"--encoder") == 0) {
+      // M2-Slice2 Task 3: crash-loop degraded-restart contract (spec 15.2)
+      // passes "--backend gdi --encoder software". The MF software encoder
+      // is the only rung today, so this parses + logs and changes nothing;
+      // anything but "software" fails (a future hardware rung slots in
+      // here without touching the spawn contract).
+      const wchar_t* v = value_of(L"--encoder");
+      if (!v) return false;
+      if (std::wcscmp(v, L"software") == 0) {
+        opt->encoder = DiagEncoder::kSoftware;
+        XNC_LOG_INFO("encoder selector: software (only rung; no-op)");
+      } else {
+        return fail(L"--encoder must be software (only encoder rung)");
+      }
     } else {
       return fail(std::wstring(L"unknown argument: ") + a);
     }

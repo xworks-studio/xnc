@@ -25,6 +25,15 @@ inline constexpr uint32_t kMaxSubsHardCap = 4;
 // DXGI is the production rung; GDI is the manual/degraded path (spec §7.6).
 enum class DiagBackend : uint8_t { kDxgi = 0, kGdi };
 
+// Encoder selector (--encoder; M2-Slice2 Task 3 supervision hook). The MF
+// software H.264 encoder is currently the ONLY encoder, so "software" is
+// accepted (and logged) and anything else fails: the flag exists so the
+// core supervisor's crash-loop degraded restart can pass
+// "--backend gdi --encoder software" (spec 15.2) and a future hardware
+// rung slots in without changing the spawn contract.
+enum class DiagEncoder : uint8_t { kSoftware = 0 };
+
+
 struct DiagOptions {
   bool console_diag = false;  // --console-diag
   bool console_rt = false;    // --console-rt
@@ -34,6 +43,7 @@ struct DiagOptions {
   uint32_t fps = 30;          // --fps (target fps, must be > 0)
   uint32_t max_subs = 4;      // --max-subs (1..4, rt mode)
   DiagBackend backend = DiagBackend::kDxgi;  // --backend dxgi|gdi (default dxgi)
+  DiagEncoder encoder = DiagEncoder::kSoftware;  // --encoder software (only rung)
   std::wstring out_path;      // --out (required with --console-diag)
   std::wstring pipe_name;     // --pipe (default kDefaultRtPipe in rt mode)
   std::vector<uint8_t> secret;  // --secret <hex> OR --secret-stdin (filled by
