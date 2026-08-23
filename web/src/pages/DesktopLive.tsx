@@ -48,6 +48,15 @@ interface DesktopStartResponse {
   turn?: { urls: string[]; username: string; credential: string };
 }
 
+interface DisplayEntry {
+  index: number;
+  originX: number;
+  originY: number;
+  w: number;
+  h: number;
+  primary: boolean;
+}
+
 interface SignalingFrame {
   type: string;
   sdp?: string;
@@ -57,6 +66,8 @@ interface SignalingFrame {
   width?: number;
   height?: number;
   fps?: number;
+  /** M2-S3 Task 5: ready-frame displays table */
+  displays?: DisplayEntry[];
   /** display_changed generation */
   generation?: number;
   /** display_changed geometry */
@@ -181,6 +192,9 @@ export default function DesktopLive() {
   const [nodeName, setNodeName] = useState<string | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
   const [agentState, setAgentState] = useState<string | null>(null);
+  /** M2-S3 Task 5: displays from the ready frame + selected index. */
+  const [displays, setDisplays] = useState<DisplayEntry[]>([]);
+  const [displaySel, setDisplaySel] = useState(0);
   const [stats, setStats] = useState({
     fps: 0,
     firstFrameMs: 0,
@@ -622,6 +636,14 @@ export default function DesktopLive() {
             case "ready":
               setState("signaling");
               if (f.width && f.height) applyDims(f.width, f.height);
+              if (f.displays?.length) {
+                setDisplays(f.displays);
+                const active =
+                  f.displays.find(
+                    (d) => d.primary || (d.w === f.width && d.h === f.height),
+                  ) ?? f.displays[0];
+                setDisplaySel(active.index);
+              }
               // relay-only PC per the dev topology (non-TLS coturn = M2)
               pc = new RTCPeerConnection({
                 iceServers: [
@@ -804,6 +826,20 @@ export default function DesktopLive() {
     }
   };
 
+  // M2-S3 Task 5: display dropdown → {switch_display} signaling frame (old
+  // agents ignore the unknown type; results arrive as display_changed
+  // reason="switch" / state invalid_display).
+  const sendSwitchDisplay = (index: number) => {
+    try {
+      wsHandle.__xncDesktopWs?.send(
+        JSON.stringify({ type: "switch_display", index }),
+      );
+      setDisplaySel(index);
+    } catch {
+      /* session dead */
+    }
+  };
+
   const leaseLabel =
     lease.status === "granted"
       ? "input held"
@@ -818,6 +854,20 @@ export default function DesktopLive() {
         <span className={`screen-state screen-state-${state}`}>{STATE_LABELS[state]}</span>
         <span className="dim mono">ice:{iceState}</span>
         {dims && <span className="dim mono">{dims}</span>}
+        {displays.length > 1 && (
+          <select
+            className="desktop-display-select mono"
+            value={displaySel}
+            onChange={(e) => sendSwitchDisplay(Number(e.target.value))}
+            title="capture display (switch_display)"
+          >
+            {displays.map((d) => (
+              <option key={d.index} value={d.index}>
+                {`#${d.index} ${d.w}x${d.h}${d.primary ? " *" : ""}`}
+              </option>
+            ))}
+          </select>
+        )}
         <span className="dim mono">h264/relay</span>
         {agentState && <span className="dim mono">{agentState}</span>}
         <button onClick={sendPli} className="desktop-pli" type="button">

@@ -272,7 +272,11 @@ bool RunResetSequence(ResetSequence& s) {
   *s.warmup_gen_feeds = 0;
   *s.warmup_phase_logged = false;
   s.sink->OnState("capture_rebuilt", true);  // RtServer: generation++
-  if (dims_changed) s.sink->OnDisplayChanged(new_w, new_h, s.reason);
+  // M2-S3 Task 5: a display SWITCH always notifies (0x010A reason="switch")
+  // even when the two monitors share a resolution - viewers must refresh the
+  // displays list and re-map input coordinates to the new output.
+  if (dims_changed || std::strcmp(s.reason, kResetReasonSwitch) == 0)
+    s.sink->OnDisplayChanged(new_w, new_h, s.reason);
   XNC_LOG_INFO("capture_reset_done reason=%s w=%u h=%u dims_changed=%d elapsed_ms=%llu",
                s.reason, new_w, new_h, dims_changed ? 1 : 0,
                static_cast<unsigned long long>(NowMs() - t_start));

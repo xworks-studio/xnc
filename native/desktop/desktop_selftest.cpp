@@ -1819,10 +1819,11 @@ int SelftestMain() {
               kr.sub_id == 3 && std::strcmp(kr.reason, "pli") == 0);
     const xnc::HostHelloPayload hh{1, 64, 48, 15, 4};
     const std::vector<uint8_t> hw = xnc::EncodeHostHello(hh);
-    const uint8_t want_h[20] = {1, 0, 0, 0, 64, 0, 0, 0, 48, 0, 0, 0,
-                                15, 0, 0, 0, 4, 0, 0, 0};
+    // M2-S3 Task 5: displays 扩展后空表仍多 4 字节 count=0(兼容前缀不变)
+    const uint8_t want_h[24] = {1, 0, 0, 0, 64, 0, 0, 0, 48, 0, 0, 0,
+                                15, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0};
     CHECK("codec-hello-bytes",
-          hw.size() == 20 && std::equal(hw.begin(), hw.end(), want_h));
+          hw.size() == 24 && std::equal(hw.begin(), hw.end(), want_h));
     xnc::HostHelloPayload hh2;
     CHECK("codec-hello-rt",
           xnc::DecodeHostHello(xnc::Frame{0, xnc::kMsgHostHello, 0, hw}, &hh2) &&
@@ -4260,6 +4261,155 @@ int SelftestMain() {
     CHECK("wic-sof-found", pw != 0 && ph != 0);
     CHECK("wic-dims", pw == jw && ph == jh);
     CHECK("wic-nonempty", jpeg.size() > 500);
+  }
+
+  // ---- M2-Slice3 Task 5:多显示器枚举 + 切换 ----
+  {
+    // 纯枚举表构造(fake outputs 经 seam):去重、GDI 序稳定索引、primary。
+    std::vector<xnc::RawDisplayOutput> raws = {
+        {11, true, 0, 0, 1920, 1080, true},      // adapter 序:primary 在前
+        {22, true, -2560, 0, 2560, 1440, false}, // GDI 序第一位
+        {11, true, 0, 0, 1920, 1080, true},      // 重复 monitor 11(跨适配器)
+        {33, true, 1920, 0, 1280, 1024, false},  // GDI 未列 → 表尾
+        {44, false, 0, 0, 1, 1, false},          // 未挂桌面:跳过
+    };
+    const std::vector<uint64_t> gdi = {22, 11};
+    const std::vector<xnc::DisplayInfo> table = xnc::BuildDisplayTable(raws, gdi);
+    CHECK("disp-count", table.size() == 3);
+    CHECK("disp-gdi-order", table.size() == 3 && table[0].idx == 0 &&
+                              table[0].monitor_id == 22 && table[1].idx == 1 &&
+                              table[1].monitor_id == 11);
+    CHECK("disp-tail", table.size() == 3 && table[2].monitor_id == 33 &&
+                         table[2].idx == 2);
+    CHECK("disp-geom", table.size() == 3 && table[0].origin_x == -2560 &&
+                         table[0].w == 2560 && table[0].h == 1440);
+    CHECK("disp-primary",
+          table.size() == 3 && table[1].primary == 1 && table[0].primary == 0);
+
+    // HOST_HELLO displays 块黄金字节(兼容扩展:legacy 20B 前缀不变)。
+    xnc::HostHelloPayload hh;
+    hh.gen = 7; hh.w = 1920; hh.h = 1080; hh.fps = 30; hh.max_subs = 4;
+    hh.displays = table;
+    const std::vector<uint8_t> wire = xnc::EncodeHostHello(hh);
+    CHECK("hh-size", wire.size() == 24 + 3 * 21);
+    const uint8_t want_head[24] = {7, 0, 0, 0, 0x80, 7, 0, 0, 0x38, 4, 0, 0,
+                                   30, 0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0};
+    CHECK("hh-head-golden", std::memcmp(wire.data(), want_head, 24) == 0);
+    // entry 0(idx=0, origin=-2560=0xFFFFF600, 2560x1440, 非 primary)
+    CHECK("hh-entry0-origin", wire[28] == 0x00 && wire[29] == 0xF6 &&
+                                wire[30] == 0xFF && wire[31] == 0xFF);
+    CHECK("hh-entry0-dims", wire[36] == 0x00 && wire[37] == 0x0A &&
+                              wire[40] == 0xA0 && wire[41] == 0x05);
+    CHECK("hh-entry0-notprimary", wire[44] == 0);
+    // entry 1(idx=1, primary=1)
+    const size_t e1 = 24 + 21;
+    CHECK("hh-entry1", wire[e1] == 1 && wire[e1 + 20] == 1);
+    // entry 2(idx=2, origin.x=1920=0x780)
+    const size_t e2 = 24 + 42;
+    CHECK("hh-entry2", wire[e2] == 2 && wire[e2 + 4] == 0x80 && wire[e2 + 5] == 0x07);
+    // round trip
+    xnc::HostHelloPayload back{};
+    xnc::Frame hf{0, xnc::kMsgHostHello, 0, wire};
+    CHECK("hh-roundtrip", xnc::DecodeHostHello(hf, &back) && back.gen == 7 &&
+                            back.w == 1920 && back.h == 1080 &&
+                            back.displays.size() == 3 &&
+                            back.displays[0].origin_x == -2560 &&
+                            back.displays[1].primary == 1 &&
+                            back.displays[2].idx == 2);
+    // legacy 20B 载荷仍可解码(displays 空)
+    std::vector<uint8_t> legacy(20, 0);
+    xnc::Frame lf{0, xnc::kMsgHostHello, 0, legacy};
+    xnc::HostHelloPayload lback{};
+    CHECK("hh-legacy20", xnc::DecodeHostHello(lf, &lback) && lback.displays.empty());
+    // 截断 displays 块拒绝
+    std::vector<uint8_t> trunc(wire.begin(), wire.begin() + 26);
+    xnc::Frame tf{0, xnc::kMsgHostHello, 0, trunc};
+    CHECK("hh-truncated-rejected", !xnc::DecodeHostHello(tf, &lback));
+
+    // 0x0128 codec
+    CHECK("sw-enc", xnc::EncodeSwitchDisplay(99).size() == 4 &&
+                      xnc::EncodeSwitchDisplay(99)[0] == 99);
+    uint32_t sidx = 0;
+    xnc::Frame sf{0, xnc::kMsgSwitchDisplay, 3, xnc::EncodeSwitchDisplay(2)};
+    CHECK("sw-dec", xnc::DecodeSwitchDisplay(sf, &sidx) && sidx == 2);
+    xnc::Frame bad{0, xnc::kMsgSwitchDisplay, 3, {1, 2, 3}};
+    CHECK("sw-dec-badsize", !xnc::DecodeSwitchDisplay(bad, &sidx));
+  }
+  { // rt 场景 ⑧(M2-S3 Task 5):HOST_HELLO 带 displays;0x0128 非法 idx →
+    // STATE{invalid_display}(可恢复,无 reset);合法 idx → 受理 + reset 请求
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(kRtW, kRtH, kRtFps, kRtBitrate, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: rt8-init err=%s\n", err.c_str());
+    CHECK("rt8-init", init_ok);
+    if (init_ok) {
+      xnc::RtServer rt;
+      xnc::RtServer::Opts ro = rt_opts(5);
+      // 静态存储:displays_fn/switch_display_fn 是无捕获 fn 指针
+      static std::vector<xnc::DisplayInfo> fake_table;
+      static uint32_t switched_idx = 0xFFFFFFFFu;
+      fake_table.clear();
+      switched_idx = 0xFFFFFFFFu;
+      xnc::DisplayInfo d0; d0.idx = 0; d0.w = kRtW; d0.h = kRtH; d0.primary = 1;
+      xnc::DisplayInfo d1; d1.idx = 1; d1.origin_x = 64; d1.w = 32; d1.h = 24;
+      fake_table.push_back(d0); fake_table.push_back(d1);
+      ro.displays_fn = [](void*) { return fake_table; };
+      ro.switch_display_fn = [](void*, uint32_t idx) {
+        if (idx >= fake_table.size()) return false;
+        switched_idx = idx;
+        return true;
+      };
+      xnc::CaptureReset reset;  // clock=null → TakeReset 立即可取(无消费方)
+      ro.reset = &reset;
+      CHECK("rt8-start", rt.Start(ro, kRtW, kRtH));
+      ScriptedCapture cap(kRtW, kRtH, 3);
+      xnc::PipelineOpts po;
+      po.duration_s = 2;
+      po.fps = kRtFps;
+      po.target_bitrate_bps = kRtBitrate;
+      xnc::PipelineResult res;
+      std::thread pipe_th([&] { res = xnc::Pipeline::Run(cap, enc, rt, po); });
+      RtTestClient a;
+      CHECK("rt8-connect", a.Connect(ro.pipe_name.c_str(), kRtSecret, sizeof(kRtSecret)));
+      CHECK("rt8-attach-hello", a.Attach(9));
+      CHECK("rt8-hello-displays", a.hello_ok_ && a.hello_.displays.size() == 2 &&
+                                   a.hello_.displays[1].origin_x == 64);
+      // 非法 idx(表大小 2)→ STATE{invalid_display} + FlagError 应答,无 reset
+      CHECK("rt8-send-invalid", a.SendRaw(xnc::kMsgSwitchDisplay,
+                                          xnc::EncodeSwitchDisplay(99)));
+      // 合法 idx=1 → FlagResponse 应答 + reset 请求记账
+      CHECK("rt8-send-valid", a.SendRaw(xnc::kMsgSwitchDisplay,
+                                        xnc::EncodeSwitchDisplay(1)));
+      bool saw_invalid_state = false, saw_ok_resp = false, saw_err_resp = false;
+      const ULONGLONG dl = GetTickCount64() + 2500;
+      while (GetTickCount64() < dl &&
+             !(saw_invalid_state && saw_ok_resp && saw_err_resp)) {
+        xnc::Frame f;
+        if (!a.ReadFrameT(f, 200)) break;
+        a.CountFrame(f);
+        if (f.message_type == xnc::kMsgState) {
+          xnc::StateEventPayload st;
+          if (xnc::DecodeStateEvent(f, &st) && std::strcmp(st.code, "invalid_display") == 0)
+            saw_invalid_state = st.recoverable != 0;
+        } else if (f.message_type == xnc::kMsgSwitchDisplay) {
+          if (f.flags & xnc::kFlagError) saw_err_resp = true;
+          if (f.flags & xnc::kFlagResponse) saw_ok_resp = true;
+        }
+      }
+      pipe_th.join();
+      rt.Shutdown();
+      CHECK("rt8-invalid-state", saw_invalid_state);
+      CHECK("rt8-invalid-error-resp", saw_err_resp);
+      CHECK("rt8-valid-ok-resp", saw_ok_resp);
+      CHECK("rt8-switch-fn-idx", switched_idx == 1);
+      CHECK("rt8-reset-requested", reset.requests() == 1);
+      const xnc::RtServer::Stats st = rt.stats();
+      CHECK("rt8-stats", st.switch_accepted == 1 && st.switch_invalid == 1);
+      CHECK("rt8-pipeline-ok", res.ok);
+      std::printf("SELFTEST NOTE: rt8 switch_accepted=%llu switch_invalid=%llu reset_reqs=%u\n",
+                  (unsigned long long)st.switch_accepted,
+                  (unsigned long long)st.switch_invalid, reset.requests());
+    }
   }
   if (fails == 0) std::printf("selftest ok\n");
   return fails == 0 ? 0 : 1;

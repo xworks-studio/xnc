@@ -158,6 +158,7 @@ type fakeEnv struct {
 	sasHR        uint32
 	sasCode      string
 	sasErr       error
+	switchIdxs   []uint32
 }
 
 func (f *fakeEnv) sendMouse(b []byte) error { f.mouse = append(f.mouse, b); return nil }
@@ -169,6 +170,10 @@ func (f *fakeEnv) sendSAS(ctx context.Context) (bool, uint32, string, error) {
 	return f.sasOK, f.sasHR, f.sasCode, f.sasErr
 }
 func (f *fakeEnv) sasAsync(ctx context.Context) error { return f.sasErr }
+func (f *fakeEnv) switchDisplay(ctx context.Context, index uint32) error {
+	f.switchIdxs = append(f.switchIdxs, index)
+	return nil
+}
 func (f *fakeEnv) wait(ctx context.Context, d time.Duration) { f.waits = append(f.waits, d) }
 func (f *fakeEnv) cursorCount() uint64                       { return f.cursors }
 
@@ -332,4 +337,24 @@ func TestRunInputStepsSasOp(t *testing.T) {
 			t.Errorf("no input should follow a SAS timeout")
 		}
 	})
+}
+
+// M2-S3 Task 5:switch_display op 解析 + 执行 roundtrip(控制面 op,不占 seq)。
+func TestSwitchDisplayOpRoundtrip(t *testing.T) {
+	steps := parse(t, `[
+		{"op":"switch_display","index":1},
+		{"op":"switch_display","index":0},
+		{"op":"wait","ms":10}
+	]`)
+	env := &fakeEnv{}
+	res := runInputSteps(t.Context(), steps, env)
+	if !res.OK || len(res.Steps) != 3 || res.LastSeq != 0 {
+		t.Fatalf("result = %+v", res)
+	}
+	if len(env.switchIdxs) != 2 || env.switchIdxs[0] != 1 || env.switchIdxs[1] != 0 {
+		t.Fatalf("switchIdxs = %v", env.switchIdxs)
+	}
+	if _, err := parseInputScript(strings.NewReader(`[{"op":"switch_display"}]`)); err == nil {
+		t.Fatal("switch_display without index accepted")
+	}
 }

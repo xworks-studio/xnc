@@ -37,6 +37,9 @@ inline constexpr char kResetReasonDesktopSwitch[] = "desktop_switch";
 inline constexpr char kResetReasonResolution[] = "resolution";
 inline constexpr char kResetReasonAccessLost[] = "access_lost";
 inline constexpr char kResetReasonChangeBackend[] = "change_backend";
+// M2-Slice3 Task 5: MSG_SWITCH_DISPLAY 0x0128 - the rebuild rebinds the
+// selected output (DxgiSelectDisplay) and DISPLAY_CHANGED carries this reason.
+inline constexpr char kResetReasonSwitch[] = "switch";
 
 // Width of the DISPLAY_CHANGED reason field (0x010A [char reason[24]]).
 inline constexpr size_t kResetReasonMax = 24;
@@ -52,6 +55,7 @@ inline int ResetReasonPriority(const char* reason) {
   if (reason == nullptr) return 0;
   if (std::strcmp(reason, kResetReasonDesktopSwitch) == 0) return 3;
   if (std::strcmp(reason, kResetReasonResolution) == 0) return 2;
+  if (std::strcmp(reason, kResetReasonSwitch) == 0) return 2;  // explicit request
   return 1;  // access_lost / change_backend / unknown
 }
 

@@ -48,6 +48,7 @@ type scriptStep struct {
 	Op      string  `json:"op"`
 	X       *int32  `json:"x"`
 	Y       *int32  `json:"y"`
+	Index   *uint32 `json:"index"`
 	Buttons *int    `json:"buttons"`
 	Btn     *int    `json:"btn"`
 	Down    *bool   `json:"down"`
@@ -59,10 +60,12 @@ type scriptStep struct {
 	Caps    *bool   `json:"caps"`
 	Num     *bool   `json:"num"`
 
-	// scan 在解析期由 Code 查 keymap.go 得出(未知 code = 解析错误)。
+	//	scan 在解析期由 Code 查 keymap.go 得出(未知 code = 解析错误)。
 	scan scanCode
 	// units 是 S 的 UTF-16 编码(TEXT 直接送 unit)。
 	units []uint16
+	// switchIdx 是 switch_display op 的目标显示器索引(M2-S3 Task 5)。
+	switchIdx *uint32
 }
 
 // 脚本约束(与 agent 预校验对齐,解析期即拒;T3 契约)。
@@ -107,8 +110,17 @@ func validateStep(i int, s *scriptStep) error {
 		return nil
 	case "sas", "sas_async":
 		// 无字段;控制面 op(不发 DataChannel,不占 seq)。sas_async =
-		// 发出不等待(M2-Slice2 T5 门⑥:与随后的 sas op 构成同会话
+		// 发出不等待(M2-S2 T5 门⑥:与随后的 sas op 构成同会话
 		// 并发,后到者应回 busy)。
+		return nil
+	case "switch_display":
+		// M2-S3 Task 5:控制面 op(session WS {"type":"switch_display"});
+		// host 侧结果经 displaySamples(reason=switch)/ state
+		// invalid_display 观测,不占 seq。
+		if err := req(s.Index != nil, "switch_display needs index"); err != nil {
+			return err
+		}
+		s.switchIdx = s.Index
 		return nil
 	case "move":
 		if err := req(s.X != nil && s.Y != nil, "move needs x and y"); err != nil {
@@ -161,7 +173,7 @@ func validateStep(i int, s *scriptStep) error {
 	case "lease_drop":
 		return fmt.Errorf("%s: lease_drop not supported — T3 lease vocabulary has no voluntary release (disconnect or 30s idle revokes); drop the step or end the viewer", at)
 	default:
-		return fmt.Errorf("%s: unknown op %q (want lease/sas/move/button/wheel/key/text/lock/wait)", at, s.Op)
+		return fmt.Errorf("%s: unknown op %q (want lease/sas/sas_async/switch_display/move/button/wheel/key/text/lock/wait)", at, s.Op)
 	}
 }
 
@@ -285,6 +297,10 @@ type stepEnv interface {
 	// sasAsync 发 secure_attention 不等待回执(M2-Slice2 T5 门⑥:
 	// 并发 SAS busy 证据,回执经主循环 INFO 日志 + 后续 sas op 观测)。
 	sasAsync(ctx context.Context) error
+	// switchDisplay 发 {"type":"switch_display","index":N}(M2-S3 Task 5;
+	// 发出即成功 —— host 侧结果经 DISPLAY_CHANGED reason=switch /
+	// STATE invalid_display 下行帧观测)。
+	switchDisplay(ctx context.Context, index uint32) error
 	wait(ctx context.Context, d time.Duration) // 可中断等待
 	cursorCount() uint64                        // cursor 通道累计消息数
 }
@@ -318,6 +334,13 @@ func runInputSteps(ctx context.Context, steps []scriptStep, env stepEnv) *script
 					return err
 				}
 				r.Detail = "fired"
+				return nil
+			case "switch_display":
+				// 控制面 op:发出即成功(结果经下行帧观测;不占 seq)。
+				if err := env.switchDisplay(ctx, *s.switchIdx); err != nil {
+					return err
+				}
+				r.Detail = fmt.Sprintf("index=%d", *s.switchIdx)
 				return nil
 			case "sas":
 				// 控制面 op:round-trip 成功即步骤成功(拒绝码进 detail,

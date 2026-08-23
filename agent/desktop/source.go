@@ -21,11 +21,22 @@ type Frame struct {
 }
 
 // HelloInfo 是 HOST_HELLO 内容镜像;gen 递增代表 capture 重建。
+// Displays 为 M2-S3 Task 5 的 displays[] 镜像(nil = 旧 host 未携带)。
 type HelloInfo struct {
-	Gen     uint32
+	Gen      uint32
+	W, H     uint32
+	Fps      uint32
+	MaxSubs  uint32
+	Displays []Display
+}
+
+// Display 是 HOST_HELLO displays[] 一项的镜像(M2-S3 Task 5)。
+type Display struct {
+	Index   uint32
+	OriginX int32
+	OriginY int32
 	W, H    uint32
-	Fps     uint32
-	MaxSubs uint32
+	Primary bool
 }
 
 // StateEvent 是 STATE 事件镜像(dxgi_access_denied / capture_rebuilt 等)。
@@ -97,4 +108,12 @@ type SasResult struct {
 // 无 core 拓扑)收到 secure_attention 请求时按 unsupported 应答。
 type SasCaller interface {
 	SendSAS(reason string) SasResult
+}
+
+// DisplaySwitcher 是 Source 的可选能力(M2-Slice3 Task 5):切换采集
+// 输出到 displays 表中 index 对应的显示器(0x0128;host 校验后统一
+// reset 重建绑定)。未实现者(旧 host、fake)收到 switch_display 时按
+// unsupported 应答。
+type DisplaySwitcher interface {
+	SwitchDisplay(index uint32) error
 }

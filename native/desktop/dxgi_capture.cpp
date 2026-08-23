@@ -30,7 +30,9 @@
 #include <cstdio>
 #include <cstdlib>  // strtoul
 #include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #include "../common/log.h"
 #include "capture.h"
@@ -75,6 +77,153 @@ struct DxgiCapture::Impl {
   ComPtr<IDXGIOutputDuplication> dupl;
   ComPtr<ID3D11Texture2D> staging;  // persistent CPU-readable full-frame copy
 };
+
+// ---- M2-Slice3 Task 5: process-global displays table + selection ----
+// The table refreshes on every DxgiCapture::Init (and on the first snapshot
+// request); g_desired records the requested output index (kDisplaySelectAuto
+// = primary-or-0) and is consumed by the NEXT Init - that is how a switch
+// rides the unified CaptureReset (set + RequestReset("switch") -> rebuild).
+namespace {
+std::mutex g_disp_mu;
+std::vector<DisplayInfo> g_displays;
+uint32_t g_desired = kDisplaySelectAuto;
+
+// One enumerated attached output with its owning adapter kept alive.
+struct EnumeratedOutput {
+  ComPtr<IDXGIAdapter> adapter;
+  ComPtr<IDXGIOutput> output;
+  RawDisplayOutput raw;
+};
+
+// Walks EVERY adapter x output of the DXGI factory (M2-S3 Task 5): all
+// desktop-attached outputs, with desktop coordinates + primary flag +
+// HMONITOR as the dedupe/order key. The legacy Init bound output #0 of the
+// device's own adapter; this walk is what makes the full table (and cross-
+// adapter switching) possible.
+bool EnumerateAllOutputs(ComPtr<IDXGIFactory1>* factory,
+                         std::vector<EnumeratedOutput>* outs, std::string* err) {
+  HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory1),
+                                  reinterpret_cast<void**>(factory->GetAddressOf()));
+  if (FAILED(hr)) {
+    SetHrErr(err, "CreateDXGIFactory1", hr);
+    return false;
+  }
+  for (UINT a = 0;; ++a) {
+    ComPtr<IDXGIAdapter> adapter;
+    hr = (*factory)->EnumAdapters(a, &adapter);
+    if (hr == DXGI_ERROR_NOT_FOUND) break;
+    if (FAILED(hr)) {
+      SetHrErr(err, "EnumAdapters", hr);
+      return false;
+    }
+    for (UINT o = 0;; ++o) {
+      ComPtr<IDXGIOutput> output;
+      hr = adapter->EnumOutputs(o, &output);
+      if (hr == DXGI_ERROR_NOT_FOUND) break;
+      if (FAILED(hr)) break;  // per-adapter walk: skip the rest of this one
+      DXGI_OUTPUT_DESC od{};
+      if (FAILED(output->GetDesc(&od)) || !od.AttachedToDesktop) continue;
+      EnumeratedOutput e;
+      e.adapter = adapter;
+      e.output = output;
+      e.raw.monitor_id = static_cast<uint64_t>(
+          reinterpret_cast<uintptr_t>(od.Monitor));
+      e.raw.x = od.DesktopCoordinates.left;
+      e.raw.y = od.DesktopCoordinates.top;
+      e.raw.w = static_cast<uint32_t>(od.DesktopCoordinates.right -
+                                      od.DesktopCoordinates.left);
+      e.raw.h = static_cast<uint32_t>(od.DesktopCoordinates.bottom -
+                                      od.DesktopCoordinates.top);
+      if (od.Monitor != nullptr) {
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(od.Monitor, &mi))
+          e.raw.primary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+      }
+      outs->push_back(std::move(e));
+    }
+  }
+  return true;
+}
+
+// GDI monitor order (EnumDisplayMonitors callback order - the same order
+// EnumDisplayDevices reports displays in, M0 repo knowledge). These ids
+// become the STABLE display indices; outputs GDI does not list append.
+BOOL CALLBACK CollectMonitorOrder(HMONITOR mon, HDC, LPRECT, LPARAM lp) {
+  auto* order = reinterpret_cast<std::vector<uint64_t>*>(lp);
+  order->push_back(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mon)));
+  return TRUE;
+}
+
+// Refreshes g_displays from a fresh adapter walk. Empty on failure (the
+// caller's Init surfaces the error; snapshots just see an empty table).
+void RefreshGlobalTable() {
+  ComPtr<IDXGIFactory1> factory;
+  std::vector<EnumeratedOutput> outs;
+  std::string err;
+  std::vector<RawDisplayOutput> raws;
+  if (EnumerateAllOutputs(&factory, &outs, &err)) {
+    raws.reserve(outs.size());
+    for (const auto& e : outs) raws.push_back(e.raw);
+  }
+  std::vector<uint64_t> gdi_order;
+  EnumDisplayMonitors(nullptr, nullptr, CollectMonitorOrder,
+                      reinterpret_cast<LPARAM>(&gdi_order));
+  std::vector<DisplayInfo> table = BuildDisplayTable(raws, gdi_order);
+  std::lock_guard<std::mutex> lk(g_disp_mu);
+  g_displays = std::move(table);
+}
+
+// Orders the enumerated outputs to match the (already GDI-ordered) table:
+// table[i] <- first unused output whose monitor_id matches (or geometry
+// matches when the id is 0). Null entries = no live output (dropped).
+std::vector<EnumeratedOutput*> OrderOutputsByTable(
+    std::vector<EnumeratedOutput>* outs, const std::vector<DisplayInfo>& table) {
+  std::vector<EnumeratedOutput*> ordered(table.size(), nullptr);
+  std::vector<bool> used(outs->size(), false);
+  for (size_t t = 0; t < table.size(); ++t) {
+    for (size_t i = 0; i < outs->size(); ++i) {
+      if (used[i]) continue;
+      const RawDisplayOutput& r = (*outs)[i].raw;
+      const DisplayInfo& d = table[t];
+      const bool match = d.monitor_id != 0 ? r.monitor_id == d.monitor_id
+                                           : (r.x == d.origin_x && r.y == d.origin_y &&
+                                              r.w == d.w && r.h == d.h);
+      if (match) {
+        used[i] = true;
+        ordered[t] = &(*outs)[i];
+        break;
+      }
+    }
+  }
+  return ordered;
+}
+}  // namespace
+
+std::vector<DisplayInfo> DxgiDisplaysSnapshot() {
+  {
+    std::lock_guard<std::mutex> lk(g_disp_mu);
+    if (!g_displays.empty()) return g_displays;
+  }
+  RefreshGlobalTable();  // never enumerated (e.g. GDI-forced run)
+  std::lock_guard<std::mutex> lk(g_disp_mu);
+  return g_displays;
+}
+
+bool DxgiSelectDisplay(uint32_t idx) {
+  {
+    std::lock_guard<std::mutex> lk(g_disp_mu);
+    if (!g_displays.empty() && idx < g_displays.size()) {
+      g_desired = idx;
+      return true;
+    }
+  }
+  RefreshGlobalTable();
+  std::lock_guard<std::mutex> lk(g_disp_mu);
+  if (idx >= g_displays.size()) return false;
+  g_desired = idx;
+  return true;
+}
 
 DxgiCapture::DxgiCapture() : impl_(new Impl) {}
 DxgiCapture::~DxgiCapture() { delete impl_; }
@@ -140,13 +289,64 @@ bool DxgiCapture::Init(std::string* err) {
   w_ = 0;
   h_ = 0;  // forces Reduplicate to (re)create staging for the new mode
 
-  // 1. Hardware device on the default adapter (VIDEO_SUPPORT for the M4 GPU
-  //    encoder path, BGRA for the CPU path). WARP fallback covers drivers
-  //    without D3D11 hardware support.
+  // 1. Enumerate ALL attached outputs across every adapter (M2-S3 Task 5),
+  //    build the GDI-ordered stable table and refresh the process-global
+  //    snapshot (HOST_HELLO displays[] reads it).
+  ComPtr<IDXGIFactory1> factory;
+  std::vector<EnumeratedOutput> outs;
+  if (!EnumerateAllOutputs(&factory, &outs, err)) return false;
+  std::vector<uint64_t> gdi_order;
+  EnumDisplayMonitors(nullptr, nullptr, CollectMonitorOrder,
+                      reinterpret_cast<LPARAM>(&gdi_order));
+  std::vector<RawDisplayOutput> raws;
+  raws.reserve(outs.size());
+  for (const auto& e : outs) raws.push_back(e.raw);
+  std::vector<DisplayInfo> table = BuildDisplayTable(raws, gdi_order);
+  {
+    std::lock_guard<std::mutex> lk(g_disp_mu);
+    g_displays = table;
+  }
+  if (table.empty()) {
+    if (err) *err = "no desktop-attached output";
+    return false;
+  }
+
+  // 2. Resolve the desired index: kDisplaySelectAuto = primary, else 0 (the
+  //    pre-Task-5 "first duplicable output" family); an explicit selection
+  //    (MSG_SWITCH_DISPLAY -> DxgiSelectDisplay) binds at the NEXT rebuild.
+  uint32_t want = 0;
+  {
+    std::lock_guard<std::mutex> lk(g_disp_mu);
+    if (g_desired != kDisplaySelectAuto) {
+      want = g_desired;
+    } else {
+      want = 0;
+      for (const auto& d : table)
+        if (d.primary) { want = d.idx; break; }
+    }
+  }
+  if (want >= table.size()) {
+    char buf[64];
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "display index %u out of range (%zu)",
+                want, table.size());
+    if (err) *err = buf;
+    return false;
+  }
+  std::vector<EnumeratedOutput*> ordered = OrderOutputsByTable(&outs, table);
+
+  // 3. Hardware device on the TARGET output's adapter (VIDEO_SUPPORT for the
+  //    M4 GPU encoder path, BGRA for the CPU path). WARP fallback covers
+  //    drivers without D3D11 hardware support (default adapter).
+  const EnumeratedOutput* target = ordered[want];
+  if (target == nullptr) {
+    if (err) *err = "selected display has no live output";
+    return false;
+  }
   D3D_FEATURE_LEVEL fl{};
-  HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-                                 D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                                 nullptr, 0, D3D11_SDK_VERSION, &impl_->dev, &fl, &impl_->ctx);
+  HRESULT hr = D3D11CreateDevice(
+      target->adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+      D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+      nullptr, 0, D3D11_SDK_VERSION, &impl_->dev, &fl, &impl_->ctx);
   if (FAILED(hr)) {
     XNC_LOG_INFO("dxgi hardware device failed hr=0x%08lX, trying WARP",
                  static_cast<unsigned long>(hr));
@@ -159,47 +359,29 @@ bool DxgiCapture::Init(std::string* err) {
     }
   }
 
-  // 2. Device → adapter → first desktop-attached output that duplicates.
-  ComPtr<IDXGIDevice> dxgi_dev;
-  hr = impl_->dev.As(&dxgi_dev);
-  if (FAILED(hr)) {
-    SetHrErr(err, "QI IDXGIDevice", hr);
-    return false;
-  }
-  ComPtr<IDXGIAdapter> adapter;
-  hr = dxgi_dev->GetAdapter(&adapter);
-  if (FAILED(hr)) {
-    SetHrErr(err, "GetAdapter", hr);
-    return false;
-  }
-
+  // 4. Duplicate the selected output; on failure walk the remaining table
+  //    entries whose output lives on the SAME adapter (a device cannot
+  //    duplicate another adapter's output - the fallback stays within it).
   std::string last_err = "no desktop-attached output";
-  for (UINT i = 0;; ++i) {
-    ComPtr<IDXGIOutput> output;
-    hr = adapter->EnumOutputs(i, &output);
-    if (hr == DXGI_ERROR_NOT_FOUND) break;
-    if (FAILED(hr)) {
-      SetHrErr(err, "EnumOutputs", hr);
-      return false;
-    }
-    DXGI_OUTPUT_DESC od{};
-    if (FAILED(output->GetDesc(&od)) || !od.AttachedToDesktop) continue;
-
+  for (uint32_t t = want; t < table.size(); ++t) {
+    const EnumeratedOutput* e = ordered[t];
+    if (e == nullptr || e->adapter.Get() != target->adapter.Get()) continue;
     ComPtr<IDXGIOutput1> o1;
     ComPtr<IDXGIOutput5> o5;
-    output.As(&o1);   // always available on DXGI 1.2+
-    output.As(&o5);   // Windows 10+; absence is fine (fallback below)
+    e->output.As(&o1);  // always available on DXGI 1.2+
+    e->output.As(&o5);  // Windows 10+; absence is fine (fallback below)
     impl_->out1 = o1;
     impl_->out5 = o5;
 
     if (Reduplicate(err)) {
       have_base_frame_ = false;
-      XNC_LOG_INFO("dxgi duplication ready output=%u w=%u h=%u via=%s", i, w_, h_,
+      XNC_LOG_INFO("dxgi duplication ready display=%u of %zu w=%u h=%u via=%s",
+                   t, table.size(), w_, h_,
                    impl_->out5 ? "DuplicateOutput1" : "DuplicateOutput");
       return true;
     }
     last_err = err ? *err : "duplicate failed";
-    XNC_LOG_INFO("dxgi duplicate failed on output %u err=\"%s\"", i, last_err.c_str());
+    XNC_LOG_INFO("dxgi duplicate failed on display %u err=\"%s\"", t, last_err.c_str());
     impl_->dupl.Reset();
     impl_->out1.Reset();
     impl_->out5.Reset();

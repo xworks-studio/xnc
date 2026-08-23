@@ -547,6 +547,9 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
     ro.bitrate_bps = kDiagBitrateBps;
     ro.input = input.get();
     ro.cursor = cursor.get();
+    // M2-S3 Task 5: 0x0128 switch + HOST_HELLO displays[].
+    ro.displays_fn = [](void*) { return xnc::DxgiDisplaysSnapshot(); };
+    ro.switch_display_fn = [](void*, uint32_t idx) { return xnc::DxgiSelectDisplay(idx); };
     input->StartJanitor();
     if (!rt.Start(ro, capture.Width(), capture.Height())) {
       write_stats(fail_result("rt_server_start_failed"));
@@ -640,6 +643,12 @@ int RunConsoleRt(const xnc::DiagOptions& opt) {
   ro.desktop_name_fn = &DesktopNameThunk;
   ro.desktop_name_ctx = &watch;
   ro.reset = &capture_reset;
+  // M2-S3 Task 5: 0x0128 switch + HOST_HELLO displays[]. NOTE: while the
+  // GDI rung is active the selection lands but binds at the next DXGI
+  // rebuild (GDI cannot select an output; the ladder's DXGI probe/upgrade
+  // picks the desired index up at SwapToDxgi's fresh Init).
+  ro.displays_fn = [](void*) { return xnc::DxgiDisplaysSnapshot(); };
+  ro.switch_display_fn = [](void*, uint32_t idx) { return xnc::DxgiSelectDisplay(idx); };
   xnc::RtServer server;
   capture.SetStateSink(&server);  // backend swaps -> STATE backend_changed
   const int rc = server.Serve(capture, encoder, ro);

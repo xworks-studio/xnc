@@ -185,6 +185,18 @@ func (e *serverInputEnv) sasAsync(ctx context.Context) error {
 	return nil
 }
 
+// switchDisplay 发 {"type":"switch_display","index":N}(M2-S3 Task 5;
+// 发出即成功,结果经下行帧观测)。
+func (e *serverInputEnv) switchDisplay(ctx context.Context, index uint32) error {
+	wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	jb, _ := json.Marshal(map[string]any{"type": "switch_display", "index": index})
+	if err := e.ws.Write(wctx, websocket.MessageText, jb); err != nil {
+		return fmt.Errorf("send switch_display: %w", err)
+	}
+	return nil
+}
+
 func (e *serverInputEnv) sendSAS(ctx context.Context) (bool, uint32, string, error) {
 	if stale := drainSasReplies(e.sasCh); stale > 0 {
 		e.v.log.Warn("sas: discarded stale result frame(s) from an earlier op", "count", stale)

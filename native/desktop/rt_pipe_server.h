@@ -22,6 +22,20 @@
 //                               (M2-Slice1 Task 2; broadcast when a unified
 //                               capture reset changed the stream geometry;
 //                               subscribers treat it as HOST_HELLO update)
+//   MSG_SWITCH_DISPLAY 0x0128 req  [u32 idx]  (M2-Slice3 Task 5)
+//                               validate idx < displays count -> select +
+//                               unified CaptureReset(reason="switch"; the
+//                               rebuild rebinds that output, ForceIDR via the
+//                               reset's base-frame rewind, then HOST_HELLO
+//                               re-emit + DISPLAY_CHANGED reason=switch);
+//                               invalid -> STATE{invalid_display} (recoverable)
+//                               + error response, NO reset.
+//                               HOST_HELLO displays[] extension (same task,
+//                               compatible): 20 legacy bytes + [u32 count]
+//                               { [u32 idx][s32 originX][s32 originY][u32 w]
+//                                 [u32 h][u8 primary] } (21 bytes/entry);
+//                               legacy w/h/fps/max_subs stay = the ACTIVE
+//                               display's geometry.
 //
 // sub_ids are client-chosen (non-zero, unique per server). IDR semantics
 // (spec §7.5 + Slice1 carry-over): attach/queue-overflow/explicit requests
@@ -64,6 +78,7 @@
 #include "../common/frame.h"
 #include "capture.h"       // ICapture
 #include "capture_reset.h"  // kResetReasonMax, CopyReason (0x010A reason field)
+#include "dxgi_capture.h"  // DisplayInfo (HOST_HELLO displays[]; M2-S3 Task 5)
 #include "mf_encoder.h"    // MfSoftEncoder
 #include "pipeline.h"      // AuSink, PipelineOpts
 #include "subscribers.h"
@@ -77,7 +92,7 @@ class CursorManager;  // cursor_manager.h
 constexpr uint16_t kMsgAttach = 0x0102, kMsgDetach = 0x0103, kMsgKeyframeReq = 0x0104,
                    kMsgFrame = 0x0105, kMsgHostHello = 0x0106, kMsgState = 0x0107,
                    kMsgInput = 0x0108, kMsgCursor = 0x0109,
-                   kMsgDisplayChanged = 0x010A;
+                   kMsgDisplayChanged = 0x010A, kMsgSwitchDisplay = 0x0128;
 
 // AU payload bound (proto.MaxSessionFrameBytes).
 inline constexpr size_t kMaxAuBytes = size_t(8) << 20;
@@ -129,6 +144,8 @@ struct FrameEventPayload {
 };
 struct HostHelloPayload {
   uint32_t gen = 0, w = 0, h = 0, fps = 0, max_subs = 0;
+  // M2-S3 Task 5: the displays table (empty = legacy 20-byte payload).
+  std::vector<DisplayInfo> displays;
 };
 struct StateEventPayload {
   char code[32] = {0};  // NUL-padded fixed field
@@ -214,22 +231,68 @@ inline bool DecodeFrameEvent(const Frame& f, FrameEventPayload* out) {
   return true;
 }
 
+// HOST_HELLO: legacy 20 bytes, then (M2-S3 Task 5) the displays block
+// [u32 count]{ [u32 idx][s32 ox][s32 oy][u32 w][u32 h][u8 primary] }.
+inline constexpr size_t kDisplayEntryBytes = 21;
+
 inline std::vector<uint8_t> EncodeHostHello(const HostHelloPayload& h) {
-  std::vector<uint8_t> p(20, 0);
+  std::vector<uint8_t> p(20 + 4 + kDisplayEntryBytes * h.displays.size(), 0);
   rt_detail::PutU32(p.data(), h.gen);
   rt_detail::PutU32(p.data() + 4, h.w);
   rt_detail::PutU32(p.data() + 8, h.h);
   rt_detail::PutU32(p.data() + 12, h.fps);
   rt_detail::PutU32(p.data() + 16, h.max_subs);
+  rt_detail::PutU32(p.data() + 20, static_cast<uint32_t>(h.displays.size()));
+  for (size_t i = 0; i < h.displays.size(); ++i) {
+    uint8_t* e = p.data() + 24 + kDisplayEntryBytes * i;
+    const DisplayInfo& d = h.displays[i];
+    rt_detail::PutU32(e, d.idx);
+    rt_detail::PutU32(e + 4, static_cast<uint32_t>(d.origin_x));
+    rt_detail::PutU32(e + 8, static_cast<uint32_t>(d.origin_y));
+    rt_detail::PutU32(e + 12, d.w);
+    rt_detail::PutU32(e + 16, d.h);
+    e[20] = d.primary != 0 ? 1 : 0;
+  }
   return p;
 }
 inline bool DecodeHostHello(const Frame& f, HostHelloPayload* out) {
-  if (out == nullptr || f.payload.size() != 20) return false;
+  if (out == nullptr) return false;
+  if (f.payload.size() == 20) {  // legacy server (displays unknown)
+    out->displays.clear();
+  } else {
+    if (f.payload.size() < 24) return false;
+    const uint32_t n = rt_detail::GetU32(f.payload.data() + 20);
+    if (f.payload.size() != 24 + kDisplayEntryBytes * n) return false;
+    out->displays.resize(n);
+    for (uint32_t i = 0; i < n; ++i) {
+      const uint8_t* e = f.payload.data() + 24 + kDisplayEntryBytes * i;
+      DisplayInfo& d = out->displays[i];
+      d.idx = rt_detail::GetU32(e);
+      d.origin_x = rt_detail::GetS32(e + 4);
+      d.origin_y = rt_detail::GetS32(e + 8);
+      d.w = rt_detail::GetU32(e + 12);
+      d.h = rt_detail::GetU32(e + 16);
+      d.primary = e[20] != 0 ? 1 : 0;
+    }
+  }
   out->gen = rt_detail::GetU32(f.payload.data());
   out->w = rt_detail::GetU32(f.payload.data() + 4);
   out->h = rt_detail::GetU32(f.payload.data() + 8);
   out->fps = rt_detail::GetU32(f.payload.data() + 12);
   out->max_subs = rt_detail::GetU32(f.payload.data() + 16);
+  return true;
+}
+
+// ---- 0x0128 MSG_SWITCH_DISPLAY req: [u32 idx] (M2-Slice3 Task 5) ----
+
+inline std::vector<uint8_t> EncodeSwitchDisplay(uint32_t idx) {
+  std::vector<uint8_t> p(4, 0);
+  rt_detail::PutU32(p.data(), idx);
+  return p;
+}
+inline bool DecodeSwitchDisplay(const Frame& f, uint32_t* idx) {
+  if (idx == nullptr || f.payload.size() != 4) return false;
+  *idx = rt_detail::GetU32(f.payload.data());
   return true;
 }
 
@@ -464,6 +527,16 @@ class RtServer : public AuSink {
     // with DISPLAY_CHANGED broadcasts). Optional - null keeps the legacy
     // fatal-on-error behavior.
     CaptureReset* reset = nullptr;
+    // M2-Slice3 Task 5: displays-table provider (HOST_HELLO displays[] and
+    // 0x0128 validation). Optional - null = empty table (every switch is
+    // rejected as invalid_display). Returns a snapshot copy.
+    std::vector<DisplayInfo> (*displays_fn)(void*) = nullptr;
+    void* displays_ctx = nullptr;
+    // 0x0128 handler: bind idx as the desired output (consumed at the next
+    // rebuild). Returns false when the index is invalid (STATE
+    // invalid_display; no reset). Optional - null = same as always-false.
+    bool (*switch_display_fn)(void*, uint32_t idx) = nullptr;
+    void* switch_display_ctx = nullptr;
   };
 
   struct Stats {
@@ -483,6 +556,8 @@ class RtServer : public AuSink {
     uint64_t input_dropped = 0;   // stale seq or injection failure (Inject != ok)
     uint64_t cursor_events = 0;   // 0x0109 events broadcast
     uint64_t display_changes = 0; // 0x010A events broadcast (M2-S1 T2)
+    uint64_t switch_accepted = 0; // 0x0128 accepted -> reset(reason=switch)
+    uint64_t switch_invalid = 0;  // 0x0128 rejected idx / no handler (M2-S3 T5)
   };
 
   RtServer() = default;
@@ -532,6 +607,8 @@ class RtServer : public AuSink {
   void AcceptLoop(HANDLE first_pipe);
   void ReaderLoop(std::shared_ptr<SubConn> c);
   void SenderLoop(std::shared_ptr<SubConn> c);
+  // Displays-table snapshot (opts_.displays_fn; empty when not wired).
+  std::vector<DisplayInfo> CurrentDisplays();
   // Pushes a control frame to one subscriber (never dropped; backlog
   // overflow returns false = wedged connection, caller disconnects).
   bool PushControlTo(SubConn* c, const Frame& f);

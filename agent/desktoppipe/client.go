@@ -55,6 +55,7 @@ const (
 	msgInput       uint16 = 0x0108
 	msgCursor      uint16 = 0x0109
 	msgDisplayChg  uint16 = 0x010A
+	msgSwitchDisp  uint16 = 0x0128
 )
 
 // 0x0108 type 值(C++ kInput* 镜像)。
@@ -92,6 +93,9 @@ const (
 	reasonLen = 32
 	// displayReasonLen 是 0x010A reason 字段宽度(NUL 填充,有效 23)。
 	displayReasonLen = 24
+	// displayEntryLen 是 HOST_HELLO displays[] 每项字节数(M2-S3 Task 5):
+	// [u32 idx][s32 ox][s32 oy][u32 w][u32 h][u8 primary]。
+	displayEntryLen = 21
 )
 
 // SubOpts 是 ATTACH 携带的整形参数(0 = 未指定,由 host 用默认)。
@@ -109,11 +113,24 @@ type Frame struct {
 }
 
 // HelloInfo 是 HOST_HELLO 内容;gen 递增代表 capture 重建(T2 语义)。
+// Displays 是 M2-S3 Task 5 的 displays[] 块(旧 server 不携带 = nil);
+// W/H 恒为「当前活动显示器」几何(与 displays[] 中某一项一致)。
 type HelloInfo struct {
-	Gen     uint32
+	Gen      uint32
+	W, H     uint32
+	Fps      uint32
+	MaxSubs  uint32
+	Displays []Display
+}
+
+// Display 是 HOST_HELLO displays[] 的一项(M2-S3 Task 5;与 native
+// DisplayInfo 逐字段镜像)。Index 为稳定表索引(0x0128 携带同一值)。
+type Display struct {
+	Index   uint32
+	OriginX int32
+	OriginY int32
 	W, H    uint32
-	Fps     uint32
-	MaxSubs uint32
+	Primary bool
 }
 
 // StateEvent 是 STATE 事件(stable code + 可恢复性)。
@@ -344,6 +361,16 @@ func (s *Sub) Err() error {
 // 31 字节)。写失败返回错误;连接已关返回 errClosed。
 func (s *Sub) RequestKeyframe(reason string) error {
 	return s.writeCtrl(&ipc.Frame{MessageType: msgKeyframeReq, Payload: encodeKeyframeReq(s.subID, reason)})
+}
+
+// SendSwitchDisplay 发送 0x0128 [u32 idx](M2-Slice3 Task 5)。host 校验
+// idx < displays 数量:合法 → 统一 reset(reason=switch)重建绑定新输出
+// (随后 HOST_HELLO 重发 + DISPLAY_CHANGED reason=switch);非法 → STATE
+// {invalid_display}(可恢复)且不 reset。host 端能力/仲裁由调用方负责。
+func (s *Sub) SendSwitchDisplay(idx uint32) error {
+	p := make([]byte, 4)
+	binary.LittleEndian.PutUint32(p, idx)
+	return s.writeCtrl(&ipc.Frame{MessageType: msgSwitchDisp, RequestID: 1, Payload: p})
 }
 
 // Close 发送 DETACH(尽力而为)、关闭连接并置 done(解除泵的可能
@@ -597,16 +624,36 @@ func decodeFrame(p []byte) (Frame, error) {
 }
 
 func decodeHostHello(p []byte) (*HelloInfo, error) {
-	if len(p) != 20 {
-		return nil, fmt.Errorf("desktoppipe: host_hello payload %d bytes, want 20", len(p))
+	// M2-S3 Task 5:legacy 20B(无 displays)或 24B + 21B*n 扩展载荷。
+	if len(p) != 20 && (len(p) < 24 || (len(p)-24)%displayEntryLen != 0) {
+		return nil, fmt.Errorf("desktoppipe: host_hello payload %d bytes, want 20 or 24+21n", len(p))
 	}
-	return &HelloInfo{
+	h := &HelloInfo{
 		Gen:     binary.LittleEndian.Uint32(p),
 		W:       binary.LittleEndian.Uint32(p[4:]),
 		H:       binary.LittleEndian.Uint32(p[8:]),
 		Fps:     binary.LittleEndian.Uint32(p[12:]),
 		MaxSubs: binary.LittleEndian.Uint32(p[16:]),
-	}, nil
+	}
+	if len(p) >= 24 {
+		n := binary.LittleEndian.Uint32(p[20:])
+		if uint64(len(p)-24) != uint64(n)*displayEntryLen {
+			return nil, fmt.Errorf("desktoppipe: host_hello displays count %d vs payload %d", n, len(p))
+		}
+		h.Displays = make([]Display, 0, n)
+		for i := uint32(0); i < n; i++ {
+			e := p[24+i*displayEntryLen:]
+			h.Displays = append(h.Displays, Display{
+				Index:   binary.LittleEndian.Uint32(e),
+				OriginX: int32(binary.LittleEndian.Uint32(e[4:])),
+				OriginY: int32(binary.LittleEndian.Uint32(e[8:])),
+				W:       binary.LittleEndian.Uint32(e[12:]),
+				H:       binary.LittleEndian.Uint32(e[16:]),
+				Primary: e[20] != 0,
+			})
+		}
+	}
+	return h, nil
 }
 
 // decodeState 解码 STATE 事件 [char code[32]][u8 recoverable]。
@@ -659,6 +706,7 @@ func displayAsHello(ev DisplayChanged, prev *HelloInfo) *HelloInfo {
 	if prev != nil {
 		h.Fps = prev.Fps
 		h.MaxSubs = prev.MaxSubs
+		h.Displays = prev.Displays // 0x010A 不携带 displays;沿用旧表
 	}
 	return h
 }

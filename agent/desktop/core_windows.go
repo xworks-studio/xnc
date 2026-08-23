@@ -271,7 +271,20 @@ func (p *pipeSource) Hello() *HelloInfo {
 	if h == nil {
 		return nil
 	}
-	return &HelloInfo{Gen: h.Gen, W: h.W, H: h.H, Fps: h.Fps, MaxSubs: h.MaxSubs}
+	out := &HelloInfo{Gen: h.Gen, W: h.W, H: h.H, Fps: h.Fps, MaxSubs: h.MaxSubs}
+	if len(h.Displays) > 0 {
+		out.Displays = make([]Display, len(h.Displays))
+		for i, d := range h.Displays {
+			out.Displays[i] = Display{Index: d.Index, OriginX: d.OriginX,
+				OriginY: d.OriginY, W: d.W, H: d.H, Primary: d.Primary}
+		}
+	}
+	return out
+}
+
+// SwitchDisplay 发送 0x0128(M2-S3 Task 5;DisplaySwitcher 能力)。
+func (p *pipeSource) SwitchDisplay(index uint32) error {
+	return p.sub.SendSwitchDisplay(index)
 }
 
 func (p *pipeSource) RequestKeyframe(reason string) error { return p.sub.RequestKeyframe(reason) }

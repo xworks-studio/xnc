@@ -234,7 +234,9 @@ func TestDialAndPump(t *testing.T) {
 	}
 
 	hello := sub.Hello()
-	if hello == nil || *hello != (HelloInfo{Gen: 3, W: 1920, H: 1080, Fps: 30, MaxSubs: 4}) {
+	// M2-S3:HelloInfo 含 slice 字段,不可整体比较,逐字段断言。
+	if hello == nil || hello.Gen != 3 || hello.W != 1920 || hello.H != 1080 ||
+		hello.Fps != 30 || hello.MaxSubs != 4 || len(hello.Displays) != 0 {
 		t.Fatalf("Hello() = %+v", hello)
 	}
 
@@ -652,5 +654,103 @@ func TestDoneErrOnHostDisconnect(t *testing.T) {
 	_ = sub.Close() // 幂等安全;Err 保持非 nil(下线原因不被抹除)
 	if err := sub.Err(); err == nil {
 		t.Fatal("Err() must stay non-nil after post-disconnect Close")
+	}
+}
+
+// ---- M2-Slice3 Task 5:HOST_HELLO displays[] 解析 + 0x0128 切换 ----
+
+// 黄金载荷与 native/desktop/desktop_selftest.cpp 的 hh-head-golden 同源
+// (gen=7 1920x1080@30 + 3 项 displays;双实现交叉)。
+func TestDecodeHostHelloDisplaysGolden(t *testing.T) {
+	p := make([]byte, 24+3*21)
+	tPut32(p, 0, 7)
+	tPut32(p, 4, 1920)
+	tPut32(p, 8, 1080)
+	tPut32(p, 12, 30)
+	tPut32(p, 16, 4)
+	tPut32(p, 20, 3)
+	// entry0: idx=0 origin(-2560,0) 2560x1440 非 primary
+	tPut32(p, 24, 0)
+	tPut32(p, 28, s32u(-2560))
+	tPut32(p, 32, 0)
+	tPut32(p, 36, 2560)
+	tPut32(p, 40, 1440)
+	// entry1: idx=1 origin(0,0) 1920x1080 primary
+	tPut32(p, 45, 1)
+	tPut32(p, 65, 1)
+	// entry2: idx=2 origin(1920,0) 1280x1024 非 primary
+	tPut32(p, 66, 2)
+	tPut32(p, 70, 1920)
+	tPut32(p, 78, 1280)
+	tPut32(p, 82, 1024)
+
+	h, err := decodeHostHello(p)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if h.Gen != 7 || h.W != 1920 || h.H != 1080 || h.Fps != 30 || h.MaxSubs != 4 {
+		t.Fatalf("legacy fields: %+v", h)
+	}
+	if len(h.Displays) != 3 {
+		t.Fatalf("displays len = %d, want 3", len(h.Displays))
+	}
+	d0, d1, d2 := h.Displays[0], h.Displays[1], h.Displays[2]
+	if d0.Index != 0 || d0.OriginX != -2560 || d0.W != 2560 || d0.H != 1440 || d0.Primary {
+		t.Fatalf("d0: %+v", d0)
+	}
+	if d1.Index != 1 || d1.Primary != true {
+		t.Fatalf("d1: %+v", d1)
+	}
+	if d2.Index != 2 || d2.OriginX != 1920 || d2.W != 1280 || d2.H != 1024 || d2.Primary {
+		t.Fatalf("d2: %+v", d2)
+	}
+}
+
+// 旧 server 的 20B 载荷仍可解(Displays nil)。
+func TestDecodeHostHelloLegacy20(t *testing.T) {
+	h, err := decodeHostHello(tEncHostHello(3, 1920, 1080, 30, 4))
+	if err != nil || h.Gen != 3 || h.MaxSubs != 4 {
+		t.Fatalf("legacy decode: %+v err=%v", h, err)
+	}
+	if h.Displays != nil {
+		t.Fatalf("legacy displays = %+v, want nil", h.Displays)
+	}
+}
+
+// 截断/count 不一致拒绝。
+func TestDecodeHostHelloDisplaysMalformed(t *testing.T) {
+	if _, err := decodeHostHello(make([]byte, 26)); err == nil {
+		t.Fatal("26-byte payload accepted")
+	}
+	if _, err := decodeHostHello(make([]byte, 21)); err == nil {
+		t.Fatal("21-byte payload accepted")
+	}
+	p := make([]byte, 24+21)
+	tPut32(p, 20, 2) // count=2 但仅 1 项
+	if _, err := decodeHostHello(p); err == nil {
+		t.Fatal("count mismatch accepted")
+	}
+}
+
+// SendSwitchDisplay 线上形态:0x0128 + [u32 idx](4 字节小端)。
+func TestSendSwitchDisplayWire(t *testing.T) {
+	c, s := net.Pipe()
+	defer c.Close()
+	defer s.Close()
+	sub := &Sub{conn: c, subID: 5}
+	errCh := make(chan error, 1)
+	go func() { errCh <- sub.SendSwitchDisplay(2) }()
+	f, err := ipc.ReadFrame(s)
+	if err != nil {
+		t.Fatalf("read frame: %v", err)
+	}
+	if f.MessageType != msgSwitchDisp {
+		t.Fatalf("message type = %#04x, want 0x0128", f.MessageType)
+	}
+	if len(f.Payload) != 4 || binary.LittleEndian.Uint32(f.Payload) != 2 {
+		t.Fatalf("payload = %v, want [2 0 0 0]", f.Payload)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("send: %v", err)
 	}
 }

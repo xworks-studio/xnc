@@ -76,6 +76,91 @@ inline bool SamplePointsNotUniform(const uint8_t* bgra, uint32_t w, uint32_t h) 
 // DXGI_ERROR_SESSION_DISCONNECTED carried in the "<step>: hr=0x%08X" format.
 bool DxgiErrIsDesktopAccessDenied(const std::string& err);
 
+// ---- M2-Slice3 Task 5: multi-display enumeration ----
+//
+// One attached desktop output. idx is the STABLE table index (GDI monitor
+// order - see BuildDisplayTable); origin is the desktop-coordinate position
+// of the output's top-left corner; primary mirrors MONITORINFOF_PRIMARY.
+// monitor_id is the internal dedupe/order key (the HMONITOR value; 0 when
+// unknown - such entries append at the table tail).
+struct DisplayInfo {
+  uint32_t idx = 0;
+  int32_t origin_x = 0, origin_y = 0;
+  uint32_t w = 0, h = 0;
+  uint8_t primary = 0;
+  uint64_t monitor_id = 0;
+};
+
+// One raw enumerated output (adapter-walk order), the injectable seam the
+// selftest feeds with fake outputs. attached mirrors DXGI
+// OUTPUT_DESC.AttachedToDesktop; x/y/w/h the DesktopCoordinates rect;
+// primary from GetMonitorInfo; monitor_id the HMONITOR (0 = unknown).
+struct RawDisplayOutput {
+  uint64_t monitor_id = 0;
+  bool attached = true;
+  int32_t x = 0, y = 0;
+  uint32_t w = 0, h = 0;
+  bool primary = false;
+};
+
+// Builds the stable displays table from the adapter-walk outputs:
+//   1. dedupe by monitor_id (keep the first occurrence; id 0 never dedupes);
+//   2. index in GDI-order first (the ids in gdi_order, in that order -
+//      EnumDisplayMonitors callback order aligns with EnumDisplayDevices,
+//      M0 repo knowledge), then any outputs GDI did not list (adapter-walk
+//      order, including monitor_id == 0) appended at the tail.
+// Output DisplayInfo.idx == position in the returned vector.
+inline std::vector<DisplayInfo> BuildDisplayTable(
+    const std::vector<RawDisplayOutput>& adapter_order,
+    const std::vector<uint64_t>& gdi_order) {
+  std::vector<DisplayInfo> deduped;
+  for (const auto& r : adapter_order) {
+    if (!r.attached) continue;
+    if (r.monitor_id != 0) {
+      bool dup = false;
+      for (const auto& d : deduped)
+        if (d.monitor_id == r.monitor_id) { dup = true; break; }
+      if (dup) continue;
+    }
+    DisplayInfo d;
+    d.origin_x = r.x; d.origin_y = r.y; d.w = r.w; d.h = r.h;
+    d.primary = r.primary ? 1 : 0;
+    d.monitor_id = r.monitor_id;
+    deduped.push_back(d);
+  }
+  std::vector<DisplayInfo> out;
+  std::vector<bool> used(deduped.size(), false);
+  for (const uint64_t id : gdi_order) {
+    if (id == 0) continue;
+    for (size_t i = 0; i < deduped.size(); ++i) {
+      if (!used[i] && deduped[i].monitor_id == id) {
+        used[i] = true;
+        out.push_back(deduped[i]);
+        break;
+      }
+    }
+  }
+  for (size_t i = 0; i < deduped.size(); ++i)
+    if (!used[i]) out.push_back(deduped[i]);
+  for (size_t i = 0; i < out.size(); ++i) out[i].idx = static_cast<uint32_t>(i);
+  return out;
+}
+
+// Selection sentinel: "auto" = primary display if one is attached, else
+// table entry 0 (the pre-Task-5 behavior picked the first duplicable output;
+// primary-first keeps single-display nodes identical).
+inline constexpr uint32_t kDisplaySelectAuto = 0xFFFFFFFFu;
+
+// Snapshot of the process-global displays table (refreshed on every
+// DxgiCapture::Init; empty when DXGI enumeration never ran). Thread-safe.
+std::vector<DisplayInfo> DxgiDisplaysSnapshot();
+
+// Validates idx against the CURRENT table (refreshing it if empty) and
+// records it as the desired selection - consumed by the NEXT Init/rebuild
+// (switch = set this + RequestReset("switch")). Returns false for an out-of
+// -range index or an empty table.
+bool DxgiSelectDisplay(uint32_t idx);
+
 // DXGI Desktop Duplication with CPU readback. Single-threaded use only.
 class DxgiCapture final : public ICapture {
  public:

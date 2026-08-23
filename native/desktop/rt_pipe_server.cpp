@@ -471,8 +471,10 @@ void RtServer::ReaderLoop(std::shared_ptr<SubConn> c) {
                  static_cast<unsigned long>(client_pid), ap.max_fps, ap.max_w,
                  ap.bitrate);
 
-    // HOST_HELLO immediately after attach (plan Task 2).
-    const HostHelloPayload hh{gen_.load(), src_w_, src_h_, opts_.fps, opts_.max_subs};
+    // HOST_HELLO immediately after attach (plan Task 2). M2-S3 Task 5: the
+    // payload carries the full displays table (empty when no provider).
+    HostHelloPayload hh{gen_.load(), src_w_, src_h_, opts_.fps, opts_.max_subs};
+    hh.displays = CurrentDisplays();
     if (!PushControlTo(c.get(), Frame{kFlagEvent, kMsgHostHello, 0, EncodeHostHello(hh)}))
       break;  // control backlog: wedged connection
     // First subscriber: the cursor poller runs only while someone watches
@@ -547,6 +549,51 @@ void RtServer::ReaderLoop(std::shared_ptr<SubConn> c) {
                           Frame{kFlagResponse | kFlagError, kMsgKeyframeReq,
                                 f.request_id, {}});
           }
+          break;
+        }
+        case kMsgSwitchDisplay: {
+          // 0x0128 (M2-S3 Task 5): validate idx < displays count -> select +
+          // unified reset(reason="switch"; the rebuild binds the new output,
+          // ForceIDR comes from the reset's base-frame rewind); invalid ->
+          // STATE{invalid_display} (recoverable) + error response, no reset.
+          uint32_t idx = 0;
+          if (!DecodeSwitchDisplay(f, &idx)) {
+            std::lock_guard<std::mutex> lk(mu_);
+            stats_.switch_invalid++;
+            PushControlTo(c.get(),
+                          Frame{kFlagResponse | kFlagError, kMsgSwitchDisplay,
+                                f.request_id, {}});
+            break;
+          }
+          const std::vector<DisplayInfo> table = CurrentDisplays();
+          const bool ok = idx < table.size() && opts_.switch_display_fn != nullptr &&
+                          opts_.switch_display_fn(opts_.switch_display_ctx, idx);
+          if (!ok) {
+            {
+              std::lock_guard<std::mutex> lk(mu_);
+              stats_.switch_invalid++;
+            }
+            XNC_LOG_INFO("rt switch_display rejected sub=%u idx=%u count=%zu",
+                         c->sub_id, idx, table.size());
+            PushControlTo(c.get(),
+                          Frame{kFlagEvent, kMsgState, 0,
+                                EncodeStateEvent("invalid_display", true)});
+            PushControlTo(c.get(),
+                          Frame{kFlagResponse | kFlagError, kMsgSwitchDisplay,
+                                f.request_id, {}});
+            break;
+          }
+          {
+            std::lock_guard<std::mutex> lk(mu_);
+            stats_.switch_accepted++;
+          }
+          XNC_LOG_INFO("rt switch_display sub=%u idx=%u (reset reason=switch)",
+                       c->sub_id, idx);
+          if (opts_.reset != nullptr)
+            opts_.reset->RequestReset(kResetReasonSwitch);
+          if (!PushControlTo(c.get(), Frame{kFlagResponse, kMsgSwitchDisplay,
+                                             f.request_id, {}}))
+            goto conn_done;
           break;
         }
         case kMsgPing: {
@@ -693,7 +740,8 @@ void RtServer::ConsumePendingIdr(const char* reason) {
 
 void RtServer::OnState(const char* code, bool recoverable) {
   if (code == nullptr) return;
-  if (std::strcmp(code, "capture_rebuilt") == 0) {
+  const bool rebuilt = std::strcmp(code, "capture_rebuilt") == 0;
+  if (rebuilt) {
     gen_.fetch_add(1);  // next HOST_HELLO carries the new generation
     XNC_LOG_INFO("rt generation++ gen=%u", gen_.load());
   }
@@ -703,6 +751,12 @@ void RtServer::OnState(const char* code, bool recoverable) {
   for (auto& kv : conns_) {
     std::lock_guard<std::mutex> clk(kv.second->mu);
     kv.second->q->PushControl(ev);
+    if (rebuilt) {
+      HostHelloPayload hh{gen_.load(), src_w_, src_h_, opts_.fps, opts_.max_subs};
+      hh.displays = CurrentDisplays();
+      kv.second->q->PushControl(
+          Frame{kFlagEvent, kMsgHostHello, 0, EncodeHostHello(hh)});
+    }
     kv.second->cv.notify_all();
   }
   XNC_LOG_INFO("rt_state code=%s recoverable=%d subs=%zu", code, recoverable ? 1 : 0,
@@ -736,6 +790,14 @@ void RtServer::OnDisplayChanged(uint32_t w, uint32_t h, const char* reason) {
 }
 
 // ---- helpers / accessors ----
+
+// Displays-table snapshot (M2-S3 Task 5): the provider is expected to be
+// cheap + thread-safe (xnc-desktop wires DxgiDisplaysSnapshot; the selftest
+// a fixed table). Empty when no provider is configured.
+std::vector<DisplayInfo> RtServer::CurrentDisplays() {
+  if (opts_.displays_fn == nullptr) return {};
+  return opts_.displays_fn(opts_.displays_ctx);
+}
 
 // Pushes a control frame (never dropped while healthy). False = control
 // backlog exhausted: the connection is wedged, disconnect it.

@@ -5,9 +5,12 @@
 //
 // agent → viewer:
 //
-//	{"type":"ready","width":1920,"height":1080,"fps":30,"gen":1}
+//	{"type":"ready","width":1920,"height":1080,"fps":30,"gen":1,
+//	 "displays":[{"index":0,"originX":0,"originY":0,"w":1920,"h":1080,
+//	 "primary":true}]}
 //	    StartCapture + pipe ATTACH 完成(HOST_HELLO 内容);viewer 收到后才
 //	    发 offer(时序契约;更早到达的 offer 也会被处理,但正常流如此)。
+//	    displays 为 M2-S3 Task 5 的多显示器表(旧 agent 省略)。
 //	{"type":"answer","sdp":"v=0..."}            对 viewer offer 的 SDP answer。
 //	{"type":"ice","candidate":{...}}            trickle 候选(浏览器
 //	    RTCIceCandidateInit 形态:{candidate,sdpMid,sdpMLineIndex,
@@ -41,6 +44,11 @@
 //	                                            门控 = server capability
 //	                                            (input.secure_attention,owner 专属)
 //	                                            + core 侧 --allow-sas 双保险)。
+//	{"type":"switch_display","index":1}         切换采集显示器(M2-Slice3
+//	                                            Task 5;需 input.* capability)
+//	                                            → Source(DisplaySwitcher)→
+//	                                            0x0128;非法 idx 由 host 回
+//	                                            STATE{invalid_display}。
 //
 // agent → viewer(SAS 结果帧,M2-Slice1 Task 5):
 //
@@ -101,6 +109,9 @@ const (
 	// M2-Slice1 Task 5:secure attention(viewer SAS 按钮 ↔ core 0x0110)。
 	vocabSecureAttention       = "secure_attention"
 	vocabSecureAttentionResult = "secure_attention_result"
+	// M2-Slice3 Task 5:显示器切换(control 上行;host 侧回
+	// STATE{invalid_display} / DISPLAY_CHANGED reason=switch 下行)。
+	vocabSwitchDisplay = "switch_display"
 	// M2-Slice3 Task 2:意图自愈通知(经既有 state 帧形态;未知 code 的
 	// 旧 viewer 按未知 state 忽略,向后兼容)。
 	vocabStateReattached  = "reattached"
@@ -221,7 +232,8 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 	}
 	if hello != nil {
 		w.write(ctx, readyFrame{Type: vocabReady,
-			Width: hello.W, Height: hello.H, Fps: hello.Fps, Gen: hello.Gen})
+			Width: hello.W, Height: hello.H, Fps: hello.Fps, Gen: hello.Gen,
+			Displays: displaysOf(hello)})
 	} else {
 		w.write(ctx, readyFrame{Type: vocabReady})
 	}
@@ -361,6 +373,27 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 				w.write(ctx, secureAttentionResultFrame{
 					Type: vocabSecureAttentionResult, OK: res.OK, HR: res.HR, Code: res.Code})
 			}()
+		case vocabSwitchDisplay:
+			// M2-Slice3 Task 5:viewer 显示器下拉 → 0x0128。门控 = server
+			// capability input.*(与其它输入同路;view-only 会话拒绝)。
+			// 非法 idx / 旧 host 由下行帧表达(host STATE{invalid_display}
+			// / DISPLAY_CHANGED reason=switch / state invalid_display)。
+			var sf switchDisplayFrame
+			if json.Unmarshal(b, &sf) != nil || sf.Index < 0 {
+				continue
+			}
+			if !ictl.capAllows(proto.CapInputMouse) && !ictl.capAllows(proto.CapInputKeyboard) {
+				w.write(ctx, stateFrame{Type: vocabState, Code: "switch_denied", Recoverable: false})
+				continue
+			}
+			sw, ok := dyn.(DisplaySwitcher)
+			if !ok {
+				w.write(ctx, stateFrame{Type: vocabState, Code: "switch_unsupported", Recoverable: false})
+				continue
+			}
+			if err := sw.SwitchDisplay(uint32(sf.Index)); err != nil {
+				log.Debug("switch_display failed", "index", sf.Index, "err", err)
+			}
 		default:
 			// 未知 type:忽略(向后兼容词汇演进)。
 		}
@@ -454,11 +487,40 @@ func (h *Handler) failFast(ctx context.Context, ws *websocket.Conn, code, msg st
 // ---- 出站信令帧形态(T5/T6 的 JSON 契约载体)----
 
 type readyFrame struct {
-	Type   string `json:"type"`
-	Width  uint32 `json:"width,omitempty"`
-	Height uint32 `json:"height,omitempty"`
-	Fps    uint32 `json:"fps,omitempty"`
-	Gen    uint32 `json:"gen,omitempty"`
+	Type     string     `json:"type"`
+	Width    uint32     `json:"width,omitempty"`
+	Height   uint32     `json:"height,omitempty"`
+	Fps      uint32     `json:"fps,omitempty"`
+	Gen      uint32     `json:"gen,omitempty"`
+	Displays []displayJSON `json:"displays,omitempty"`
+}
+
+// switchDisplayFrame 是 {"type":"switch_display","index":N} 上行帧。
+type switchDisplayFrame struct {
+	Type  string `json:"type"`
+	Index int64  `json:"index"`
+}
+
+// displayJSON 是 displays[] 的 viewer 契约形态(与 Display 镜像)。
+type displayJSON struct {
+	Index   uint32 `json:"index"`
+	OriginX int32  `json:"originX"`
+	OriginY int32  `json:"originY"`
+	W       uint32 `json:"w"`
+	H       uint32 `json:"h"`
+	Primary bool   `json:"primary"`
+}
+
+// displaysOf 把 HelloInfo.Displays 转 viewer 形态(nil 透传省略字段)。
+func displaysOf(h *HelloInfo) []displayJSON {
+	if h == nil || len(h.Displays) == 0 {
+		return nil
+	}
+	out := make([]displayJSON, 0, len(h.Displays))
+	for _, d := range h.Displays {
+		out = append(out, displayJSON(d))
+	}
+	return out
 }
 
 type answerFrame struct {

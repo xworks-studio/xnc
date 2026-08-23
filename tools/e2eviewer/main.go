@@ -78,6 +78,7 @@ type config struct {
 	inputScript         string        // server 模式:连接+首关键帧后按 JSON 步骤注入输入
 	inputBeforeKeyframe bool          // 探针:跳过首关键帧门(锁屏静止场景注入)
 	sas                 bool          // server 模式:连接后发一次 secure_attention,结果+计时进 summary
+	switchDisplay       int           // server 模式:连接后发一次 switch_display(-1=off;M2-S3 Task 5)
 	jsonOnly            bool
 }
 
@@ -109,6 +110,8 @@ func parseFlags() *config {
 		"probe only: run the input script without waiting for the first decoded keyframe (e.g. static locked-screen scenarios where no IDR ever emerges)")
 	flag.BoolVar(&c.sas, "sas", false,
 		"server mode: after connect, send one {secure_attention} control frame (core 0x0110) and record the result + timing in the summary JSON (sas field)")
+	flag.IntVar(&c.switchDisplay, "switch-display", -1,
+		"server mode: after connect, send one {switch_display,index=N} control frame (M2-S3 Task 5; observe displaySamples reason=switch / state invalid_display)")
 	flag.BoolVar(&c.jsonOnly, "json", false, "print only the JSON summary")
 	flag.Parse()
 	return c
@@ -198,6 +201,7 @@ type viewer struct {
 	// 模式 0x010A 通道,两路共用)。计数全量,样本截 cap。
 	displayMu      sync.Mutex
 	displayEvents  uint64
+	helloDisplays  []displayInfo // ready 帧 displays[](M2-S3 Task 5)
 	displaySamples []displaySample
 
 	// STATE 事件记录(M2-Slice1 Task 6 门证据:② recovering/capture_rebuilt
@@ -236,6 +240,14 @@ type sasOutcome struct {
 	Code  string `json:"code,omitempty"`
 	AtMs  int64  `json:"atMs,omitempty"`
 	RttMs int64  `json:"rttMs,omitempty"`
+}
+
+// switchOutcome 是 --switch-display 的 summary 记录(M2-S3 Task 5):
+// 发出时刻 + 目标索引;host 侧结果在 displaySamples/stateSamples。
+type switchOutcome struct {
+	Sent  bool   `json:"sent"`
+	Index uint32 `json:"index"`
+	AtMs  int64  `json:"atMs"`
 }
 
 // beginSas 记一次请求发出,返回发出时刻(viewer 相对 ms)。
@@ -301,6 +313,23 @@ const cursorSampleCap = 4096
 // displaySampleCap 同上(display_changed 事件极稀疏,防御性上限)。
 const displaySampleCap = 1024
 
+// displayInfo 是 ready 帧 displays[] 的一项(M2-S3 Task 5;观测进 summary)。
+type displayInfo struct {
+	Index   uint32 `json:"index"`
+	OriginX int32  `json:"originX"`
+	OriginY int32  `json:"originY"`
+	W       uint32 `json:"w"`
+	H       uint32 `json:"h"`
+	Primary bool   `json:"primary"`
+}
+
+// recordDisplays 记 ready 帧携带的 displays 表(每次 ready 覆盖)。
+func (v *viewer) recordDisplays(ds []displayInfo) {
+	v.displayMu.Lock()
+	defer v.displayMu.Unlock()
+	v.helloDisplays = append([]displayInfo(nil), ds...)
+}
+
 // recordDisplay 记一条 display_changed 事件(server 信令帧 / direct 0x010A)。
 func (v *viewer) recordDisplay(gen, w, h uint32, reason string) {
 	v.displayMu.Lock()
@@ -319,6 +348,18 @@ func (v *viewer) displayStats() (uint64, []displaySample) {
 	out := make([]displaySample, len(v.displaySamples))
 	copy(out, v.displaySamples)
 	return v.displayEvents, out
+}
+
+// helloDisplaysSnapshot 返回 ready 帧 displays 表副本(M2-S3 Task 5)。
+func (v *viewer) helloDisplaysSnapshot() []displayInfo {
+	v.displayMu.Lock()
+	defer v.displayMu.Unlock()
+	if len(v.helloDisplays) == 0 {
+		return nil
+	}
+	out := make([]displayInfo, len(v.helloDisplays))
+	copy(out, v.helloDisplays)
+	return out
 }
 
 // stateSampleCap 同 displaySampleCap(STATE 事件稀疏,防御性上限)。
@@ -569,6 +610,7 @@ type summary struct {
 	CursorEvents     uint64          `json:"cursorEvents"`
 	CursorSamples    []cursorSample  `json:"cursorSamples,omitempty"`
 	DisplayEvents    uint64          `json:"displayEvents"`
+	HelloDisplays    []displayInfo   `json:"helloDisplays,omitempty"`
 	DisplaySamples   []displaySample `json:"displaySamples,omitempty"`
 	DisplayResumeMs  []int64         `json:"displayResumeMs,omitempty"`
 	StateEvents      uint64          `json:"stateEvents"`
@@ -576,6 +618,7 @@ type summary struct {
 	AuTimesMs        []int64         `json:"auTimesMs,omitempty"`
 	KeyTimesMs       []int64         `json:"keyTimesMs,omitempty"`
 	Sas              *sasOutcome     `json:"sas,omitempty"`
+	Switch           *switchOutcome  `json:"switch,omitempty"`
 	Input            *scriptResult   `json:"input,omitempty"`
 	DurationMs       int64           `json:"durationMs"`
 	AssertionsPassed bool            `json:"assertionsPassed"`
@@ -607,6 +650,7 @@ func (v *viewer) collect(mode, dump string, ran time.Duration) *summary {
 		KeyframeReqs: v.keyframeReqs.Load(), PliToIdrMaxMs: v.pliIDRMax.Load(),
 		CursorEvents: cur, CursorSamples: samples,
 		DisplayEvents: dEvents, DisplaySamples: dSamples,
+		HelloDisplays: v.helloDisplaysSnapshot(),
 		DisplayResumeMs: resume,
 		StateEvents:     sEvents, StateSamples: sSamples,
 		AuTimesMs:  auTimes,
@@ -764,6 +808,9 @@ func runDirect(c *config) (*summary, error) {
 	}
 	if c.sas {
 		return nil, errors.New("--sas requires server mode (secure_attention rides the session control WS; direct mode bypasses the agent)")
+	}
+	if c.switchDisplay >= 0 {
+		return nil, errors.New("--switch-display requires server mode (switch_display rides the session control WS; direct mode bypasses the agent)")
 	}
 	secret, err := hex.DecodeString(c.directSecretHex)
 	if err != nil || len(secret) == 0 {
@@ -1040,12 +1087,15 @@ func runServer(c *config) (*summary, error) {
 				OK          *bool                    `json:"ok"`
 				HR          uint32                   `json:"hr"`
 				Recoverable bool                     `json:"recoverable"`
+				// M2-S3 Task 5:ready 帧的 displays 表(观测;进 summary)。
+				Displays []displayInfo `json:"displays"`
 			}
 			if json.Unmarshal(b, &f) != nil {
 				continue
 			}
 			switch f.Type {
 			case "ready":
+				v.recordDisplays(f.Displays)
 				select {
 				case readyCh <- struct{}{}:
 				default:
@@ -1137,6 +1187,22 @@ func runServer(c *config) (*summary, error) {
 		}
 		return s, err
 	}
+	// --switch-display(M2-S3 Task 5):连接后发一次 switch_display;
+	// host 侧结果经 DISPLAY_CHANGED reason=switch / STATE invalid_display
+	// 下行帧观测(displaySamples / stateSamples),不构成断言。
+	var swOut *switchOutcome
+	if c.switchDisplay >= 0 {
+		swOut = &switchOutcome{Index: uint32(c.switchDisplay),
+			AtMs: time.Since(v.start).Milliseconds()}
+		wctx, wcancel := context.WithTimeout(ctx, 10*time.Second)
+		jb, _ := json.Marshal(map[string]any{"type": "switch_display", "index": c.switchDisplay})
+		if err := ws.Write(wctx, websocket.MessageText, jb); err != nil {
+			log.Warn("--switch-display send failed", "err", err)
+		} else {
+			swOut.Sent = true
+		}
+		wcancel()
+	}
 	if c.sas {
 		// --sas(M2-Slice1 Task 5):连接后发一次 secure_attention(core
 		// 0x0110 经 agent 转发),回执 + rtt 进 summary.sas。门控拒绝亦是
@@ -1186,6 +1252,7 @@ func runServer(c *config) (*summary, error) {
 	}
 	s := v.collect("server", c.out, time.Since(v.start))
 	s.Input = inputRes
+	s.Switch = swOut
 	return s, nil
 }
 

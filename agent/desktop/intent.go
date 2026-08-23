@@ -314,6 +314,17 @@ func (s intentSource) cur() Source {
 	return src
 }
 
+// SwitchDisplay 转发 0x0128 到当前源(M2-S3 Task 5;DisplaySwitcher 能力
+// 的透明转发——重挂后的新源自带同能力)。
+func (s intentSource) SwitchDisplay(index uint32) error {
+	if src := s.cur(); src != nil {
+		if sw, ok := src.(DisplaySwitcher); ok {
+			return sw.SwitchDisplay(index)
+		}
+	}
+	return context.Canceled
+}
+
 func (s intentSource) Hello() *HelloInfo {
 	if src := s.cur(); src != nil {
 		return src.Hello()
