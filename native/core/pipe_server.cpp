@@ -416,9 +416,13 @@ SnapshotSpawnResult RealSnapshotSpawn(uint32_t session, uint32_t max_w) {
   wchar_t tmp_dir[MAX_PATH] = {0};
   const DWORD tl = GetTempPathW(MAX_PATH, tmp_dir);
   if (tl == 0 || tl >= MAX_PATH) return fail("INTERNAL");
+  // Temp name carries pid + per-process monotonic seq: concurrent snapshot
+  // spawns (multiple sessions / rapid retries) never collide on one path
+  // (T3 review fix carried into T4).
+  static std::atomic<unsigned> snap_seq{0};
   wchar_t path[MAX_PATH + 64] = {0};
-  swprintf(path, MAX_PATH + 64, L"%lsxnc-snap-%lu.jpg", tmp_dir,
-           GetCurrentProcessId());
+  swprintf(path, MAX_PATH + 64, L"%lsxnc-snap-%lu-%u.jpg", tmp_dir,
+           GetCurrentProcessId(), snap_seq.fetch_add(1) + 1);
 
   HANDLE token = nullptr;
   std::string err;
