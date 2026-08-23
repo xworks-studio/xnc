@@ -597,34 +597,50 @@ int RunConsoleRt(const xnc::DiagOptions& opt) {
 
   xnc::LadderOpts lopt = LadderOptsFor(opt);
   lopt.reset = &capture_reset;
-  xnc::LadderCapture capture(lopt);
-  std::string cap_err;
-  if (!capture.Init(&cap_err)) {
-    if (xnc::DxgiErrIsDesktopAccessDenied(cap_err)) {
-      XNC_LOG_ERROR("dxgi_access_denied_session0 err=\"%s\"", cap_err.c_str());
-    } else {
-      XNC_LOG_ERROR("capture_init_failed err=\"%s\"", cap_err.c_str());
+  // M2-Slice3 Task 6 (logoff/logon self-heal gate): spawning into a session
+  // whose input desktop is the logon UI (WTSConnected console, Winlogon
+  // desktop) DENIES duplication 0x80070005 even as SYSTEM (M2-Slice1 T1
+  // evidence). The old path constructed the ladder, Init failed, the child
+  // exited before the rt pipe existed -> core PIPE_TIMEOUT killed it and
+  // the agent's reattach attempts all failed (run-9 gate evidence).
+  // Now: probe reachability with a THROWAWAY DxgiCapture (LadderCapture::
+  // Init is single-shot - a second call assigns a joinable probe thread
+  // and std::terminate-aborts, the run-10 crash); while denied, start the
+  // rt pipe IMMEDIATELY with provisional display geometry and wait for the
+  // Default desktop (logon completes / unlock). The ladder itself is
+  // constructed and Init'd EXACTLY ONCE, after the wait.
+  bool logon_wait = false;
+  {
+    std::string perr;
+    std::unique_ptr<xnc::ICapture> reach(xnc::TryCreateDxgiCapture(&perr));
+    if (reach == nullptr && xnc::DxgiErrIsDesktopAccessDenied(perr)) {
+      logon_wait = true;
+      XNC_LOG_INFO("console_rt reachability denied err=\"%s\" (logon-UI wait)", perr.c_str());
     }
-    return 1;
   }
-  XNC_LOG_INFO("capture_init w=%u h=%u", capture.Width(), capture.Height());
 
-  xnc::MfSoftEncoder encoder;
-  std::string enc_err;
-  if (!encoder.Init(capture.Width(), capture.Height(), opt.fps, kDiagBitrateBps,
-                    &enc_err)) {
-    XNC_LOG_ERROR("encoder_init_failed err=\"%s\"", enc_err.c_str());
-    return 1;
+  // Provisional HOST_HELLO/input geometry: real table when it enumerates,
+  // else a safe 1920x1080 placeholder (logon-UI wait only; the real dims
+  // ride the post-wait display_changed + capture_rebuilt).
+  uint32_t pw = 1920, ph = 1080;
+  {
+    const std::vector<xnc::DisplayInfo> ds = xnc::DxgiDisplaysSnapshot();
+    for (const auto& d : ds) {
+      if (d.primary || (pw == 1920 && ph == 1080 && d.w)) {
+        pw = d.w; ph = d.h;
+        if (d.primary) break;
+      }
+    }
   }
 
   xnc::InputManager::Opts iopt;
-  iopt.hello_w = capture.Width();  // MOVE coords are HOST_HELLO-space px
-  iopt.hello_h = capture.Height();
+  iopt.hello_w = pw;  // MOVE coords are HOST_HELLO-space px
+  iopt.hello_h = ph;
   xnc::InputManager input(iopt);
   input.StartJanitor();
   xnc::CursorManager::Opts copt;
-  copt.hello_w = capture.Width();
-  copt.hello_h = capture.Height();
+  copt.hello_w = pw;  // HOST_HELLO stream space
+  copt.hello_h = ph;
   xnc::CursorManager cursor(copt);
 
   xnc::RtServer::Opts ro;
@@ -650,7 +666,60 @@ int RunConsoleRt(const xnc::DiagOptions& opt) {
   ro.displays_fn = [](void*) { return xnc::DxgiDisplaysSnapshot(); };
   ro.switch_display_fn = [](void*, uint32_t idx) { return xnc::DxgiSelectDisplay(idx); };
   xnc::RtServer server;
+  if (logon_wait) {
+    XNC_LOG_INFO("console_rt_logon_wait (pipe up with provisional dims; probing for the Default desktop)");
+    if (!server.Start(ro, pw, ph)) { input.StopJanitor(); return 1; }
+    const ULONGLONG deadline = GetTickCount64() + 110000;  // agent intent window 90s + margin
+    for (;;) {
+      Sleep(500);
+      // Probe with a THROWAWAY DxgiCapture: LadderCapture::Init is single
+      // -shot (a second call assigns a joinable probe thread -> terminate).
+      std::string perr;
+      std::unique_ptr<xnc::ICapture> probe(xnc::TryCreateDxgiCapture(&perr));
+      if (probe != nullptr) break;
+      if (!xnc::DxgiErrIsDesktopAccessDenied(perr)) {
+        XNC_LOG_ERROR("logon_wait probe failed err=\"%s\"", perr.c_str());
+        server.Shutdown();
+        input.StopJanitor();
+        return 1;
+      }
+      if (GetTickCount64() >= deadline) {
+        XNC_LOG_ERROR("logon_wait gave up after 110s (still denied)");
+        server.Shutdown();
+        input.StopJanitor();
+        return 1;
+      }
+    }
+  }
+
+  // The ladder is constructed and Init'd EXACTLY ONCE (single-shot Init).
+  xnc::LadderCapture capture(lopt);
   capture.SetStateSink(&server);  // backend swaps -> STATE backend_changed
+  {
+    std::string ierr;
+    if (!capture.Init(&ierr)) {
+      XNC_LOG_ERROR("capture_init_failed err=\"%s\"", ierr.c_str());
+      if (logon_wait) { server.Shutdown(); input.StopJanitor(); }
+      return 1;
+    }
+    XNC_LOG_INFO("capture_init w=%u h=%u", capture.Width(), capture.Height());
+  }
+  if (logon_wait) {
+    XNC_LOG_INFO("logon_wait recovered w=%u h=%u", capture.Width(), capture.Height());
+    // Notify subscribers exactly like a unified reset: geometry first (the
+    // rebuilt hello re-emit then carries the NEW dims), then rebuilt.
+    server.OnDisplayChanged(capture.Width(), capture.Height(), "reattach");
+    server.OnState("capture_rebuilt", true);
+  }
+
+  xnc::MfSoftEncoder encoder;
+  std::string enc_err;
+  if (!encoder.Init(capture.Width(), capture.Height(), opt.fps, kDiagBitrateBps,
+                    &enc_err)) {
+    XNC_LOG_ERROR("encoder_init_failed err=\"%s\"", enc_err.c_str());
+    if (logon_wait) { server.Shutdown(); input.StopJanitor(); }
+    return 1;
+  }
   const int rc = server.Serve(capture, encoder, ro);
   watch.Stop();
   input.StopJanitor();  // ReleaseAll already ran in RtServer::Shutdown

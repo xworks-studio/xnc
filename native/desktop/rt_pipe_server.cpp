@@ -263,7 +263,12 @@ bool RtServer::Start(const Opts& o, uint32_t src_w, uint32_t src_h) {
 }
 
 int RtServer::Serve(ICapture& cap, MfSoftEncoder& enc, const Opts& o) {
-  if (!Start(o, cap.Width(), cap.Height())) return 1;
+  // M2-S3 Task 6: a logon-UI boot pre-starts the pipe (Start) BEFORE the
+  // capture exists so the core's 2s spawn window sees it; Serve must adopt
+  // the already-started server instead of failing Start's started_ guard.
+  if (!started_) {
+    if (!Start(o, cap.Width(), cap.Height())) return 1;
+  }
   g_active_rt.store(this);
   SetConsoleCtrlHandler(OnRtCtrlEvent, TRUE);
   XNC_LOG_INFO("console_rt_start pipe=%ls fps=%u bitrate=%u max_subs=%u w=%u h=%u",
