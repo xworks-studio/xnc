@@ -100,3 +100,63 @@ func TestSummaryEvaluate(t *testing.T) {
 
 // 编译期锁 ICE server 形态(pion 版本升级时的兼容哨兵)。
 var _ = webrtc.ICETransportPolicyRelay
+
+// TestPliRetryDecision — pending-PLI 重发的判定表(M1-Slice3 承接:
+// 1.5s 无 IDR 即重发,轮上限 3 发;frames>0 与否由调用侧状态隐含,
+// 决策只看 episode)。
+func TestPliRetryDecision(t *testing.T) {
+	const retryAfter = 1500 * time.Millisecond
+	cases := []struct {
+		since    time.Duration
+		attempts int
+		want     bool
+	}{
+		{since: 0, attempts: 1, want: false},                    // 刚发完
+		{since: 1499 * time.Millisecond, attempts: 1, want: false}, // 未到 1.5s
+		{since: 1500 * time.Millisecond, attempts: 1, want: true},  // 到点,首轮
+		{since: 10 * time.Second, attempts: 1, want: true},         // 迟到仍可重发
+		{since: 10 * time.Second, attempts: 2, want: true},         // 第 2 次重发(共 3 发)
+		{since: 10 * time.Second, attempts: 3, want: false},        // 轮上限:不再发
+		{since: 10 * time.Second, attempts: 0, want: false},        // 无 episode(0=已复位)
+		{since: 10 * time.Second, attempts: -1, want: false},       // 病态输入
+	}
+	for _, c := range cases {
+		if got := pliRetryDecision(c.since, c.attempts, maxPliEpisodeSends, retryAfter); got != c.want {
+			t.Errorf("pliRetryDecision(since=%v, attempts=%d) = %v, want %v",
+				c.since, c.attempts, got, c.want)
+		}
+	}
+	// 自定义上限/超时参数亦尊重。
+	if !pliRetryDecision(2*time.Second, 1, 5, time.Second) {
+		t.Errorf("maxSends=5 should allow retry at attempts=1")
+	}
+	if pliRetryDecision(2*time.Second, 1, 5, 5*time.Second) {
+		t.Errorf("retryAfter=5s should not retry at since=2s")
+	}
+}
+
+// TestCursorRecording — cursor 通道记录:计数全量、样本截 cap、stats 副本。
+func TestCursorRecording(t *testing.T) {
+	v := &viewer{start: time.Now()}
+	for i := 0; i < cursorSampleCap+100; i++ {
+		v.recordCursor(int32(i), int32(-i), i%2 == 0)
+	}
+	n, samples := v.cursorStats()
+	if n != cursorSampleCap+100 {
+		t.Errorf("cursorEvents = %d, want %d", n, cursorSampleCap+100)
+	}
+	if len(samples) != cursorSampleCap {
+		t.Fatalf("samples = %d, want %d", len(samples), cursorSampleCap)
+	}
+	if samples[0].X != 0 || samples[0].Visible != 1 || samples[1].Visible != 0 {
+		t.Errorf("sample[0:1] = %+v %+v", samples[0], samples[1])
+	}
+	if samples[len(samples)-1].X != cursorSampleCap-1 {
+		t.Errorf("overflow samples should be dropped, not appended")
+	}
+	// stats 返回副本:改副本不影响内部。
+	samples[0].X = 9999
+	if _, again := v.cursorStats(); again[0].X == 9999 {
+		t.Errorf("cursorStats must return a copy")
+	}
+}

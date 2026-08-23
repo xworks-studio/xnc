@@ -42,6 +42,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -73,6 +74,8 @@ type config struct {
 	pliInterval         time.Duration
 	pliAt               time.Duration // 0=off;run 内该时刻单发一次 PLI
 	keyframeRetryAfter  time.Duration // 0=off;server 模式无帧到达超过此时长发 keyframe-req(丢包自救)
+	pliRetryAfter       time.Duration // 0=off;待验证 PLI 超时重发(frames>0 亦触发,上限 3 发/轮)
+	inputScript         string        // server 模式:连接+首关键帧后按 JSON 步骤注入输入
 	jsonOnly            bool
 }
 
@@ -96,6 +99,10 @@ func parseFlags() *config {
 	flag.DurationVar(&c.pliAt, "pli-at", 0, "send one RTCP PLI this far into the run (0=off)")
 	flag.DurationVar(&c.keyframeRetryAfter, "keyframe-retry-after", 0,
 		"server mode: if no AU has decoded yet for this long, send a {keyframe-req} signaling frame (0=off; lossy-link self-heal)")
+	flag.DurationVar(&c.pliRetryAfter, "pli-retry-after", 1500*time.Millisecond,
+		"re-send a pending (unanswered) PLI after this long — even while frames flow (bounded: 3 sends per episode; 0=off)")
+	flag.StringVar(&c.inputScript, "input-script", "",
+		"server mode: JSON step file (lease/move/button/wheel/key/text/wait) run after connect + first keyframe; results land in the summary JSON (schema: inputscript.go)")
 	flag.BoolVar(&c.jsonOnly, "json", false, "print only the JSON summary")
 	flag.Parse()
 	return c
@@ -169,8 +176,51 @@ type viewer struct {
 	firstAt   atomic.Int64 // UnixNano;0 = 未收帧
 	firstKey  atomic.Bool  // 首个解码 AU 是否 IDR(门③承接断言)
 
-	pliMu     atomic.Int64 // 最近一次 PLI 发出(UnixNano;0=无待验证)
-	pliIDRMax atomic.Int64 // PLI→IDR 最大时延(ms;0=未发生)
+	pliMu       atomic.Int64 // 最近一次 PLI 发出(UnixNano;0=无待验证)
+	pliFirstAt  atomic.Int64 // 本轮首 PLI(UnixNano;0=无)——PLI→IDR 从首发起算
+	pliAttempts atomic.Int32 // 本轮(episode)PLI 已发送数(含首发)
+	pliRetries  atomic.Uint64
+	pliIDRMax   atomic.Int64 // PLI→IDR 最大时延(ms;0=未发生)
+
+	// cursor 通道记录(server 模式;计数全量,样本截 cap —— T6 门④
+	// 时延核对用,TMs = 相对 viewer start)。
+	cursorMu      sync.Mutex
+	cursorEvents  uint64
+	cursorSamples []cursorSample
+}
+
+// cursorSample 是一条 cursor 通道事件(summary.cursorSamples 元素)。
+type cursorSample struct {
+	TMs     int64 `json:"tMs"`
+	X       int32 `json:"x"`
+	Y       int32 `json:"y"`
+	Visible uint8 `json:"visible"`
+}
+
+// cursorSampleCap 限制 summary 体积;超出后样本丢弃(计数仍全量)。
+const cursorSampleCap = 4096
+
+// recordCursor 记一条 cursor 通道事件(server 模式 OnDataChannel 调用)。
+func (v *viewer) recordCursor(x, y int32, visible bool) {
+	v.cursorMu.Lock()
+	defer v.cursorMu.Unlock()
+	v.cursorEvents++
+	if len(v.cursorSamples) < cursorSampleCap {
+		s := cursorSample{TMs: time.Since(v.start).Milliseconds(), X: x, Y: y}
+		if visible {
+			s.Visible = 1
+		}
+		v.cursorSamples = append(v.cursorSamples, s)
+	}
+}
+
+// cursorStats 返回(累计事件数,样本副本)。
+func (v *viewer) cursorStats() (uint64, []cursorSample) {
+	v.cursorMu.Lock()
+	defer v.cursorMu.Unlock()
+	out := make([]cursorSample, len(v.cursorSamples))
+	copy(out, v.cursorSamples)
+	return v.cursorEvents, out
 }
 
 func newViewer(c *config, ice []webrtc.ICEServer, relay bool, log *slog.Logger) (*viewer, error) {
@@ -234,15 +284,19 @@ func newViewer(c *config, ice []webrtc.ICEServer, relay bool, log *slog.Logger) 
 					v.firstKey.Store(desktop.IsKeyframeAU(smp.Data))
 				}
 				if desktop.IsKeyframeAU(smp.Data) {
-					if t := v.pliMu.Load(); t != 0 {
-						ms := time.Since(time.Unix(0, t)).Milliseconds()
-						for {
-							old := v.pliIDRMax.Load()
-							if ms <= old || v.pliIDRMax.CompareAndSwap(old, ms) {
-								break
+					if t := v.pliMu.Swap(0); t != 0 {
+						// PLI→IDR 从本轮首 PLI 起算(重发不重置表尺:
+						// 慢就是慢,门④不能被 retry 稀释)。
+						if f := v.pliFirstAt.Swap(0); f != 0 {
+							ms := time.Since(time.Unix(0, f)).Milliseconds()
+							for {
+								old := v.pliIDRMax.Load()
+								if ms <= old || v.pliIDRMax.CompareAndSwap(old, ms) {
+									break
+								}
 							}
 						}
-						v.pliMu.Store(0)
+						v.pliAttempts.Store(0) // episode 关闭
 					}
 					v.keyframes.Add(1)
 				}
@@ -268,6 +322,7 @@ func (v *viewer) waitConnected(d time.Duration) error {
 }
 
 // sendPLI 向首个 track 发 RTCP PLI(无 track 时为 no-op 返回 false)。
+// 发送成功即开/续一个 PLI episode(attempts 计数;见 pliRetryDecision)。
 func (v *viewer) sendPLI(d time.Duration) bool {
 	select {
 	case tr := <-v.trackCh:
@@ -277,39 +332,63 @@ func (v *viewer) sendPLI(d time.Duration) bool {
 			return false
 		}
 		v.plisSent.Add(1)
-		v.pliMu.Store(time.Now().UnixNano())
+		now := time.Now().UnixNano()
+		v.pliMu.Store(now)
+		if v.pliAttempts.Add(1) == 1 {
+			v.pliFirstAt.Store(now)
+		}
 		return true
 	case <-time.After(d):
 		return false
 	}
 }
 
+// maxPliEpisodeSends:单个待验证 PLI 轮的上限发送数(首发 + 2 次重发;
+// M1-Slice3 keyframe-retry 承接:pending PLI 1.5s 无 IDR 即重发,
+// frames>0 亦触发)。--pli-interval 心跳是操作者显式行为,不受此限。
+const maxPliEpisodeSends = 3
+
+// pliRetryDecision:待验证 PLI(最近一次发出于 since 前,本轮已发
+// attempts 次)是否应重发。纯函数(单测锁定)。
+func pliRetryDecision(since time.Duration, attempts, maxSends int, retryAfter time.Duration) bool {
+	return attempts > 0 && attempts < maxSends && since >= retryAfter
+}
+
 // summary 是断言输入与 --json 输出形态(T6 脚本契约)。
 type summary struct {
-	Mode             string   `json:"mode"`
-	Connected        bool     `json:"connected"`
-	FirstFrameMs     int64    `json:"firstFrameMs"`
-	FirstKey         bool     `json:"firstKey"`
-	RtpPackets       uint64   `json:"rtpPackets"`
-	Frames           uint64   `json:"frames"`
-	Keyframes        uint64   `json:"keyframes"`
-	Bytes            uint64   `json:"bytes"`
-	DumpFile         string   `json:"dumpFile,omitempty"`
-	Relay            bool     `json:"relay"`
-	PlisSent         uint64   `json:"plisSent"`
-	KeyframeReqs     uint64   `json:"keyframeReqs"`
-	PliToIdrMaxMs    int64    `json:"pliToIdrMaxMs"`
-	DurationMs       int64    `json:"durationMs"`
-	AssertionsPassed bool     `json:"assertionsPassed"`
-	Failures         []string `json:"failures,omitempty"`
+	Mode             string         `json:"mode"`
+	StartUnixMs      int64          `json:"startUnixMs"` // viewer 起点绝对时刻(cursorSamples.tMs 的零点)
+	Connected        bool           `json:"connected"`
+	FirstFrameMs     int64          `json:"firstFrameMs"`
+	FirstKey         bool           `json:"firstKey"`
+	RtpPackets       uint64         `json:"rtpPackets"`
+	Frames           uint64         `json:"frames"`
+	Keyframes        uint64         `json:"keyframes"`
+	Bytes            uint64         `json:"bytes"`
+	DumpFile         string         `json:"dumpFile,omitempty"`
+	Relay            bool           `json:"relay"`
+	PlisSent         uint64         `json:"plisSent"`
+	PliRetries       uint64         `json:"pliRetries"`
+	KeyframeReqs     uint64         `json:"keyframeReqs"`
+	PliToIdrMaxMs    int64          `json:"pliToIdrMaxMs"`
+	CursorEvents     uint64         `json:"cursorEvents"`
+	CursorSamples    []cursorSample `json:"cursorSamples,omitempty"`
+	Input            *scriptResult  `json:"input,omitempty"`
+	DurationMs       int64          `json:"durationMs"`
+	AssertionsPassed bool           `json:"assertionsPassed"`
+	Failures         []string       `json:"failures,omitempty"`
 }
 
 func (v *viewer) collect(mode, dump string, ran time.Duration) *summary {
+	cur, samples := v.cursorStats()
 	s := &summary{
 		Mode: mode, Relay: v.relay, DumpFile: dump,
+		StartUnixMs: v.start.UnixMilli(),
 		RtpPackets: v.rtpPkts.Load(), Frames: v.frames.Load(),
 		Keyframes: v.keyframes.Load(), Bytes: v.bytes.Load(),
-		PlisSent: v.plisSent.Load(), KeyframeReqs: v.keyframeReqs.Load(), PliToIdrMaxMs: v.pliIDRMax.Load(),
+		PlisSent: v.plisSent.Load(), PliRetries: v.pliRetries.Load(),
+		KeyframeReqs: v.keyframeReqs.Load(), PliToIdrMaxMs: v.pliIDRMax.Load(),
+		CursorEvents: cur, CursorSamples: samples,
 		DurationMs: ran.Milliseconds(),
 	}
 	if t := v.firstAt.Load(); t != 0 {
@@ -364,9 +443,11 @@ func (s *summary) report(c *config) {
 	}
 }
 
-// runFor 跑满 duration:PLI 心跳(可选)+ 单发 PLI(--pli-at)+ 中途进度一行。
-func (v *viewer) runFor(ctx context.Context, c *config) {
-	deadline := time.Now().Add(c.duration)
+// runFor 跑满 d:PLI 心跳(可选)+ 单发 PLI(--pli-at)+ pending-PLI
+// 超时重发(--pli-retry-after)+ 中途进度一行。d 与 c.duration 分离:
+// --input-script 场景脚本结束后仍有观察尾段。
+func (v *viewer) runFor(ctx context.Context, c *config, d time.Duration) {
+	deadline := time.Now().Add(d)
 	var pliTick <-chan time.Time
 	if c.pliInterval > 0 {
 		t := time.NewTicker(c.pliInterval)
@@ -394,7 +475,7 @@ func (v *viewer) runFor(ctx context.Context, c *config) {
 				v.log.Info("one-shot PLI sent (--pli-at)")
 			}
 		case <-time.After(200 * time.Millisecond):
-			// 丢包自救:首帧迟迟未落地(首 IDR 被链路打散)→ 经信令重请
+			// 丢包自救 ①:首帧迟迟未落地(首 IDR 被链路打散)→ 经信令重请
 			// 关键帧,节流 = 冷却期不短于 --keyframe-retry-after 的一半。
 			if c.keyframeRetryAfter > 0 && v.keyframeReqFn != nil && v.frames.Load() == 0 {
 				ref := v.lastKeyReqAt.Load()
@@ -406,6 +487,19 @@ func (v *viewer) runFor(ctx context.Context, c *config) {
 					v.lastKeyReqAt.Store(time.Now().UnixNano())
 				}
 			}
+			// 丢包自救 ②(M1-Slice3 承接):PLI 已发但 IDR 未回(链路把
+			// PLI 或 IDR 打散,frames>0 亦可能)→ 1.5s 重发,轮上限 3 发。
+			if c.pliRetryAfter > 0 {
+				if t := v.pliMu.Load(); t != 0 {
+					since := time.Since(time.Unix(0, t))
+					if pliRetryDecision(since, int(v.pliAttempts.Load()), maxPliEpisodeSends, c.pliRetryAfter) {
+						if v.sendPLI(2 * time.Second) {
+							v.pliRetries.Add(1)
+							v.log.Info("pending PLI unanswered, re-sent", "sinceMs", since.Milliseconds())
+						}
+					}
+				}
+			}
 			v.log.Info("progress", "frames", v.frames.Load(), "keyframes", v.keyframes.Load())
 		}
 	}
@@ -415,6 +509,9 @@ func (v *viewer) runFor(ctx context.Context, c *config) {
 
 func runDirect(c *config) (*summary, error) {
 	log := slog.Default()
+	if c.inputScript != "" {
+		return nil, errors.New("--input-script requires server mode (direct-pipe publisher has no input datachannels)")
+	}
 	secret, err := hex.DecodeString(c.directSecretHex)
 	if err != nil || len(secret) == 0 {
 		return nil, errors.New("--direct-secret must be non-empty hex")
@@ -502,7 +599,7 @@ func runDirect(c *config) (*summary, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), c.duration)
 	defer cancel()
-	v.runFor(ctx, c)
+	v.runFor(ctx, c, c.duration)
 
 	_ = pub.Close()
 	_ = sub.Close()
@@ -546,6 +643,19 @@ func runServer(c *config) (*summary, error) {
 	if c.server == "" || c.node == "" || c.token == "" {
 		return nil, errors.New("server mode needs --server, --node and --token")
 	}
+	// 输入脚本解析期即全量校验(未知 op/字段、键码、上限;错误带下标)。
+	var steps []scriptStep
+	if c.inputScript != "" {
+		f, err := os.Open(c.inputScript)
+		if err != nil {
+			return nil, fmt.Errorf("--input-script: %w", err)
+		}
+		steps, err = parseInputScript(f)
+		_ = f.Close()
+		if err != nil {
+			return nil, err
+		}
+	}
 	// 打开会话(T5 契约:POST /api/nodes/{id}/desktop → websocketUrl+turn)。
 	body, _ := json.Marshal(map[string]any{"signaling": "webrtc"})
 	req, err := http.NewRequest(http.MethodPost,
@@ -584,7 +694,11 @@ func runServer(c *config) (*summary, error) {
 	if strings.HasPrefix(wsURL, "/") {
 		wsURL = strings.Replace(strings.Replace(c.server, "https://", "wss://", 1), "http://", "ws://", 1) + wsURL
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), c.duration+30*time.Second)
+	timeout := c.duration + 30*time.Second
+	if steps != nil {
+		timeout += scriptWaitBudget(steps) // 脚本预算(含等首关键帧 + wait 全额)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	ws, _, err := websocket.Dial(ctx, wsURL, nil)
 	if err != nil {
@@ -605,6 +719,28 @@ func runServer(c *config) (*summary, error) {
 		b, _ := json.Marshal(map[string]any{"type": "keyframe-req"})
 		_ = ws.Write(wctx, websocket.MessageText, b)
 	}
+
+	// m=application 前提(T3 报告结论):pion viewer 的 offer 需先建一条
+	// 占位 DC 才含 SCTP 段,agent 预建的 input/mouse/cursor 通道(in-band
+	// 协商)才有传输可骑。占位通道本身不用(浏览器 offer 默认含,同效)。
+	if _, err := v.pc.CreateDataChannel("xnc-viewer-sctp", nil); err != nil {
+		return nil, fmt.Errorf("placeholder datachannel: %w", err)
+	}
+	chs := &channelSet{}
+	leaseCh := make(chan leaseEvent, 8)
+	leaseState := &leaseNote{}
+	v.pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		switch dc.Label() {
+		case dcLabelInput, dcLabelMouse:
+			chs.put(dc)
+		case dcLabelCursor:
+			dc.OnMessage(func(m webrtc.DataChannelMessage) {
+				if x, y, vis, ok := decodeCursorWire(m.Data); ok {
+					v.recordCursor(x, y, vis)
+				}
+			})
+		}
+	})
 
 	// 入站信令泵:单 goroutine 读全部帧——coder/websocket 禁止并发 Reader。
 	// T4 写法里 waitReady 与本泵并发读同一连接,server 模式当时未经 live
@@ -632,6 +768,8 @@ func runServer(c *config) (*summary, error) {
 				SDP       string                   `json:"sdp"`
 				Candidate *webrtc.ICECandidateInit `json:"candidate"`
 				Code      string                   `json:"code"`
+				LeaseID   string                   `json:"leaseId"`
+				Reason    string                   `json:"reason"`
 			}
 			if json.Unmarshal(b, &f) != nil {
 				continue
@@ -653,6 +791,17 @@ func runServer(c *config) (*summary, error) {
 				}
 			case "state":
 				log.Info("agent state", "code", f.Code)
+			case "lease_granted", "lease_denied", "lease_revoked":
+				// T3 lease 词汇(inputlive.go stepEnv 消费;revoked 另记
+				// 原因进 input 脚本结果)。
+				ev := leaseEvent{kind: strings.TrimPrefix(f.Type, "lease_"), leaseID: f.LeaseID, reason: f.Reason}
+				if ev.kind == "revoked" {
+					leaseState.setRevoked(f.Reason)
+				}
+				select {
+				case leaseCh <- ev:
+				default: // 满 = 无人消费(stale 事件),丢
+				}
 			case "error":
 				wsErr <- fmt.Errorf("agent error frame: %s", f.Code)
 				return
@@ -694,14 +843,32 @@ func runServer(c *config) (*summary, error) {
 	wcancel()
 
 	if err := v.waitConnected(25 * time.Second); err != nil {
-		return v.collect("server", c.out, time.Since(v.start)), err
+		s := v.collect("server", c.out, time.Since(v.start))
+		if steps != nil {
+			s.Input = &scriptResult{Err: "not connected: " + err.Error()}
+		}
+		return s, err
 	}
-	v.runFor(ctx, c)
+	// 输入脚本(连接 + 首关键帧后跑;结果进 summary.input,不参与
+	// --expect-* 断言 —— 场景期望由 e2e 脚本对 steps 自行判定)。
+	var inputRes *scriptResult
+	if steps != nil {
+		inputRes = runServerScript(ctx, steps, v, chs, leaseCh, leaseState, ws, log)
+	}
+	// 观察尾段:脚本结束后至少 3s(cursor 事件/PLI-IDR 余波可见),
+	// 且不短于 --duration。
+	tail := c.duration
+	if inputRes != nil && tail < 3*time.Second {
+		tail = 3 * time.Second
+	}
+	v.runFor(ctx, c, tail)
 	_ = v.pc.Close()
 	if v.out != nil {
 		_ = v.out.Close()
 	}
-	return v.collect("server", c.out, time.Since(v.start)), nil
+	s := v.collect("server", c.out, time.Since(v.start))
+	s.Input = inputRes
+	return s, nil
 }
 
 func main() {
