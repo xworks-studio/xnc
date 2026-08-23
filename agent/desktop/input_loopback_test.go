@@ -579,9 +579,10 @@ func TestLeaseLoopbackTwoViewers(t *testing.T) {
 	host := newInputHost()
 	st := &inputFakeStarter{host: host}
 	h := &Handler{Log: slog.Default(), Starter: st}
-	// 注入短 idle(默认 30s;此处真定时器 150ms)加速 idle 撤销路径。
+	// 注入短 idle(默认 30s;真定时器 1s)加速 idle 撤销路径;窗口在
+	// v1 最后一次输入后重起(见下),不受前置握手耗时影响。
 	tbl := newLeaseTable()
-	tbl.idle = 150 * time.Millisecond
+	tbl.idle = time.Second
 	h.leases = tbl
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -612,13 +613,17 @@ func TestLeaseLoopbackTwoViewers(t *testing.T) {
 	sendJSON(t, ctx, v2.ws, map[string]any{"type": vocabKeyframeReq})
 	time.Sleep(100 * time.Millisecond)
 
-	// v1 idle(150ms 无输入)→ lease_revoked{idle} 广播到持有者。
+	// v1 输入一次(idle 窗口自此重起)→ 之后静默 1s → lease_revoked{idle}
+	// 广播到持有者。这次输入也顺带验证 v1 持有者路径到达 host。
+	v1.sendDC(dcLabelMouse, encMouseMsg(1, 7, 8, 0))
+	waitCount(t, host, 1)
 	r := v1.nextSignal(func(m map[string]any) bool { return m["type"] == vocabLeaseRevoked }, 5*time.Second)
 	if r["reason"] != "idle" {
 		t.Fatalf("revoke reason = %v, want idle", r["reason"])
 	}
 
-	// 表已释放:v2 重试请求 → 授予;其输入现在到达 host。
+	// 表已释放:v2 重试请求 → 授予;其输入现在到达 host(独立 seq 空间,
+	// sub_id 不同)。
 	granted := false
 	for i := 0; i < 50 && !granted; i++ {
 		sendJSON(t, ctx, v2.ws, map[string]any{"type": vocabLeaseRequest})
@@ -634,9 +639,13 @@ func TestLeaseLoopbackTwoViewers(t *testing.T) {
 		t.Fatal("v2 never granted after v1 revoke")
 	}
 	v2.sendDC(dcLabelMouse, encMouseMsg(1, 10, 20, 0))
-	waitCount(t, host, 1)
-	if recs := host.records(); recs[0].X != 10 || recs[0].Y != 20 {
-		t.Fatalf("v2 MOVE rec = %+v", recs[0])
+	waitCount(t, host, 2)
+	recs := host.records()
+	if recs[0].X != 7 || recs[0].Y != 8 || recs[0].SubID == recs[1].SubID {
+		t.Fatalf("v1 rec = %+v, v2 rec = %+v (sub must differ)", recs[0], recs[1])
+	}
+	if recs[1].X != 10 || recs[1].Y != 20 {
+		t.Fatalf("v2 MOVE rec = %+v", recs[1])
 	}
 
 	// v2 断连释放:v1(仍在)重新请求 → 授予(移交闭环)。
