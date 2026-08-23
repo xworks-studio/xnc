@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -50,6 +51,36 @@ const (
 	// MsgSas 是 SendSAS 请求(M2-Slice1 Task 4:capability 门控的
 	// secure attention;Task 5 = 本侧调用方)。
 	MsgSas uint16 = 0x0110
+	// MsgCreateShell / MsgKillShell(M2-Slice2 Task 3/4:exec/shell 经
+	// xnc-core 的令牌语义进程创建)。
+	MsgCreateShell uint16 = 0x0120
+	MsgKillShell   uint16 = 0x0121
+)
+
+// WTSActiveConsole 是 0x0120 wts 字段的哨兵值:调用方(agent)没有 wts
+// 上下文,0xFFFFFFFF = "核心解析活动控制台会话"(agent<->core 文档化契约,
+// native/core pipe_server.h 同注)。
+const WTSActiveConsole uint32 = 0xFFFFFFFF
+
+// Shell token kind(0x0120 token_kind 字段)。
+const (
+	TokenUser   uint8 = 0
+	TokenSystem uint8 = 1
+)
+
+// Shell profile 白名单(0x0120 profile 字段枚举;spec §8.2——核心只认
+// 枚举,xnc-shell 自解析路径)。
+const (
+	ProfilePowershell uint8 = 0
+	ProfilePwsh       uint8 = 1
+	ProfileCmd        uint8 = 2
+	ProfileBash       uint8 = 3
+)
+
+// ShellMode 0x0120 mode 字段。
+const (
+	ModeInteractive uint8 = 0
+	ModeOneshot     uint8 = 1
 )
 
 // sasReasonLen 镜像 native/core pipe_server.h kSasReasonLen:0x0110 请求
@@ -178,6 +209,128 @@ func (c *Client) SendSAS(reason string) (hr uint32, err error) {
 		return 0, err
 	}
 	return decodeSasResp(f.Payload)
+}
+
+// ShellCreateReq 是 0x0120 的参数形态(native/core ShellCreateReq 的
+// Go 镜像)。WTS 通常填 WTSActiveConsole 哨兵(核心解析活动控制台);
+// Env 为 "K=V" 列表——值含 '\n' 不可表示,Encode 阶段即拒(BAD_PAYLOAD
+// 语义前置;核心侧对裸段同样拒绝)。
+type ShellCreateReq struct {
+	WTS        uint32
+	TokenKind  uint8 // TokenUser / TokenSystem
+	Profile    uint8 // Profile* 白名单枚举
+	Mode       uint8 // ModeInteractive / ModeOneshot
+	Cols       uint16
+	Rows       uint16
+	Cwd        string
+	Env        []string
+	Cmd        string
+	TimeoutSec uint32
+}
+
+// CreateShell 请求核心以指定令牌语义 spawn xnc-shell(0x0120)并回进程
+// 描述符:成功响应 [u32 pid][u16 nameLen][pipeName utf8][32B secret]。
+// 拒绝走 RejectedError(NO_ACTIVE_SESSION / SESSION_MISMATCH /
+// BAD_PAYLOAD / SPAWN_FAILED / PIPE_TIMEOUT / TOKEN_FAILED / RNG_FAILED)。
+func (c *Client) CreateShell(r ShellCreateReq) (pid uint32, pipeName string, secret []byte, err error) {
+	p, err := EncodeShellCreateReq(r)
+	if err != nil {
+		return 0, "", nil, err
+	}
+	f, err := c.roundTrip(rpcTimeout, MsgCreateShell, p)
+	if err != nil {
+		return 0, "", nil, err
+	}
+	return decodeShellCreateResp(f.Payload)
+}
+
+// KillShell 请求核心终止 shell 子进程(0x0121 [u32 pid];核心按存储
+// handle 限定,幂等)。
+func (c *Client) KillShell(pid uint32) error {
+	p := make([]byte, 4)
+	binary.LittleEndian.PutUint32(p, pid)
+	_, err := c.roundTrip(rpcTimeout, MsgKillShell, p)
+	return err
+}
+
+// EncodeShellCreateReq 编码 0x0120 请求(布局见 pipe_server.h;小端):
+// [u32 wts][u8 token_kind][u8 profile][u8 mode][u16 cols][u16 rows]
+// [u16 cwdLen][cwd][u16 envLen][env "K=V\n" join][u16 cmdLen][cmd]
+// [u32 timeoutSec]。域校验前置:profile/mode 枚举、oneshot 必带 cmd、
+// env 值含 '\n' 或缺 '=' 即错(生产者契约,不静默拆分)。
+func EncodeShellCreateReq(r ShellCreateReq) ([]byte, error) {
+	if r.WTS == 0 {
+		r.WTS = WTSActiveConsole // 缺省哨兵:核心解析活动控制台
+	}
+	if r.Profile > ProfileBash {
+		return nil, fmt.Errorf("coreclient: create_shell: bad profile %d", r.Profile)
+	}
+	if r.TokenKind > TokenSystem {
+		return nil, fmt.Errorf("coreclient: create_shell: bad token kind %d", r.TokenKind)
+	}
+	if r.Mode > ModeOneshot {
+		return nil, fmt.Errorf("coreclient: create_shell: bad mode %d", r.Mode)
+	}
+	if r.Mode == ModeOneshot && r.Cmd == "" {
+		return nil, errors.New("coreclient: create_shell: oneshot requires cmd")
+	}
+	for _, kv := range r.Env {
+		if !strings.Contains(kv, "=") {
+			return nil, fmt.Errorf("coreclient: create_shell: env entry %q missing '='", kv)
+		}
+		if strings.Contains(kv, "\n") {
+			return nil, fmt.Errorf("coreclient: create_shell: env entry %q contains newline", kv)
+		}
+	}
+	if len(r.Cwd) > 0xFFFF || len(r.Cmd) > 0xFFFF {
+		return nil, errors.New("coreclient: create_shell: cwd/cmd too long")
+	}
+	env := strings.Join(r.Env, "\n")
+	if len(env) > 0xFFFF {
+		return nil, errors.New("coreclient: create_shell: env too long")
+	}
+	p := make([]byte, 0, 20+len(r.Cwd)+len(env)+len(r.Cmd))
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], r.WTS)
+	p = append(p, b[:]...)
+	p = append(p, r.TokenKind, r.Profile, r.Mode)
+	var h [2]byte
+	binary.LittleEndian.PutUint16(h[:], r.Cols)
+	p = append(p, h[:]...)
+	binary.LittleEndian.PutUint16(h[:], r.Rows)
+	p = append(p, h[:]...)
+	binary.LittleEndian.PutUint16(h[:], uint16(len(r.Cwd)))
+	p = append(p, h[:]...)
+	p = append(p, r.Cwd...)
+	binary.LittleEndian.PutUint16(h[:], uint16(len(env)))
+	p = append(p, h[:]...)
+	p = append(p, env...)
+	binary.LittleEndian.PutUint16(h[:], uint16(len(r.Cmd)))
+	p = append(p, h[:]...)
+	p = append(p, r.Cmd...)
+	binary.LittleEndian.PutUint32(b[:], r.TimeoutSec)
+	p = append(p, b[:]...)
+	return p, nil
+}
+
+// decodeShellCreateResp 解码 ok 响应 [u32 pid][u16 nameLen][pipeName]
+// [32B secret](与 start_capture 同形,少 gen)。
+func decodeShellCreateResp(p []byte) (pid uint32, name string, secret []byte, err error) {
+	const hdr = 6
+	if len(p) < hdr+captureSecretLen {
+		return 0, "", nil, fmt.Errorf("coreclient: create_shell response %d bytes, want >= %d", len(p), hdr+captureSecretLen)
+	}
+	pid = binary.LittleEndian.Uint32(p)
+	nameLen := int(binary.LittleEndian.Uint16(p[4:hdr]))
+	if len(p) != hdr+nameLen+captureSecretLen {
+		return 0, "", nil, fmt.Errorf("coreclient: create_shell response length mismatch: nameLen=%d total=%d", nameLen, len(p))
+	}
+	name = string(p[hdr : hdr+nameLen])
+	if name == "" {
+		return 0, "", nil, errors.New("coreclient: create_shell response: empty pipe name")
+	}
+	secret = append([]byte(nil), p[hdr+nameLen:hdr+nameLen+captureSecretLen]...)
+	return pid, name, secret, nil
 }
 
 // roundTrip 写一条请求帧并等待同 RequestID 的 FlagResponse(时限
@@ -370,6 +523,10 @@ func msgName(mt uint16) string {
 		return "stop_capture"
 	case MsgSas:
 		return "sas"
+	case MsgCreateShell:
+		return "create_shell"
+	case MsgKillShell:
+		return "kill_shell"
 	}
 	return fmt.Sprintf("msg %#04x", mt)
 }

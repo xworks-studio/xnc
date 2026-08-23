@@ -77,5 +77,5 @@ func (h *handlers) desktopStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.startSession(w, r, proto.KindDesktop, params, "desktop.open", "desktop.close",
-		map[string]any{"turn": turn})
+		map[string]any{"turn": turn}, nil)
 }

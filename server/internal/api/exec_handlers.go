@@ -38,6 +38,9 @@ type execReq struct {
 	Cwd        string   `json:"cwd"`
 	Shell      string   `json:"shell"`
 	Env        []string `json:"env"`
+	// System(M2-Slice2):SYSTEM 令牌显式请求,owner-only RBAC +
+	// 审计 system=true;缺省 false = 用户令牌(spec §8.4 不隐式提权)。
+	System bool `json:"system"`
 }
 
 func pgUUID(id uuid.UUID) pgtype.UUID { return pgtype.UUID{Bytes: id, Valid: true} }
@@ -48,15 +51,21 @@ func mustJSON(v any) []byte {
 }
 
 // execStart 处理 POST /api/nodes/{id}/exec：鉴权（router 中间件）+ RBAC
-// （operator 及以上）→ 校验 → 委托 startSession（Create（双侧 token）→ 装配
-// finish/notify 钩子 → 经控制连接下发 SESSION_OPEN → 审计 exec.start → 202
-// 统一异步响应）。
+// （operator 及以上；system=true 收紧为 owner-only，M2-Slice2）→ 校验 →
+// 委托 startSession（Create（双侧 token）→ 装配 finish/notify 钩子 →
+// 经控制连接下发 SESSION_OPEN → 审计 exec.start（system=true 时携带）
+// → 202 统一异步响应）。
 func (h *handlers) execStart(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, execBodyMaxBytes)
 
 	var req execReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondError(w, proto.Err(400, proto.CodeInternal, "bad request"))
+		return
+	}
+	// system 令牌 = owner-only(Slice3 换票据 capability 前的最低线,
+	// 裁决记录):operator 403 由 requireMinRole 统一写出。
+	if req.System && !h.requireSystemRole(w, r) {
 		return
 	}
 	timeout := execTimeoutDefault
@@ -80,23 +89,41 @@ func (h *handlers) execStart(w http.ResponseWriter, r *http.Request) {
 
 	params, err := json.Marshal(proto.ExecParams{
 		Command: req.Command, Script: req.Script, TimeoutSec: timeout, Cwd: req.Cwd,
-		Shell: req.Shell, Env: req.Env,
+		Shell: req.Shell, Env: req.Env, System: req.System,
 	})
 	if err != nil {
 		respondError(w, proto.Err(500, proto.CodeInternal, "encode params"))
 		return
 	}
-	h.startSession(w, r, proto.KindExec, params, "exec.start", "exec.finish", nil)
+	var audit map[string]string
+	if req.System {
+		audit = map[string]string{"system": "true"}
+	}
+	h.startSession(w, r, proto.KindExec, params, "exec.start", "exec.finish", nil, audit)
+}
+
+// requireSystemRole 校验 system 令牌请求的 owner 身份(403 已写出时
+// 返回 false;节点不存在统一 404,不泄漏存在性)。
+func (h *handlers) requireSystemRole(w http.ResponseWriter, r *http.Request) bool {
+	nodeID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		respondError(w, proto.Err(404, proto.CodeNodeNotFound, "node not found"))
+		return false
+	}
+	_, ok := h.requireMinRole(w, r, nodeID, "owner")
+	return ok
 }
 
 // startSession 是 exec/shell/file/tunnel/screen/desktop 共享的会话创建路径：
 // RBAC（requireMinRole "operator"）→ Create（双侧 token）→ 装配 finish/notify
 // 钩子 → 经控制连接下发 SESSION_OPEN → 审计 openAction → 202。
-// extra（可 nil）并入 202 响应体（desktop 的 turn 配置等 kind 特有字段）。
+// extra（可 nil）并入 202 响应体（desktop 的 turn 配置等 kind 特有字段；
+// 绝不入审计——TURN 凭据不得落审计行）。auditExtra（可 nil）并入 open
+// 审计 metadata（exec/shell 的 system=true 标记）。
 // 返回 (result, true) 表示已写 202；false 表示已写错误响应。
 func (h *handlers) startSession(w http.ResponseWriter, r *http.Request,
 	kind string, params json.RawMessage, openAction, closeAction string,
-	extra map[string]any,
+	extra map[string]any, auditExtra map[string]string,
 ) (*session.CreateResult, bool) {
 	u := auth.UserFrom(r.Context())
 	nodeID, err := uuid.Parse(chi.URLParam(r, "id"))
@@ -172,9 +199,13 @@ func (h *handlers) startSession(w http.ResponseWriter, r *http.Request,
 	// 取消 r.Context()，审计 open 行必须不受影响。
 	actx, acancel := context.WithTimeout(context.Background(), auditInsertTimeout)
 	defer acancel()
+	meta := map[string]string{"kind": kind, "sessionId": res.Session.ID}
+	for k, v := range auditExtra {
+		meta[k] = v
+	}
 	_ = h.st.Q().InsertAuditLog(actx, sqlc.InsertAuditLogParams{
 		UserID: pgUUID(u.ID), NodeID: pgUUID(nodeID), Action: openAction,
-		Metadata: mustJSON(map[string]string{"kind": kind, "sessionId": res.Session.ID}),
+		Metadata: mustJSON(meta),
 	})
 	// AgentToken 绝不进 REST 响应；client 拿到的 token 是一次性 ClientToken。
 	body := map[string]any{

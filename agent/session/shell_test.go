@@ -1,5 +1,3 @@
-//go:build windows
-
 package session
 
 import (
@@ -7,10 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"os/exec"
-	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -24,7 +18,7 @@ import (
 // runShell 起 httptest WS 让 Shell 作为客户端拨入；返回服务侧连接与 Handle
 // 返回（清理已落定）时关闭的 done 信号。拨号错误经 errCh 回报（goroutine
 // 内不 require）。
-func runShell(t *testing.T, params proto.ShellParams) (*websocket.Conn, <-chan struct{}) {
+func runShell(t *testing.T, host ShellHost, params proto.ShellParams) (*websocket.Conn, <-chan struct{}) {
 	t.Helper()
 	up := make(chan *websocket.Conn, 1)
 	errCh := make(chan error, 1)
@@ -47,12 +41,10 @@ func runShell(t *testing.T, params proto.ShellParams) (*websocket.Conn, <-chan s
 			errCh <- err
 			return
 		}
-		NewShell(testLogger()).Handle(context.Background(), c, "sess-shell", raw)
+		(&Shell{Log: testLogger(), Host: host}).Handle(context.Background(), c, "sess-shell", raw)
 	}()
 	select {
 	case c := <-up:
-		// LIFO：先于 srv.Close 关闭服务侧连接，解除 Shell 关闭握手与
-		// srv.Close 等待 handler 退出之间的互等。
 		t.Cleanup(func() { c.CloseNow() })
 		return c, done
 	case err := <-errCh:
@@ -63,8 +55,7 @@ func runShell(t *testing.T, params proto.ShellParams) (*websocket.Conn, <-chan s
 	return nil, done
 }
 
-// collectUntil 从 ws 读帧直到 match 返回 true（跳过非 binary 或不匹配的帧），
-// 超时 fail。返回匹配帧原文。
+// collectUntil 从 ws 读帧直到 match 返回 true（跳过不匹配的帧），超时 fail。
 func collectUntil(t *testing.T, ws *websocket.Conn, match func(kind string, data []byte) bool, timeout time.Duration) []byte {
 	t.Helper()
 	deadline := time.After(timeout)
@@ -90,7 +81,7 @@ func collectUntil(t *testing.T, ws *websocket.Conn, match func(kind string, data
 	}
 }
 
-// writeBin 发送 binary 帧（client 键入 / 原始 pty 输入字节）。
+// writeBin 发送 binary 帧（client 键入 / pty 输入字节）。
 func writeBin(t *testing.T, ws *websocket.Conn, b []byte) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -116,24 +107,23 @@ func mustShellMsg(t *testing.T, typ string, payload any) []byte {
 	return b
 }
 
-// processAlive 经 tasklist 检查 pid 是否仍在进程表。
-func processAlive(t *testing.T, pid int64) bool {
-	t.Helper()
-	if pid == 0 {
-		return false
-	}
-	pidStr := strconv.FormatInt(pid, 10)
-	out, err := exec.Command("tasklist", "/FI", "PID eq "+pidStr).Output()
-	if err != nil {
-		return false
-	}
-	return strings.Contains(string(out), pidStr)
-}
+// TestShellBeginEchoResizeKill:经 fake host 全链:SHELL_BEGIN(实际
+// profile)、pty 双向、SHELL_RESIZE 透传(Resize 字节)、断开 → Kill。
+func TestShellBeginEchoResizeKill(t *testing.T) {
+	host := &fakeHost{build: func(spec ShellSpec) *fakeProc {
+		p := &fakeProc{spec: spec, profile: "PWSH",
+			streamCh: make(chan ShellStream, 16), exitCh: make(chan uint32, 1)}
+		p.onKill = func(fp *fakeProc) {
+			select {
+			case fp.exitCh <- 1:
+			default:
+			}
+		}
+		return p
+	}}
+	ws, done := runShell(t, host, proto.ShellParams{Cols: 80, Rows: 25, Shell: "pwsh", System: true})
 
-func TestShellEchoResizeCtrlC(t *testing.T) {
-	ws, done := runShell(t, proto.ShellParams{Cols: 80, Rows: 25})
-
-	// 1) SHELL_BEGIN 先行，报告实际 shell
+	// 1) SHELL_BEGIN 先行,报告实际 profile
 	begin := collectUntil(t, ws, func(k string, d []byte) bool {
 		if k != "text" {
 			return false
@@ -145,89 +135,95 @@ func TestShellEchoResizeCtrlC(t *testing.T) {
 	var m proto.Message
 	require.NoError(t, json.Unmarshal(begin, &m))
 	require.NoError(t, m.Decode(&sb))
-	assert.NotEmpty(t, sb.Shell)
+	assert.Equal(t, "PWSH", sb.Shell)
 
-	// 2) echo 回显（VT 序列夹杂，bytes.Contains 判定）
-	writeBin(t, ws, []byte("echo sh-echo-ok\r"))
-	collectUntil(t, ws, func(k string, d []byte) bool {
-		return k == "binary" && strings.Contains(string(d), "sh-echo-ok")
-	}, 10*time.Second)
+	// 2) 键入 → stdin 泵(fake host 记录)
+	writeBin(t, ws, []byte("echo sh-echo\r"))
+	proc := host.lastProc()
+	require.NotNil(t, proc)
+	require.Eventually(t, func() bool { return len(proc.Stdin()) > 0 }, 5*time.Second, 50*time.Millisecond)
+	assert.Equal(t, "echo sh-echo\r", string(proc.Stdin()))
 
-	// 3) resize 后继续工作
+	// 3) resize 字节透传
 	writeText(t, ws, mustShellMsg(t, "SHELL_RESIZE", proto.ShellResize{Cols: 100, Rows: 40}))
-	writeBin(t, ws, []byte("echo sh-post-resize\r"))
+	require.Eventually(t, func() bool {
+		rs := proc.Resizes()
+		return len(rs) == 1 && rs[0] == [2]int{100, 40}
+	}, 5*time.Second, 50*time.Millisecond)
+
+	// 4) pty 输出 → ws binary
+	proc.emit(ShellStream{Bytes: []byte("sh-out-payload")})
 	collectUntil(t, ws, func(k string, d []byte) bool {
-		return k == "binary" && strings.Contains(string(d), "sh-post-resize")
+		return k == "binary" && string(d) == "sh-out-payload"
 	}, 10*time.Second)
 
-	// 4) Ctrl+C 会话存活
-	writeBin(t, ws, []byte{0x03})
-	writeBin(t, ws, []byte("echo sh-after-ctrlc\r"))
-	collectUntil(t, ws, func(k string, d []byte) bool {
-		return k == "binary" && strings.Contains(string(d), "sh-after-ctrlc")
-	}, 10*time.Second)
+	// 5) spec 透传:interactive + cols/rows + system
+	specs := host.specs()
+	require.Len(t, specs, 1)
+	assert.True(t, specs[0].Interactive)
+	assert.Equal(t, 80, specs[0].Cols)
+	assert.Equal(t, 25, specs[0].Rows)
+	assert.Equal(t, "PWSH", specs[0].Profile)
+	assert.True(t, specs[0].System)
 
-	// 5) 退出 → Handle 返回（会话结束信号）
-	writeBin(t, ws, []byte("exit\r"))
+	// 6) 对端断开 → Kill(杀树)后 Handle 返回
+	_ = ws.CloseNow()
 	select {
 	case <-done:
 	case <-time.After(15 * time.Second):
-		t.Fatal("Handle did not return after exit")
+		t.Fatal("Handle did not return after disconnect")
 	}
+	assert.GreaterOrEqual(t, proc.Killed(), 1, "disconnect must kill the shell tree")
 }
 
-func TestShellCloseKillsProcess(t *testing.T) {
-	ws, _ := runShell(t, proto.ShellParams{Cols: 80, Rows: 25})
+// TestShellExitEndsSession:shell 自然退出(exit)→ Handle 返回。
+func TestShellExitEndsSession(t *testing.T) {
+	host := &fakeHost{}
+	ws, done := runShell(t, host, proto.ShellParams{Cols: 80, Rows: 25})
 	collectUntil(t, ws, func(k string, d []byte) bool {
-		return k == "text" && strings.Contains(string(d), "SHELL_BEGIN")
+		return k == "text" && json.Unmarshal(d, &proto.Message{}) == nil
 	}, 10*time.Second)
-
-	// SHELL_BEGIN 已发出 → lastStartedPID 已写入 conPTY 记录的 shell PID。
-	pid := lastStartedPID.Load()
-	require.NotZero(t, pid, "shell PID must be recorded after start")
-
-	_ = ws.CloseNow() // 模拟 client 断开
-
-	require.Eventually(t, func() bool {
-		return !processAlive(t, pid)
-	}, 10*time.Second, 300*time.Millisecond, "shell process must die after disconnect")
+	host.lastProc().exitCh <- 0
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("Handle did not return after shell exit")
+	}
 }
 
-// TestShellPromptPrefix：会话输出应出现 [HOSTNAME] PS 前缀提示符，
-// 且启动命令注入无回显（-NoExit -Command 不经交互行编辑器）。
-func TestShellPromptPrefix(t *testing.T) {
-	host, _ := os.Hostname()
-	want := "[" + host + "] PS "
-	ws, done := runShell(t, proto.ShellParams{Cols: 80, Rows: 25})
-	defer func() { _ = ws.CloseNow() }()
-	_ = done
+// TestShellStartRejected:创建拒绝(NO_ACTIVE_SESSION)→ ERROR
+// SHELL_START_FAILED,message 携带稳定码。
+func TestShellStartRejected(t *testing.T) {
+	host := &fakeHost{reject: &ShellHostError{Code: CodeNoActiveSession}}
+	ws, _ := runShell(t, host, proto.ShellParams{Cols: 80, Rows: 25})
+	errFrame := collectUntil(t, ws, func(k string, d []byte) bool {
+		if k != "text" {
+			return false
+		}
+		var m proto.Message
+		return json.Unmarshal(d, &m) == nil && m.Type == proto.TypeError
+	}, 10*time.Second)
+	var m proto.Message
+	require.NoError(t, json.Unmarshal(errFrame, &m))
+	var ep proto.ErrorPayload
+	require.NoError(t, m.Decode(&ep))
+	assert.Equal(t, proto.CodeShellStartFailed, ep.Code)
+	assert.Equal(t, "NO_ACTIVE_SESSION", ep.Message)
+}
 
-	// 单读循环：触发提示符渲染并累积全部输出（同时供回显断言）。
-	writeBin(t, ws, []byte("\r"))
-	var all []byte
-	deadline := time.After(15 * time.Second)
-	found := false
-	for !found {
-		select {
-		case <-deadline:
-			t.Fatalf("prompt prefix %q not seen; output so far: %q", want, all)
-		default:
+// TestShellCoreUnavailable:无 host 凭据 → ERROR,code CORE_UNAVAILABLE。
+func TestShellCoreUnavailable(t *testing.T) {
+	ws, _ := runShell(t, nil, proto.ShellParams{Cols: 80, Rows: 25})
+	errFrame := collectUntil(t, ws, func(k string, d []byte) bool {
+		if k != "text" {
+			return false
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		typ, data, err := ws.Read(ctx)
-		cancel()
-		if err != nil {
-			t.Fatalf("read: %v (output: %q)", err, all)
-		}
-		if typ == websocket.MessageBinary {
-			all = append(all, data...)
-			if strings.Contains(string(all), want) {
-				found = true
-			}
-		}
-	}
-	writeBin(t, ws, []byte("exit\r"))
-
-	assert.NotContains(t, string(all), "function global:prompt",
-		"startup command must not be echoed")
+		var m proto.Message
+		return json.Unmarshal(d, &m) == nil && m.Type == proto.TypeError
+	}, 10*time.Second)
+	var m proto.Message
+	require.NoError(t, json.Unmarshal(errFrame, &m))
+	var ep proto.ErrorPayload
+	require.NoError(t, m.Decode(&ep))
+	assert.Equal(t, "CORE_UNAVAILABLE", ep.Message)
 }

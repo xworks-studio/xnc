@@ -1,25 +1,26 @@
-// exec.go — 会话 kind=exec 的命令模式：子进程 stdout/stderr 以 1 字节前缀
-// （0x01/0x02）的 binary 帧流式转发到会话 WS，退出后发终态 EXEC_RESULT；
-// 超时与 SESSION_CLOSE（ctx 取消）都杀整个进程树。
+// exec.go — 会话 kind=exec 的命令模式(M2-Slice2 Task 4 起经 xnc-core
+// 创建:xnc-shell oneshot 模式,令牌语义 spec §8.4——默认用户令牌,
+// System=true 显式 SYSTEM):stdout/stderr 以 1 字节前缀(0x01/0x02)的
+// binary 帧流式转发到会话 WS,退出后发终态 EXEC_RESULT;超时与
+// SESSION_CLOSE(ctx 取消)都杀整个进程树(0x0126 + 核心 KillShell)。
+// 旧直连 spawn 路径已移除(ledger 裁决:无双路径);core 不可达 →
+// EXEC_RESULT.Code=CORE_UNAVAILABLE(dev 拓扑文档化行为)。
 package session
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
-	"strings"
-	"sync"
 	"time"
-	"xnc/agent/machineinfo"
 
 	"github.com/coder/websocket"
 
+	"xnc/agent/machineinfo"
 	"xnc/proto"
 )
 
@@ -46,14 +47,16 @@ const (
 // 加固，T7 收口）。
 var sessionIDRe = regexp.MustCompile(`^[A-Za-z0-9-]+$`)
 
-// Exec 命令模式处理器。TmpDir 为空 = os.TempDir()（脚本模式临时文件目录，
+// Exec 命令模式处理器。Host 为 nil 时用 DefaultShellHost(dev 环境变量);
+// 测试注入 fake。TmpDir 为空 = os.TempDir()（脚本模式临时文件目录，
 // 测试注入点）。
 type Exec struct {
 	Log    *slog.Logger
+	Host   ShellHost
 	TmpDir string
 }
 
-func NewExec(log *slog.Logger) *Exec { return &Exec{Log: log} }
+func NewExec(log *slog.Logger) *Exec { return &Exec{Log: log, Host: DefaultShellHost(log)} }
 
 func (ex *Exec) logger() *slog.Logger {
 	if ex.Log != nil {
@@ -62,24 +65,31 @@ func (ex *Exec) logger() *slog.Logger {
 	return slog.Default()
 }
 
+func (ex *Exec) host() ShellHost {
+	if ex.Host != nil {
+		return ex.Host
+	}
+	return nil // 无凭据:创建即 CORE_UNAVAILABLE
+}
+
 // Handle 运行一条命令直至终态：pump 输出 → EXEC_RESULT → 正常关闭 WS。
 // 返回即会话结束（引擎随后 CloseNow）。
 func (ex *Exec) Handle(ctx context.Context, ws *websocket.Conn, sessionID string, params json.RawMessage) {
 	var p proto.ExecParams
 	if err := json.Unmarshal(params, &p); err != nil {
-		ex.result(ctx, ws, nil, false, 0)
+		ex.result(ctx, ws, nil, false, 0, "")
 		return
 	}
 	// sessionID 会进入临时脚本路径：非白名单形态（如 "../../evil"）即拒绝
 	// 整会话，路径穿越在落盘前终结。
 	if !sessionIDRe.MatchString(sessionID) {
 		ex.logger().Warn("exec refused malformed session id", "session", sessionID)
-		ex.result(ctx, ws, nil, false, 0)
+		ex.result(ctx, ws, nil, false, 0, "")
 		return
 	}
 	if len(p.Script) > execMaxScriptBytes {
 		// server 已拦 256KB；agent 兜底，防篡改路径直接落盘超大文件
-		ex.result(ctx, ws, nil, false, 0)
+		ex.result(ctx, ws, nil, false, 0, "")
 		return
 	}
 	deadline := time.Duration(p.TimeoutSec) * time.Second
@@ -91,93 +101,112 @@ func (ex *Exec) Handle(ctx context.Context, ws *websocket.Conn, sessionID string
 	if p.Script != "" {
 		if _, err := ex.writeScript(sessionID, p.Script); err != nil {
 			ex.logger().Warn("exec write script failed", "session", sessionID, "err", err)
-			ex.result(ctx, ws, nil, false, time.Since(start).Milliseconds())
+			ex.result(ctx, ws, nil, false, time.Since(start).Milliseconds(), "")
 			return
 		}
 		defer func() { _ = os.Remove(ex.scriptPath(sessionID)) }()
 	}
-	cmd, err := ex.buildCommand(p, sessionID)
+	command, profile, err := buildExecCommand(p, ex.scriptPath(sessionID))
 	if err != nil {
-		ex.result(ctx, ws, nil, false, time.Since(start).Milliseconds())
-		return
-	}
-	if p.Cwd != "" {
-		cmd.Dir = p.Cwd
-	}
-	stdout, _ := cmd.StdoutPipe()
-	stderr, _ := cmd.StderrPipe()
-	if err := cmd.Start(); err != nil {
-		ex.logger().Warn("exec start failed", "session", sessionID, "err", err)
-		ex.result(ctx, ws, nil, false, time.Since(start).Milliseconds())
+		ex.logger().Warn("exec build command failed", "session", sessionID, "err", err)
+		ex.result(ctx, ws, nil, false, time.Since(start).Milliseconds(), "BAD_PAYLOAD")
 		return
 	}
 
-	// StdoutPipe 语义：Wait 会关闭管道——必须先排空 pump 再 Wait，否则
-	// 进程退出前的末段输出会被截断。
-	var pumps sync.WaitGroup
-	ex.pump(&pumps, ctx, ws, stdout, stdoutPrefix)
-	ex.pump(&pumps, ctx, ws, stderr, stderrPrefix)
-	waitCh := make(chan error, 1)
+	host := ex.host()
+	if host == nil {
+		ex.result(ctx, ws, nil, false, time.Since(start).Milliseconds(), CodeCoreUnavailable)
+		return
+	}
+	proc, err := host.CreateShell(ShellSpec{
+		System:     p.System,
+		Profile:    profile,
+		Cwd:        p.Cwd,
+		Env:        p.Env,
+		Command:    command,
+		TimeoutSec: int(deadline / time.Second),
+	})
+	if err != nil {
+		code := CodeCoreUnavailable
+		var she *ShellHostError
+		if errors.As(err, &she) {
+			code = she.Code
+		}
+		ex.logger().Warn("exec create shell rejected", "session", sessionID, "code", code)
+		ex.result(ctx, ws, nil, false, time.Since(start).Milliseconds(), code)
+		return
+	}
+
+	// 输出泵:shellpipe stream → 会话 WS binary 帧。
+	wrote := make(chan struct{})
 	go func() {
-		pumps.Wait()
-		waitCh <- cmd.Wait()
+		defer close(wrote)
+		for d := range proc.Stream() {
+			prefix := stdoutPrefix
+			if d.Stderr {
+				prefix = stderrPrefix
+			}
+			frame := append([]byte{prefix}, d.Bytes...)
+			wctx, cancel := context.WithTimeout(ctx, execWriteTimeout)
+			werr := ws.Write(wctx, websocket.MessageBinary, frame)
+			cancel()
+			if werr != nil {
+				return
+			}
+		}
 	}()
 
 	timedOut := make(chan struct{}, 1)
 	timer := time.AfterFunc(deadline, func() {
-		timedOut <- struct{}{}
-		killTree(cmd.Process.Pid)
+		// 非阻塞投递:xnc-shell 自带同参超时(shellhost 杀树),本定时
+		// 器只驱动 TimedOut 上报;杀树统一走下方 select 的 Kill 路径,
+		// 保证单次 Kill(重复 Kill 在对端已终结时会阻塞写)。
+		select {
+		case timedOut <- struct{}{}:
+		default:
+		}
 	})
 	defer timer.Stop()
 
 	var exitCode *int
 	timed := false
+	exit := proc.Exit()
 	select {
-	case <-waitCh:
-		if code := cmd.ProcessState.ExitCode(); code >= 0 {
-			exitCode = &code
+	case code := <-exit:
+		// shellhost 侧超时先杀时,EXIT 与本地定时器竞争:以 timed 位
+		// 为准(超时终态 ExitCode=null,镜像旧语义)。
+		select {
+		case <-timedOut:
+			timed = true
+		default:
+		}
+		if !timed && code < 0x80000000 {
+			c := int(code)
+			exitCode = &c
 		}
 	case <-ctx.Done():
-		killTree(cmd.Process.Pid)
-		<-waitCh
+		_ = proc.Kill()
+		<-exit
 	case <-timedOut:
 		timed = true
-		killTree(cmd.Process.Pid)
-		<-waitCh
+		_ = proc.Kill() // 0x0126 杀树 + 核心 KillShell 兜底
+		<-exit
 	}
+	// 排空输出泵再发终态(镜像旧 pumps.Wait 语义:末段输出不因终态帧
+	// 提前而截断;连接已死时由写时限兜底)。
+	select {
+	case <-wrote:
+	case <-time.After(execWriteTimeout):
+	}
+	_ = proc.Close()
 	ex.logger().Debug("exec finished", "session", sessionID, "timedOut", timed, "durationMs", time.Since(start).Milliseconds())
-	ex.result(ctx, ws, exitCode, timed, time.Since(start).Milliseconds())
-}
-
-// pump 为一条输出流起一个转发 goroutine（stdout 与 stderr 各调一次）：
-// 读到数据即包装 [prefix]+payload 写为 binary 帧；写失败（含 ctx 取消）或
-// 流结束（EOF/管道随进程退出关闭）即退出，经 wg 汇报排空。
-func (ex *Exec) pump(wg *sync.WaitGroup, ctx context.Context, ws *websocket.Conn, r io.Reader, prefix byte) {
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		buf := make([]byte, 32*1024)
-		for {
-			n, err := r.Read(buf)
-			if n > 0 {
-				frame := append([]byte{prefix}, buf[:n]...)
-				wctx, cancel := context.WithTimeout(ctx, execWriteTimeout)
-				werr := ws.Write(wctx, websocket.MessageBinary, frame)
-				cancel()
-				if werr != nil {
-					return
-				}
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
+	ex.result(ctx, ws, exitCode, timed, time.Since(start).Milliseconds(), "")
 }
 
 // result 发送终态 EXEC_RESULT 并以正常关闭码收线；写失败静默（会话已死）。
-func (ex *Exec) result(ctx context.Context, ws *websocket.Conn, code *int, timed bool, ms int64) {
-	msg, _ := proto.NewMsg(typeExecResult, proto.ExecResult{ExitCode: code, TimedOut: timed, DurationMs: ms})
+// code 非 "" = 稳定拒绝码(CORE_UNAVAILABLE / NO_ACTIVE_SESSION…)透传。
+func (ex *Exec) result(ctx context.Context, ws *websocket.Conn, code *int, timed bool, ms int64, stable string) {
+	msg, _ := proto.NewMsg(typeExecResult, proto.ExecResult{ExitCode: code, TimedOut: timed, DurationMs: ms, Code: stable})
 	b, _ := json.Marshal(msg)
 	wctx, cancel := context.WithTimeout(ctx, execWriteTimeout)
 	defer cancel()
@@ -185,95 +214,56 @@ func (ex *Exec) result(ctx context.Context, ws *websocket.Conn, code *int, timed
 	_ = ws.Close(websocket.StatusNormalClosure, "")
 }
 
-// buildCommand 按请求的 shell 类型构建执行命令。
-//
-// shell 值：auto（探测最佳）、bash、pwsh、powershell、cmd。
-// 命令模式内联执行（-c / -Command / cmd /c）；脚本模式执行已落盘文件。
-// 环境变量经前缀注入（按 shell 语法）。
-func (ex *Exec) buildCommand(p proto.ExecParams, sessionID string) (*exec.Cmd, error) {
+// buildExecCommand 把 ExecParams 解析为 (oneshot command, profile 白名
+// 名)。auto 由 agent 侧按 machineinfo 探测序解析为具体 profile(core 只
+// 认枚举,不接收路径,spec §8.2)。脚本模式命令 = 临时文件调用串
+// (pwsh/powershell: `& '<path>'`;bash: 前斜杠路径;cmd: 路径原样——
+// 与旧直连行为一致)。
+func buildExecCommand(p proto.ExecParams, scriptPath string) (command, profile string, err error) {
 	shell := p.Shell
 	if shell == "" || shell == "auto" {
 		shells := machineinfo.DetectShells()
 		shell = shells[0]
 	}
-
-	// 环境变量前缀（命令模式时拼在命令前；脚本模式设到子进程 env）。
-	prefix := envPrefix(shell, p.Env)
-
-	var cmd *exec.Cmd
-	scriptPath := ex.scriptPath(sessionID)
-
 	switch shell {
 	case "bash":
-		exe := machineinfo.FindBash()
-		if exe == "" {
-			return nil, fmt.Errorf("bash not available on this node")
-		}
+		profile = "BASH"
 		if p.Script != "" {
-			cmd = exec.Command(exe, scriptPath)
+			command = "'" + filepath.ToSlash(scriptPath) + "'"
 		} else {
-			cmd = exec.Command(exe, "-c", prefix+p.Command)
+			command = p.Command
 		}
-
 	case "cmd":
+		profile = "CMD"
 		if p.Script != "" {
-			cmd = exec.Command("cmd", "/c", prefix+scriptPath)
+			command = scriptPath
 		} else {
-			cmd = exec.Command("cmd", "/c", prefix+p.Command)
+			command = p.Command
 		}
-
 	case "pwsh", "powershell":
+		profile = "POWERSHELL"
+		if shell == "pwsh" {
+			profile = "PWSH"
+		}
 		if p.Script != "" {
-			// -ExecutionPolicy Bypass：默认 Restricted 策略会拒绝加载 .ps1 文件
-			// （agent 以 LocalSystem 运行，本就是管理通道，策略在此非安全边界）。
-			cmd = exec.Command(shell, "-NoLogo", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-				"-File", scriptPath)
+			command = "& '" + scriptPath + "'"
 		} else {
-			cmd = exec.Command(shell, "-NoLogo", "-NonInteractive", "-Command", prefix+p.Command)
+			command = p.Command
 		}
-
 	default:
-		return nil, fmt.Errorf("unsupported shell %q (available: bash, pwsh, powershell, cmd)", shell)
+		return "", "", fmt.Errorf("unsupported shell %q (available: bash, pwsh, powershell, cmd)", shell)
 	}
-
-	// 脚本模式的环境变量直接设到子进程 env（比前缀注入更可靠）。
-	if p.Script != "" && len(p.Env) > 0 {
-		for _, kv := range p.Env {
-			if k, v, ok := strings.Cut(kv, "="); ok {
-				cmd.Env = append(cmd.Environ(), k+"="+v)
-			}
-		}
+	if p.Script == "" && p.Command == "" {
+		return "", "", fmt.Errorf("command or script required")
 	}
-
-	return cmd, nil
-}
-
-// envPrefix 按 shell 语法构建环境变量注入前缀。
-func envPrefix(shell string, env []string) string {
-	if len(env) == 0 {
-		return ""
-	}
-	var sb strings.Builder
-	for _, kv := range env {
-		k, v, ok := strings.Cut(kv, "=")
-		if !ok {
-			continue
-		}
-		switch shell {
-		case "bash":
-			sb.WriteString(fmt.Sprintf("export %s='%s'; ", k, v))
-		case "cmd":
-			sb.WriteString(fmt.Sprintf("set %s=%s&& ", k, v))
-		default: // pwsh / powershell
-			sb.WriteString(fmt.Sprintf("$env:%s='%s'; ", k, v))
-		}
-	}
-	return sb.String()
+	return command, profile, nil
 }
 
 func (ex *Exec) writeScript(sessionID, script string) (string, error) {
 	path := ex.scriptPath(sessionID)
-	return path, os.WriteFile(path, []byte(script), 0o600)
+	// 0o644:shell 经用户令牌运行,须可读(agent SYSTEM 落盘,0644 让
+	// 用户 token 侧的 xnc-shell 能读取)。
+	return path, os.WriteFile(path, []byte(script), 0o644)
 }
 
 func (ex *Exec) scriptPath(sessionID string) string {

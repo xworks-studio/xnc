@@ -19,18 +19,23 @@ const (
 )
 
 // shellStart 处理 POST /api/nodes/{id}/shell：4KB 体上限 + cols/rows/shell
-// 校验 → 委托 startSession（KindShell，审计 shell.open/shell.close）。
+// 校验 → 委托 startSession（KindShell，审计 shell.open/shell.close；
+// system=true 时 owner-only RBAC + 审计 system=true，M2-Slice2）。
 // Params 经 proto.ShellParams 序列化（omitempty：非零 cols/rows 均写出，
 // 0 已在入口替换为缺省 120/30；shell 空串省略，由 agent 探测决定）。
 func (h *handlers) shellStart(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, shellBodyMaxBytes)
 	var req struct {
-		Cols  int    `json:"cols"`
-		Rows  int    `json:"rows"`
-		Shell string `json:"shell"`
+		Cols   int    `json:"cols"`
+		Rows   int    `json:"rows"`
+		Shell  string `json:"shell"`
+		System bool   `json:"system"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondError(w, proto.Err(400, proto.CodeInternal, "bad request"))
+		return
+	}
+	if req.System && !h.requireSystemRole(w, r) {
 		return
 	}
 	if req.Cols == 0 {
@@ -48,11 +53,15 @@ func (h *handlers) shellStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	params, err := json.Marshal(proto.ShellParams{
-		Cols: req.Cols, Rows: req.Rows, Shell: req.Shell,
+		Cols: req.Cols, Rows: req.Rows, Shell: req.Shell, System: req.System,
 	})
 	if err != nil {
 		respondError(w, proto.Err(500, proto.CodeInternal, "encode params"))
 		return
 	}
-	h.startSession(w, r, proto.KindShell, params, "shell.open", "shell.close", nil)
+	var audit map[string]string
+	if req.System {
+		audit = map[string]string{"system": "true"}
+	}
+	h.startSession(w, r, proto.KindShell, params, "shell.open", "shell.close", nil, audit)
 }

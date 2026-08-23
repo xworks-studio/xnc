@@ -52,6 +52,7 @@ func newExecCmd() *cobra.Command {
 		shell   string
 		env     []string
 		file    string
+		system  bool
 	)
 	cmd := &cobra.Command{
 		Use:   "exec <node> [flags] <command...> | --file <path> | -",
@@ -76,10 +77,11 @@ Examples:
   xnc exec node1 --shell cmd "dir C:\\xnc"
   xnc exec node1 --file deploy.ps1
   cat script.sh | xnc exec node1 -
-  xnc exec node1 --cwd C:\\xnc --env DEBUG=1 "tool.exe"`,
+  xnc exec node1 --cwd C:\\xnc --env DEBUG=1 "tool.exe"
+  xnc exec node1 --system "whoami"   # SYSTEM token (owner-only, audited)`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(c *cobra.Command, args []string) error {
-			return runExecUnified(c, args, timeout, cwd, shell, env, file)
+			return runExecUnified(c, args, timeout, cwd, shell, env, file, system)
 		},
 	}
 	cmd.Flags().IntVar(&timeout, "timeout", execTimeoutDefault,
@@ -91,6 +93,8 @@ Examples:
 		"environment variable KEY=VAL (repeatable)")
 	cmd.Flags().StringVar(&file, "file", "",
 		"script file path (alternative to positional command)")
+	cmd.Flags().BoolVar(&system, "system", false,
+		"run with the SYSTEM token (default: console user token; owner-only, audited)")
 	addJSONFlag(cmd)
 	return cmd
 }
@@ -104,7 +108,7 @@ func newRunCmd() *cobra.Command {
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(c *cobra.Command, args []string) error {
 			file, _ := c.Flags().GetString("file")
-			return runExecUnified(c, args, timeout, "", "auto", nil, file)
+			return runExecUnified(c, args, timeout, "", "auto", nil, file, false)
 		},
 	}
 	cmd.Flags().IntVar(&timeout, "timeout", execTimeoutDefault,
@@ -116,7 +120,7 @@ func newRunCmd() *cobra.Command {
 }
 
 // runExecUnified 统一执行入口。
-func runExecUnified(cmd *cobra.Command, args []string, timeout int, cwd, shell string, env []string, file string) error {
+func runExecUnified(cmd *cobra.Command, args []string, timeout int, cwd, shell string, env []string, file string, system bool) error {
 	if e := checkExecTimeout(cmd, timeout); e != nil {
 		return e
 	}
@@ -163,7 +167,7 @@ func runExecUnified(cmd *cobra.Command, args []string, timeout int, cwd, shell s
 		return failAPI(cmd, e)
 	}
 
-	body := map[string]any{"timeoutSec": timeout, "shell": shell}
+	body := map[string]any{"timeoutSec": timeout, "shell": shell, "system": system}
 	if command != "" {
 		body["command"] = command
 	}

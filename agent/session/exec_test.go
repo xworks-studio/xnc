@@ -4,13 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -22,17 +20,19 @@ import (
 	"xnc/proto"
 )
 
-func testLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
-}
+type discard struct{}
 
-func isWindows() bool { return runtime.GOOS == "windows" }
+func (discard) Write(p []byte) (int, error) { return len(p), nil }
+
+func testLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(discard{}, nil))
+}
 
 // runExec 起 httptest WS 服务端并让 Exec 作为客户端拨入；返回服务侧连接。
 // 注意：dial 错误经 errCh 回报（goroutine 内禁用 require）。
-func runExec(t *testing.T, params proto.ExecParams) *websocket.Conn {
+func runExec(t *testing.T, host ShellHost, params proto.ExecParams) *websocket.Conn {
 	t.Helper()
-	ws, _ := runExecIn(t, "sess-test", "", params)
+	ws, _ := runExecIn(t, host, "sess-test", "", params)
 	return ws
 }
 
@@ -40,7 +40,7 @@ func runExec(t *testing.T, params proto.ExecParams) *websocket.Conn {
 // （空 = os.TempDir）。除服务侧连接外，还返回 Handle 返回（其 defer 清理
 // 已执行完毕）时关闭的 done 信号——脚本生命周期用例据此在断言目录前等待
 // 临时文件删除落定：EXEC_RESULT 帧先于 Handle 返回到达。
-func runExecIn(t *testing.T, sessionID, tmpDir string, params proto.ExecParams) (*websocket.Conn, <-chan struct{}) {
+func runExecIn(t *testing.T, host ShellHost, sessionID, tmpDir string, params proto.ExecParams) (*websocket.Conn, <-chan struct{}) {
 	t.Helper()
 	up := make(chan *websocket.Conn, 1)
 	errCh := make(chan error, 1)
@@ -63,7 +63,7 @@ func runExecIn(t *testing.T, sessionID, tmpDir string, params proto.ExecParams) 
 			errCh <- err
 			return
 		}
-		(&Exec{Log: testLogger(), TmpDir: tmpDir}).Handle(context.Background(), c, sessionID, raw)
+		(&Exec{Log: testLogger(), Host: host, TmpDir: tmpDir}).Handle(context.Background(), c, sessionID, raw)
 	}()
 	select {
 	case c := <-up:
@@ -112,7 +112,7 @@ func readFrame(t *testing.T, ws *websocket.Conn) (string, []byte) {
 }
 
 // collectExec 消费会话帧直至 EXEC_RESULT：binary 帧按前缀归入 stdout/stderr，
-// text 帧解码终态。windows 与非 windows 用例共用以消除断言重复。
+// text 帧解码终态。
 func collectExec(t *testing.T, ws *websocket.Conn) (string, string, *proto.ExecResult) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
@@ -138,42 +138,110 @@ func collectExec(t *testing.T, ws *websocket.Conn) (string, string, *proto.ExecR
 	return stdout.String(), stderr.String(), res
 }
 
+// TestExecCommandStreamsAndExits:fake host 服务 canned stdout/stderr +
+// exit 7;spec 透传 command/profile/system。
 func TestExecCommandStreamsAndExits(t *testing.T) {
-	cmd := `Write-Output hello; Write-Error boom; exit 7`
-	params := proto.ExecParams{Command: cmd, TimeoutSec: 30, Shell: "powershell"}
-	if !isWindows() {
-		cmd = `echo hello; echo boom 1>&2; exit 7`
-	}
-	ws := runExec(t, params)
+	host := &fakeHost{build: func(spec ShellSpec) *fakeProc {
+		p := &fakeProc{spec: spec, profile: spec.Profile,
+			streamCh: make(chan ShellStream, 16), exitCh: make(chan uint32, 1)}
+		go func() {
+			p.emit(ShellStream{Bytes: []byte("hello")})
+			p.emit(ShellStream{Stderr: true, Bytes: []byte("boom")})
+			p.exitCh <- 7
+			close(p.streamCh)
+		}()
+		return p
+	}}
+	ws := runExec(t, host, proto.ExecParams{Command: "whoami", TimeoutSec: 30, Shell: "cmd", System: true})
 	stdout, stderr, res := collectExec(t, ws)
 	assert.Contains(t, stdout, "hello")
 	assert.Contains(t, stderr, "boom")
 	require.NotNil(t, res.ExitCode)
 	assert.Equal(t, 7, *res.ExitCode)
 	assert.False(t, res.TimedOut)
-	assert.True(t, res.DurationMs >= 0)
+	assert.Empty(t, res.Code)
+
+	specs := host.specs()
+	require.Len(t, specs, 1)
+	assert.Equal(t, "whoami", specs[0].Command)
+	assert.Equal(t, "CMD", specs[0].Profile)
+	assert.True(t, specs[0].System, "system flag must reach the shell host")
+	assert.False(t, specs[0].Interactive)
+	assert.EqualValues(t, 30, specs[0].TimeoutSec)
 }
 
+// TestExecDefaultUserToken:System 缺省 false(不隐式提权,spec §8.4)。
+func TestExecDefaultUserToken(t *testing.T) {
+	host := &fakeHost{build: func(spec ShellSpec) *fakeProc {
+		p := &fakeProc{spec: spec, profile: spec.Profile,
+			streamCh: make(chan ShellStream, 16), exitCh: make(chan uint32, 1)}
+		p.exitCh <- 0
+		close(p.streamCh)
+		return p
+	}}
+	ws := runExec(t, host, proto.ExecParams{Command: "whoami", Shell: "powershell"})
+	_, _, res := collectExec(t, ws)
+	require.NotNil(t, res.ExitCode)
+	specs := host.specs()
+	require.Len(t, specs, 1)
+	assert.False(t, specs[0].System)
+	assert.Equal(t, "POWERSHELL", specs[0].Profile)
+}
+
+// TestExecTimeoutKills:超时 → Kill(杀树)+ TimedOut=true + ExitCode=null。
 func TestExecTimeoutKillsAndReports(t *testing.T) {
-	cmd := `Start-Sleep 60`
-	if !isWindows() {
-		cmd = `sleep 60`
-	}
+	host := &fakeHost{build: func(spec ShellSpec) *fakeProc {
+		p := &fakeProc{spec: spec, profile: spec.Profile,
+			streamCh: make(chan ShellStream, 16), exitCh: make(chan uint32, 1)}
+		p.onKill = func(fp *fakeProc) {
+			select {
+			case fp.exitCh <- 1:
+			default:
+			}
+			close(fp.streamCh)
+		}
+		return p
+	}}
 	start := time.Now()
-	ws := runExec(t, proto.ExecParams{Command: cmd, TimeoutSec: 1, Shell: "powershell"})
+	ws := runExec(t, host, proto.ExecParams{Command: "sleep", TimeoutSec: 1, Shell: "cmd"})
 	_, _, res := collectExec(t, ws)
 	assert.True(t, res.TimedOut)
 	assert.Nil(t, res.ExitCode)
-	assert.Less(t, time.Since(start), 15*time.Second) // 秒级杀掉，非等满 60s
+	assert.Less(t, time.Since(start), 15*time.Second)
+	assert.Equal(t, 1, host.lastProc().Killed(), "timeout must kill via the shell host")
+}
+
+// TestExecNoActiveSessionPropagates:用户令牌 + 无活动会话 → EXEC_RESULT
+// 携带 NO_ACTIVE_SESSION 稳定码(不隐式提权)。
+func TestExecNoActiveSessionPropagates(t *testing.T) {
+	host := &fakeHost{reject: &ShellHostError{Code: CodeNoActiveSession}}
+	ws := runExec(t, host, proto.ExecParams{Command: "whoami", Shell: "cmd"})
+	_, _, res := collectExec(t, ws)
+	assert.Nil(t, res.ExitCode)
+	assert.Equal(t, "NO_ACTIVE_SESSION", res.Code)
+}
+
+// TestExecCoreUnavailable:无 host 凭据(dev 无 xnc-core)→ CORE_UNAVAILABLE。
+func TestExecCoreUnavailable(t *testing.T) {
+	ws := runExec(t, nil, proto.ExecParams{Command: "whoami", Shell: "cmd"})
+	_, _, res := collectExec(t, ws)
+	assert.Nil(t, res.ExitCode)
+	assert.Equal(t, "CORE_UNAVAILABLE", res.Code)
 }
 
 func TestExecScriptLifecycle(t *testing.T) {
 	dir := t.TempDir()
-	script := "Write-Output from-script\nexit 3"
-	if !isWindows() {
-		script = "echo from-script\nexit 3"
-	}
-	ws, done := runExecIn(t, "sess-script", dir, proto.ExecParams{Script: script, TimeoutSec: 30, Shell: "powershell"})
+	host := &fakeHost{build: func(spec ShellSpec) *fakeProc {
+		p := &fakeProc{spec: spec, profile: spec.Profile,
+			streamCh: make(chan ShellStream, 16), exitCh: make(chan uint32, 1)}
+		go func() {
+			p.emit(ShellStream{Bytes: []byte("from-script")})
+			p.exitCh <- 3
+			close(p.streamCh)
+		}()
+		return p
+	}}
+	ws, done := runExecIn(t, host, "sess-script", dir, proto.ExecParams{Script: "Write-Output from-script\nexit 3", TimeoutSec: 30, Shell: "powershell"})
 	stdout, _, res := collectExec(t, ws)
 	assert.Contains(t, stdout, "from-script")
 	require.NotNil(t, res.ExitCode)
@@ -182,11 +250,24 @@ func TestExecScriptLifecycle(t *testing.T) {
 	// 成功路径：临时脚本已删除（等 Handle 返回，defer 删除落定）。
 	waitHandleDone(t, ws, done)
 	assertDirEmpty(t, dir)
+
+	// 脚本模式命令 = 临时文件调用串(& '<path>')。
+	specs := host.specs()
+	require.Len(t, specs, 1)
+	assert.Contains(t, specs[0].Command, "sess-script")
+	assert.Equal(t, "POWERSHELL", specs[0].Profile)
 }
 
 func TestExecScriptCleanupOnFailure(t *testing.T) {
 	dir := t.TempDir()
-	ws, done := runExecIn(t, "sess-fail", dir, proto.ExecParams{Script: "exit 9", TimeoutSec: 30})
+	host := &fakeHost{build: func(spec ShellSpec) *fakeProc {
+		p := &fakeProc{spec: spec, profile: spec.Profile,
+			streamCh: make(chan ShellStream, 16), exitCh: make(chan uint32, 1)}
+		p.exitCh <- 9
+		close(p.streamCh)
+		return p
+	}}
+	ws, done := runExecIn(t, host, "sess-fail", dir, proto.ExecParams{Script: "exit 9", TimeoutSec: 30})
 	_, _, res := collectExec(t, ws)
 	require.NotNil(t, res.ExitCode)
 	require.Equal(t, 9, *res.ExitCode)
@@ -197,8 +278,9 @@ func TestExecScriptCleanupOnFailure(t *testing.T) {
 
 func TestExecOversizeScriptRefused(t *testing.T) {
 	dir := t.TempDir()
+	host := &fakeHost{}
 	huge := strings.Repeat("a", 1024*1024+1)
-	ws, _ := runExecIn(t, "sess-huge", dir, proto.ExecParams{Script: huge, TimeoutSec: 5})
+	ws, _ := runExecIn(t, host, "sess-huge", dir, proto.ExecParams{Script: huge, TimeoutSec: 5})
 
 	kind, data := readFrame(t, ws)
 	require.Equal(t, "text", kind)
@@ -210,17 +292,15 @@ func TestExecOversizeScriptRefused(t *testing.T) {
 	assert.Nil(t, r.ExitCode)
 
 	assertDirEmpty(t, dir) // no temp file written for oversize script
+	assert.Empty(t, host.specs())
 }
 
 // TestExecHostileSessionIDRefused 路径穿越形态的 sessionID（T6 评审加固）：
 // 整会话拒绝、null exitCode，且不在 TmpDir（乃至其逃逸目标）落任何文件。
 func TestExecHostileSessionIDRefused(t *testing.T) {
 	dir := t.TempDir()
-	script := "Write-Output pwned"
-	if !isWindows() {
-		script = "echo pwned"
-	}
-	ws, _ := runExecIn(t, "../../evil", dir, proto.ExecParams{Script: script, TimeoutSec: 5})
+	host := &fakeHost{}
+	ws, _ := runExecIn(t, host, "../../evil", dir, proto.ExecParams{Script: "Write-Output pwned", TimeoutSec: 5})
 
 	kind, data := readFrame(t, ws)
 	require.Equal(t, "text", kind)
@@ -236,4 +316,32 @@ func TestExecHostileSessionIDRefused(t *testing.T) {
 	// 逃逸目标同样不得出现文件。
 	_, err := os.Stat(filepath.Join(filepath.Dir(dir), "evil.ps1"))
 	assert.True(t, os.IsNotExist(err), "script must not escape TmpDir via traversal")
+	assert.Empty(t, host.specs())
+}
+
+// TestBuildExecCommandMapping:auto 解析为具体白名单 profile;显式 shell
+// 映射;非法 shell 拒绝;script → 调用串。
+func TestBuildExecCommandMapping(t *testing.T) {
+	cmd, profile, err := buildExecCommand(proto.ExecParams{Command: "dir", Shell: "bash"}, "")
+	require.NoError(t, err)
+	assert.Equal(t, "dir", cmd)
+	assert.Equal(t, "BASH", profile)
+
+	cmd, profile, err = buildExecCommand(proto.ExecParams{Command: "dir", Shell: "pwsh"}, "")
+	require.NoError(t, err)
+	assert.Equal(t, "PWSH", profile)
+
+	_, profile, err = buildExecCommand(proto.ExecParams{Command: "dir", Shell: "auto"}, "")
+	require.NoError(t, err)
+	assert.Contains(t, []string{"BASH", "PWSH", "POWERSHELL", "CMD"}, profile)
+
+	_, _, err = buildExecCommand(proto.ExecParams{Command: "dir", Shell: "zsh"}, "")
+	assert.Error(t, err)
+
+	cmd, _, err = buildExecCommand(proto.ExecParams{Script: "x", Shell: "powershell"}, `C:\t\xnc-s.ps1`)
+	require.NoError(t, err)
+	assert.Equal(t, `& 'C:\t\xnc-s.ps1'`, cmd)
+
+	_, _, err = buildExecCommand(proto.ExecParams{Shell: "cmd"}, "")
+	assert.Error(t, err, "command or script required")
 }

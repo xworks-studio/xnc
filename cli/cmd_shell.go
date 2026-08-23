@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
-	"strings"
-	"strconv"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/coder/websocket"
@@ -29,18 +29,21 @@ const (
 
 func newShellCmd() *cobra.Command {
 	var cols, rows int
+	var system bool
 	cmd := &cobra.Command{
-		Use:   "shell <node> [--cols N] [--rows N]",
+		Use:   "shell <node> [--cols N] [--rows N] [--system]",
 		Short: "Open an interactive shell on a node (disconnect with ~. on an empty line)",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runShell(cmd, args, cols, rows)
+			return runShell(cmd, args, cols, rows, system)
 		},
 	}
 	cmd.Flags().IntVar(&cols, "cols", 0,
 		"initial terminal width (default: current terminal, else 120; disables auto-resize)")
 	cmd.Flags().IntVar(&rows, "rows", 0,
 		"initial terminal height (default: current terminal, else 30; disables auto-resize)")
+	cmd.Flags().BoolVar(&system, "system", false,
+		"run with the SYSTEM token (default: console user token; owner-only, audited)")
 	return cmd
 }
 
@@ -50,7 +53,7 @@ func newShellCmd() *cobra.Command {
 // poll for resizes（显式 --cols/--rows 时禁用，避免尺寸回弹）, stream
 // binary output to stdout, set the terminal title to the node name, and
 // exit 0 when the peer closes（打印 disconnect 提示）or ERROR (exit 250).
-func runShell(cmd *cobra.Command, args []string, flagCols, flagRows int) error {
+func runShell(cmd *cobra.Command, args []string, flagCols, flagRows int, system bool) error {
 	fd := int(os.Stdin.Fd())
 	if !term.IsTerminal(fd) {
 		return failUsage(cmd, "xnc shell requires an interactive terminal; use xnc exec for scripting")
@@ -85,7 +88,7 @@ func runShell(cmd *cobra.Command, args []string, flagCols, flagRows int) error {
 		WebsocketURL string `json:"websocketUrl"`
 	}
 	if e := cl.Do("POST", "/api/nodes/"+url.PathEscape(ref.ID)+"/shell",
-		map[string]any{"cols": cols, "rows": rows}, &created); e != nil {
+		map[string]any{"cols": cols, "rows": rows, "system": system}, &created); e != nil {
 		return failAPI(cmd, e)
 	}
 

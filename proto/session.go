@@ -48,7 +48,7 @@ func (t *DesktopTurnConfig) Configured() bool {
 // DesktopParams 会话 Params 的 desktop 形态（M1-Slice2）。
 type DesktopParams struct {
 	// Signaling 目前仅 "webrtc"；空视同 "webrtc"（本片唯一形态）。
-	Signaling string `json:"signaling,omitempty"`
+	Signaling string             `json:"signaling,omitempty"`
 	Turn      *DesktopTurnConfig `json:"turn,omitempty"`
 	// WTSSession 目标 WTS 会话 id；0 = 活动控制台会话（dev 默认）。
 	WTSSession uint32 `json:"wtsSession,omitempty"`
@@ -80,28 +80,36 @@ type SessionClose struct {
 }
 
 // ExecParams 会话 Params 的 exec 形态；command 与 script 二选一。
+// System(M2-Slice2):true = SYSTEM 令牌显式请求(server 侧 owner-only
+// RBAC + 审计 system=true;agent 经 xnc-core CreateShell token_kind 落
+// 地);缺省 false = 用户令牌(spec §8.4,加字段向后兼容)。
 type ExecParams struct {
 	Command    string   `json:"command,omitempty"`
 	Script     string   `json:"script,omitempty"`
 	TimeoutSec int      `json:"timeoutSec,omitempty"`
 	Cwd        string   `json:"cwd,omitempty"`
-	Shell      string   `json:"shell,omitempty"`    // auto|bash|pwsh|powershell|cmd
-	Env        []string `json:"env,omitempty"`      // KEY=VAL 列表
+	Shell      string   `json:"shell,omitempty"` // auto|bash|pwsh|powershell|cmd
+	Env        []string `json:"env,omitempty"`   // KEY=VAL 列表
+	System     bool     `json:"system,omitempty"`
 }
 
 // ExecResult exec 会话 WS 的终态 text 帧；超时/被杀时 ExitCode 为 null。
+// Code 非 "" = 稳定拒绝码(CORE_UNAVAILABLE / NO_ACTIVE_SESSION /
+// SESSION_MISMATCH…,创建即失败,进程未启动)。
 type ExecResult struct {
 	ExitCode   *int   `json:"exitCode"`
 	TimedOut   bool   `json:"timedOut"`
 	DurationMs int64  `json:"durationMs"`
+	Code       string `json:"code,omitempty"`
 }
 
 // ShellParams 会话 Params 的 shell 形态；Cols/Rows 为 0 时用默认 120x30，
-// Shell 为空时由 agent 按探测结果决定。
+// Shell 为空时由 agent 按探测结果决定。System 语义同 ExecParams。
 type ShellParams struct {
-	Cols  int    `json:"cols,omitempty"`
-	Rows  int    `json:"rows,omitempty"`
-	Shell string `json:"shell,omitempty"`
+	Cols   int    `json:"cols,omitempty"`
+	Rows   int    `json:"rows,omitempty"`
+	Shell  string `json:"shell,omitempty"`
+	System bool   `json:"system,omitempty"`
 }
 
 // ShellBegin agent → client：实际使用的 shell（SHELL_BEGIN text 帧）。
