@@ -106,14 +106,26 @@ func runInteractive(conn net.Conn, o *serverOpts) error {
 
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- pty.Wait() }()
-	var exitCode uint32
+	killed := false
 	select {
 	case <-waitCh: // shell 退出(exit 命令):捕获退出码
-	case <-done: // 输出流结束(pty 关闭)
-	case <-gone: // 对端断开 / KILL
+	case <-done: // 输出流结束(pty 关闭;Wait/KillAndClose 兜底收割)
+	case <-gone: // 对端断开 / KILL:杀树语义
+		killed = true
 	}
+	// 先收尾(KillAndClose 幂等,内含 5s 进程句柄等待),再上报终态:
+	// 杀树后的 GetExitCodeProcess 才可见。被杀路径(killed)落定的退出码
+	// 为 0 时不可信 —— force 非零;自然退出(含 0)不受影响(T2 评审修复:
+	// 被杀的 shell 绝不上报 exit 0)。
+	pty.KillAndClose()
+	var exitCode uint32
 	if pty.exitCode != nil {
 		exitCode = *pty.exitCode
+	} else {
+		exitCode = 1 // 未捕获到退出码:视为异常终态
+	}
+	if killed && exitCode == 0 {
+		exitCode = 1
 	}
 	_ = conn.SetWriteDeadline(time.Now().Add(dataWriteTimeout))
 	_ = writeFrame(conn, &ipc.Frame{MessageType: msgShellExit, Payload: encodeExit(exitCode)})

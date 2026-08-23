@@ -191,10 +191,44 @@ func TestInteractiveSmokeOverPipe(t *testing.T) {
 	require.NoError(t, ipc.WriteFrame(conn, &ipc.Frame{
 		MessageType: msgShellData, Payload: encodeData(streamStdin, []byte("exit\r")),
 	}))
-	payload := readMsg(t, conn, msgShellExit)
-	code, err := decodeExit(payload)
+	for { // exit 后仍有尾部输出(提示符回显):消费直至 EXIT
+		f, err := ipc.ReadFrame(conn)
+		require.NoError(t, err)
+		if f.MessageType == msgShellExit {
+			code, err := decodeExit(f.Payload)
+			require.NoError(t, err)
+			assert.Equal(t, uint32(0), code)
+			return
+		}
+	}
+}
+
+// TestInteractiveKillReportsNonzeroExit T2 评审修复的钉子:交互 shell 被
+// KILL 后 SHELL_EXIT 绝不上报 0(修复前 KILL 路径 exitCode nil → 0)。
+func TestInteractiveKillReportsNonzeroExit(t *testing.T) {
+	exe, err := exec.LookPath("cmd.exe")
 	require.NoError(t, err)
-	assert.Equal(t, uint32(0), code)
+	o := &serverOpts{
+		secret: testSecret(), profile: "CMD", exe: exe, mode: "interactive",
+		cols: 80, rows: 25, log: testLogger(),
+	}
+	conn := dialShell(t, startShellServer(t, o), o.secret)
+	readMsg(t, conn, msgShellBegin) // BEGIN 先于任何输出
+
+	time.Sleep(300 * time.Millisecond) // 让 cmd 进入就绪提示符
+	require.NoError(t, ipc.WriteFrame(conn, &ipc.Frame{MessageType: msgShellKill}))
+
+	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+	for {
+		f, err := ipc.ReadFrame(conn)
+		require.NoError(t, err)
+		if f.MessageType == msgShellExit {
+			code, err := decodeExit(f.Payload)
+			require.NoError(t, err)
+			assert.NotEqual(t, uint32(0), code, "killed interactive shell must not report exit 0")
+			return
+		}
+	}
 }
 
 // TestHandshakeRejectsWrongSecret 错误 secret 的客户端必须被拒。
