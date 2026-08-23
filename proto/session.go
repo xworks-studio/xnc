@@ -58,7 +58,26 @@ type DesktopParams struct {
 	WTSSession uint32 `json:"wtsSession,omitempty"`
 	// IceTransportPolicy 缺省 "relay"；DesktopIceAll 仅测试。
 	IceTransportPolicy string `json:"iceTransportPolicy,omitempty"`
+	// LeaseID（M2-Slice3 Task 4）：server 侧 per-node 仲裁的唯一活约 id。
+	// 仅授予会话的 params 携带（每节点同时至多一个）；未携带 = view-only。
+	// agent 侧输入转发以本字段为凭（本地仲裁表已退役，spec §11.1）。
+	LeaseID string `json:"leaseId,omitempty"`
+	// Capabilities（M2-Slice3 Task 4）：server 按 RBAC 角色在会话创建时
+	// 计算并下发（viewer: [screen.view]; operator: +[input.mouse,
+	// input.keyboard]; owner: +[input.secure_attention, shell.system]），
+	// agent 侧强制：input.* 缺失拒转发对应输入、input.secure_attention
+	// 缺失拒 SAS（spec §14）。客户端提交值被白名单剥离，只来自 server。
+	Capabilities []string `json:"capabilities,omitempty"`
 }
+
+// Desktop capability 词汇（server 下发 / agent 强制，spec §14）。
+const (
+	CapScreenView        = "screen.view"
+	CapInputMouse        = "input.mouse"
+	CapInputKeyboard     = "input.keyboard"
+	CapInputSecureAttn   = "input.secure_attention"
+	CapShellSystem       = "shell.system"
+)
 
 // SessionOpen 经控制连接下发：agent 按 WsURL（含 token 的绝对 URL）拨号。
 type SessionOpen struct {

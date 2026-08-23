@@ -1,6 +1,7 @@
 package session
 
 import (
+	"encoding/json"
 	"log/slog"
 	"sync/atomic"
 	"testing"
@@ -298,4 +299,79 @@ func TestDesktopNoMaxLifetime(t *testing.T) {
 	time.Sleep(300 * time.Millisecond) // 跨越多个 janitor 周期
 	s := m.SessionsOf(id, proto.KindDesktop)
 	require.Len(t, s, 1, "desktop session must not be lifetime-closed by shell governance")
+}
+
+// —— M2-Slice3 Task 4:per-node desktop lease 仲裁(spec §11.1)——
+
+// TestDesktopLeaseArbitration:单授予/并发拒绝/持有者关闭释放/再授予;
+// params 嵌入 leaseId 与 CreateResult 一致。
+func TestDesktopLeaseArbitration(t *testing.T) {
+	id, m := onlineMgr(t)
+	defer m.Close()
+
+	r1, apiErr := m.Create(id, uuid.New(), proto.KindDesktop, []byte(`{"signaling":"webrtc"}`))
+	require.Nil(t, apiErr)
+	assert.True(t, r1.LeaseGranted)
+	assert.Len(t, r1.LeaseID, 16)
+	// params 已嵌入 leaseId(SESSION_OPEN/REST 同源)。
+	var p1 proto.DesktopParams
+	require.NoError(t, json.Unmarshal(r1.Session.Params, &p1))
+	assert.Equal(t, r1.LeaseID, p1.LeaseID)
+	sid, lid := m.DesktopLeaseOf(id)
+	assert.Equal(t, r1.Session.ID, sid)
+	assert.Equal(t, r1.LeaseID, lid)
+
+	// 第二会话(仍在并发上限内):照常创建但 view-only。
+	r2, apiErr := m.Create(id, uuid.New(), proto.KindDesktop, []byte(`{}`))
+	require.Nil(t, apiErr)
+	assert.False(t, r2.LeaseGranted)
+	assert.Empty(t, r2.LeaseID)
+	var p2 proto.DesktopParams
+	require.NoError(t, json.Unmarshal(r2.Session.Params, &p2))
+	assert.Empty(t, p2.LeaseID)
+	// 约仍归 r1。
+	sid, _ = m.DesktopLeaseOf(id)
+	assert.Equal(t, r1.Session.ID, sid)
+
+	// 持有者关闭 → 释放 → 下一会话可授予。
+	m.NotifyClose(r1.Session.ID, "client-gone")
+	sid, _ = m.DesktopLeaseOf(id)
+	assert.Empty(t, sid)
+	r3, apiErr := m.Create(id, uuid.New(), proto.KindDesktop, []byte(`{}`))
+	require.Nil(t, apiErr)
+	assert.True(t, r3.LeaseGranted)
+}
+
+// TestDesktopLeaseIdleExpiry:持有者 >TTL 无信令活动 → janitor 撤约
+// (会话保留 view-only);TTL 内活动续期。
+func TestDesktopLeaseIdleExpiry(t *testing.T) {
+	id, m := onlineMgr(t)
+	defer m.Close()
+	m.DesktopIdleTimeout = 0                   // 不让 idle 会话回收干扰
+	m.DesktopLeaseTTL = 100 * time.Millisecond // 只考察 lease TTL
+	m.setJanitorInterval(20 * time.Millisecond)
+
+	r1, _ := m.Create(id, uuid.New(), proto.KindDesktop, []byte(`{}`))
+	require.True(t, r1.LeaseGranted)
+
+	// 活动续期:持续 touch 跨越多个 TTL 窗口,约不丢。
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		m.touch(r1.Session, time.Now())
+		time.Sleep(30 * time.Millisecond)
+	}
+	if _, lid := m.DesktopLeaseOf(id); lid == "" {
+		t.Fatal("active holder must keep the lease (activity renewal)")
+	}
+
+	// 停止活动 → TTL 内撤销;会话仍在(view-only)。
+	require.Eventually(t, func() bool {
+		_, lid := m.DesktopLeaseOf(id)
+		return lid == ""
+	}, 3*time.Second, 20*time.Millisecond, "idle lease must be revoked")
+	assert.Len(t, m.SessionsOf(id, proto.KindDesktop), 1, "session survives lease expiry (view-only)")
+
+	// 撤约后新会话可授予。
+	r2, _ := m.Create(id, uuid.New(), proto.KindDesktop, []byte(`{}`))
+	assert.True(t, r2.LeaseGranted)
 }

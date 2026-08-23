@@ -31,12 +31,16 @@
 //	{"type":"keyframe-req"}                     显式关键帧请求(T6 加:浏览器无
 //	                                            法从 JS 发 RTCP PLI,实验页 PLI 按钮走此帧;映射到与真 PLI 同一条
 //	                                            RequestKeyframe 路径,reason="viewer-pli")。
-//	{"type":"lease_request"}                    输入控制权请求(M1-Slice3;
-//	                                            见 input.go 头注释)。
+//	{"type":"lease_request"}                    输入控制权查询(M2-Slice3 Task 4:
+//	                                            仲裁在 server——持有 server 签
+//	                                            发 leaseId 的会话 granted,其余
+//	                                            denied{held};词汇见 input.go)。
 //	{"type":"secure_attention"}                 SAS 触发(M2-Slice1 Task 5):
 //	                                            → Starter(SasCaller) → core
 //	                                            0x0110(reason="viewer";
-//	                                            门控 = core 侧 --allow-sas)。
+//	                                            门控 = server capability
+//	                                            (input.secure_attention,owner 专属)
+//	                                            + core 侧 --allow-sas 双保险)。
 //
 // agent → viewer(SAS 结果帧,M2-Slice1 Task 5):
 //
@@ -54,6 +58,7 @@
 //	{"type":"lease_granted","leaseId":"<16 hex>"}
 //	{"type":"lease_denied","reason":"held"}
 //	{"type":"lease_revoked","reason":"idle"|"disconnect"}
+//	    (server 仲裁下 agent 不再主动产生;词汇保留供旧 viewer)
 //
 // 二进制帧:本 kind 无(输入/光标走 DataChannel,见 input.go)。未知 type
 // 一律忽略(向后兼容)。
@@ -111,21 +116,22 @@ const (
 )
 
 // Handler 实现 session.Handler(kind=desktop)。Starter 决定帧源;nil 时
-// Handle 直接报错(注册侧应保证非 nil)。lease 表惰性建立:每 Handler
-// 一份 = 一个 Starter = 一个采集实例(多 viewer 会话共享仲裁;测试可
-// 预置 h.leases 注入短 idle)。
+// Handle 直接报错(注册侧应保证非 nil)。serverLease 登记表惰性建立:每
+// Handler 一份 = 一个 Starter = 一个采集实例(M2-Slice3 Task 4:仲裁在
+// server,agent 只登记/比对 params 携带的 server leaseId;测试可预置
+// h.leases 注入)。
 type Handler struct {
 	Log     *slog.Logger
 	Starter Starter
 
 	leaseOnce sync.Once
-	leases    *leaseTable
+	leases    *serverLease
 }
 
-func (h *Handler) leaseTable() *leaseTable {
+func (h *Handler) serverLeases() *serverLease {
 	h.leaseOnce.Do(func() {
 		if h.leases == nil {
-			h.leases = newLeaseTable()
+			h.leases = newServerLease()
 		}
 	})
 	return h.leases
@@ -196,10 +202,13 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 	defer it.close() // 成功 ATTACH 之后才登记(失败路径无配对可结清)
 	dyn := it.source()
 
-	// ①b 输入/lease 控制器(本会话一条;close 合成卡键释放并释放 lease,
-	// defer LIFO:在 pub.Close 之后、src/closeAll 之前运行——键释放需要
-	// pipe 仍开)。源 = 意图动态源:重挂后输入/光标自动走新 sub。
-	ictl := newInputController(dyn, h.leaseTable(), log)
+	// ①b 输入/lease 控制器(本会话一条;close 合成卡键释放并释放本地
+	// lease 登记,defer LIFO:在 pub.Close 之后、src/closeAll 之前运行
+	// ——键释放需要 pipe 仍开)。源 = 意图动态源:重挂后输入/光标自动走
+	// 新 sub。leaseId/capabilities 均来自 server 签发的 params(M2-Slice3
+	// Task 4:未携带 leaseId = view-only;input.* 缺失拒对应输入)。
+	ictl := newInputController(dyn, h.serverLeases(), sessionID, p.LeaseID,
+		p.Capabilities, log)
 	defer ictl.close()
 
 	// ② ready(HOST_HELLO 维度 + fps→默认帧时长)。
@@ -257,8 +266,8 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 
 	// ④ 信令主循环:offer 建联(恰好一次),ice 喂候选。
 	var (
-		pub        *Publisher
-		pubOnce    sync.Once
+		pub         *Publisher
+		pubOnce     sync.Once
 		sasInFlight atomic.Bool // 同会话并发 SAS ≤1(M2-Slice2 Task 1)
 	)
 	defer func() {
@@ -313,18 +322,26 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 				log.Debug("viewer keyframe request failed", "err", err)
 			}
 		case vocabLeaseRequest:
-			// M1 简化仲裁(input.go):首请求者得;撤销时经 notify 回
-			// lease_revoked 帧;非持有者输入丢弃+计数(不断连)。
-			if id, ok := ictl.grantLease(func(reason string) {
-				w.write(ctx, leaseRevokedFrame{Type: vocabLeaseRevoked, Reason: reason})
-			}); ok {
-				w.write(ctx, leaseGrantedFrame{Type: vocabLeaseGranted, LeaseID: id})
+			// M2-Slice3 Task 4:仲裁在 server——本会话 params 带 server
+			// 签发 leaseId 且仍是当前活约 → granted(回显该 leaseId);
+			// 否则 denied{held}(view-only 会话与非持有者同答)。词汇
+			// 保留供旧 viewer;agent 不再本地授予/撤销。
+			if ictl.holdsLease() {
+				w.write(ctx, leaseGrantedFrame{Type: vocabLeaseGranted, LeaseID: ictl.serverLeaseID()})
 			} else {
 				w.write(ctx, leaseDeniedFrame{Type: vocabLeaseDenied, Reason: "held"})
 			}
 		case vocabSecureAttention:
 			// M2-Slice1 Task 5:viewer SAS 按钮 → Starter(SasCaller)→
 			// core 0x0110(门控 = core 侧 --allow-sas,票据 = Slice3)。
+			// M2-Slice3 Task 4:server capability 把门——params 未下发
+			// input.secure_attention(owner 专属)立即回 capability_denied,
+			// 不触达 Starter/core(RBAC 拒绝在 server 侧已定,agent 执行)。
+			if !ictl.capAllows(proto.CapInputSecureAttn) {
+				w.write(ctx, secureAttentionResultFrame{
+					Type: vocabSecureAttentionResult, OK: false, HR: 0, Code: "capability_denied"})
+				continue
+			}
 			// 异步执行:core RPC 上限 15s,不阻塞信令循环(晚到的 offer/
 			// ice 不受牵连);回复帧经 wsWriter 串行写出,时序无约束。
 			// M2-Slice2 Task 1:同会话 in-flight 去重——同时至多一条 SAS

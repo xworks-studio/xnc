@@ -99,7 +99,7 @@ func (h *handlers) execStart(w http.ResponseWriter, r *http.Request) {
 	if req.System {
 		audit = map[string]string{"system": "true"}
 	}
-	h.startSession(w, r, proto.KindExec, params, "exec.start", "exec.finish", nil, audit)
+	h.startSession(w, r, proto.KindExec, params, "exec.start", "exec.finish", nil, audit, nil)
 }
 
 // requireSystemRole 校验 system 令牌请求的 owner 身份(403 已写出时
@@ -120,10 +120,13 @@ func (h *handlers) requireSystemRole(w http.ResponseWriter, r *http.Request) boo
 // extra（可 nil）并入 202 响应体（desktop 的 turn 配置等 kind 特有字段；
 // 绝不入审计——TURN 凭据不得落审计行）。auditExtra（可 nil）并入 open
 // 审计 metadata（exec/shell 的 system=true 标记）。
+// extraFn（可 nil，M2-Slice3 Task 4）：Create 之后按结果追加响应字段
+// （desktop 的 lease 判定 {granted,leaseId}——授予与否只有 Create 后可知）。
 // 返回 (result, true) 表示已写 202；false 表示已写错误响应。
 func (h *handlers) startSession(w http.ResponseWriter, r *http.Request,
 	kind string, params json.RawMessage, openAction, closeAction string,
 	extra map[string]any, auditExtra map[string]string,
+	extraFn func(res *session.CreateResult) map[string]any,
 ) (*session.CreateResult, bool) {
 	u := auth.UserFrom(r.Context())
 	nodeID, err := uuid.Parse(chi.URLParam(r, "id"))
@@ -133,8 +136,14 @@ func (h *handlers) startSession(w http.ResponseWriter, r *http.Request,
 	}
 	// RBAC：operator 及以上方可开会话（exec/shell/file/tunnel 全经此路径）；
 	// 非成员 404、viewer 403 由 requireMinRole 统一写出。
-	if _, ok := h.requireMinRole(w, r, nodeID, "operator"); !ok {
+	node, ok := h.requireMinRole(w, r, nodeID, "operator")
+	if !ok {
 		return nil, false
+	}
+	// desktop（M2-Slice3 Task 4）：按请求者角色计算 capability 集并入 params
+	//（客户端提交值已在 handler 白名单剥离——这里只来自 server RBAC）。
+	if kind == proto.KindDesktop {
+		params = withDesktopCapabilities(r.Context(), h, node, u.ID, params)
 	}
 
 	// Create 内部检查 reg.Online：节点无控制连接 → 409 NODE_OFFLINE。
@@ -178,8 +187,10 @@ func (h *handlers) startSession(w http.ResponseWriter, r *http.Request,
 		respondError(w, proto.Err(409, proto.CodeNodeOffline, "node is offline"))
 		return nil, false
 	}
+	// SESSION_OPEN 用 manager 侧 params（desktop 授予时 leaseId 已嵌入；
+	// 与 REST 响应/agent 看到的同一份）。
 	openMsg, err := proto.NewMsg(proto.TypeSessionOpen, proto.SessionOpen{
-		SessionID: res.Session.ID, Kind: kind, Params: params,
+		SessionID: res.Session.ID, Kind: kind, Params: res.Session.Params,
 		AgentToken: res.AgentToken,
 		WsURL:      wsBaseURL(r) + "/api/agent/session?token=" + res.AgentToken,
 		ExpiresAt:  res.ExpiresAt,
@@ -216,6 +227,11 @@ func (h *handlers) startSession(w http.ResponseWriter, r *http.Request,
 	}
 	for k, v := range extra {
 		body[k] = v
+	}
+	if extraFn != nil {
+		for k, v := range extraFn(res) {
+			body[k] = v
+		}
 	}
 	respondJSON(w, 202, body)
 	return res, true

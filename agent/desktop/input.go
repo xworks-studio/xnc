@@ -25,18 +25,22 @@
 //	5 TEXT   [u16 len][utf16le units]      代理对按 unit 透传
 //	6 LOCK   [u8 caps][u8 num]
 //
-// == lease(control WS 信令,M1 简化仲裁;server 侧 = M2,spec §11.1 偏差
+// == lease(control WS 信令词汇保留,仲裁已移 server;M2-Slice3 Task 4,
 //
-//	   已裁决)==
+//	   spec §11.1 split-arbitration 裁决)==
 //
 //		viewer → agent:{"type":"lease_request"}
 //		agent → viewer:{"type":"lease_granted","leaseId":"<16 hex>"}
 //		              {"type":"lease_denied","reason":"held"}
 //		              {"type":"lease_revoked","reason":"idle"|"disconnect"}
 //
-// 首请求者得;持有者 WS 断连(Handle 返回)或 30s 无输入 → 撤销并广播
-// lease_revoked;非持有者输入丢弃+计数(不断连)。lease 表每 Handler 一份
-// (= 一个 Starter = 一个采集实例;多 viewer 会话共享)。
+// server = 谁 MAY hold(每节点同时至多一个活约;60s TTL 由持有者会话 WS
+// 信令活跃续期,持有者会话关闭即释放——均在 server manager)。agent =
+// 执行:会话 params 带 server 签发 leaseId 才是持有者(本地仲裁表已退役);
+// lease_request 仅按「本会话是否持有 server 约」作答 granted/denied{held};
+// 输入放行 = leaseId 匹配。断连语义:持有者 WS 关闭 → agent 释放本地记录
+// (server 侧撤销/再授以其 TTL/关闭钩子为权威)。lease_revoked 帧保留于
+// 词汇(旧 viewer 兼容),server 仲裁下 agent 不再主动产生。
 //
 // == 预校验(§11.7;全部丢弃+计数)==
 //
@@ -51,15 +55,15 @@
 package desktop
 
 import (
-	"crypto/rand"
 	"encoding/binary"
-	"encoding/hex"
 	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/pion/webrtc/v4"
+
+	"xnc/proto"
 )
 
 // DataChannel 标签(T4/T5 契约)。
@@ -87,7 +91,6 @@ const (
 	moveMinGap        = 2 * time.Millisecond // ≤500Hz
 	inputEPSBudget    = 1000
 	inputBudgetWindow = time.Second
-	leaseIdleTimeout  = 30 * time.Second
 	cursorWireBytes   = 9
 	mouseMsgWireBytes = 18 // [u64 seq][s32 x][s32 y][u16 buttons]
 )
@@ -148,112 +151,58 @@ func encodeInputWire(subID uint32, m *InputMsg) []byte {
 	return p
 }
 
-// ---- lease 表(每 Handler = 每采集实例一份)----
-
-// leaseGrant 是一次持有记录;idle 定时器链在最后输入后 idle 无新输入时撤销。
-type leaseGrant struct {
-	id        string
-	notify    func(reason string)
-	lastInput time.Time
-	stop      func() // 停掉当前 idle 定时器(nil 安全)
-}
-
-// leaseTable 串行化授予/释放/idle 检查;idle 与 now/after 可注入(测试)。
-type leaseTable struct {
-	mu     sync.Mutex
-	holder *leaseGrant
-
-	idle  time.Duration
-	now   func() time.Time
-	after func(time.Duration, func()) func()
-}
-
-func newLeaseTable() *leaseTable {
-	return &leaseTable{
-		idle:  leaseIdleTimeout,
-		now:   time.Now,
-		after: stoppableAfterFunc,
-	}
-}
-
-// stoppableAfterFunc 把 time.AfterFunc 包成返回 stop 的 after 形态。
+// stoppableAfterFunc 把 time.AfterFunc 包成返回 stop 的 after 形态(测试注入)。
 func stoppableAfterFunc(d time.Duration, fn func()) func() {
 	tm := time.AfterFunc(d, fn)
 	return func() { tm.Stop() }
 }
 
-// request 授予(空闲时)或拒绝;notify 在撤销(idle)时被调用。
-func (t *leaseTable) request(notify func(reason string)) (string, bool) {
-	t.mu.Lock()
-	if t.holder != nil {
-		t.mu.Unlock()
-		return "", false
-	}
-	var b [8]byte
-	_, _ = rand.Read(b[:])
-	g := &leaseGrant{id: hex.EncodeToString(b[:]), notify: notify, lastInput: t.now()}
-	t.holder = g
-	g.stop = t.armIdleLocked(g)
-	t.mu.Unlock()
-	return g.id, true
+// ---- server lease 登记表(M2-Slice3 Task 4;每 Handler = 每采集实例一份)----
+
+// serverLease 登记当前活约:server 每节点同时至多签发一个 leaseId,且只
+// 写进被授予会话的 params。agent 侧执行 = 输入放行仅对 leaseId 匹配的
+// 会话;新签发覆盖旧值(server 撤销旧约后才可能签新约——后到者为权威,
+// 过期的旧持有者自然失配)。持有者 WS 关闭 → release 清空(移交语义:
+// 下一个被 server 授予的会话注册后即生效)。
+type serverLease struct {
+	mu        sync.Mutex
+	activeID  string // 当前活约 leaseId("" = 本实例无持有者)
+	activeKey string // 持有者会话标识(登记键;释放时比对)
 }
 
-// armIdleLocked 布防 idle 检查;调用方持 mu。
-func (t *leaseTable) armIdleLocked(g *leaseGrant) func() {
-	return t.after(t.idle, func() { t.idleCheck(g) })
-}
+func newServerLease() *serverLease { return &serverLease{} }
 
-// idleCheck 是定时器回调:无输入满 idle → 撤销;否则按剩余时间重布防。
-func (t *leaseTable) idleCheck(g *leaseGrant) {
-	t.mu.Lock()
-	if t.holder != g {
-		t.mu.Unlock()
-		return // 已释放/被替换
-	}
-	elapsed := t.now().Sub(g.lastInput)
-	if elapsed >= t.idle {
-		t.holder = nil
-		t.mu.Unlock()
-		if g.notify != nil {
-			g.notify("idle")
-		}
+// register 登记一个携带 server leaseId 的会话(后到覆盖:server 单活约,
+// 新签发即撤销旧约)。leaseID 空(view-only 会话)不登记。
+func (l *serverLease) register(key, leaseID string) {
+	if leaseID == "" {
 		return
 	}
-	g.stop = t.after(t.idle-elapsed, func() { t.idleCheck(g) })
-	t.mu.Unlock()
+	l.mu.Lock()
+	l.activeID, l.activeKey = leaseID, key
+	l.mu.Unlock()
 }
 
-// allows 判定 id 是否当前持有者;是则顺带刷新 idle 基准。
-func (t *leaseTable) allows(id string) bool {
-	if id == "" {
-		return false
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.holder == nil || t.holder.id != id {
-		return false
-	}
-	t.holder.lastInput = t.now()
-	return true
-}
-
-// release 主动释放(持有者会话终结);notify(reason) 尽力送达。
-func (t *leaseTable) release(id, reason string) {
-	t.mu.Lock()
-	g := t.holder
-	if g == nil || g.id != id {
-		t.mu.Unlock()
+// release 会话终结时清登记(仅当它仍是持有者)。
+func (l *serverLease) release(key, leaseID string) {
+	if leaseID == "" {
 		return
 	}
-	t.holder = nil
-	stop := g.stop
-	t.mu.Unlock()
-	if stop != nil {
-		stop()
+	l.mu.Lock()
+	if l.activeKey == key && l.activeID == leaseID {
+		l.activeID, l.activeKey = "", ""
 	}
-	if g.notify != nil {
-		g.notify(reason)
+	l.mu.Unlock()
+}
+
+// allows 判定 leaseID 是否当前活约(view-only 会话恒 false)。
+func (l *serverLease) allows(leaseID string) bool {
+	if leaseID == "" {
+		return false
 	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.activeID != "" && l.activeID == leaseID
 }
 
 // ---- 计数器 ----
@@ -264,6 +213,7 @@ type inputCounters struct {
 	oversize      atomic.Uint64
 	invalid       atomic.Uint64
 	noLease       atomic.Uint64
+	noCapability  atomic.Uint64
 	staleSeq      atomic.Uint64
 	budgetDropped atomic.Uint64
 	coalesced     atomic.Uint64
@@ -280,6 +230,7 @@ type InputStats struct {
 	Oversize      uint64
 	Invalid       uint64
 	NoLease       uint64
+	NoCapability  uint64
 	StaleSeq      uint64
 	BudgetDropped uint64
 	Coalesced     uint64
@@ -293,7 +244,10 @@ type InputStats struct {
 
 type inputController struct {
 	src      Source
-	tbl      *leaseTable
+	leases   *serverLease // 采集实例共享的 server 活约登记表
+	sessKey  string       // 会话标识(登记键;每个 Handle 调用唯一)
+	leaseID  string       // server 签发的本会话 leaseId("" = view-only)
+	caps     map[string]bool
 	log      *slog.Logger
 	counters inputCounters
 
@@ -302,7 +256,6 @@ type inputController struct {
 	after func(time.Duration, func()) func()
 
 	mu       sync.Mutex
-	leaseID  string
 	lastSeq  uint64
 	fwdAt    []time.Time // 1s 滑窗内转发时戳(≤1000eps 预算)
 	pendMove *InputMsg   // ≤500Hz 合并的待发 MOVE(保留最新)
@@ -318,15 +271,51 @@ type inputController struct {
 	cursorDC *webrtc.DataChannel
 }
 
-func newInputController(src Source, tbl *leaseTable, log *slog.Logger) *inputController {
+// newInputController 组装本会话的输入控制器。leaseID = server 授予时
+// params 携带的 leaseId("" = view-only);caps = server 下发的 capability
+// 集(输入放行前按 input.mouse/input.keyboard 校验,spec §14)。
+func newInputController(src Source, leases *serverLease, sessKey, leaseID string,
+	caps []string, log *slog.Logger) *inputController {
 	if log == nil {
 		log = slog.Default()
 	}
+	cm := map[string]bool{}
+	for _, cp := range caps {
+		cm[cp] = true
+	}
+	leases.register(sessKey, leaseID)
 	return &inputController{
-		src: src, tbl: tbl, log: log,
+		src: src, leases: leases, sessKey: sessKey, leaseID: leaseID, caps: cm,
+		log: log,
 		now: time.Now, after: stoppableAfterFunc,
 		heldKeys: map[uint32]struct{}{}, heldBtns: map[uint8]struct{}{},
 	}
+}
+
+// holdsLease 报告本会话是否当前 server 活约持有者(lease_request 作答依据)。
+func (c *inputController) holdsLease() bool {
+	return c.leases.allows(c.leaseID)
+}
+
+// serverLeaseID 返回 server 签发给本会话的 leaseId(view-only 为 "")。
+func (c *inputController) serverLeaseID() string {
+	return c.leaseID
+}
+
+// capAllows 报告本会话是否具备 capability(server 下发集;未下发 = 拒)。
+func (c *inputController) capAllows(cap string) bool {
+	return c.caps[cap]
+}
+
+// capForInputType 输入类型 → 所需 capability;"" = 未知(前级已拒)。
+func capForInputType(t uint8) string {
+	switch t {
+	case inputTypeMove, inputTypeButton, inputTypeWheel:
+		return proto.CapInputMouse
+	case inputTypeKey, inputTypeText, inputTypeLock:
+		return proto.CapInputKeyboard
+	}
+	return ""
 }
 
 // newDataChannel 在 publisher PC 上建一条 DC(lossy = 不可靠无序)。
@@ -357,41 +346,6 @@ func (c *inputController) attach(pub *Publisher) error {
 	c.inputDC.OnMessage(func(m webrtc.DataChannelMessage) { c.handleInput(m.Data) })
 	c.mouseDC.OnMessage(func(m webrtc.DataChannelMessage) { c.handleMouse(m.Data) })
 	return nil
-}
-
-// grantLease 向本会话的表请求并记录 leaseID(撤销后表自然拒绝旧 id)。
-// notify 外再包一层 onLeaseRevoked:撤销时清空本会话的 down 键/钮跟踪——
-// 旧持有者随后的 WS 关闭不得再合成 up 抬掉新持有者按下的同键(T3 review
-// Minor 2);物理残留由 host 侧 janitor(>30s 强制 KeyUp)兜底。
-func (c *inputController) grantLease(notify func(reason string)) (string, bool) {
-	id, ok := c.tbl.request(func(reason string) {
-		c.onLeaseRevoked()
-		if notify != nil {
-			notify(reason)
-		}
-	})
-	if ok {
-		c.mu.Lock()
-		c.leaseID = id
-		c.mu.Unlock()
-	}
-	return id, ok
-}
-
-// onLeaseRevoked 清空本会话的 down 键/钮跟踪(lease 已撤销;本会话
-// close() 的合成释放从此为空集)。幂等;lease 有效性仍以表判定为准。
-func (c *inputController) onLeaseRevoked() {
-	c.mu.Lock()
-	c.heldKeys = map[uint32]struct{}{}
-	c.heldBtns = map[uint8]struct{}{}
-	c.mu.Unlock()
-}
-
-// currentLease 返回当前记录的 leaseID(可能已被撤销——以表判定为准)。
-func (c *inputController) currentLease() string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.leaseID
 }
 
 // handleMouse 处理 mouse 通道(MOVE);入口即计数,后续逐级预校验。
@@ -507,8 +461,14 @@ func (c *inputController) handleInput(b []byte) {
 func (c *inputController) process(m *InputMsg) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.tbl.allows(c.leaseID) {
+	if !c.leases.allows(c.leaseID) {
 		c.counters.noLease.Add(1)
+		return
+	}
+	// capability 强制(spec §14):input.mouse / input.keyboard 缺失即拒
+	// 对应输入(丢弃+计数;server 只对 operator+ 下发输入集)。
+	if cp := capForInputType(m.Type); cp != "" && !c.caps[cp] {
+		c.counters.noCapability.Add(1)
 		return
 	}
 	if m.Seq <= c.lastSeq {
@@ -658,32 +618,35 @@ func (c *inputController) close() {
 		btns = append(btns, b)
 	}
 	seq := c.lastSeq
-	leaseID := c.leaseID
 	c.mu.Unlock()
 
-	sub := c.src.SubID()
-	for _, k := range keys {
-		seq++
-		m := &InputMsg{Seq: seq, Type: inputTypeKey, Scan: uint16(k & 0xFFFF), Extended: uint8(k >> 16), Down: 0}
-		if err := c.src.SendInput(encodeInputWire(sub, m)); err == nil {
-			c.counters.sent.Add(1)
+	// 卡键合成释放仅限仍持有 server 约:server 已移交(新 leaseId 覆盖)的
+	// 旧会话 close 不得合成 up 抬掉新持有者按下的同键(T3 review Minor 2
+	// 语义在 server 仲裁下的等价物);物理残留由 host 侧 janitor(>30s
+	// 强制 KeyUp)兜底。
+	if c.leases.allows(c.leaseID) {
+		sub := c.src.SubID()
+		for _, k := range keys {
+			seq++
+			m := &InputMsg{Seq: seq, Type: inputTypeKey, Scan: uint16(k & 0xFFFF), Extended: uint8(k >> 16), Down: 0}
+			if err := c.src.SendInput(encodeInputWire(sub, m)); err == nil {
+				c.counters.sent.Add(1)
+			}
+		}
+		for _, b := range btns {
+			seq++
+			m := &InputMsg{Seq: seq, Type: inputTypeButton, Btn: b, Down: 0}
+			if err := c.src.SendInput(encodeInputWire(sub, m)); err == nil {
+				c.counters.sent.Add(1)
+			}
 		}
 	}
-	for _, b := range btns {
-		seq++
-		m := &InputMsg{Seq: seq, Type: inputTypeButton, Btn: b, Down: 0}
-		if err := c.src.SendInput(encodeInputWire(sub, m)); err == nil {
-			c.counters.sent.Add(1)
-		}
-	}
-	if leaseID != "" {
-		c.tbl.release(leaseID, "disconnect")
-	}
+	c.leases.release(c.sessKey, c.leaseID)
 	st := c.stats()
 	c.log.Info("desktop input closed",
 		"mouseMsgs", st.MouseMsgs, "inputMsgs", st.InputMsgs,
 		"oversize", st.Oversize, "invalid", st.Invalid,
-		"noLease", st.NoLease, "staleSeq", st.StaleSeq,
+		"noLease", st.NoLease, "noCapability", st.NoCapability, "staleSeq", st.StaleSeq,
 		"budgetDropped", st.BudgetDropped, "coalesced", st.Coalesced,
 		"sent", st.Sent, "sendFailed", st.SendFailed,
 		"cursorSent", st.CursorSent, "cursorFailed", st.CursorFailed)
@@ -696,6 +659,7 @@ func (c *inputController) stats() InputStats {
 		Oversize:      c.counters.oversize.Load(),
 		Invalid:       c.counters.invalid.Load(),
 		NoLease:       c.counters.noLease.Load(),
+		NoCapability:  c.counters.noCapability.Load(),
 		StaleSeq:      c.counters.staleSeq.Load(),
 		BudgetDropped: c.counters.budgetDropped.Load(),
 		Coalesced:     c.counters.coalesced.Load(),

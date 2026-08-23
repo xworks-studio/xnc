@@ -63,5 +63,5 @@ func (h *handlers) shellStart(w http.ResponseWriter, r *http.Request) {
 	if req.System {
 		audit = map[string]string{"system": "true"}
 	}
-	h.startSession(w, r, proto.KindShell, params, "shell.open", "shell.close", nil, audit)
+	h.startSession(w, r, proto.KindShell, params, "shell.open", "shell.close", nil, audit, nil)
 }

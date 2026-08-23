@@ -18,12 +18,14 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -476,18 +478,28 @@ func (vs *viewerSession) close() {
 
 // startInputServer 起一个 httptest WS server,每连接一个 Handle 调用
 // (多 viewer = 多会话,共享 Handler 与 lease 表)。
-func startInputServer(t *testing.T, ctx context.Context, h *Handler) string {
+// startInputServer 起一个 httptest WS server,每连接一个 Handle 调用
+// (多 viewer = 多会话,共享 Handler 与 server lease 登记表)。params 供
+// 测试注入 server 侧签发形态(leaseId/capabilities;M2-Slice3 Task 4)。
+func startInputServer(t *testing.T, ctx context.Context, h *Handler,
+	params func(n int) json.RawMessage) string {
 	t.Helper()
+	var n atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
 		}
 		c.SetReadLimit(1 << 20)
-		h.Handle(ctx, c, "sess", json.RawMessage(`{"signaling":"webrtc","iceTransportPolicy":"all"}`))
+		h.Handle(ctx, c, fmt.Sprintf("sess-%d", n.Add(1)), params(int(n.Load())))
 	}))
 	t.Cleanup(srv.Close)
 	return "ws" + strings.TrimPrefix(srv.URL, "http")
+}
+
+// 固定 params(无 server leaseId = view-only;回环输入测试的缺省形态)。
+func plainParams() json.RawMessage {
+	return json.RawMessage(`{"signaling":"webrtc","iceTransportPolicy":"all"}`)
 }
 
 // TestInputLoopbackSequence:五类输入经真实 DataChannel → agent → 0x0108 →
@@ -499,16 +511,22 @@ func TestInputLoopbackSequence(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	wsURL := startInputServer(t, ctx, h)
+	// server 授予形态:params 携带 leaseId + operator capability 集。
+	const l1 = "1122334455667788"
+	grantedParams := func(int) json.RawMessage {
+		return json.RawMessage(fmt.Sprintf(
+			`{"signaling":"webrtc","iceTransportPolicy":"all","leaseId":%q,"capabilities":["screen.view","input.mouse","input.keyboard"]}`, l1))
+	}
+	wsURL := startInputServer(t, ctx, h, grantedParams)
 	vs := connectViewerInput(t, ctx, wsURL)
 	defer vs.close()
 
-	// lease:首请求授予,leaseId 为 16 hex。
+	// lease_request:持有 server 约 → granted 回显同一 leaseId(仲裁在
+	// server;agent 只作答)。
 	sendJSON(t, ctx, vs.ws, map[string]any{"type": vocabLeaseRequest})
 	g := vs.nextSignal(func(m map[string]any) bool { return m["type"] == vocabLeaseGranted }, 5*time.Second)
-	leaseID, _ := g["leaseId"].(string)
-	if len(leaseID) != 16 {
-		t.Fatalf("leaseId = %q, want 16 hex chars", leaseID)
+	if got, _ := g["leaseId"].(string); got != l1 {
+		t.Fatalf("leaseId = %q, want server-issued %q", got, l1)
 	}
 
 	// 输入序列:MOVE(mouse 通道)→ BUTTON/KEY/TEXT/LOCK(input 通道)。
@@ -591,29 +609,39 @@ func TestInputLoopbackSequence(t *testing.T) {
 	}
 }
 
-// TestLeaseLoopbackTwoViewers:双会话 lease 仲裁全链。
+// TestLeaseLoopbackTwoViewers(M2-Slice3 Task 4,split-arbitration 全链):
+// server 授予会话(params 带 leaseId L1)输入到达 host;view-only 会话
+// (无 leaseId)lease_request → denied{held}、输入丢弃不到 host;持有者
+// 断连后,server 向新 viewer 签发 L2(新会话 params)→ 输入经新 sub 到
+// 达 host(移交闭环;server = 谁 MAY hold,agent = 执行)。
 func TestLeaseLoopbackTwoViewers(t *testing.T) {
 	host := newInputHost()
 	st := &inputFakeStarter{host: host}
 	h := &Handler{Log: slog.Default(), Starter: st}
-	// 注入短 idle(默认 30s;真定时器 1s)加速 idle 撤销路径;窗口在
-	// v1 最后一次输入后重起(见下),不受前置握手耗时影响。
-	tbl := newLeaseTable()
-	tbl.idle = time.Second
-	h.leases = tbl
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	wsURL := startInputServer(t, ctx, h)
 
+	wsURL := startInputServer(t, ctx, h, func(n int) json.RawMessage {
+		switch n {
+		case 1: // v1:server 授予 L1
+			return json.RawMessage(`{"signaling":"webrtc","iceTransportPolicy":"all","leaseId":"aaaaaaaaaaaaaaaa","capabilities":["screen.view","input.mouse","input.keyboard"]}`)
+		default: // v2+:view-only(server 未授予)
+			return plainParams()
+		}
+	})
+
+	// v1(持有者):lease_request → granted;输入到达 host。
 	v1 := connectViewerInput(t, ctx, wsURL)
 	defer v1.close()
 	sendJSON(t, ctx, v1.ws, map[string]any{"type": vocabLeaseRequest})
 	if g := v1.nextSignal(func(m map[string]any) bool { return m["type"] == vocabLeaseGranted }, 5*time.Second); g == nil {
 		t.Fatal("v1 grant missing")
 	}
+	v1.sendDC(dcLabelMouse, encMouseMsg(1, 7, 8, 0))
+	waitCount(t, host, 1)
 
-	// 第二会话:denied{held} + 非持有者输入丢弃(不到 host,不断连)。
+	// v2(view-only):denied{held} + 输入丢弃(不到 host,不断连)。
 	v2 := connectViewerInput(t, ctx, wsURL)
 	defer v2.close()
 	sendJSON(t, ctx, v2.ws, map[string]any{"type": vocabLeaseRequest})
@@ -623,62 +651,81 @@ func TestLeaseLoopbackTwoViewers(t *testing.T) {
 	}
 	v2.sendDC(dcLabelMouse, encMouseMsg(1, 5, 5, 0))
 	time.Sleep(300 * time.Millisecond)
-	if host.count() != 0 {
-		t.Fatalf("non-holder input reached host: %+v", host.records())
+	if host.count() != 1 {
+		t.Fatalf("view-only input reached host: %+v", host.records())
 	}
-	// v2 仍连接(丢弃不惩罚断连):通道仍 open、会话信令仍应答。
+	// v2 仍连接(丢弃不惩罚断连):会话信令仍应答。
 	sendJSON(t, ctx, v2.ws, map[string]any{"type": vocabKeyframeReq})
 	time.Sleep(100 * time.Millisecond)
 
-	// v1 输入一次(idle 窗口自此重起)→ 之后静默 1s → lease_revoked{idle}
-	// 广播到持有者。这次输入也顺带验证 v1 持有者路径到达 host。
-	v1.sendDC(dcLabelMouse, encMouseMsg(1, 7, 8, 0))
-	waitCount(t, host, 1)
-	r := v1.nextSignal(func(m map[string]any) bool { return m["type"] == vocabLeaseRevoked }, 5*time.Second)
-	if r["reason"] != "idle" {
-		t.Fatalf("revoke reason = %v, want idle", r["reason"])
+	// v1 断连 → agent 释放本地登记;server 撤约并签发 L2 给新 viewer v3
+	// (模拟:server 在旧持有者关闭后对新会话授予,新 params 带 L2)。
+	v1.close()
+	v3 := connectViewerInput(t, ctx, wsURL)
+	defer v3.close()
+	sendJSON(t, ctx, v3.ws, map[string]any{"type": vocabLeaseRequest})
+	if g := v3.nextSignal(func(m map[string]any) bool { return m["type"] == vocabLeaseDenied }, 5*time.Second); g == nil {
+		t.Fatal("v3 (view-only) must be denied before server grants it")
 	}
+	v3.close()
 
-	// 表已释放:v2 重试请求 → 授予;其输入现在到达 host(独立 seq 空间,
-	// sub_id 不同)。
-	granted := false
-	for i := 0; i < 50 && !granted; i++ {
-		sendJSON(t, ctx, v2.ws, map[string]any{"type": vocabLeaseRequest})
-		select {
-		case m := <-v2.sig:
-			if m["type"] == vocabLeaseGranted {
-				granted = true
-			}
-		case <-time.After(100 * time.Millisecond):
-		}
+	// server 现在授予 v4:新会话 params 带 L2 → 输入经新 sub 到达 host。
+	wsURL2 := startInputServer(t, ctx, h, func(int) json.RawMessage {
+		return json.RawMessage(`{"signaling":"webrtc","iceTransportPolicy":"all","leaseId":"bbbbbbbbbbbbbbbb","capabilities":["screen.view","input.mouse","input.keyboard"]}`)
+	})
+	v4 := connectViewerInput(t, ctx, wsURL2)
+	defer v4.close()
+	sendJSON(t, ctx, v4.ws, map[string]any{"type": vocabLeaseRequest})
+	if g := v4.nextSignal(func(m map[string]any) bool { return m["type"] == vocabLeaseGranted }, 5*time.Second); g == nil {
+		t.Fatal("v4 grant missing after server re-grant")
 	}
-	if !granted {
-		t.Fatal("v2 never granted after v1 revoke")
-	}
-	v2.sendDC(dcLabelMouse, encMouseMsg(1, 10, 20, 0))
+	v4.sendDC(dcLabelMouse, encMouseMsg(1, 10, 20, 0))
 	waitCount(t, host, 2)
 	recs := host.records()
 	if recs[0].X != 7 || recs[0].Y != 8 || recs[0].SubID == recs[1].SubID {
-		t.Fatalf("v1 rec = %+v, v2 rec = %+v (sub must differ)", recs[0], recs[1])
+		t.Fatalf("v1 rec = %+v, v4 rec = %+v (sub must differ)", recs[0], recs[1])
 	}
 	if recs[1].X != 10 || recs[1].Y != 20 {
-		t.Fatalf("v2 MOVE rec = %+v", recs[1])
+		t.Fatalf("v4 MOVE rec = %+v", recs[1])
+	}
+}
+
+// TestCapabilityLoopbackEnforced(M2-Slice3 Task 4):会话持 server lease
+// 但 capability 集只读(viewer 形态)→ 输入丢弃不到 host;secure_attention
+// → {ok:false,code:"capability_denied"} 不触达 Starter。
+func TestCapabilityLoopbackEnforced(t *testing.T) {
+	host := newInputHost()
+	src := newFakeSource()
+	st := &fakeStarter{src: src, sasResult: SasResult{OK: true}}
+	h := &Handler{Log: slog.Default(), Starter: st}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wsURL := startInputServer(t, ctx, h, func(int) json.RawMessage {
+		return json.RawMessage(`{"signaling":"webrtc","iceTransportPolicy":"all","leaseId":"cccccccccccccccc","capabilities":["screen.view"]}`)
+	})
+	vs := connectViewerInput(t, ctx, wsURL)
+	defer vs.close()
+
+	// 持有 lease(viewer 形态被授予输入约):lease_request granted,
+	// 但 input.* 缺失 → 输入丢弃。
+	sendJSON(t, ctx, vs.ws, map[string]any{"type": vocabLeaseRequest})
+	if g := vs.nextSignal(func(m map[string]any) bool { return m["type"] == vocabLeaseGranted }, 5*time.Second); g == nil {
+		t.Fatal("grant missing")
+	}
+	vs.sendDC(dcLabelMouse, encMouseMsg(1, 5, 5, 0))
+	time.Sleep(300 * time.Millisecond)
+	if host.count() != 0 {
+		t.Fatalf("capability-less input reached host: %+v", host.records())
 	}
 
-	// v2 断连释放:v1(仍在)重新请求 → 授予(移交闭环)。
-	v2.close()
-	got := false
-	for i := 0; i < 50 && !got; i++ {
-		sendJSON(t, ctx, v1.ws, map[string]any{"type": vocabLeaseRequest})
-		select {
-		case m := <-v1.sig:
-			if m["type"] == vocabLeaseGranted {
-				got = true
-			}
-		case <-time.After(100 * time.Millisecond):
-		}
+	// SAS:未下发 input.secure_attention → capability_denied,不触达 Starter。
+	sendJSON(t, ctx, vs.ws, map[string]any{"type": vocabSecureAttention})
+	res := vs.nextSignal(func(m map[string]any) bool { return m["type"] == vocabSecureAttentionResult }, 5*time.Second)
+	if res["ok"] != false || res["code"] != "capability_denied" {
+		t.Fatalf("secure_attention_result = %v, want capability_denied", res)
 	}
-	if !got {
-		t.Fatal("v1 never granted after v2 disconnect")
+	if calls := st.sasCalls(); len(calls) != 0 {
+		t.Fatalf("SendSAS calls = %v, must not reach Starter without capability", calls)
 	}
 }

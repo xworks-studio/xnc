@@ -458,7 +458,7 @@ func TestSessionLoopbackVideoAndPLI(t *testing.T) {
 			return
 		}
 		c.SetReadLimit(1 << 20)
-		h.Handle(ctx, c, "sess-1", json.RawMessage(`{"signaling":"webrtc","iceTransportPolicy":"all"}`))
+		h.Handle(ctx, c, "sess-1", json.RawMessage(`{"signaling":"webrtc","iceTransportPolicy":"all","capabilities":["screen.view","input.mouse","input.keyboard","input.secure_attention"]}`))
 		close(handlerDone)
 	}))
 	defer srv.Close()
@@ -644,7 +644,7 @@ func TestSessionSecureAttentionAndStateVocab(t *testing.T) {
 			return
 		}
 		c.SetReadLimit(1 << 20)
-		h.Handle(ctx, c, "sess-sas", json.RawMessage(`{"signaling":"webrtc","iceTransportPolicy":"all"}`))
+		h.Handle(ctx, c, "sess-sas", json.RawMessage(`{"signaling":"webrtc","iceTransportPolicy":"all","capabilities":["screen.view","input.mouse","input.keyboard","input.secure_attention"]}`))
 		close(handlerDone)
 	}))
 	defer srv.Close()
@@ -726,7 +726,7 @@ func TestSessionSecureAttentionUnsupported(t *testing.T) {
 			return
 		}
 		c.SetReadLimit(1 << 20)
-		h.Handle(ctx, c, "sess-sas2", json.RawMessage(`{"signaling":"webrtc"}`))
+		h.Handle(ctx, c, "sess-sas2", json.RawMessage(`{"signaling":"webrtc","capabilities":["screen.view","input.secure_attention"]}`))
 	}))
 	defer srv.Close()
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
@@ -769,7 +769,7 @@ func TestSessionSecureAttentionDedupBusy(t *testing.T) {
 			return
 		}
 		c.SetReadLimit(1 << 20)
-		h.Handle(ctx, c, "sess-sas3", json.RawMessage(`{"signaling":"webrtc"}`))
+		h.Handle(ctx, c, "sess-sas3", json.RawMessage(`{"signaling":"webrtc","capabilities":["screen.view","input.secure_attention"]}`))
 		close(handlerDone)
 	}))
 	defer srv.Close()
@@ -843,4 +843,4 @@ func TestSessionSecureAttentionDedupBusy(t *testing.T) {
 type bareStarter struct{ src *fakeSource }
 
 func (st *bareStarter) Start(_ context.Context, _ uint32) (Source, error) { return st.src, nil }
-func (st *bareStarter) Stop() error                                      { return nil }
+func (st *bareStarter) Stop() error                                       { return nil }

@@ -48,6 +48,18 @@ type Manager struct {
 	DesktopPerNode     int
 	DesktopIdleTimeout time.Duration
 
+	// DesktopLeaseTTL（M2-Slice3 Task 4，spec §11.1）：per-node 输入 lease
+	// TTL（默认 60s），续期 = 持有者会话 WS 活跃（pump 每帧刷新
+	// lastActivity）；janitor 扫描时发现持有者 >TTL 无信令活动即撤销
+	// （会话保留 = view-only；测试可缩短）。
+	DesktopLeaseTTL time.Duration
+
+	// desktopLeases：per-node 输入 lease 仲裁表（M2-Slice3 Task 4，spec
+	// §11.1）。server 只裁「谁 MAY hold」——每节点同时至多一个活约；执行
+	// （输入放行/SAS capability）在 agent 侧凭 params.leaseId 完成
+	// （split-arbitration，见任务报告）。
+	desktopLeases map[uuid.UUID]*desktopLease
+
 	janitorInterval time.Duration // mu 保护；janitorLoop 每轮重读
 	stopJanitor     chan struct{}
 	kickJanitor     chan struct{} // interval 变更后立即重臂定时器
@@ -89,19 +101,30 @@ type session struct {
 // Session 是对外只读视图（ID/Kind/NodeID/UserID/Params）。
 type Session session
 
+// desktopLease 一次 per-node 输入约（node → 单条，存 Manager.desktopLeases）。
+type desktopLease struct {
+	SessionID string
+	LeaseID   string
+}
+
 type CreateResult struct {
 	Session     *Session
 	AgentToken  string // 仅进 SESSION_OPEN，绝不进 REST 响应
 	ClientToken string // REST 响应的 token
 	ExpiresAt   time.Time
 	ClientPath  string // "/api/session/<id>"
+	// LeaseGranted/LeaseID（desktop 专属）：本会话是否夺得该节点输入约；
+	// 授予时 LeaseID 已嵌入 Session.Params（SESSION_OPEN 与 REST 同源）。
+	LeaseGranted bool
+	LeaseID      string
 }
 
 func New(reg *registry.Registry, log *slog.Logger) *Manager {
 	m := &Manager{
 		reg: reg, log: log, sessions: map[string]*session{},
-		ShellPerNode: 10, ShellIdleTimeout: 30 * time.Minute, ShellMaxLifetime: 8 * time.Hour,
-		DesktopPerNode: 4, DesktopIdleTimeout: 5 * time.Minute,
+		desktopLeases: map[uuid.UUID]*desktopLease{},
+		ShellPerNode:  10, ShellIdleTimeout: 30 * time.Minute, ShellMaxLifetime: 8 * time.Hour,
+		DesktopPerNode: 4, DesktopIdleTimeout: 5 * time.Minute, DesktopLeaseTTL: 60 * time.Second,
 		janitorInterval: janitorDefaultInterval,
 		stopJanitor:     make(chan struct{}),
 		kickJanitor:     make(chan struct{}, 1),
@@ -163,12 +186,61 @@ func (m *Manager) Create(nodeID, userID uuid.UUID, kind string, params json.RawM
 		}
 	}
 	m.sessions[s.ID] = s
+	var res CreateResult
+	if kind == proto.KindDesktop {
+		// per-node lease 仲裁（spec §11.1）：授予则 leaseId 嵌入 params
+		// （SESSION_OPEN 与 REST 响应同源）；拒绝则会话照常创建（view-only）。
+		if leaseID, ok := m.grantDesktopLeaseLocked(s, time.Now()); ok {
+			s.Params = embedDesktopLeaseID(s.Params, leaseID)
+			res.LeaseGranted, res.LeaseID = true, leaseID
+		}
+	}
 	m.mu.Unlock()
 	s.ttl = time.AfterFunc(openingTTL, func() { m.expire(s) })
-	return &CreateResult{
-		Session: (*Session)(s), AgentToken: s.agentToken, ClientToken: s.clientToken,
-		ExpiresAt: s.expiresAt, ClientPath: "/api/session/" + s.ID,
-	}, nil
+	res.Session, res.AgentToken, res.ClientToken = (*Session)(s), s.agentToken, s.clientToken
+	res.ExpiresAt, res.ClientPath = s.expiresAt, "/api/session/"+s.ID
+	return &res, nil
+}
+
+// grantDesktopLeaseLocked 尝试把 node 的输入约授予 s：空闲/持有者已关闭/
+// 持有者 TTL 内无信令活动（janitor 兜底；正常撤销走 close 钩子）→ 授予；
+// 否则拒绝（会话仍创建，view-only）。调用方持 mu 且 s 已入表。
+func (m *Manager) grantDesktopLeaseLocked(s *session, now time.Time) (string, bool) {
+	if old := m.desktopLeases[s.NodeID]; old != nil {
+		if holder, ok := m.sessions[old.SessionID]; ok && holder.ID == old.SessionID &&
+			now.Sub(time.Unix(0, holder.lastActivity.Load())) <= m.DesktopLeaseTTL {
+			return "", false // 活约在手且 TTL 内有活动：拒绝
+		}
+		delete(m.desktopLeases, s.NodeID) // 持有者已关/超时：回收再授予
+	}
+	leaseID := newToken()[:16]
+	m.desktopLeases[s.NodeID] = &desktopLease{SessionID: s.ID, LeaseID: leaseID}
+	return leaseID, true
+}
+
+// embedDesktopLeaseID 把授予的 leaseId 写回 desktop params（解码失败 =
+// 非法形态，原样返回；handler 侧保证是 DesktopParams）。
+func embedDesktopLeaseID(params json.RawMessage, leaseID string) json.RawMessage {
+	var p proto.DesktopParams
+	if json.Unmarshal(params, &p) != nil {
+		return params
+	}
+	p.LeaseID = leaseID
+	b, err := json.Marshal(p)
+	if err != nil {
+		return params
+	}
+	return b
+}
+
+// DesktopLeaseOf 返回某节点当前输入约持有者（测试/观测；无活约 = 零值）。
+func (m *Manager) DesktopLeaseOf(nodeID uuid.UUID) (sessionID, leaseID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if l := m.desktopLeases[nodeID]; l != nil {
+		return l.SessionID, l.LeaseID
+	}
+	return "", ""
 }
 
 // expire Opening 超时终局：未粘合即关闭。expiresAt 压到过去让 attach 的
@@ -306,6 +378,10 @@ func (m *Manager) close(s *session, reason string, remove bool) {
 		if remove {
 			delete(m.sessions, s.ID)
 		}
+		// 持有者会话终结 → 释放该节点输入约（后续 Create 可授予新 viewer）。
+		if l := m.desktopLeases[s.NodeID]; l != nil && l.SessionID == s.ID {
+			delete(m.desktopLeases, s.NodeID)
+		}
 		m.mu.Unlock()
 		if agentWS != nil {
 			_ = agentWS.CloseNow()
@@ -381,6 +457,16 @@ func (m *Manager) sweep(now time.Time) {
 	}
 	var expire []expiration
 	m.mu.Lock()
+	// desktop lease TTL 撤销（spec §11.1）：持有者 >TTL 无信令活动 → 撤约
+	// （会话保留 = view-only；janitor 周期 30s < TTL 60s 兜底）。
+	for nodeID, l := range m.desktopLeases {
+		holder, ok := m.sessions[l.SessionID]
+		if !ok || now.Sub(time.Unix(0, holder.lastActivity.Load())) > m.DesktopLeaseTTL {
+			delete(m.desktopLeases, nodeID)
+			m.log.Info("desktop lease expired",
+				"node", nodeID, "session", l.SessionID, "leaseId", l.LeaseID)
+		}
+	}
 	for id, s := range m.sessions {
 		switch s.Kind {
 		case proto.KindShell:

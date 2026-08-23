@@ -1,8 +1,8 @@
 // input_test.go — Task 3 确定性单测(无 WebRTC):0x0108 编码黄金字节、
-// 预校验(§11.7:尺寸/按钮位/seq 单调/无 lease/预算)、move 合并(≤500Hz,
-// barrier 冲刷)、lease 表语义(授予/拒绝/断连释放/30s idle 撤销)。
-// 时钟全部注入(now/after),无真实 sleep 依赖;loopback(真实双 PC)见
-// input_loopback_test.go。
+// 预校验(§11.7:尺寸/按钮位/seq 单调/无 lease/无 capability/预算)、
+// move 合并(≤500Hz,barrier 冲刷)、server lease 登记表语义(M2-Slice3
+// Task 4:登记/比对/释放/新签发覆盖)。时钟全部注入(now/after),无真实
+// sleep 依赖;loopback(真实双 PC)见 input_loopback_test.go。
 package desktop
 
 import (
@@ -97,15 +97,29 @@ func (q *manualTimerQueue) fireDue() {
 	}
 }
 
+// 测试常量:server 签发形态的 leaseId 与 capability 集。
+const (
+	testLeaseID = "0123456789abcdef"
+	viewLeaseID = "fff000fff000fff0"
+	opLeaseID   = "0f0f0f0f0f0f0f0f"
+)
+
+var (
+	opCaps  = []string{"screen.view", "input.mouse", "input.keyboard"}
+	viewCap = []string{"screen.view"}
+)
+
 // newTestController 组装一个不依赖 WebRTC 的 controller(假时钟由调用方接)。
-func newTestController(t *testing.T, subID uint32) (*inputController, *inputFakeSource, *leaseTable) {
+// M2-Slice3 Task 4:构造即持有 server 签发 leaseId(操作者语义)。
+func newTestController(t *testing.T, subID uint32) (*inputController, *inputFakeSource, *serverLease) {
 	t.Helper()
 	host := newInputHost()
 	src := &inputFakeSource{host: host, subID: subID,
 		frameCh: make(chan Frame, 8), stateCh: make(chan StateEvent, 4),
 		cursorCh: make(chan CursorEvent, 4), done: make(chan struct{})}
-	tbl := newLeaseTable()
-	return newInputController(src, tbl, slog.Default()), src, tbl
+	leases := newServerLease()
+	c := newInputController(src, leases, "sess-test", testLeaseID, opCaps, slog.Default())
+	return c, src, leases
 }
 
 func stat(t *testing.T, c *inputController, f func(InputStats) uint64) uint64 {
@@ -185,27 +199,26 @@ func TestEncodeInputWireGoldens(t *testing.T) {
 	}
 }
 
-// TestInputPreValidation:尺寸/形状/按钮位/seq/lease 门,全确定性(假时钟)。
+// TestInputPreValidation:尺寸/形状/按钮位/seq/lease/capability 门,全
+// 确定性(假时钟)。
 func TestInputPreValidation(t *testing.T) {
 	c, src, _ := newTestController(t, 9)
 
-	// 无 lease:合法 move 也必须丢弃(计数,不断连)。
-	c.handleMouse(encMouseMsg(1, 5, 5, 0))
-	if got := stat(t, c, func(s InputStats) uint64 { return s.NoLease }); got != 1 {
+	// view-only(无 server leaseId):合法 move 也必须丢弃(计数,不断连)。
+	vo := newInputController(src, newServerLease(), "sess-vo", "", opCaps, slog.Default())
+	vo.handleMouse(encMouseMsg(1, 5, 5, 0))
+	if got := stat(t, vo, func(s InputStats) uint64 { return s.NoLease }); got != 1 {
 		t.Fatalf("noLease = %d, want 1", got)
 	}
 	if n := src.host.count(); n != 0 {
 		t.Fatalf("host saw %d msgs before lease", n)
 	}
 
-	// 授予后预校验逐项。
-	if _, ok := c.grantLease(nil); !ok {
-		t.Fatal("first lease request must be granted")
-	}
-	c.handleMouse(make([]byte, maxInputMsgBytes+1)) // 2049B → oversize
-	c.handleMouse(make([]byte, 10))                 // 短帧 → invalid
-	c.handleInput(make([]byte, 4))                  // 短帧 → invalid
-	c.handleMouse(encMouseMsg(2, 1, 1, 0x20))       // buttons > 0x1F → invalid
+	// 持有者(server leaseId 已登记)预校验逐项。
+	c.handleMouse(make([]byte, maxInputMsgBytes+1))                // 2049B → oversize
+	c.handleMouse(make([]byte, 10))                                // 短帧 → invalid
+	c.handleInput(make([]byte, 4))                                 // 短帧 → invalid
+	c.handleMouse(encMouseMsg(2, 1, 1, 0x20))                      // buttons > 0x1F → invalid
 	c.handleInput(encInputMsg(3, inputTypeMove, make([]byte, 10))) // MOVE 走 input 通道 → invalid
 	if got := stat(t, c, func(s InputStats) uint64 { return s.Oversize }); got != 1 {
 		t.Fatalf("oversize = %d, want 1", got)
@@ -254,9 +267,6 @@ func TestInputBudget1000eps(t *testing.T) {
 	c.now = func() time.Time { return clock }
 	q := &manualTimerQueue{now: c.now}
 	c.after = q.after
-	if _, ok := c.grantLease(nil); !ok {
-		t.Fatal("grant failed")
-	}
 	send := func(seq uint64) {
 		c.handleInput(encInputMsg(seq, inputTypeKey, keyPayload(uint16(seq%255)+1, 1, 0)))
 	}
@@ -286,9 +296,6 @@ func TestMoveCoalescing(t *testing.T) {
 	c.now = func() time.Time { return clock }
 	q := &manualTimerQueue{now: c.now}
 	c.after = q.after
-	if _, ok := c.grantLease(nil); !ok {
-		t.Fatal("grant failed")
-	}
 	// t0:seq1 立即转发;seq2/3/4 同瞬到达 → 合并(保 4)。
 	c.handleMouse(encMouseMsg(1, 10, 10, 0))
 	c.handleMouse(encMouseMsg(2, 20, 10, 0))
@@ -318,66 +325,41 @@ func TestMoveCoalescing(t *testing.T) {
 	}
 }
 
-// TestLeaseTable:授予/拒绝/断连释放/idle 撤销(真定时器,短 idle)。
-func TestLeaseTable(t *testing.T) {
-	tbl := newLeaseTable()
-	tbl.idle = 60 * time.Millisecond
-
-	var mu sync.Mutex
-	reasons := []string{}
-	notify := func(r string) { mu.Lock(); reasons = append(reasons, r); mu.Unlock() }
-
-	id1, ok := tbl.request(notify)
-	if !ok || len(id1) != 16 {
-		t.Fatalf("grant = %q ok=%v", id1, ok)
-	}
-	if _, ok := tbl.request(notify); ok {
-		t.Fatal("second request must be denied while held")
-	}
-	if !tbl.allows(id1) {
+// TestServerLeaseRegistry(M2-Slice3 Task 4):登记/比对/释放/新签发覆盖
+// ——server 每节点单活约,agent 只执行。
+func TestServerLeaseRegistry(t *testing.T) {
+	l := newServerLease()
+	l.register("s1", "aaaabbbbccccdddd")
+	if !l.allows("aaaabbbbccccdddd") {
 		t.Fatal("holder must be allowed")
 	}
-	if tbl.allows("bogus") || tbl.allows("") {
+	if l.allows("bogus") || l.allows("") {
 		t.Fatal("non-holder must be rejected")
 	}
-	tbl.release(id1, "disconnect")
-	if tbl.allows(id1) {
+	l.release("s1", "aaaabbbbccccdddd")
+	if l.allows("aaaabbbbccccdddd") {
 		t.Fatal("released lease must be rejected")
 	}
-	mu.Lock()
-	if len(reasons) != 1 || reasons[0] != "disconnect" {
-		t.Fatalf("reasons = %v, want [disconnect]", reasons)
+	// 释放后新会话可登记(移交闭环)。
+	l.register("s2", "1111222233334444")
+	if !l.allows("1111222233334444") {
+		t.Fatal("new holder must be allowed after transfer")
 	}
-	mu.Unlock()
-
-	// idle:60ms 无输入 → revoke("idle") + 表释放 → 可再授予。
-	revoked := make(chan string, 1)
-	id2, ok := tbl.request(func(r string) { revoked <- r })
-	if !ok {
-		t.Fatal("re-grant after release failed")
+	// 非持有者释放不得清别人的约。
+	l.release("s1", "1111222233334444")
+	if !l.allows("1111222233334444") {
+		t.Fatal("release by non-holder must not clear the active lease")
 	}
-	if !tbl.allows(id2) {
-		t.Fatal("fresh holder must be allowed")
-	}
-	select {
-	case r := <-revoked:
-		if r != "idle" {
-			t.Fatalf("idle revoke reason = %q", r)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("idle revoke never fired")
-	}
-	if _, ok := tbl.request(nil); !ok {
-		t.Fatal("lease must be free after idle revoke")
+	// server 新签发(旧约已在其侧撤销)覆盖:旧持有者自然失配。
+	l.register("s3", "eeeeffff00001111")
+	if l.allows("1111222233334444") || !l.allows("eeeeffff00001111") {
+		t.Fatal("newer server grant must supersede the stale leaseId")
 	}
 }
 
 // TestHeldKeyReleaseOnClose:会话终结合成 KEY/BUTTON up(卡键清理),seq 续接。
 func TestHeldKeyReleaseOnClose(t *testing.T) {
-	c, src, tbl := newTestController(t, 9)
-	if _, ok := c.grantLease(nil); !ok {
-		t.Fatal("grant failed")
-	}
+	c, src, leases := newTestController(t, 9)
 	c.handleInput(encInputMsg(1, inputTypeKey, keyPayload(0x1E, 1, 0)))
 	c.handleInput(encInputMsg(2, inputTypeKey, keyPayload(0x2A, 1, 1))) // extended LShift
 	c.handleInput(encInputMsg(3, inputTypeButton, []byte{1, 1}))        // L down
@@ -387,7 +369,7 @@ func TestHeldKeyReleaseOnClose(t *testing.T) {
 	waitCount(t, src.host, 6) // KEY up(0x2A ext) + BUTTON up(1)
 	recs := src.host.records()
 	if len(recs) != 6 {
-		t.Fatalf("recs = %d", len(recs))
+		t.Fatalf("recs = %d, want 6", len(recs))
 	}
 	// 合成 up 的 seq 严格续接(5、6),host 无 stale 丢弃。
 	for i, r := range recs {
@@ -402,8 +384,8 @@ func TestHeldKeyReleaseOnClose(t *testing.T) {
 	if recs[4].Type != inputTypeKey || recs[4].Scan != 0x2A || recs[4].Extended != 1 || recs[4].Down != 0 {
 		t.Fatalf("key up rec = %+v", recs[4])
 	}
-	// close 后 lease 已释放。
-	if tbl.allows(c.currentLease()) {
+	// close 后本地登记已释放(server 侧撤销由其 TTL/关闭钩子权威)。
+	if leases.allows(testLeaseID) {
 		t.Fatal("lease must be released after close")
 	}
 	// 幂等。
@@ -411,53 +393,28 @@ func TestHeldKeyReleaseOnClose(t *testing.T) {
 	waitCount(t, src.host, 6)
 }
 
-// TestIdleRevokeClearsHeldTracking(T3 review Minor 2 回归):持有者按住键
-// → idle 撤销 → 新持有者按下同键 → 旧持有者 WS 关闭不得合成 up 抬掉新
-// 持有者的键。撤销即清跟踪;物理残留由 host 侧 janitor 兜底。假时钟驱动
-// (controller 与 lease 表共享 manualTimerQueue),idle 只在推进时钟时发生。
-func TestIdleRevokeClearsHeldTracking(t *testing.T) {
-	c, src, tbl := newTestController(t, 9)
-	clock := time.Unix(0, 0)
-	c.now = func() time.Time { return clock }
-	q := &manualTimerQueue{now: c.now}
-	c.after = q.after
-	tbl.now, tbl.after = c.now, q.after
-	tbl.idle = 30 * time.Second
-
-	revoked := make(chan string, 1)
-	if _, ok := c.grantLease(func(r string) { revoked <- r }); !ok {
-		t.Fatal("grant failed")
-	}
-	// 旧持有者按下 A;30s 无输入 → idle 撤销。
+// TestLeaseTransferDoesNotLiftNewHolderKeys(T3 review Minor 2 语义在
+// server 仲裁下的回归):server 移交(新 leaseId 签发注册)后,旧持有者
+// close 不得合成 up 抬掉新持有者按下的同键——失约即停合成释放,物理残留
+// 由 host 侧 janitor(>30s 强制 KeyUp)兜底。
+func TestLeaseTransferDoesNotLiftNewHolderKeys(t *testing.T) {
+	c, src, leases := newTestController(t, 9)
+	// 旧持有者(L1)按下 A。
 	c.handleInput(encInputMsg(1, inputTypeKey, keyPayload(0x1E, 1, 0)))
 	waitCount(t, src.host, 1)
-	clock = clock.Add(tbl.idle + time.Millisecond)
-	q.fireDue()
-	select {
-	case r := <-revoked:
-		if r != "idle" {
-			t.Fatalf("revoke reason = %q, want idle", r)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("idle revoke never fired")
-	}
 
-	// 新持有者(共享同一 lease 表/同一 host 全局键态)取得 lease 并按下 A。
+	// server 移交:新会话携新 leaseId L2 注册(覆盖 L1)并按下 A。
 	src2 := &inputFakeSource{host: src.host, subID: 10,
 		frameCh: make(chan Frame, 8), stateCh: make(chan StateEvent, 4),
 		cursorCh: make(chan CursorEvent, 4), done: make(chan struct{})}
-	c2 := newInputController(src2, tbl, slog.Default())
-	c2.now, c2.after = c.now, q.after
-	if _, ok := c2.grantLease(nil); !ok {
-		t.Fatal("re-grant after idle revoke failed")
-	}
+	c2 := newInputController(src2, leases, "sess-new", opLeaseID, opCaps, slog.Default())
 	c2.handleInput(encInputMsg(1, inputTypeKey, keyPayload(0x1E, 1, 0)))
 	waitCount(t, src.host, 2)
-	if !tbl.allows(c2.currentLease()) {
-		t.Fatal("new holder must hold the lease")
+	if c.holdsLease() {
+		t.Fatal("stale holder must lose the lease after new server grant")
 	}
 
-	// 旧持有者现在才断连(close 同步完成):不得合成任何 up。
+	// 旧持有者断连:不得合成任何 up。
 	c.close()
 	recs := src.host.records()
 	if len(recs) != 2 {
@@ -467,13 +424,37 @@ func TestIdleRevokeClearsHeldTracking(t *testing.T) {
 	if last.Type != inputTypeKey || last.Scan != 0x1E || last.Down != 1 || last.SubID != 10 {
 		t.Fatalf("new holder key-down must be the last host record: %+v", last)
 	}
-	// 新持有者随后正常 close(未 idle):仍应释放自己的键(修复不破坏正常路径)。
+	// 新持有者正常 close:仍应释放自己的键(修复不破坏正常路径)。
 	c2.close()
 	waitCount(t, src.host, 3)
 	up := src.host.records()[2]
 	if up.Type != inputTypeKey || up.Scan != 0x1E || up.Down != 0 || up.SubID != 10 {
 		t.Fatalf("new holder synthetic up = %+v", up)
 	}
+}
+
+// TestCapabilityGate(M2-Slice3 Task 4):server 未下发 input.* → 对应输入
+// 丢弃+计数(持有 lease 也不放行);operator 集照常。
+func TestCapabilityGate(t *testing.T) {
+	host := newInputHost()
+	src := &inputFakeSource{host: host, subID: 9,
+		frameCh: make(chan Frame, 8), stateCh: make(chan StateEvent, 4),
+		cursorCh: make(chan CursorEvent, 4), done: make(chan struct{})}
+	leases := newServerLease()
+	view := newInputController(src, leases, "sess-view", viewLeaseID, viewCap, slog.Default())
+	view.handleMouse(encMouseMsg(1, 5, 5, 0))                              // 无 input.mouse
+	view.handleInput(encInputMsg(2, inputTypeKey, keyPayload(0x1E, 1, 0))) // 无 input.keyboard
+	if got := stat(t, view, func(s InputStats) uint64 { return s.NoCapability }); got != 2 {
+		t.Fatalf("noCapability = %d, want 2", got)
+	}
+	if n := host.count(); n != 0 {
+		t.Fatalf("capability-less input reached host: %+v", host.records())
+	}
+	// operator(鼠标+键盘)照常。
+	op := newInputController(src, leases, "sess-op", opLeaseID, opCaps, slog.Default())
+	op.handleMouse(encMouseMsg(1, 5, 5, 0))
+	op.handleInput(encInputMsg(2, inputTypeKey, keyPayload(0x1E, 1, 0)))
+	waitCount(t, host, 2)
 }
 
 // waitCount 轮询 host 记录数到 n(转发异步经 controller 锁外计数)。

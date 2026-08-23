@@ -33,6 +33,13 @@ type desktopOpenResp struct {
 	ExpiresAt    time.Time                `json:"expiresAt"`
 	WebsocketURL string                   `json:"websocketUrl"`
 	Turn         *proto.DesktopTurnConfig `json:"turn"`
+	Lease        *desktopLeaseResp        `json:"lease"`
+}
+
+// desktopLeaseResp：202 响应的 lease 判定（M2-Slice3 Task 4）。
+type desktopLeaseResp struct {
+	Granted bool   `json:"granted"`
+	LeaseID string `json:"leaseId"`
 }
 
 // TestDesktopSessionEndToEnd：202 → SESSION_OPEN 携带 KindDesktop + 服务端
@@ -201,4 +208,84 @@ func TestDesktopRBAC(t *testing.T) {
 			assert.Equal(t, proto.CodeNodeNotFound, errCode, user)
 		}
 	}
+}
+
+// TestDesktopLeaseAndCapabilities（M2-Slice3 Task 4）：
+// ① 首会话 202 + lease{granted:true,leaseId} 且 SESSION_OPEN params 嵌入
+//
+//	同一 leaseId（REST/agent 同源）；
+//
+// ② 第二会话（并发上限内）202 + granted:false（view-only），params 无
+//
+//	leaseId；
+//
+// ③ capability 集按角色下发：owner 含 input.secure_attention/shell.system，
+//
+//	operator 含 input.mouse/keyboard 无 SAS；viewer 403（RBAC 层拒绝，
+//	capability 只对已建会话生效）。
+func TestDesktopLeaseAndCapabilities(t *testing.T) {
+	f := newRBACFixture(t)
+	ctrl := dialControl(t, f.env, f.nodeID)
+	openCh := captureManySessionOpens(t, ctrl, 3)
+	path := "/api/nodes/" + f.nodeID + "/desktop"
+
+	postDesk := func(tok string) (*desktopOpenResp, int) {
+		resp := doJSON(t, f.srv.URL, "POST", path, tok, `{}`)
+		code := resp.StatusCode
+		var body desktopOpenResp
+		if code == 202 {
+			require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+		}
+		resp.Body.Close()
+		return &body, code
+	}
+
+	// ① owner（非 admin 用户）：授予 + capability 全集。
+	body, code := postDesk(f.tokens["owner"])
+	require.Equal(t, 202, code)
+	require.NotNil(t, body.Lease)
+	assert.True(t, body.Lease.Granted)
+	assert.Len(t, body.Lease.LeaseID, 16)
+	select {
+	case so := <-openCh:
+		var p proto.DesktopParams
+		require.NoError(t, jsonUnmarshal(so.Params, &p))
+		assert.Equal(t, body.Lease.LeaseID, p.LeaseID, "SESSION_OPEN params must embed the REST leaseId")
+		require.ElementsMatch(t, []string{
+			proto.CapScreenView, proto.CapInputMouse, proto.CapInputKeyboard,
+			proto.CapInputSecureAttn, proto.CapShellSystem,
+		}, p.Capabilities)
+	case <-time.After(3 * time.Second):
+		t.Fatal("no SESSION_OPEN (owner)")
+	}
+
+	// ② operator（并发上限内第二 viewer）：view-only + operator 集。
+	body2, code := postDesk(f.tokens["operator"])
+	require.Equal(t, 202, code)
+	require.NotNil(t, body2.Lease)
+	assert.False(t, body2.Lease.Granted, "second concurrent session must be view-only")
+	select {
+	case so := <-openCh:
+		var p proto.DesktopParams
+		require.NoError(t, jsonUnmarshal(so.Params, &p))
+		assert.Empty(t, p.LeaseID)
+		require.ElementsMatch(t, []string{
+			proto.CapScreenView, proto.CapInputMouse, proto.CapInputKeyboard,
+		}, p.Capabilities)
+	case <-time.After(3 * time.Second):
+		t.Fatal("no SESSION_OPEN (operator)")
+	}
+
+	// ③ viewer：RBAC 拒绝（403）——capability 集只对已建会话有意义。
+	_, code = postDesk(f.tokens["viewer"])
+	assert.Equal(t, 403, code)
+
+	// 持有者关闭 → 约 → 新会话授予（server 仲裁移交闭环）。
+	sess := f.env.Sess.SessionsOf(mustUUID(f.nodeID), proto.KindDesktop)
+	require.NotEmpty(t, sess)
+	f.env.Sess.NotifyClose(sess[0].ID, "test")
+	body3, code := postDesk(f.tokens["owner"])
+	require.Equal(t, 202, code)
+	require.NotNil(t, body3.Lease)
+	assert.True(t, body3.Lease.Granted, "lease must be re-grantable after holder close")
 }

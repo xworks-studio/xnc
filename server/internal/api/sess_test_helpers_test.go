@@ -128,3 +128,30 @@ func readRaw(t *testing.T, ws *websocket.Conn) (string, []byte) {
 
 // jsonUnmarshal 是 json.Unmarshal 的别名（测试正文用它保持简洁）。
 func jsonUnmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }
+
+// captureManySessionOpens：captureSessionOpen 的多条变体（M2-Slice3 Task 4
+// 的多 viewer lease 测试需要连续接收多条 SESSION_OPEN）。
+func captureManySessionOpens(t *testing.T, ctrlWS *websocket.Conn, n int) chan proto.SessionOpen {
+	t.Helper()
+	ch := make(chan proto.SessionOpen, n)
+	go func() {
+		for i := 0; i < n; i++ {
+			m := readMsg(t, ctrlWS)
+			if m.Type == proto.TypeSessionClose {
+				i-- // holder close 触发的 SESSION_CLOSE 跳过(lease 测试)
+				continue
+			}
+			if m.Type != proto.TypeSessionOpen {
+				t.Errorf("expected %s on control conn, got %s", proto.TypeSessionOpen, m.Type)
+				return
+			}
+			var so proto.SessionOpen
+			if err := m.Decode(&so); err != nil {
+				t.Errorf("decode %s: %v", proto.TypeSessionOpen, err)
+				return
+			}
+			ch <- so
+		}
+	}()
+	return ch
+}
