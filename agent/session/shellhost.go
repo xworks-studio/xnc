@@ -48,7 +48,8 @@ type ShellStream struct {
 
 // ShellProc 是一个经 core 创建的 shell 进程(oneshot 或 interactive)。
 // Stream/Exit 通道在连接终结后关闭;Kill 为杀树语义(0x0126 + 核心
-// KillShell 兜底)。
+// KillShell 兜底)。Dropped 返回 oneshot 路径超输出预算丢弃的字节数
+// (interactive 恒 0;>0 时 EXEC_RESULT.Truncated 置位,fake 可注入)。
 type ShellProc interface {
 	// Profile 返回 xnc-shell 实际生效的 profile 名(SHELL_BEGIN 内容)。
 	Profile() string
@@ -57,6 +58,7 @@ type ShellProc interface {
 	Kill() error
 	Stream() <-chan ShellStream
 	Exit() <-chan uint32
+	Dropped() uint64
 	Close() error
 }
 

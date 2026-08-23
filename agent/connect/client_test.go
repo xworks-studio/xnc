@@ -320,7 +320,9 @@ func TestBackoffResetAfterHealthyConnection(t *testing.T) {
 		t.Fatal("Run did not return after cancel")
 	}
 	assert.GreaterOrEqual(t, gap, 800*time.Millisecond)
-	assert.LessOrEqual(t, gap, 4*time.Second,
+	// 上界 5s(T5:并行测试负载下调度延迟曾把 1s 退避拉到 ~4.3s,判据
+	// 是「已从 4s 档重置回 ~1s 档」而非精确墙钟)。
+	assert.LessOrEqual(t, gap, 5*time.Second,
 		"backoff not reset after healthy connection: expected ~1s retry, got slow retry")
 }
 

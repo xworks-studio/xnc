@@ -345,3 +345,36 @@ func TestBuildExecCommandMapping(t *testing.T) {
 	_, _, err = buildExecCommand(proto.ExecParams{Shell: "cmd"}, "")
 	assert.Error(t, err, "command or script required")
 }
+
+// TestExecTruncatedFlag:Dropped()>0(超预算丢弃)→ EXEC_RESULT.Truncated
+// =true(T5 截断诚实化;marker 行由 shellpipe 层负责,此处钉终态位)。
+func TestExecTruncatedFlag(t *testing.T) {
+	host := &fakeHost{build: func(spec ShellSpec) *fakeProc {
+		p := &fakeProc{spec: spec, profile: spec.Profile,
+			streamCh: make(chan ShellStream, 16), exitCh: make(chan uint32, 1)}
+		p.droppedVal = 4096
+		go func() {
+			p.emit(ShellStream{Bytes: []byte("partial")})
+			p.exitCh <- 0
+			close(p.streamCh)
+		}()
+		return p
+	}}
+	ws := runExec(t, host, proto.ExecParams{Command: "big", TimeoutSec: 30, Shell: "cmd"})
+	_, _, res := collectExec(t, ws)
+	assert.True(t, res.Truncated)
+}
+
+// TestExecNotTruncatedWhenNoDrop:Dropped()==0 → Truncated 缺省 false。
+func TestExecNotTruncatedWhenNoDrop(t *testing.T) {
+	host := &fakeHost{build: func(spec ShellSpec) *fakeProc {
+		p := &fakeProc{spec: spec, profile: spec.Profile,
+			streamCh: make(chan ShellStream, 16), exitCh: make(chan uint32, 1)}
+		p.exitCh <- 0
+		close(p.streamCh)
+		return p
+	}}
+	ws := runExec(t, host, proto.ExecParams{Command: "whoami", Shell: "cmd"})
+	_, _, res := collectExec(t, ws)
+	assert.False(t, res.Truncated)
+}

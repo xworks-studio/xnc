@@ -20,6 +20,8 @@ type fakeProc struct {
 
 	streamCh chan ShellStream
 	exitCh   chan uint32
+	// droppedVal 由用例注入(Dropped() 返回,Truncated 测试)。
+	droppedVal uint64
 	// onKill 由用例注入(默认:交付 exitCode)。
 	onKill func(p *fakeProc)
 }
@@ -77,6 +79,13 @@ func (p *fakeProc) Resizes() [][2]int {
 func (p *fakeProc) Stream() <-chan ShellStream { return p.streamCh }
 
 func (p *fakeProc) Exit() <-chan uint32 { return p.exitCh }
+
+// Dropped 返回注入的丢弃计数(T5 Truncated 测试用;缺省 0)。
+func (p *fakeProc) Dropped() uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.droppedVal
+}
 
 func (p *fakeProc) Close() error {
 	p.mu.Lock()

@@ -6,6 +6,7 @@
 package shellpipe
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"net"
@@ -155,4 +156,52 @@ func TestStdinResizeKill(t *testing.T) {
 	assert.Equal(t, "dir\r", string(f.stdin))
 	assert.Equal(t, [][2]uint16{{100, 40}}, f.resizes)
 	assert.True(t, f.killed)
+}
+
+// TestExecBudgetTruncationMarker(T5):预算启用 + 消费停滞 → 超预算字节
+// 计数丢弃,终结时末尾交付 stderr marker 行;预算内数据不丢。
+func TestExecBudgetTruncationMarker(t *testing.T) {
+	const secret = "shell-pipe-secret"
+	f := &fakeShell{secret: []byte(secret), ctrlSeen: make(chan struct{}, 64)}
+	oldDial := dialPipe
+	serverConn, clientConn := net.Pipe()
+	dialPipe = func(_ context.Context, _ string) (net.Conn, error) { return clientConn, nil }
+	t.Cleanup(func() { dialPipe = oldDial })
+
+	go func() {
+		defer serverConn.Close()
+		if err := ServerHandshake(serverConn, f.secret); err != nil {
+			return
+		}
+		_ = ipc.WriteFrame(serverConn, &ipc.Frame{MessageType: msgShellBegin, Payload: EncodeBegin(80, 25, "CMD")})
+		// 100 帧 × 50B = 5000B stdout;通道 64 帧 + 预算 200B 后丢弃。
+		payload := EncodeData(StreamStdout, bytes.Repeat([]byte("x"), 50))
+		for i := 0; i < 100; i++ {
+			if ipc.WriteFrame(serverConn, &ipc.Frame{MessageType: msgShellData, Payload: payload}) != nil {
+				return
+			}
+		}
+		_ = ipc.WriteFrame(serverConn, &ipc.Frame{MessageType: msgShellExit, Payload: EncodeExit(0)})
+	}()
+
+	c, err := Dial("fake", []byte(secret))
+	require.NoError(t, err)
+	c.SetExecBudget(200)
+
+	// 停滞消费:等服务端写完(写完 = EXIT 已入客户端)再开始读。
+	time.Sleep(500 * time.Millisecond)
+	var stdout, stderr bytes.Buffer
+	for d := range c.DataCh() {
+		if d.Stream == StreamStdout {
+			stdout.Write(d.Bytes)
+		} else {
+			stderr.Write(d.Bytes)
+		}
+	}
+	assert.Less(t, stdout.Len(), 5000, "output beyond budget+channel must be dropped")
+	assert.Contains(t, stderr.String(), "[xnc] output truncated:", "marker line must be appended")
+	assert.Greater(t, c.DroppedBytes(), uint64(0))
+	assert.Equal(t, uint64(5000-stdout.Len()), c.DroppedBytes(), "dropped+delivered must account for all bytes")
+	code := <-c.ExitCh()
+	assert.EqualValues(t, 0, code)
 }

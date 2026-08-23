@@ -13,9 +13,12 @@
 //	MSG_SHELL_KILL   0x0126 req   (无 payload)
 //	MSG_SHELL_STATE  0x0127 event [char code[24]](NUL 填充)
 //
-// 消费模型:DataCh/StateCh 缓冲通道(满丢——oneshot 输出由会话层转发,
-// 背压经 ws 写时限体现);ExitCh 在 SHELL_EXIT 后交付一次退出码并随泵
-// 退出关闭。Kill 发 0x0126(xnc-shell 杀整棵进程树)。
+// 消费模型:DataCh/StateCh 缓冲通道;ExitCh 在 SHELL_EXIT 后交付一次
+// 退出码并随泵退出关闭。oneshot(exec)路径经 SetExecBudget 启用每流
+// 输出预算(默认 4MB):通道满先入内部队列,超预算丢弃+计数,终结时
+// 追加 stderr marker 行并同步 Truncated(T5);interactive VT 流保持
+// 满丢(背压经 ws 写时限体现,可接受)。Kill 发 0x0126(xnc-shell 杀整
+// 棵进程树)。
 package shellpipe
 
 import (
@@ -58,7 +61,18 @@ const (
 	stateChDepth     = 4
 	profileFieldLen  = 16
 	stateFieldLen    = 24
+
+	// defaultExecBudgetPerStream 是 oneshot(exec)路径的输出背压预算:
+	// 消费停滞时每条流(stdout/stderr)最多缓冲这么 多字节,超出才丢弃
+	// 并计数(T5:满丢 → 预算 + 显式 marker + Truncated)。
+	defaultExecBudgetPerStream = 4 << 20 // 4MB
+	// drainTimeout 是终结时排空缓冲的每帧时限(消费方已死则放弃余量)。
+	drainTimeout = 2 * time.Second
 )
+
+// TruncationMarkerFmt 是超预算丢弃后在输出末尾追加的 stderr 标记行
+// 格式(T5 定向修;EXEC_RESULT.Truncated 同步置位)。
+const TruncationMarkerFmt = "\n[xnc] output truncated: %d bytes dropped\n"
 
 // dialPipe 是可注入的拨号函数(测试换 net.Pipe 适配器;生产 = winio)。
 var dialPipe = func(ctx context.Context, pipe string) (net.Conn, error) {
@@ -98,6 +112,16 @@ type Conn struct {
 	closed  bool
 	exitVal *uint32
 	pumpErr error
+
+	// 输出背压预算(T5,仅 oneshot/exec 路径启用;interactive VT 流
+	// 保持满丢——见 SetExecBudget 注释):
+	//   budget>0 时,通道满的数据先入 pend 队列(每流字节数 ≤ budget),
+	//   超出才丢弃并计入 dropped;终结时 pend 连同 marker(如有丢弃)
+	//   一并排空进 dataCh。
+	budget    int // 每流字节预算;0 = 未启用(旧行为:通道满即丢)
+	pend      []Data
+	pendBytes [3]int
+	dropped   [3]uint64
 }
 
 // Dial 连接 xnc-shell pipe,完成握手并同步等待 SHELL_BEGIN(即 shell
@@ -164,8 +188,29 @@ func Dial(pipe string, secret []byte) (*Conn, error) {
 	}
 }
 
-// DataCh 交付 stdout/stderr 数据;连接终结后关闭。满时丢弃(会话层
-// 转发写时限构成端到端背压,此处不放大内存)。
+// SetExecBudget 启用 oneshot(exec)路径的输出背压预算(每流 perStream
+// 字节,≤0 用默认 4MB)。必须在收到第一批输出前调用(Dial 返回后、
+// 会话开始泵数据前);interactive VT 流不启用——终端输出本身有节流且
+// 语义上是"最新画面",满丢可接受(会话层转发写时限构成端到端背压)。
+// 启用后超预算丢弃会计数并在终结时追加 stderr marker(TruncationMarker)。
+func (c *Conn) SetExecBudget(perStream int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if perStream <= 0 {
+		perStream = defaultExecBudgetPerStream
+	}
+	c.budget = perStream
+}
+
+// DroppedBytes 返回因超预算丢弃的累计字节数(stdout+stderr)。
+func (c *Conn) DroppedBytes() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.dropped[StreamStdout] + c.dropped[StreamStderr]
+}
+
+// DataCh 交付 stdout/stderr 数据;连接终结后关闭。预算未启用时通道满
+// 即丢弃(interactive VT 流,可接受);启用时见 SetExecBudget。
 func (c *Conn) DataCh() <-chan Data { return c.dataCh }
 
 // StateCh 交付 STATE 事件;连接终结后关闭。
@@ -261,12 +306,9 @@ func (c *Conn) pump() {
 			if stream == StreamStdin {
 				continue
 			}
-			select {
-			case c.dataCh <- Data{Stream: stream, Bytes: data}:
-			case <-c.done:
+			if !c.enqueueData(Data{Stream: stream, Bytes: data}) {
 				c.teardown(exit)
 				return
-			default: // 满丢(见 DataCh 注释)
 			}
 		case msgShellState:
 			ev, err := decodeState(f.Payload)
@@ -292,18 +334,82 @@ func (c *Conn) pump() {
 	}
 }
 
+// enqueueData 把一条输出数据交付给消费方:预算启用时通道满先入 pend
+// 队列(每流 ≤ budget 字节),超出丢弃并计数;未启用时保持旧行为
+// (通道满即丢)。返回 false = 泵应终结(done 已关)。
+func (c *Conn) enqueueData(d Data) bool {
+	c.mu.Lock()
+	// 先排空既有 pend(消费方腾出的空间优先给最老的数据)。
+flush:
+	for len(c.pend) > 0 {
+		select {
+		case c.dataCh <- c.pend[0]:
+			c.pendBytes[c.pend[0].Stream] -= len(c.pend[0].Bytes)
+			c.pend = c.pend[1:]
+		default:
+			break flush
+		}
+	}
+	if len(c.pend) == 0 {
+		select {
+		case c.dataCh <- d:
+			c.mu.Unlock()
+			return true
+		case <-c.done:
+			c.mu.Unlock()
+			return false
+		default:
+		}
+	}
+	if c.budget > 0 {
+		if c.pendBytes[d.Stream]+len(d.Bytes) <= c.budget {
+			c.pend = append(c.pend, d)
+			c.pendBytes[d.Stream] += len(d.Bytes)
+		} else {
+			c.dropped[d.Stream] += uint64(len(d.Bytes))
+		}
+	} // budget==0: 旧满丢行为(interactive)
+	c.mu.Unlock()
+	return true
+}
+
+// drainPend 在终结时把 pend 排空进 dataCh(阻塞带时限:消费方已死则
+// 放弃余量),随后关闭数据通道。
+func (c *Conn) drainPend() {
+	c.mu.Lock()
+	pend := c.pend
+	c.pend = nil
+	c.mu.Unlock()
+	for _, d := range pend {
+		select {
+		case c.dataCh <- d:
+		case <-time.After(drainTimeout):
+			return
+		}
+	}
+}
+
 // teardown 是泵的下线路径:投递退出码(未见 EXIT 视作异常终态 1,
-// 镜像 shellhost interactive 语义)、关闭 done 与全部数据通道。
+// 镜像 shellhost interactive 语义)、关闭 done 与全部数据通道。预算
+// 启用且发生丢弃时,末尾追加 stderr marker 行(T5)。
 func (c *Conn) teardown(exit *uint32) {
 	code := uint32(1)
 	if exit != nil {
 		code = *exit
 	}
+	c.mu.Lock()
+	dropped := c.dropped[StreamStdout] + c.dropped[StreamStderr]
+	if c.budget > 0 && dropped > 0 {
+		m := Data{Stream: StreamStderr, Bytes: []byte(fmt.Sprintf(TruncationMarkerFmt, dropped))}
+		c.pend = append(c.pend, m)
+	}
+	c.mu.Unlock()
 	c.doneOnce.Do(func() { close(c.done) })
 	select {
 	case c.exitCh <- code:
 	default:
 	}
+	c.drainPend()
 	close(c.dataCh)
 	close(c.stateCh)
 	close(c.exitCh)

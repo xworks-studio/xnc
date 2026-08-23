@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -65,11 +66,13 @@ func (ex *Exec) logger() *slog.Logger {
 	return slog.Default()
 }
 
+// host 与 shell.go 对齐(T5 平价修):Host 未注入时回退
+// DefaultShellHost(dev 环境变量),仍无凭据则 nil → CORE_UNAVAILABLE。
 func (ex *Exec) host() ShellHost {
 	if ex.Host != nil {
 		return ex.Host
 	}
-	return nil // 无凭据:创建即 CORE_UNAVAILABLE
+	return DefaultShellHost(ex.logger())
 }
 
 // Handle 运行一条命令直至终态：pump 输出 → EXEC_RESULT → 正常关闭 WS。
@@ -77,19 +80,19 @@ func (ex *Exec) host() ShellHost {
 func (ex *Exec) Handle(ctx context.Context, ws *websocket.Conn, sessionID string, params json.RawMessage) {
 	var p proto.ExecParams
 	if err := json.Unmarshal(params, &p); err != nil {
-		ex.result(ctx, ws, nil, false, 0, "")
+		ex.result(ctx, ws, nil, false, 0, "", false)
 		return
 	}
 	// sessionID 会进入临时脚本路径：非白名单形态（如 "../../evil"）即拒绝
 	// 整会话，路径穿越在落盘前终结。
 	if !sessionIDRe.MatchString(sessionID) {
 		ex.logger().Warn("exec refused malformed session id", "session", sessionID)
-		ex.result(ctx, ws, nil, false, 0, "")
+		ex.result(ctx, ws, nil, false, 0, "", false)
 		return
 	}
 	if len(p.Script) > execMaxScriptBytes {
 		// server 已拦 256KB；agent 兜底，防篡改路径直接落盘超大文件
-		ex.result(ctx, ws, nil, false, 0, "")
+		ex.result(ctx, ws, nil, false, 0, "", false)
 		return
 	}
 	deadline := time.Duration(p.TimeoutSec) * time.Second
@@ -101,7 +104,7 @@ func (ex *Exec) Handle(ctx context.Context, ws *websocket.Conn, sessionID string
 	if p.Script != "" {
 		if _, err := ex.writeScript(sessionID, p.Script); err != nil {
 			ex.logger().Warn("exec write script failed", "session", sessionID, "err", err)
-			ex.result(ctx, ws, nil, false, time.Since(start).Milliseconds(), "")
+			ex.result(ctx, ws, nil, false, time.Since(start).Milliseconds(), "", false)
 			return
 		}
 		defer func() { _ = os.Remove(ex.scriptPath(sessionID)) }()
@@ -109,13 +112,13 @@ func (ex *Exec) Handle(ctx context.Context, ws *websocket.Conn, sessionID string
 	command, profile, err := buildExecCommand(p, ex.scriptPath(sessionID))
 	if err != nil {
 		ex.logger().Warn("exec build command failed", "session", sessionID, "err", err)
-		ex.result(ctx, ws, nil, false, time.Since(start).Milliseconds(), "BAD_PAYLOAD")
+		ex.result(ctx, ws, nil, false, time.Since(start).Milliseconds(), "BAD_PAYLOAD", false)
 		return
 	}
 
 	host := ex.host()
 	if host == nil {
-		ex.result(ctx, ws, nil, false, time.Since(start).Milliseconds(), CodeCoreUnavailable)
+		ex.result(ctx, ws, nil, false, time.Since(start).Milliseconds(), CodeCoreUnavailable, false)
 		return
 	}
 	proc, err := host.CreateShell(ShellSpec{
@@ -133,7 +136,7 @@ func (ex *Exec) Handle(ctx context.Context, ws *websocket.Conn, sessionID string
 			code = she.Code
 		}
 		ex.logger().Warn("exec create shell rejected", "session", sessionID, "code", code)
-		ex.result(ctx, ws, nil, false, time.Since(start).Milliseconds(), code)
+		ex.result(ctx, ws, nil, false, time.Since(start).Milliseconds(), code, false)
 		return
 	}
 
@@ -157,7 +160,12 @@ func (ex *Exec) Handle(ctx context.Context, ws *websocket.Conn, sessionID string
 	}()
 
 	timedOut := make(chan struct{}, 1)
+	var timerFired atomic.Bool
 	timer := time.AfterFunc(deadline, func() {
+		// 原子置位先于投递(T5 竞态修):EXIT 与定时器同时就绪时,
+		// select 随机选分支,exit 分支经 timerFired 仍能判超时——
+		// 本地定时器已发射即视为超时终态,无论 EXIT 处理先后。
+		timerFired.Store(true)
 		// 非阻塞投递:xnc-shell 自带同参超时(shellhost 杀树),本定时
 		// 器只驱动 TimedOut 上报;杀树统一走下方 select 的 Kill 路径,
 		// 保证单次 Kill(重复 Kill 在对端已终结时会阻塞写)。
@@ -173,14 +181,11 @@ func (ex *Exec) Handle(ctx context.Context, ws *websocket.Conn, sessionID string
 	exit := proc.Exit()
 	select {
 	case code := <-exit:
-		// shellhost 侧超时先杀时,EXIT 与本地定时器竞争:以 timed 位
-		// 为准(超时终态 ExitCode=null,镜像旧语义)。
-		select {
-		case <-timedOut:
+		// 定时器已发射(含 shellhost 侧同参超时先杀的竞争)即超时终态:
+		// ExitCode=null,镜像旧语义。
+		if timerFired.Load() {
 			timed = true
-		default:
-		}
-		if !timed && code < 0x80000000 {
+		} else if code < 0x80000000 {
 			c := int(code)
 			exitCode = &c
 		}
@@ -199,14 +204,16 @@ func (ex *Exec) Handle(ctx context.Context, ws *websocket.Conn, sessionID string
 	case <-time.After(execWriteTimeout):
 	}
 	_ = proc.Close()
-	ex.logger().Debug("exec finished", "session", sessionID, "timedOut", timed, "durationMs", time.Since(start).Milliseconds())
-	ex.result(ctx, ws, exitCode, timed, time.Since(start).Milliseconds(), "")
+	truncated := proc.Dropped() > 0 // 超预算丢弃:marker 行已在输出末尾
+	ex.logger().Debug("exec finished", "session", sessionID, "timedOut", timed, "truncated", truncated, "durationMs", time.Since(start).Milliseconds())
+	ex.result(ctx, ws, exitCode, timed, time.Since(start).Milliseconds(), "", truncated)
 }
 
 // result 发送终态 EXEC_RESULT 并以正常关闭码收线；写失败静默（会话已死）。
 // code 非 "" = 稳定拒绝码(CORE_UNAVAILABLE / NO_ACTIVE_SESSION…)透传。
-func (ex *Exec) result(ctx context.Context, ws *websocket.Conn, code *int, timed bool, ms int64, stable string) {
-	msg, _ := proto.NewMsg(typeExecResult, proto.ExecResult{ExitCode: code, TimedOut: timed, DurationMs: ms, Code: stable})
+// truncated:输出超预算丢弃发生过(末尾已带 stderr marker 行,T5)。
+func (ex *Exec) result(ctx context.Context, ws *websocket.Conn, code *int, timed bool, ms int64, stable string, truncated bool) {
+	msg, _ := proto.NewMsg(typeExecResult, proto.ExecResult{ExitCode: code, TimedOut: timed, DurationMs: ms, Code: stable, Truncated: truncated})
 	b, _ := json.Marshal(msg)
 	wctx, cancel := context.WithTimeout(ctx, execWriteTimeout)
 	defer cancel()

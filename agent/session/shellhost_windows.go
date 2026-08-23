@@ -115,11 +115,18 @@ func (h *coreShellHost) CreateShell(spec ShellSpec) (ShellProc, error) {
 		if errors.As(err, &rej) {
 			return nil, &ShellHostError{Code: rej.Code}
 		}
-		// 连接级故障(core 消失于请求中途):下次重拨。
-		_ = c.Close()
-		h.mu.Lock()
-		h.client = nil
-		h.mu.Unlock()
+		// 连接级故障(T5 定向修):不无条件收线共享连接——单次超时
+		// (连接仍健康)时硬 Close 会把并发在飞 RPC 打成伪
+		// CORE_UNAVAILABLE。改为 Ping 探活:确实已死才丢弃引用
+		// (在飞 RPC 已/将收到真实读错误),健康则保留,下次复用。
+		if _, perr := c.Ping(); perr != nil {
+			_ = c.Close()
+			h.mu.Lock()
+			if h.client == c {
+				h.client = nil
+			}
+			h.mu.Unlock()
+		}
 		return nil, &ShellHostError{Code: CodeCoreUnavailable}
 	}
 	conn, err := shellpipe.Dial(pipeName, shellSecret)
@@ -129,6 +136,10 @@ func (h *coreShellHost) CreateShell(spec ShellSpec) (ShellProc, error) {
 			h.log.Warn("shellhost: orphan kill_shell failed", "pid", pid)
 		}
 		return nil, &ShellHostError{Code: CodeCoreUnavailable}
+	}
+	if !spec.Interactive {
+		// oneshot(exec):启用每流 4MB 输出预算(T5 截断诚实化)。
+		conn.SetExecBudget(0)
 	}
 	return &coreShellProc{host: h, conn: conn, pid: pid}, nil
 }
@@ -171,6 +182,9 @@ func (p *coreShellProc) Stream() <-chan ShellStream {
 }
 
 func (p *coreShellProc) Exit() <-chan uint32 { return p.conn.ExitCh() }
+
+// Dropped 返回 oneshot 路径超预算丢弃字节数(interactive 恒 0)。
+func (p *coreShellProc) Dropped() uint64 { return p.conn.DroppedBytes() }
 
 var _ ShellProc = (*coreShellProc)(nil)
 var _ ShellHost = (*coreShellHost)(nil)

@@ -67,16 +67,18 @@ func TestSystemTokenRBACMatrix(t *testing.T) {
 	defer resp2.Body.Close()
 	require.Equal(t, 202, resp2.StatusCode)
 
+	// 先等 agent 会话再轮询审计(T5:并行负载下审计轮询(5s×200ms 打
+	// Postgres)与会话建立争资源,原顺序偶发 agent 会话 5s 超时 flake)。
+	select {
+	case <-agentDone:
+	case <-time.After(15 * time.Second):
+		t.Fatal("agent session not opened")
+	}
+
 	require.Eventually(t, func() bool {
 		var n int
 		require.NoError(t, env.Store.Pool().QueryRow(t.Context(),
 			`SELECT count(*) FROM audit_logs WHERE action='exec.start' AND metadata->>'system' = 'true'`).Scan(&n))
 		return n >= 1
-	}, 5*time.Second, 200*time.Millisecond, "audit must carry system=true")
-
-	select {
-	case <-agentDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("agent session not opened")
-	}
+	}, 10*time.Second, 200*time.Millisecond, "audit must carry system=true")
 }

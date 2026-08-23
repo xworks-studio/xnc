@@ -101,6 +101,10 @@ type ExecResult struct {
 	TimedOut   bool   `json:"timedOut"`
 	DurationMs int64  `json:"durationMs"`
 	Code       string `json:"code,omitempty"`
+	// Truncated(M2-Slice2 T5):oneshot 输出超出背压预算发生丢弃时为
+	// true,且输出流末尾带 stderr 标记行 "[xnc] output truncated: N
+	// bytes dropped"(加字段,旧 client 忽略)。
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 // ShellParams 会话 Params 的 shell 形态；Cols/Rows 为 0 时用默认 120x30，
