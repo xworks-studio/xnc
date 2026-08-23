@@ -349,6 +349,15 @@ export default function DesktopLive() {
     emitMove(e); // buttons mask no longer has the released bit
   };
 
+  const onPointerCancel = (e: ReactPointerEvent<HTMLDivElement>) => {
+    // Browser ate the interaction (touch palm, pen, alt-tab…): event.buttons
+    // is 0 here and no up will ever come — send an explicit all-buttons-up
+    // MOVE so the remote side does not keep the press held down.
+    if (!ioRef.current.lease) return;
+    const p = pointerToStream(e);
+    if (p) sendMove(p.x, p.y, 0);
+  };
+
   const onContextMenu = (e: ReactMouseEvent) => {
     // Right-click belongs to the remote desktop while the lease is held.
     if (ioRef.current.lease) e.preventDefault();
@@ -785,6 +794,7 @@ export default function DesktopLive() {
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
+        onPointerCancel={onPointerCancel}
         onWheel={onWheel}
         onContextMenu={onContextMenu}
       >

@@ -360,14 +360,31 @@ func (c *inputController) attach(pub *Publisher) error {
 }
 
 // grantLease 向本会话的表请求并记录 leaseID(撤销后表自然拒绝旧 id)。
+// notify 外再包一层 onLeaseRevoked:撤销时清空本会话的 down 键/钮跟踪——
+// 旧持有者随后的 WS 关闭不得再合成 up 抬掉新持有者按下的同键(T3 review
+// Minor 2);物理残留由 host 侧 janitor(>30s 强制 KeyUp)兜底。
 func (c *inputController) grantLease(notify func(reason string)) (string, bool) {
-	id, ok := c.tbl.request(notify)
+	id, ok := c.tbl.request(func(reason string) {
+		c.onLeaseRevoked()
+		if notify != nil {
+			notify(reason)
+		}
+	})
 	if ok {
 		c.mu.Lock()
 		c.leaseID = id
 		c.mu.Unlock()
 	}
 	return id, ok
+}
+
+// onLeaseRevoked 清空本会话的 down 键/钮跟踪(lease 已撤销;本会话
+// close() 的合成释放从此为空集)。幂等;lease 有效性仍以表判定为准。
+func (c *inputController) onLeaseRevoked() {
+	c.mu.Lock()
+	c.heldKeys = map[uint32]struct{}{}
+	c.heldBtns = map[uint8]struct{}{}
+	c.mu.Unlock()
 }
 
 // currentLease 返回当前记录的 leaseID(可能已被撤销——以表判定为准)。

@@ -499,7 +499,11 @@ func TestInputLoopbackSequence(t *testing.T) {
 	}
 
 	// 输入序列:MOVE(mouse 通道)→ BUTTON/KEY/TEXT/LOCK(input 通道)。
+	// mouse 通道不可靠无序,与 input 通道无跨通道保序——先等 MOVE 到达
+	// 再发 input 突发,否则 BUTTON(seq2)先到会把 MOVE(seq1)判 staleSeq
+	// 丢弃(seq 单调是跨通道一个计数器,by design;本测试钉顺序)。
 	vs.sendDC(dcLabelMouse, encMouseMsg(1, 100, 200, 1))
+	waitCount(t, host, 1)
 	vs.sendDC(dcLabelInput, encInputMsg(2, inputTypeButton, []byte{1, 1}))
 	vs.sendDC(dcLabelInput, encInputMsg(3, inputTypeKey, keyPayload(0x1E, 1, 0)))
 	vs.sendDC(dcLabelInput, encInputMsg(4, inputTypeText, textPayload([]uint16{0x68, 0x4E2D})))

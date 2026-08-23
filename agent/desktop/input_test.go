@@ -411,6 +411,71 @@ func TestHeldKeyReleaseOnClose(t *testing.T) {
 	waitCount(t, src.host, 6)
 }
 
+// TestIdleRevokeClearsHeldTracking(T3 review Minor 2 回归):持有者按住键
+// → idle 撤销 → 新持有者按下同键 → 旧持有者 WS 关闭不得合成 up 抬掉新
+// 持有者的键。撤销即清跟踪;物理残留由 host 侧 janitor 兜底。假时钟驱动
+// (controller 与 lease 表共享 manualTimerQueue),idle 只在推进时钟时发生。
+func TestIdleRevokeClearsHeldTracking(t *testing.T) {
+	c, src, tbl := newTestController(t, 9)
+	clock := time.Unix(0, 0)
+	c.now = func() time.Time { return clock }
+	q := &manualTimerQueue{now: c.now}
+	c.after = q.after
+	tbl.now, tbl.after = c.now, q.after
+	tbl.idle = 30 * time.Second
+
+	revoked := make(chan string, 1)
+	if _, ok := c.grantLease(func(r string) { revoked <- r }); !ok {
+		t.Fatal("grant failed")
+	}
+	// 旧持有者按下 A;30s 无输入 → idle 撤销。
+	c.handleInput(encInputMsg(1, inputTypeKey, keyPayload(0x1E, 1, 0)))
+	waitCount(t, src.host, 1)
+	clock = clock.Add(tbl.idle + time.Millisecond)
+	q.fireDue()
+	select {
+	case r := <-revoked:
+		if r != "idle" {
+			t.Fatalf("revoke reason = %q, want idle", r)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("idle revoke never fired")
+	}
+
+	// 新持有者(共享同一 lease 表/同一 host 全局键态)取得 lease 并按下 A。
+	src2 := &inputFakeSource{host: src.host, subID: 10,
+		frameCh: make(chan Frame, 8), stateCh: make(chan StateEvent, 4),
+		cursorCh: make(chan CursorEvent, 4), done: make(chan struct{})}
+	c2 := newInputController(src2, tbl, slog.Default())
+	c2.now, c2.after = c.now, q.after
+	if _, ok := c2.grantLease(nil); !ok {
+		t.Fatal("re-grant after idle revoke failed")
+	}
+	c2.handleInput(encInputMsg(1, inputTypeKey, keyPayload(0x1E, 1, 0)))
+	waitCount(t, src.host, 2)
+	if !tbl.allows(c2.currentLease()) {
+		t.Fatal("new holder must hold the lease")
+	}
+
+	// 旧持有者现在才断连(close 同步完成):不得合成任何 up。
+	c.close()
+	recs := src.host.records()
+	if len(recs) != 2 {
+		t.Fatalf("old holder close synthesized %d extra msgs: %+v", len(recs)-2, recs[2:])
+	}
+	last := recs[1]
+	if last.Type != inputTypeKey || last.Scan != 0x1E || last.Down != 1 || last.SubID != 10 {
+		t.Fatalf("new holder key-down must be the last host record: %+v", last)
+	}
+	// 新持有者随后正常 close(未 idle):仍应释放自己的键(修复不破坏正常路径)。
+	c2.close()
+	waitCount(t, src.host, 3)
+	up := src.host.records()[2]
+	if up.Type != inputTypeKey || up.Scan != 0x1E || up.Down != 0 || up.SubID != 10 {
+		t.Fatalf("new holder synthetic up = %+v", up)
+	}
+}
+
 // waitCount 轮询 host 记录数到 n(转发异步经 controller 锁外计数)。
 func waitCount(t *testing.T, h *inputHost, n int) {
 	t.Helper()
