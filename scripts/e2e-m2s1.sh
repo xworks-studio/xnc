@@ -358,7 +358,7 @@ if ! node -e 'const j=require(process.argv[1]);console.log((j.input&&j.input.ste
   run_gate1
 fi
 G1_STEPS=$(node -e 'const j=require(process.argv[1]);console.log((j.input&&j.input.steps||[]).every(s=>s.ok)?1:0)' "$ART/g1-uac.json" 2>/dev/null || echo 0)
-gate "1-input-steps-ok" "$G1_STEPS" "lease+Enter steps ok${G1_RETRY_NOTE} err=$(node -e 'const j=require(process.argv[1]);console.log(j.input&&j.input.err?j.input.err:"none")' "$ART/g1-uac.json" 2>/dev/null)"
+gate "1-input-steps-ok" "$G1_STEPS" "lease+Alt+Y steps ok${G1_RETRY_NOTE} err=$(node -e 'const j=require(process.argv[1]);console.log(j.input&&j.input.err?j.input.err:"none")' "$ART/g1-uac.json" 2>/dev/null)"
 G1_PROMPT=$([ "${G1_CONSENT_UP:-0}" -ge 1 ] && echo 1 || echo 0)
 gate "1-prompt-observed" "$G1_PROMPT" "consent.exe procs at t+9: ${G1_CONSENT_UP:-?} (secure desktop up, before Enter)"
 node -e '

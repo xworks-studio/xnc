@@ -86,3 +86,8 @@
 - err_rebuilt 重建风暴退避(run-3 发现,~3010 gen bump/2s,自愈)→ Slice2 候选
 - GDI CRC 行采样灵敏度(小面积变化漏检,静态帧数低)→ Slice2 观察项
 - 绝对 cursor 时延 / wired 链路门 → 沿用 slice3 既定顺延
+
+## 收尾勘误(2026-08-23, controller)
+- 面板分辨率已实际恢复 2880x1800(session-1 setres 实查 `as=LABS w=2880 h=1800`;经 session-1 schtasks ChangeDisplaySettingsW rc=0)。
+- session-0 SYSTEM 上下文的一切 `1024x768` 读数(含 run-5 preflight 与本文档此前表述)为 DPI 虚拟化假象(T1 已知:非感知查询在 200% 节点恒报 1024x768)——所有分辨率断言以 session-1 EnumDisplaySettings 为准。run-3 事故后面板是否真曾被降档无法回溯,现态已确证。
+- 顺带修正:T6 review 所列文档小错(⑥ 3 门非 4/4、keyA 1931ms 非 19.3s、头注释 Enter→Alt+Y)一并以下方小提交修正。
