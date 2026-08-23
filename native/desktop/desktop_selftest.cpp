@@ -4286,6 +4286,22 @@ int SelftestMain() {
     CHECK("disp-primary",
           table.size() == 3 && table[1].primary == 1 && table[0].primary == 0);
 
+    // Task 6 ⑤:期望选择解析——过期选择(idx 越界,显示器拔掉/表收缩)
+    // 回落 primary 而非拒绝;auto=primary;显式有效选择保持。
+    bool stale = true;
+    CHECK("sel-explicit", xnc::ResolveDisplayIndex(2, table, &stale) == 2 && !stale);
+    CHECK("sel-auto-primary",
+          xnc::ResolveDisplayIndex(xnc::kDisplaySelectAuto, table, &stale) == 1 &&
+          !stale);
+    CHECK("sel-stale-falls-back-primary",
+          xnc::ResolveDisplayIndex(9, table, &stale) == 1 && stale);
+    const std::vector<xnc::DisplayInfo> noprimary = {
+        {0, 0, 0, 640, 480, 0, 1}, {1, 640, 0, 640, 480, 0, 2}};
+    CHECK("sel-stale-falls-back-zero",
+          xnc::ResolveDisplayIndex(5, noprimary, &stale) == 0 && stale);
+    CHECK("sel-empty-table",
+          xnc::ResolveDisplayIndex(1, {}, &stale) == 0 && !stale);
+
     // HOST_HELLO displays 块黄金字节(兼容扩展:legacy 20B 前缀不变)。
     xnc::HostHelloPayload hh;
     hh.gen = 7; hh.w = 1920; hh.h = 1080; hh.fps = 30; hh.max_subs = 4;

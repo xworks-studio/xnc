@@ -151,6 +151,22 @@ inline std::vector<DisplayInfo> BuildDisplayTable(
 // primary-first keeps single-display nodes identical).
 inline constexpr uint32_t kDisplaySelectAuto = 0xFFFFFFFFu;
 
+// Resolves the index the NEXT Init binds: an explicit in-range selection
+// wins; a STALE selection (desired >= table.size() - monitor unplugged /
+// table shrank / session rebuild lost outputs) falls back to primary, else
+// table entry 0. *stale reports the fallback (Init logs + resets to auto).
+inline uint32_t ResolveDisplayIndex(uint32_t desired,
+                                    const std::vector<DisplayInfo>& table,
+                                    bool* stale = nullptr) {
+  if (stale) *stale = false;
+  if (table.empty()) return 0;
+  if (desired != kDisplaySelectAuto && desired < table.size()) return desired;
+  if (stale) *stale = desired != kDisplaySelectAuto;
+  for (const auto& d : table)
+    if (d.primary) return d.idx;
+  return 0;
+}
+
 // Snapshot of the process-global displays table (refreshed on every
 // DxgiCapture::Init; empty when DXGI enumeration never ran). Thread-safe.
 std::vector<DisplayInfo> DxgiDisplaysSnapshot();

@@ -315,22 +315,15 @@ bool DxgiCapture::Init(std::string* err) {
   //    pre-Task-5 "first duplicable output" family); an explicit selection
   //    (MSG_SWITCH_DISPLAY -> DxgiSelectDisplay) binds at the NEXT rebuild.
   uint32_t want = 0;
+  bool stale = false;
   {
     std::lock_guard<std::mutex> lk(g_disp_mu);
-    if (g_desired != kDisplaySelectAuto) {
-      want = g_desired;
-    } else {
-      want = 0;
-      for (const auto& d : table)
-        if (d.primary) { want = d.idx; break; }
-    }
+    want = ResolveDisplayIndex(g_desired, table, &stale);
+    if (stale) g_desired = kDisplaySelectAuto;  // one-time fallback, then auto
   }
-  if (want >= table.size()) {
-    char buf[64];
-    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "display index %u out of range (%zu)",
-                want, table.size());
-    if (err) *err = buf;
-    return false;
+  if (stale) {
+    XNC_LOG_INFO("dxgi stale display selection (table=%zu) -> primary fallback idx=%u",
+                 table.size(), want);
   }
   std::vector<EnumeratedOutput*> ordered = OrderOutputsByTable(&outs, table);
 
