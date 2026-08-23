@@ -29,8 +29,90 @@
 #include <cstring>
 #include <cwchar>
 #include <thread>
+#include <vector>
 static int fails = 0;
 #define CHECK(name, cond) do { if (!(cond)) { std::printf("SELFTEST FAIL: %s\n", name); fails++; } } while (0)
+
+// ---- M2-Slice1 Task 4 fakes: scripted WTS session + fake capture spawn /
+// terminate / SendSAS (loopback block 2 + the poll-mode monitor test). The
+// fakes run on the SERVER thread (spawn/terminate) or monitor thread
+// (session fn); the assertions below read them only after the matching
+// response frame arrived, which orders the accesses.
+static std::atomic<DWORD> s_script_session{0};
+static DWORD WINAPI ScriptSessionFn() { return s_script_session.load(); }
+
+static std::vector<HANDLE> s_spawn_events;       // in spawn order (server thread)
+static std::atomic<int> s_spawn_count{0};
+static std::vector<HANDLE> s_terminated_events;  // terminate order (server thread)
+static std::atomic<int> s_sas_calls{0};
+static std::atomic<int> s_sas_as_user{-1};
+
+// Fake child = manual-reset NON-signaled event: WaitForSingleObject(h,0)
+// is WAIT_TIMEOUT (models "running"), and the detached WatchCaptureChild's
+// INFINITE wait unblocks exactly when the fake terminate signals it.
+static xnc::CaptureSpawnResult FakeCaptureSpawn(uint32_t, const wchar_t*,
+                                                const uint8_t*,
+                                                xnc::Watchdog*) {
+  HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  s_spawn_events.push_back(ev);
+  s_spawn_count.fetch_add(1);
+  xnc::CaptureSpawnResult r;
+  r.ok = true;
+  r.pid = 0x3000 + static_cast<DWORD>(s_spawn_count.load());
+  r.child = ev;
+  return r;
+}
+static BOOL WINAPI FakeTerminateProcess(HANDLE h, UINT) {
+  s_terminated_events.push_back(h);
+  SetEvent(h);  // "the process exited" -> the watcher reaps + closes
+  return TRUE;
+}
+static void WINAPI FakeSendSas(BOOL as_user) {
+  s_sas_as_user.store(static_cast<int>(as_user));
+  s_sas_calls.fetch_add(1);
+}
+static xnc::SasSendFn NullResolveSendSas() { return nullptr; }
+
+// Loopback server for block 2 (same shape as block 1's inline Loop: real
+// ServeConnection on a permissive TEST-ONLY DACL pipe).
+struct Loop2 {
+  const wchar_t* name;
+  const uint8_t* secret;
+  size_t secret_len;
+  std::atomic<bool> created{false}, handshake_ok{false};
+  uint32_t client_pid = 0;
+  void Run() {
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:P(A;;GA;;;WD)", SDDL_REVISION_1, &sd, nullptr))
+      return;
+    SECURITY_ATTRIBUTES sa{sizeof(sa), sd, FALSE};
+    HANDLE pipe = CreateNamedPipeW(name,
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1,
+        64 * 1024, 64 * 1024, 0, &sa);
+    LocalFree(sd);
+    if (pipe == INVALID_HANDLE_VALUE) return;
+    created = true;
+    HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    OVERLAPPED ov{};
+    ov.hEvent = ev;
+    BOOL connected = ConnectNamedPipe(pipe, &ov);
+    DWORD err = connected ? 0 : GetLastError();
+    bool ok = connected || err == ERROR_PIPE_CONNECTED;
+    if (!ok && err == ERROR_IO_PENDING && ev)
+      ok = WaitForSingleObject(ev, 10000) == WAIT_OBJECT_0;
+    if (ev) CloseHandle(ev);
+    if (ok) {
+      xnc::Watchdog wd;  // not Start()ed: Heartbeat target only
+      handshake_ok = xnc::ServeConnection(pipe, &wd, secret, secret_len,
+                                          &client_pid);
+    }
+    FlushFileBuffers(pipe);
+    DisconnectNamedPipe(pipe);
+    CloseHandle(pipe);
+  }
+};
 
 int SelftestMain() {
     using namespace xnc;
@@ -310,6 +392,270 @@ int SelftestMain() {
         server_thread.join();
         CHECK("loopback-server-handshake", srv.handshake_ok.load());
         CHECK("loopback-server-saw-pid", srv.client_pid == GetCurrentProcessId());
+      }
+    }
+    { // M2-Slice1 Task 4, part 1: WTS reason table, reuse decision table,
+      // live getter parity, and the poll-mode monitor with a scripted
+      // session source (notification leg = real message window + WTS
+      // registration: compiles here, live-verified on XIAOXIN in T6).
+      CHECK("wts-reason-map",
+            std::strcmp(WtsChangeReasonForCode(WTS_CONSOLE_CONNECT), "console_connect") == 0 &&
+            std::strcmp(WtsChangeReasonForCode(WTS_CONSOLE_DISCONNECT), "console_disconnect") == 0 &&
+            std::strcmp(WtsChangeReasonForCode(WTS_REMOTE_CONNECT), "remote_connect") == 0 &&
+            std::strcmp(WtsChangeReasonForCode(WTS_REMOTE_DISCONNECT), "remote_disconnect") == 0 &&
+            std::strcmp(WtsChangeReasonForCode(WTS_SESSION_LOGON), "session_logon") == 0 &&
+            std::strcmp(WtsChangeReasonForCode(WTS_SESSION_LOGOFF), "session_logoff") == 0 &&
+            std::strcmp(WtsChangeReasonForCode(WTS_SESSION_LOCK), "session_lock") == 0 &&
+            std::strcmp(WtsChangeReasonForCode(WTS_SESSION_UNLOCK), "session_unlock") == 0 &&
+            std::strcmp(WtsChangeReasonForCode(WTS_SESSION_REMOTE_CONTROL), "remote_control") == 0);
+      CHECK("wts-reason-unknown",
+            std::strcmp(WtsChangeReasonForCode(9999), "unknown") == 0);
+      // Reuse decision (pure table): no live child -> fresh; live child in
+      // the CURRENT session -> reuse; live child elsewhere (console moved,
+      // incl. "no console" 0xFFFFFFFF) -> terminate + respawn.
+      CHECK("reuse-fresh-invalid",
+            DecideCaptureReuse(false, false, 1, 1) == CaptureReuse::kFresh);
+      CHECK("reuse-fresh-exited",
+            DecideCaptureReuse(true, false, 1, 1) == CaptureReuse::kFresh);
+      CHECK("reuse-same-session",
+            DecideCaptureReuse(true, true, 1, 1) == CaptureReuse::kReuse);
+      CHECK("reuse-stale-1-2",
+            DecideCaptureReuse(true, true, 1, 2) == CaptureReuse::kRespawnStaleSession);
+      CHECK("reuse-stale-2-1",
+            DecideCaptureReuse(true, true, 2, 1) == CaptureReuse::kRespawnStaleSession);
+      CHECK("reuse-stale-no-console",
+            DecideCaptureReuse(true, true, 1, 0xFFFFFFFFu) == CaptureReuse::kRespawnStaleSession);
+      // Not-started monitor: the getter falls back to the live API value
+      // (StartCapture keeps pre-Task4 semantics when no monitor runs).
+      CHECK("wts-getter-live",
+            CoreWts().console_session() == WTSGetActiveConsoleSessionId());
+
+      // Poll-mode monitor: scripted session source, 10ms poll.
+      s_script_session.store(7);
+      WtsMonitor::Opts wo;
+      wo.use_notifications = false;
+      wo.poll_ms = 10;
+      wo.session_fn = &ScriptSessionFn;
+      std::atomic<int> fired{0};
+      WtsSessionChange got{};
+      wo.on_change = [&fired, &got](const WtsSessionChange& c) { got = c; fired++; };
+      WtsMonitor mon(wo);
+      CHECK("wts-start", mon.Start());
+      for (int i = 0; i < 300 && mon.console_session() != 7; i++) Sleep(10);
+      CHECK("wts-prime", mon.console_session() == 7);
+      Sleep(80);  // several polls on the same value: baseline never fires
+      CHECK("wts-baseline-no-fire", fired.load() == 0);
+      s_script_session.store(9);
+      for (int i = 0; i < 300 && fired.load() == 0; i++) Sleep(10);
+      CHECK("wts-poll-detect",
+            fired.load() == 1 && got.from == 7 && got.to == 9 &&
+            std::strcmp(got.reason, "poll") == 0);
+      CHECK("wts-changes-count", mon.changes() == 1);
+      Sleep(80);  // steady value: still exactly one change
+      CHECK("wts-steady-no-fire", fired.load() == 1);
+      CHECK("wts-getter-cached", mon.console_session() == 9);
+      mon.Stop();
+      mon.Stop();  // idempotent
+      CHECK("wts-restart", mon.Start() && (mon.Stop(), true));
+      // Shutdown-race pin: Stop immediately after Start with the
+      // NOTIFICATION leg enabled must terminate within the sliced wait
+      // (a blocking GetMessage loop would hang this test - the window may
+      // not exist yet when Stop's PostMessage is skipped). Real window on
+      // this box; live leg behavior (registration lines) verified in T4/T6.
+      {
+        WtsMonitor m2;  // defaults: 500ms poll, notifications on
+        CHECK("wts-start-notify", m2.Start());
+        m2.Stop();
+        CHECK("wts-stop-race-no-hang", !m2.running());
+      }
+    }
+    { // M2-Slice1 Task 4, part 2: SAS gate matrix + StartCapture session
+      // unification / respawn on a SECOND loopback against the REAL
+      // ServeConnection, with the fake spawn/terminate/session/SAS seams
+      // injected (no real token mint, no real xnc-desktop, no real sas.dll).
+      using namespace xnc;
+      const uint8_t secret[16] = {'t','e','s','t','-','p','i','p','e','-','s','e','c','r','e','t'};
+      wchar_t name[96];
+      std::swprintf(name, 96, L"\\\\.\\pipe\\xnc-core-selftest2-%lu", GetCurrentProcessId());
+      Loop2 srv{name, secret, sizeof(secret)};
+      std::thread server_thread([&srv] { srv.Run(); });
+      for (int i = 0; i < 200 && !srv.created.load(); i++) Sleep(10);
+      CHECK("loop2-pipe-created", srv.created.load());
+      HANDLE c = CreateFileW(name, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                             OPEN_EXISTING, 0, nullptr);
+      if (c == INVALID_HANDLE_VALUE) {
+        std::printf("SELFTEST FAIL: %s (err=%lu)\n", "loop2-client-open", GetLastError());
+        fails++;
+        server_thread.join();
+      } else {
+        auto get32 = [](const std::vector<uint8_t>& p, size_t off) {
+          return static_cast<uint32_t>(p[off]) |
+                 static_cast<uint32_t>(p[off + 1]) << 8 |
+                 static_cast<uint32_t>(p[off + 2]) << 16 |
+                 static_cast<uint32_t>(p[off + 3]) << 24;
+        };
+        // client handshake half (same as block 1)
+        uint8_t nonce[16]; for (int i = 0; i < 16; i++) nonce[i] = (uint8_t)(i * 5 + 3);
+        CHECK("loop2-hello", WriteFrame(c, Frame{0, kMsgHello, 0, EncodeHello(GetCurrentProcessId(), nonce)}));
+        Frame hp;
+        CHECK("loop2-read-proof", ReadFrame(c, hp) == DecodeResult::Ok && hp.message_type == kMsgHelloProof);
+        uint32_t spid = 0; uint8_t snonce[16], sproof[32], want[32];
+        CHECK("loop2-verify-server",
+              DecodeHelloProof(hp, spid, snonce, sproof) == DecodeResult::Ok &&
+              HmacSha256(secret, sizeof(secret), nonce, 16, want) &&
+              std::memcmp(want, sproof, 32) == 0);
+        uint8_t myproof[32];
+        CHECK("loop2-send-proof", HmacSha256(secret, sizeof(secret), snonce, 16, myproof) &&
+                                  WriteFrame(c, Frame{0, kMsgProof, 0, EncodeProof(myproof)}));
+
+        // ---- 0x0110 SAS gate matrix ----
+        auto sas_payload = [](const char* r) {
+          std::vector<uint8_t> p(kSasReasonLen, 0);
+          for (size_t i = 0; i + 1 < kSasReasonLen && r[i] != '\0'; i++)
+            p[i] = static_cast<uint8_t>(r[i]);
+          return p;
+        };
+        SetSasAllowed(false);           // default gate state
+        SetSasSendForTest(nullptr);
+        SetSasResolveForTest(nullptr);
+
+        CHECK("sas-badpayload-send",
+              WriteFrame(c, Frame{0, kMsgSas, 21, std::vector<uint8_t>(23, 'x')}));
+        Frame s1;
+        CHECK("sas-badpayload",
+              ReadFrame(c, s1) == DecodeResult::Ok && s1.message_type == kMsgSas &&
+              (s1.flags & (kFlagResponse | kFlagError)) == (kFlagResponse | kFlagError) &&
+              s1.request_id == 21 && s1.payload.size() == 11 &&
+              std::memcmp(s1.payload.data(), "BAD_PAYLOAD", 11) == 0);
+
+        const uint32_t audit0 = SasAuditCount();
+        SasAuditEvent ae;
+        CHECK("sas-denied-send", WriteFrame(c, Frame{0, kMsgSas, 22, sas_payload("lock-screen")}));
+        Frame s2;
+        CHECK("sas-denied",
+              ReadFrame(c, s2) == DecodeResult::Ok && s2.message_type == kMsgSas &&
+              (s2.flags & kFlagError) != 0 && s2.request_id == 22 &&
+              s2.payload.size() == 10 &&
+              std::memcmp(s2.payload.data(), "SAS_DENIED", 10) == 0);
+        CHECK("sas-denied-audit",
+              SasAuditCount() == audit0 + 1 && SasAuditLast(&ae) &&
+              !ae.allowed && !ae.attempted &&
+              std::strcmp(ae.action, "sas_denied") == 0 &&
+              std::strcmp(ae.reason, "lock-screen") == 0);
+
+        SetSasAllowed(true);            // --allow-sas
+        SetSasSendForTest(&FakeSendSas);
+        s_sas_calls.store(0); s_sas_as_user.store(-1);
+        CHECK("sas-allowed-send", WriteFrame(c, Frame{0, kMsgSas, 23, sas_payload("e2e-viewer")}));
+        Frame s3;
+        CHECK("sas-allowed-ok",
+              ReadFrame(c, s3) == DecodeResult::Ok && s3.message_type == kMsgSas &&
+              (s3.flags & kFlagResponse) != 0 && (s3.flags & kFlagError) == 0 &&
+              s3.request_id == 23 && s3.payload.size() == 4 && get32(s3.payload, 0) == 0);
+        CHECK("sas-stub-called-once",
+              s_sas_calls.load() == 1 && s_sas_as_user.load() == 0 /*AsUser=FALSE*/);
+        CHECK("sas-sent-audit-reason-passthrough",
+              SasAuditCount() == audit0 + 2 && SasAuditLast(&ae) &&
+              ae.allowed && ae.attempted && ae.hr == 0 &&
+              std::strcmp(ae.action, "sas_sent") == 0 &&
+              std::strcmp(ae.reason, "e2e-viewer") == 0);
+
+        SetSasSendForTest(nullptr);
+        SetSasResolveForTest(&NullResolveSendSas);   // sas.dll unresolvable
+        CHECK("sas-unavailable-send", WriteFrame(c, Frame{0, kMsgSas, 24, sas_payload("no-dll")}));
+        Frame s4;
+        CHECK("sas-unavailable",
+              ReadFrame(c, s4) == DecodeResult::Ok &&
+              (s4.flags & kFlagError) != 0 && s4.request_id == 24 &&
+              s4.payload.size() == 15 &&
+              std::memcmp(s4.payload.data(), "SAS_UNAVAILABLE", 15) == 0);
+        CHECK("sas-unavailable-audit",
+              SasAuditCount() == audit0 + 3 && SasAuditLast(&ae) &&
+              std::strcmp(ae.action, "sas_unavailable") == 0);
+        SetSasAllowed(false);
+        SetSasResolveForTest(nullptr);
+
+        // ---- StartCapture session unification + respawn (fake spawn) ----
+        s_script_session.store(1);
+        CoreWts().SetSessionFnForTest(&ScriptSessionFn);
+        SetCaptureSpawnForTest(&FakeCaptureSpawn);
+        SetTerminateForTest(&FakeTerminateProcess);
+        s_spawn_events.clear();
+        s_terminated_events.clear();
+        s_spawn_count.store(0);
+
+        CHECK("sc-fake-start-send",
+              WriteFrame(c, Frame{0, kMsgStartCapture, 30, {0x01,0,0,0, 0,0,0,0}}));
+        Frame r30;
+        CHECK("sc-fake-start",
+              ReadFrame(c, r30) == DecodeResult::Ok && r30.message_type == kMsgStartCapture &&
+              (r30.flags & kFlagError) == 0 && r30.payload.size() > 36 &&
+              get32(r30.payload, r30.payload.size() - 4) == 1 &&   // gen 1
+              s_spawn_count.load() == 1);
+        const uint32_t pidA = get32(r30.payload, 0);
+
+        CHECK("sc-fake-reuse-send",
+              WriteFrame(c, Frame{0, kMsgStartCapture, 31, {0x01,0,0,0, 0,0,0,0}}));
+        Frame r31;
+        CHECK("sc-fake-reuse",
+              ReadFrame(c, r31) == DecodeResult::Ok &&
+              get32(r31.payload, r31.payload.size() - 4) == 1 &&   // still gen 1
+              get32(r31.payload, 0) == pidA &&                     // same child
+              s_spawn_count.load() == 1);                          // no respawn
+
+        s_script_session.store(2);  // console session moved under the child
+        CHECK("sc-respawn-send",
+              WriteFrame(c, Frame{0, kMsgStartCapture, 32, {0x02,0,0,0, 0,0,0,0}}));
+        Frame r32;
+        CHECK("sc-respawn-on-session-change",
+              ReadFrame(c, r32) == DecodeResult::Ok &&
+              get32(r32.payload, r32.payload.size() - 4) == 2 &&   // gen 2
+              get32(r32.payload, 0) != pidA &&                     // new child
+              s_spawn_count.load() == 2);
+        CHECK("sc-respawn-terminated-old-scoped",
+              s_terminated_events.size() == 1 &&
+              s_terminated_events[0] == s_spawn_events[0]);        // old HANDLE
+
+        // Monitor-driven termination (production wiring calls this from the
+        // wts monitor thread; direct call = deterministic coverage).
+        WtsSessionChange chg{2, 3, "poll"};
+        OnActiveConsoleSessionChanged(chg);
+        CHECK("sc-monitor-terminated",
+              s_terminated_events.size() == 2 &&
+              s_terminated_events[1] == s_spawn_events[1]);
+        s_script_session.store(3);
+        CHECK("sc-post-monitor-send",
+              WriteFrame(c, Frame{0, kMsgStartCapture, 33, {0x03,0,0,0, 0,0,0,0}}));
+        Frame r33;
+        CHECK("sc-post-monitor-respawn",
+              ReadFrame(c, r33) == DecodeResult::Ok &&
+              get32(r33.payload, r33.payload.size() - 4) == 3 &&   // gen 3
+              s_spawn_count.load() == 3);
+
+        CHECK("sc-stop-send", WriteFrame(c, Frame{0, kMsgStopCapture, 34, {}}));
+        Frame st2;
+        CHECK("sc-stop-terminates",
+              ReadFrame(c, st2) == DecodeResult::Ok &&
+              (st2.flags & kFlagError) == 0 &&
+              s_terminated_events.size() == 3 &&
+              s_terminated_events[2] == s_spawn_events[2]);
+
+        // restore all seams (production defaults)
+        SetCaptureSpawnForTest(nullptr);
+        SetTerminateForTest(nullptr);
+        CoreWts().SetSessionFnForTest(nullptr);
+        SetSasAllowed(false);
+
+        CHECK("loop2-ping-after", WriteFrame(c, Frame{0, kMsgPing, 40, {}}));
+        Frame pong3;
+        CHECK("loop2-pong-after",
+              ReadFrame(c, pong3) == DecodeResult::Ok && pong3.message_type == kMsgPong &&
+              pong3.request_id == 40 && (pong3.flags & kFlagError) == 0);
+        CHECK("loop2-bye", WriteFrame(c, Frame{0, kMsgBye, 0, {}}));
+        CloseHandle(c);
+        server_thread.join();
+        CHECK("loop2-server-handshake", srv.handshake_ok.load());
+        CHECK("loop2-server-saw-pid", srv.client_pid == GetCurrentProcessId());
       }
     }
     if (fails==0) std::printf("selftest ok\n");

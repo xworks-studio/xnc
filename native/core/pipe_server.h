@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "../common/frame.h"
+#include "wts_monitor.h"  // WtsMonitor, WtsSessionChange (Task 4)
 
 namespace xnc {
 
@@ -37,6 +38,18 @@ constexpr size_t kMaxPipeSecretBytes = 128;
 //   kMsgStopCapture  request  (empty) -> empty FlagResponse (idempotent)
 constexpr uint16_t kMsgStartCapture = 0x0100, kMsgStopCapture = 0x0101;
 
+//   kMsgSas (M2-Slice1 Task 4) request [char reason[24]] (NUL-padded
+//   fixed field) -> ok response [u32 hr] | FlagError (SAS_DENIED /
+//   SAS_UNAVAILABLE / BAD_PAYLOAD). hr is a SYNTHESIZED HRESULT: the real
+//   sas.dll SendSAS returns VOID, so 0 (S_OK) means "the call returned
+//   without raising" - NOT proof a SAS was delivered - and a raised SEH
+//   exception surfaces as HRESULT_FROM_NT(exception code). Gate = the
+//   explicit --allow-sas console flag (default DENY + audit log line per
+//   attempt; the M2-Slice1 minimum bar - the capability ticket arrives in
+//   M2-Slice3). Audit trail accessor: SasAuditLast/SasAuditCount.
+constexpr uint16_t kMsgSas = 0x0110;
+inline constexpr size_t kSasReasonLen = 24;
+
 // Pure ok-response codec for kMsgStartCapture (little-endian layout above;
 // the pipe name is program-constructed ASCII so the utf8 pass is a plain
 // copy). Exposed so the selftest can assert the success layout byte for
@@ -55,6 +68,70 @@ int RunPipeServer(const wchar_t* pipe_name, const uint8_t* secret, size_t secret
 // true when the handshake succeeded (client_pid filled on success).
 bool ServeConnection(HANDLE pipe, Watchdog* wd, const uint8_t* secret,
                      size_t secret_len, uint32_t* client_pid);
+
+// ---- M2-Slice1 Task 4: WTS monitor + SAS gate (wts_monitor.h for the
+// monitor itself) ----
+
+// The core-wide WtsMonitor singleton (started/stopped by RunPipeServer).
+// StartCapture validates its wts argument against CoreWts().console_
+// session() - the LIVE active console session, unified with the monitor's
+// cache (replaces the bare WTSGetActiveConsoleSessionId call).
+WtsMonitor& CoreWts();
+
+// Monitor-thread callback (production wiring): on active console session
+// change, terminate a running capture child - scoped by the STORED HANDLE
+// (+ its logged pid; never by image name) - so the next StartCapture
+// re-spawns into the new session. Exported for the selftest's direct call.
+void OnActiveConsoleSessionChanged(const WtsSessionChange& change);
+
+// Capture reuse decision (pure, table-tested): given the stored child's
+// state and the live active session, reuse the child / spawn fresh /
+// terminate-and-respawn because the child sits in a stale session.
+enum class CaptureReuse { kFresh, kReuse, kRespawnStaleSession };
+CaptureReuse DecideCaptureReuse(bool child_valid, bool child_running,
+                                uint32_t child_session, uint32_t active_session);
+
+// SAS gate. SetSasAllowed is called by xnc-core's --allow-sas; the default
+// (and the M2-Slice3 service mode) is DENY with an audit line per attempt.
+void SetSasAllowed(bool allow);
+bool SasAllowed();
+
+// One audit record per 0x0110 attempt (mirror of the log line; test seam).
+struct SasAuditEvent {
+  uint32_t client_pid = 0;
+  bool allowed = false;    // gate verdict
+  bool attempted = false;  // SendSAS actually called
+  char action[20] = {0};   // sas_denied | sas_sent | sas_unavailable
+  char reason[kSasReasonLen + 1] = {0};  // NUL-terminated caller reason
+  uint32_t hr = 0;         // synthesized HRESULT (sas_sent only)
+};
+bool SasAuditLast(SasAuditEvent* out);
+uint32_t SasAuditCount();
+
+// Injectable seams (selftest only; nullptr restores the production
+// default). SendSAS type per sas.h: VOID WINAPI SendSAS(BOOL AsUser).
+using SasSendFn = void (WINAPI*)(BOOL as_user);
+using SasResolveFn = SasSendFn (*)();  // default: dynamic sas.dll resolve
+void SetSasSendForTest(SasSendFn fn);
+void SetSasResolveForTest(SasResolveFn fn);
+
+// Capture-spawn seam: everything from token minting to WaitPipeReady
+// (production default = RealCaptureSpawn). err = stable ASCII code
+// (TOKEN_FAILED / SPAWN_FAILED / INTERNAL / PIPE_TIMEOUT).
+struct CaptureSpawnResult {
+  bool ok = false;
+  DWORD pid = 0;
+  HANDLE child = nullptr;  // owned handle; the watcher thread closes it
+  char err[24] = {0};
+};
+using CaptureSpawnFn = CaptureSpawnResult (*)(uint32_t session,
+                                              const wchar_t* pipe_name,
+                                              const uint8_t* secret,
+                                              Watchdog* wd);
+void SetCaptureSpawnForTest(CaptureSpawnFn fn);
+
+// Terminate seam (default TerminateProcess); the fake records + signals.
+void SetTerminateForTest(BOOL (WINAPI* fn)(HANDLE, UINT));
 
 }  // namespace xnc
 

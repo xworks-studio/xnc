@@ -19,10 +19,15 @@
 #endif
 #include <windows.h>
 
+#include <bcrypt.h>
+
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
+#include "../common/frame.h"
+#include "../common/handshake.h"
 #include "../common/log.h"
 #include "pipe_server.h"
 #include "spawn.h"
@@ -38,6 +43,7 @@ void Usage(FILE* out) {
   std::fwprintf(out,
       L"xnc-core - XNC node core (M0)\n"
       L"usage: xnc-core.exe --console --smoke-secret <hex> [--pipe-name <name>]\n"
+      L"       xnc-core.exe --console --smoke-secret <hex> --sas-probe [reason]\n"
       L"       xnc-core.exe --console --diag-spawn <exe> <args...>\n"
       L"       xnc-core.exe --selftest\n"
       L"  --console       foreground: serve the XNIP pipe (DACL SYSTEM+Admins)\n"
@@ -45,6 +51,15 @@ void Usage(FILE* out) {
       L"  --smoke-secret  hex pipe secret (nominal 32B = 64 hex chars);\n"
       L"                  diagnostic --console mode only (service mode reads\n"
       L"                  the spawn channel in M1)\n"
+      L"  --allow-sas     serve mode: open the MSG_SAS (0x0110) gate. Default\n"
+      L"                  is DENY + sas_audit log line per attempt (the\n"
+      L"                  M2-Slice1 minimum bar); the M2-Slice3 service mode\n"
+      L"                  stays deny until the capability ticket lands\n"
+      L"  --sas-probe     DIAGNOSTIC CLIENT (Task 4 live check): dial the\n"
+      L"                  pipe, run the client handshake, send one MSG_SAS\n"
+      L"                  [reason] (default \"diag\") and print the response\n"
+      L"                  HRESULT / error code; no server is started. Needs\n"
+      L"                  --smoke-secret (the TARGET core's secret)\n"
       L"  --diag-spawn    session bridge: spawn xnc-desktop.exe (whitelist;\n"
       L"                  resolved next to xnc-core.exe; an explicit\n"
       L"                  'xnc-desktop.exe' first arg is also accepted) in\n"
@@ -131,12 +146,104 @@ int RunDiagSpawn(const wchar_t* child_exe, int argc, wchar_t** argv, int from) {
   return static_cast<int>(code);
 }
 
+// Diagnostic 0x0110 probe client (M2-Slice1 Task 4 live check): dial the
+// core pipe, run the client half of the spec 9.3 mutual-proof handshake,
+// send ONE MSG_SAS with the given reason, print the response and exit.
+// This exercises the SAS gate + SendSAS path end to end without touching
+// the agent (agent-side secure_attention forwarding arrives in Task 5).
+// Exit codes: 0 = ok response received (hr printed - hr is a SYNTHESIZED
+// HRESULT, 0 means the VOID sas.dll call returned, not proof of delivery);
+// 1 = transport/handshake failure; 2 = FlagError (gate denied etc).
+int RunSasProbe(const wchar_t* pipe_name, const uint8_t* secret,
+                size_t secret_len, const wchar_t* reason_w) {
+  using namespace xnc;
+  HANDLE c = CreateFileW(pipe_name, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                         OPEN_EXISTING, 0, nullptr);
+  if (c == INVALID_HANDLE_VALUE) {
+    std::fwprintf(stderr, L"xnc-core: sas probe: dial %ls failed err=%lu\n",
+                  pipe_name, GetLastError());
+    return 1;
+  }
+  uint8_t nonce[16];
+  NTSTATUS rng =
+      BCryptGenRandom(nullptr, nonce, 16, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+  if (!BCRYPT_SUCCESS(rng) ||
+      !WriteFrame(c, Frame{0, kMsgHello, 0,
+                           EncodeHello(GetCurrentProcessId(), nonce)})) {
+    std::fwprintf(stderr, L"xnc-core: sas probe: HELLO failed\n");
+    CloseHandle(c);
+    return 1;
+  }
+  Frame hp;
+  if (ReadFrame(c, hp) != DecodeResult::Ok ||
+      hp.message_type != kMsgHelloProof) {
+    std::fwprintf(stderr, L"xnc-core: sas probe: expected HELLO_PROOF\n");
+    CloseHandle(c);
+    return 1;
+  }
+  uint32_t spid = 0;
+  uint8_t snonce[16], sproof[32], want[32];
+  // The server proof is HMAC over OUR nonce (client nonce) - the same
+  // check the Go client and the selftest loopback make.
+  if (DecodeHelloProof(hp, spid, snonce, sproof) != DecodeResult::Ok ||
+      !HmacSha256(secret, secret_len, nonce, 16, want) ||
+      std::memcmp(want, sproof, 32) != 0) {
+    std::fwprintf(stderr, L"xnc-core: sas probe: server proof rejected\n");
+    CloseHandle(c);
+    return 1;
+  }
+  uint8_t myproof[32];
+  // Our proof = HMAC over the SERVER's nonce (mutual proof, spec 9.3).
+  if (!HmacSha256(secret, secret_len, snonce, 16, myproof) ||
+      !WriteFrame(c, Frame{0, kMsgProof, 0, EncodeProof(myproof)})) {
+    std::fwprintf(stderr, L"xnc-core: sas probe: PROOF send failed\n");
+    CloseHandle(c);
+    return 1;
+  }
+
+  char reason[24] = {0};
+  for (int i = 0; i < 23 && reason_w[i] != L'\0'; i++)
+    reason[i] = reason_w[i] < 128 ? static_cast<char>(reason_w[i]) : '?';
+  std::vector<uint8_t> p(reason, reason + sizeof(reason));
+  if (!WriteFrame(c, Frame{0, kMsgSas, 1, p})) {
+    std::fwprintf(stderr, L"xnc-core: sas probe: MSG_SAS send failed\n");
+    CloseHandle(c);
+    return 1;
+  }
+  Frame resp;
+  if (ReadFrame(c, resp) != DecodeResult::Ok) {
+    std::fwprintf(stderr, L"xnc-core: sas probe: no response\n");
+    CloseHandle(c);
+    return 1;
+  }
+  WriteFrame(c, Frame{0, kMsgBye, 0, {}});
+  CloseHandle(c);
+  if ((resp.flags & kFlagError) != 0) {
+    std::string code(resp.payload.begin(), resp.payload.end());
+    std::printf("sas probe: ERROR code=%s\n", code.c_str());
+    return 2;
+  }
+  uint32_t hr = 0;
+  if (resp.payload.size() == 4) {
+    hr = static_cast<uint32_t>(resp.payload[0]) |
+         static_cast<uint32_t>(resp.payload[1]) << 8 |
+         static_cast<uint32_t>(resp.payload[2]) << 16 |
+         static_cast<uint32_t>(resp.payload[3]) << 24;
+  }
+  std::printf("sas probe: response hr=0x%08lX (0 = VOID sas.dll call "
+              "returned; synthesized HRESULT, not proof of delivery)\n",
+              static_cast<unsigned long>(hr));
+  return 0;
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
   bool console = false, selftest = false, diag_spawn = false;
+  bool allow_sas = false, sas_probe = false;
   const wchar_t* pipe_name = kDefaultPipe;
   const wchar_t* secret_hex = nullptr;
+  const wchar_t* sas_reason = L"diag";
   const wchar_t* child_exe = nullptr;
   int child_args_from = 0;
   for (int i = 1; i < argc; i++) {
@@ -148,6 +255,14 @@ int wmain(int argc, wchar_t** argv) {
       pipe_name = argv[++i];
     } else if (std::wcscmp(argv[i], L"--smoke-secret") == 0 && i + 1 < argc) {
       secret_hex = argv[++i];
+    } else if (std::wcscmp(argv[i], L"--allow-sas") == 0) {
+      allow_sas = true;
+    } else if (std::wcscmp(argv[i], L"--sas-probe") == 0) {
+      sas_probe = true;
+      // optional reason (any next arg that is not another flag)
+      if (i + 1 < argc && std::wcsncmp(argv[i + 1], L"--", 2) != 0 &&
+          argv[i + 1][0] != L'\0')
+        sas_reason = argv[++i];
     } else if (std::wcscmp(argv[i], L"--diag-spawn") == 0) {
       if (i + 1 >= argc) {  // at least the child's first arg must follow
         std::fwprintf(stderr,
@@ -187,7 +302,39 @@ int wmain(int argc, wchar_t** argv) {
           L"--smoke-secret is not used in this mode\n");
       return 2;
     }
+    if (allow_sas) {
+      std::fwprintf(stderr,
+          L"xnc-core: --diag-spawn does not serve the pipe; --allow-sas is "
+          L"a serve-mode gate and is not used here\n");
+      return 2;
+    }
     return RunDiagSpawn(child_exe, argc, argv, child_args_from);
+  }
+  if (sas_probe) {
+    // Diagnostic CLIENT of another core's pipe - never starts a server.
+    if (!console) {
+      std::fwprintf(stderr, L"xnc-core: --sas-probe is only valid with --console\n");
+      Usage(stderr);
+      return 2;
+    }
+    if (!secret_hex) {
+      std::fwprintf(stderr,
+          L"xnc-core: --sas-probe needs --smoke-secret <hex> (the TARGET "
+          L"core's pipe secret)\n");
+      return 2;
+    }
+    std::string secret;
+    if (!ParseSecretHex(secret_hex, secret)) {
+      std::fwprintf(stderr, L"xnc-core: bad --smoke-secret hex\n");
+      return 2;
+    }
+    if (allow_sas)
+      std::fwprintf(stderr,
+          L"xnc-core: note: --allow-sas gates the SERVE path; it has no "
+          L"effect on --sas-probe (the target core's own gate decides)\n");
+    return RunSasProbe(pipe_name,
+                       reinterpret_cast<const uint8_t*>(secret.data()),
+                       secret.size(), sas_reason);
   }
   if (secret_hex && !console) {
     std::fwprintf(stderr,
@@ -212,6 +359,9 @@ int wmain(int argc, wchar_t** argv) {
         2 * (int)xnc::kMaxPipeSecretBytes);
     return 2;
   }
+  xnc::SetSasAllowed(allow_sas);
+  XNC_LOG_INFO("sas gate %s (0x0110; audit line per attempt)",
+               allow_sas ? "OPEN (--allow-sas)" : "DENIED (default)");
   return xnc::RunPipeServer(pipe_name,
                             reinterpret_cast<const uint8_t*>(secret.data()),
                             secret.size());

@@ -18,8 +18,9 @@ cd /d "%~dp0"
 
 if not exist ..\..\bin mkdir ..\..\bin
 rem Task 6 adds token_manager.cpp + spawn.cpp (session bridge; wtsapi32 for
-rem the WTS console-session queries).
-cl /nologo /utf-8 /W3 /MT /std:c++17 /EHsc xnc-core.cpp pipe_server.cpp token_manager.cpp spawn.cpp selftest.cpp ..\common\frame.cpp ..\common\handshake.cpp /Fe:..\..\bin\xnc-core.exe /Fo:..\..\bin\ /link bcrypt.lib advapi32.lib wtsapi32.lib
+rem the WTS console-session queries). M2-Slice1 Task 4 adds wts_monitor.cpp
+rem (WTSRegisterSessionNotificationEx also lives in wtsapi32.lib).
+cl /nologo /utf-8 /W3 /MT /std:c++17 /EHsc xnc-core.cpp pipe_server.cpp wts_monitor.cpp token_manager.cpp spawn.cpp selftest.cpp ..\common\frame.cpp ..\common\handshake.cpp /Fe:..\..\bin\xnc-core.exe /Fo:..\..\bin\ /link bcrypt.lib advapi32.lib wtsapi32.lib user32.lib
 if errorlevel 1 exit /b 1
 
 echo [core] built ..\..\bin\xnc-core.exe
