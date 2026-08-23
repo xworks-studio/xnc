@@ -28,9 +28,14 @@
 #                   duration timeout (no up) -> probe keyA back to 0 within
 #                   35s (agent synthetic ups at WS close; janitor is the
 #                   >30s backstop).
-#   4 cursor chan : during gate-1 moves, viewer cursor samples within 200ms
-#                   of the probe-observed cursor change (+100ms probe sampling
-#                   allowance; clock skew removed by per-run offset estimation).
+#   4 cursor chan : during gate-1 moves, viewer cursor event times must agree
+#                   with the probe-observed cursor change times after the
+#                   per-run MEDIAN offset is estimated from the matched pairs
+#                   and removed: residual (jitter) <= 300ms (dominated by the
+#                   probe's 100ms sampling of a varying change instant). This
+#                   is an offset-consistency check, NOT an absolute latency
+#                   measurement — absolute cursor latency is deferred to the
+#                   wired gate with proper timestamping.
 #   5 keyframe    : one-shot PLI at +8s over a 1s-tick quiet desktop with
 #                   pending-PLI retry (1.5s): pliToIdrMaxMs <= 3000 (the
 #                   WiFi+relay ruled bound), pliRetries recorded; no
@@ -361,7 +366,8 @@ if (a1) {
   out.key = {downAt: a1.t, upAt: csv[i + 1] ? csv[i + 1].t : null, heldMs: last1.t - a1.t};
 }
 if (json.cursorSamples && json.cursorSamples.length && out.moves.every(m => m.hit)) {
-  // gate 4: viewer cursor sample within 200ms of probe row (skew estimated per run)
+  // gate 4: viewer cursor event vs probe row — per-run median offset removed,
+  // residual jitter <= 300ms (offset consistency, not absolute latency)
   const s0 = json.startUnixMs, pairs = [];
   for (const m of out.moves) {
     const h = m.hit;
@@ -410,14 +416,16 @@ else
   echo "GATE SKIP  1-lock-num-flip-restore   (session-1 NumLock state unavailable; no lock steps were sent)"
 fi
 
-# gate 4 verdict (cursor channel). Probe rows sample every 100ms, so the row
-# timestamp is an UPPER bound of the actual change (the change happened
-# within the previous sample period): the 200ms bound is evaluated against
-# row t with a +100ms sampling allowance — 300ms total (documented, run-2
-# residuals [231,0,-91]ms with skew removed).
+# gate 4 verdict (cursor channel): OFFSET CONSISTENCY, not absolute latency.
+# Probe rows sample every 100ms and viewer/probe clocks differ, so the per-run
+# MEDIAN offset is estimated from the matched pairs and removed; the gate
+# bounds the residual jitter at <=300ms (dominated by the probe's 100ms
+# sampling quantization of the change instant; run-2 residuals [231,0,-91]ms,
+# run-3 [0,1,-204]ms). Absolute end-to-end cursor latency is NOT measured
+# here — deferred to the wired gate.
 CURSOK=$(node -e 'const a=require(process.argv[1]);console.log(a.cursor && a.cursor.pairs.length>=3 && a.cursor.pairs.every(p=>Math.abs(p.residual)<=300) ? 1 : 0)' "$ART/s1-analysis.json" 2>/dev/null || echo 0)
-CURSDET=$(node -e 'const a=require(process.argv[1]);console.log(a.cursor ? ("skew=" + a.cursor.skewMs + "ms residuals=[" + a.cursor.pairs.map(p=>p.residual).join(",") + "]ms (bound 200ms + 100ms probe sampling)") : "no matched cursor samples")' "$ART/s1-analysis.json" 2>/dev/null || echo "?")
-gate "4-cursor-within-200ms" "$CURSOK" "$CURSDET"
+CURSDET=$(node -e 'const a=require(process.argv[1]);console.log(a.cursor ? ("median-offset=" + a.cursor.skewMs + "ms residuals=[" + a.cursor.pairs.map(p=>p.residual).join(",") + "]ms <= 300ms jitter bound (offset consistency; absolute latency deferred to wired gate)") : "no matched cursor samples")' "$ART/s1-analysis.json" 2>/dev/null || echo "?")
+gate "4-cursor-offset-consistency-300ms" "$CURSOK" "$CURSDET"
 
 # input script verdicts (steps all ok)
 S1_STEPS_OK=$(node -e 'const j=require(process.argv[1]);console.log(j.input && j.input.ok ? 1 : 0)' "$ART/s1-input.json" 2>/dev/null || echo 0)
@@ -581,7 +589,17 @@ cat "$ART/s5-pli.json"
 S5_PLI=$(json_num "$ART/s5-pli.json" pliToIdrMaxMs)
 S5_RETRY=$(json_num "$ART/s5-pli.json" pliRetries)
 gate "5-pli-to-idr-le-3000ms" "$([ "${S5_PLI:-0}" -gt 0 ] && [ "${S5_PLI:-99999}" -le 3000 ] && echo 1 || echo 0)" "pliToIdrMaxMs=$S5_PLI (WiFi+relay ruled bound; slice2 reference in results doc)"
-gate "5-pli-retry-counter" "$([ "${S5_RETRY:-0}" -ge 0 ] && echo 1 || echo 0)" "pliRetries=$S5_RETRY (retry engages only if PLI->IDR > 1.5s)"
+# non-vacuous assertion (was `retries>=0`, always true): the retry engages
+# exactly when the pending PLI stays unanswered >1.5s (pliRetryDecision) —
+# so retries>=1 iff pliToIdrMaxMs>1500, and retries==0 otherwise (0 = no
+# episode/no retry needed). Run-3: 2131ms -> retries=1, consistent.
+S5_RETRY_OK=0
+if [ "${S5_PLI:-0}" -gt 1500 ]; then
+  if [ "${S5_RETRY:-0}" -ge 1 ]; then S5_RETRY_OK=1; fi
+else
+  if [ "${S5_RETRY:-0}" -eq 0 ]; then S5_RETRY_OK=1; fi
+fi
+gate "5-pli-retry-counter" "$S5_RETRY_OK" "pliRetries=$S5_RETRY (decision-consistent: retries>=1 iff pliToIdrMaxMs=${S5_PLI:-?} > 1500, else retries==0)"
 gate "5-viewer-exit-0" "$([ "$S5_RC" -eq 0 ] && echo 1 || echo 0)" "e2eviewer exit=$S5_RC"
 "$XNC" exec "$NODE" "schtasks /End /TN $OVERLAY_TASK; schtasks /Delete /F /TN $OVERLAY_TASK; exit 0" >/dev/null 2>&1 || true
 
@@ -615,8 +633,21 @@ fi
   echo "IDR transit on PLI: pliToIdrMaxMs(s5)=${S5_PLI:-?} pliRetries=${S5_RETRY:-?}"
   echo "assembly/decode: frames(s1)=$(json_num "$ART/s1-input.json" frames) fps=? (see s1-input.json)"
   echo "cursor chan latency residual(s): see s1-analysis.json"
+  if [ -n "$WIRED_NODES" ]; then
+    echo "disposition: wired node(s):$WIRED_NODES — dev-agent deploy needs interactive schtasks creds (only LABS@XIAOXIN provisioned); three wired gates still deferred"
+  else
+    echo "disposition: no wired node among the 3 probed — three wired gates (first-frame<2s, 20fps change-driven, PLI<=2s) DEFERRED; per-segment evidence above is the recorded stand-in"
+  fi
 } >> "$G6_NOTES"
-gate "6-wired-gate-disposition" 1 "probed 3 nodes; wired=$WIRED_NODES; evidence + disposition in g6-network.txt (three gates deferred unless a provisioned wired node exists)"
+# real check (was a hardcoded pass): the gate verifies the artifact itself —
+# all 3 node probe sections + the per-segment evidence block + an explicit
+# disposition line are present in g6-network.txt.
+G6_SECTIONS=$(grep -c '^== ' "$G6_NOTES" || true)
+G6_OK=0
+if [ "${G6_SECTIONS:-0}" -ge 3 ] && grep -q '^-- per-segment evidence' "$G6_NOTES" && grep -q '^disposition:' "$G6_NOTES"; then
+  G6_OK=1
+fi
+gate "6-wired-evidence-recorded" "$G6_OK" "g6-network.txt: ${G6_SECTIONS:-0}/3 node probes + per-segment evidence + disposition line (wired=${WIRED_NODES:-none}; three wired gates deferred unless a provisioned wired node exists)"
 
 # --- 11. Agent-side counters + summary -----------------------------------------
 

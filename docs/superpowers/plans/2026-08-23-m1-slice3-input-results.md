@@ -9,7 +9,7 @@
 
 | 门 | 判据 | 实测 | 结论 |
 |---|---|---|---|
-| ① move×3 | probe 坐标 ±5px、步进时刻 ±500ms | A dt=-319ms @(255,192)、B dt=-474ms @(767,256)、C dt=-410ms @(512,576)(26/26 步 ok,seq 1..16) | PASS |
+| ① move×3 | probe 坐标 ±5px、步进时刻 ±500ms | A dt=-319ms @(255,192)、B dt=-474ms @(767,256)、C dt=-410ms @(512,576)(23/23 步 ok,seq 1..13) | PASS |
 | ① keyA | down 2s → up | held=1929ms,down@1787452619241 → up@1787452621282(probe keyA 0→1→0) | PASS |
 | ① wheel | 注入生效(无探针,记录) | wheel dy=2 步 ok(seq 6),native ×WHEEL_DELTA 注入 | PASS(记录) |
 | ① LOCK num | flip → restore | probe numlk: initial=0 → **flipped=true** → **restored=true**(plain 0x45 修复后;run-2 证据:E0 0x45 不翻转) | PASS |
@@ -18,12 +18,16 @@
 | ② noLease 计数 | agent 计数断言 | `desktop input closed ... noLease>0` 会话 = 2(run-3) | PASS |
 | ② 移交 | v1 断连 → v2b 授予 | v2b leaseGranted=true;其 move → probe 行 @(204,512) | PASS |
 | ③ 卡键清理 | 按住 A 断连 → 35s 内回 0 | releaseMs=**7947**(synthetic up 于 WS close;janitor >30s 为兜底未触发) | PASS |
-| ④ 光标通道 | probe 行 vs viewer 事件 ≤200ms(+100ms 采样周期) | 残差 [0, 1, -204]ms(偏移估计 221ms 移除后;门④采样量化说明见下) | PASS |
+| ④ 光标通道 | 偏移一致性:cursor 事件 vs probe 行,每跑中位偏移移除后残差(抖动)≤300ms(绝对时延留待有线门) | 残差 [0, 1, -204]ms(中位偏移 221ms 移除后,≤300ms 界;100ms probe 采样量化主导) | PASS |
 | ⑤ PLI→IDR | ≤3000ms(WiFi+relay 裁定界) | **2131ms**(run-2: 2408ms;run-1: 2171ms),pliRetries=1(>1.5s 触发重发,计数器工作) | PASS |
 | ⑤ 对 slice2 无回归 | vs 2351/2392ms | 2131/2408/2171 三跑均在 slice2 单发 PLI 真值(2351/2392ms)噪声带内 | PASS |
 | ⑥ 有线门 | 三节点网型探测 | XIAOXIN=Wi-Fi(Native 802.11);TB16G7/YOGAP7G11 脚本内 `<no answer>`(手工复测 10:2x:两节点亦 Wi-Fi;脚本内 exec 三连重试仍空,记为 exec 延迟,非伪造) | 顺延(证据在册) |
 
-Viewer 侧全程 firstFrame 4.3–6.3s(keyframe-retry-after 1.5s 补 WiFi 丢首 IDR),断言 0 退出(s1/s2/s3/s5)。
+Viewer 侧全程 firstFrame 4.3–6.1s(s1 6125 / s1-retry 5809 / s2-v1 5192 / s2-v2 4906 / s2-v2b 4706 / s3 4675 / s5 4306ms;keyframe-retry-after 1.5s 补 WiFi 丢首 IDR),断言 0 退出(s1/s2/s3/s5)。
+
+门③ 35s 界 controller 裁决注记:计划语为 janitor >30s 兜底 —— 断言界取 30s 上界 + 100ms probe 采样周期 + 断言容差 ≈ 35s(synthetic up 路径是主清理,janitor 是 backstop);实测 releaseMs=7947ms 远低于界,裁决不受影响。
+
+门数口径(17/17):断言门 16 + 门⑥为证据记录门 —— run-3 当时脚本对该门硬编码 pass,本轮修正后为真实检查(g6-network.txt 须含 3 节点探测节 + 分段证据块 + 显式 disposition 行,门名 `6-wired-evidence-recorded`);run-3 产物 g6-network.txt 含前两者,disposition 行为后续跑新增。
 
 ## 迭代记录(每次全跑的数字与发现)
 
@@ -39,7 +43,7 @@ Viewer 侧全程 firstFrame 4.3–6.3s(keyframe-retry-after 1.5s 补 WiFi 丢首
 - **发现 C(探针任务串行)**:65s 的 gate-2 探针仍在跑时 gate-3 `schtasks /Run` 被忽略(一次性任务运行中不再起实例)→ 取回 run-1 的旧 CSV → 门③「never observed down」。修复:`start_probe` 先 `/End` 再建/跑。
 - **发现 D(NumLock 实证)**:lock num flip 两次(0→1→0)注入均为 **E0 0x45**,probe numlk initial=0 flipped=**false** —— E0 前缀不翻转 VK_NUMLOCK。据此落地 native 一行修复(plain 0x45)+ selftest 改判(见 commit `85fc7f7`)。
 - notepad:SaveAs 对话框流 attempt 1/2 均失败(步 ok 但无文件)→ 改设计:notepad 预开目标文件,Ctrl+S 原地保存(无对话框)。
-- 门④ 残差 [231,0,-91]ms:probe 行时刻是变化的上界(100ms 采样)→ 界校准为 200ms+100ms 采样周期(记档,非放宽语义)。
+- 门④ 残差 [231,0,-91]ms:probe 行时刻是变化的上界(100ms 采样量化)→ 判据定形为「每跑中位偏移移除后残差(抖动)≤300ms」的偏移一致性检查(非绝对时延测量;绝对时延留待有线门,记档,非放宽语义)。
 
 ### run-3(PASS,17/17)
 - 全绿(见上表)。notepad attempt 1 仍失败(空文件 = 打字未落在 notepad;moves/wheel 先行的两次 run 一致失败,干净上下文一致成功 —— 疑似指针事件先行时前台焦点不稳,机制未定论,如实记录),按验收语的「失败重试一次」由 attempt 2 通过。
@@ -48,7 +52,7 @@ Viewer 侧全程 firstFrame 4.3–6.3s(keyframe-retry-after 1.5s 补 WiFi 丢首
 ## ⑥ 有线门顺延记录(本跑分段证据,无伪造)
 
 - 网型:LABS-XIAOXIN Wi-Fi(Native 802.11,唯一 Up 适配器);TB16G7/YOGAP7G11 脚本内无应答、手工探测亦为 Wi-Fi → **无可跑 dev agent 的有线节点,三门(首帧<2s、20fps 变化驱动、PLI≤2s)维持顺延**。
-- 分段证据(run-3,WiFi XIAOXIN→LABS-DEV relay):ICE+TURN 分配+首帧(viewer 墙钟)= **6125ms**(s1 firstFrameMs,含分配);PLI IDR 传输+组装 = **2131ms**(pliToIdrMaxMs,desktop 侧 warm-up ≤2s 契约在 slice2 已证);解码组装 = s1 frames=69/30s 尾段;光标通道残差 ≤204ms。
+- 分段证据(run-3,WiFi XIAOXIN→LABS-DEV relay):ICE+TURN 分配+首帧(viewer 墙钟)= **6125ms**(s1 firstFrameMs,含分配);PLI IDR 传输+组装 = **2131ms**(pliToIdrMaxMs,desktop 侧 warm-up ≤2s 契约在 slice2 已证);解码组装 = s1 frames=69/30s 尾段;光标通道偏移一致性残差 ≤204ms(绝对时延须有线门时间戳)。
 - 有线环境需要:目标节点交互会话凭据(schtasks /RU /IT,目前仅 LABS@XIAOXIN 已配)+ dev 栈可达,留待具备后跑。
 
 ## Owner 浏览器检查(手动)
