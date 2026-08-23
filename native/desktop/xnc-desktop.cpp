@@ -38,6 +38,7 @@
 #include "../common/log.h"
 #include "capture.h"       // capture contract (ICapture/FrameBlob)
 #include "cursor_manager.h"  // CursorManager (M1-Slice3)
+#include "desktop_watch.h"  // DesktopWatch (M2-Slice1 Task 1, observation)
 #include "diag.h"
 #include "dxgi_capture.h"  // TryCreateDxgiCapture, DxgiErrIsDesktopAccessDenied
 #include "input_manager.h"  // InputManager (M1-Slice3)
@@ -48,6 +49,15 @@
 int SelftestMain();  // desktop_selftest.cpp
 
 namespace {
+
+// PipelineOpts desktop-name thunk (M2-Slice1 Task 1): the beat runs on the
+// single pipeline thread, so one static buffer is enough. Returns "" before
+// the first observation (the beat then omits the field).
+const char* DesktopNameThunk(void* ctx) {
+  static char buf[xnc::kDesktopNameMax];
+  static_cast<xnc::DesktopWatch*>(ctx)->CurrentName(buf, sizeof(buf));
+  return buf;
+}
 
 void Usage(FILE* out) {
   std::fwprintf(out,
@@ -294,6 +304,15 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
   popt.fps = opt.fps;
   popt.target_bitrate_bps = kDiagBitrateBps;
 
+  // M2-Slice1 Task 1: pure-observation desktop watch (OpenInputDesktop 500ms
+  // poll, DEFAULT/TRANSITION/WINLOGON machine). Started in BOTH console
+  // modes; transitions log desktop_transition, the per-second beat gains
+  // desktop=<name>. No capture behavior change - reset logic is Task 2.
+  xnc::DesktopWatch watch;
+  watch.Start();
+  popt.desktop_name_fn = &DesktopNameThunk;
+  popt.desktop_name_ctx = &watch;
+
   // Every diag run leaves a stats.json sidecar next to --out - including the
   // init-failure paths below (zeroed counters, ok=false + the reason), so a
   // missing sidecar always means "the process never got that far", never
@@ -443,8 +462,14 @@ int RunConsoleRt(const xnc::DiagOptions& opt) {
   ro.bitrate_bps = kDiagBitrateBps;
   ro.input = &input;
   ro.cursor = &cursor;
+  // M2-Slice1 Task 1: observation-only desktop watch (same as diag mode).
+  xnc::DesktopWatch watch;
+  watch.Start();
+  ro.desktop_name_fn = &DesktopNameThunk;
+  ro.desktop_name_ctx = &watch;
   xnc::RtServer server;
   const int rc = server.Serve(*capture, encoder, ro);
+  watch.Stop();
   input.StopJanitor();  // ReleaseAll already ran in RtServer::Shutdown
   return rc;
 }

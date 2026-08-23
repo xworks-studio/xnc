@@ -166,11 +166,16 @@ func (e *serverInputEnv) requestLease(ctx context.Context) (string, error) {
 }
 
 // runServerScript:等首关键帧 → 预算内执行脚本 → 附带 revoke 记录。
+// noKeyframeGate(诊断 --input-before-keyframe,如 M2-Slice1 锁屏探针:
+// 静止锁屏在现行 warmup 界内不出首 IDR,注入本身不依赖解码帧)跳过
+// 该等待 —— 仅探针用,常规门保持"看得见桌面才注入"。
 func runServerScript(ctx context.Context, steps []scriptStep, v *viewer,
 	chs *channelSet, leaseCh chan leaseEvent, note *leaseNote,
-	ws *websocket.Conn, log *slog.Logger) *scriptResult {
-	if err := waitFirstKeyframe(v, 25*time.Second); err != nil {
-		return &scriptResult{Err: err.Error()}
+	ws *websocket.Conn, log *slog.Logger, noKeyframeGate bool) *scriptResult {
+	if !noKeyframeGate {
+		if err := waitFirstKeyframe(v, 25*time.Second); err != nil {
+			return &scriptResult{Err: err.Error()}
+		}
 	}
 	sctx, cancel := context.WithTimeout(ctx, scriptWaitBudget(steps))
 	defer cancel()

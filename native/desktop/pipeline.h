@@ -48,6 +48,12 @@ struct PipelineOpts {
   // Optional early-stop flag (real-time mode: Ctrl+C / RtServer::Shutdown).
   // Checked once per loop iteration; nullptr = run the full duration.
   const std::atomic<bool>* stop = nullptr;
+  // Optional live desktop-name provider (M2-Slice1 DesktopWatch): when set,
+  // the per-second diag_pipeline line appends ` desktop=<name>`. Pure
+  // observation (Task 1 evidence probe) - no capture behavior change; null
+  // keeps the historical log format byte-identical.
+  const char* (*desktop_name_fn)(void*) = nullptr;
+  void* desktop_name_ctx = nullptr;
 };
 
 struct PipelineResult {

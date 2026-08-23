@@ -24,6 +24,7 @@
 // `build.bat selftest`.
 #include "capture.h"
 #include "cursor_manager.h"
+#include "desktop_watch.h"
 #include "diag.h"
 #include "dxgi_capture.h"
 #include "frame_cache.h"
@@ -612,6 +613,81 @@ bool WaitUntil(Pred pred, DWORD timeout_ms) {
     if (GetTickCount64() >= dl) return pred();
     Sleep(10);
   }
+}
+
+// ---- M2-Slice1 Task 1 fixtures: DesktopWatch fake Win32 seams ----
+// The watch's production path is OpenInputDesktop -> GetUserObjectInformation
+// (UOI_NAME) -> CloseDesktop on a 500 ms thread; the Opts function pointers
+// let the selftest drive the FULL threaded logic with scripted desktop
+// names + a logical clock (poll_ms is shrunk to 1 ms real sleep while each
+// sample advances the fake clock by 500 ms), proving the transition
+// sequence, CloseDesktop pairing and the poll-failure synthetic name.
+std::vector<std::string> g_dw_names;  // scripted observations; last repeats
+size_t g_dw_idx = 0;
+uint64_t g_dw_clock = 0;
+int g_dw_opens = 0, g_dw_closes = 0, g_dw_bad_closes = 0;
+bool g_dw_open_fail = false;
+std::mutex g_dw_ev_mu;  // guards vectors read cross-thread below
+
+HDESK WINAPI DwOpenInputDesktop(DWORD, BOOL, ACCESS_MASK) {
+  g_dw_opens++;
+  g_dw_clock += 500;  // logical time of THIS sample (see fixtures comment)
+  if (g_dw_open_fail) {
+    SetLastError(ERROR_ACCESS_DENIED);
+    return nullptr;
+  }
+  return reinterpret_cast<HDESK>(0x584E4357ull);  // 'XNCW' sentinel handle
+}
+BOOL WINAPI DwGetUserObjectInformation(HANDLE h, int info, void* pv, DWORD len,
+                                       LPDWORD needed) {
+  if (h != reinterpret_cast<HDESK>(0x584E4357ull) || info != UOI_NAME ||
+      pv == nullptr)
+    return FALSE;
+  const size_t i = g_dw_idx < g_dw_names.size() ? g_dw_idx : g_dw_names.size() - 1;
+  ++g_dw_idx;
+  const std::string& n = g_dw_names[i];
+  wchar_t* w = static_cast<wchar_t*>(pv);
+  size_t k = 0;
+  for (; k + 1 < len / sizeof(wchar_t) && k < n.size(); ++k)
+    w[k] = static_cast<wchar_t>(n[k]);
+  w[k] = L'\0';
+  if (needed) *needed = static_cast<DWORD>((k + 1) * sizeof(wchar_t));
+  return TRUE;
+}
+BOOL WINAPI DwCloseDesktop(HDESK h) {
+  if (h == reinterpret_cast<HDESK>(0x584E4357ull)) {
+    g_dw_closes++;
+    return TRUE;
+  }
+  g_dw_bad_closes++;  // double close / foreign handle = leak or corruption
+  SetLastError(ERROR_INVALID_HANDLE);
+  return FALSE;
+}
+ULONGLONG WINAPI DwClock() { return g_dw_clock; }
+
+// Builds watch Opts over the fake seams; poll_ms is REAL sleep (1 ms) while
+// the logical clock advances 500 ms per sample, so a scripted run of N names
+// completes in ~N ms wall time with 500 ms-spaced observation timestamps.
+xnc::DesktopWatch::Opts TestWatchOpts(
+    std::function<void(const xnc::DesktopTransition&)> cb) {
+  xnc::DesktopWatch::Opts o;
+  o.poll_ms = 1;
+  o.transition_timeout_ms = 2000;
+  o.on_transition = std::move(cb);
+  o.open_input_desktop = &DwOpenInputDesktop;
+  o.get_user_object_info = &DwGetUserObjectInformation;
+  o.close_desktop = &DwCloseDesktop;
+  o.clock_ms = &DwClock;
+  return o;
+}
+void ResetWatchSeams(std::vector<std::string> names) {
+  g_dw_names = std::move(names);
+  g_dw_idx = 0;
+  g_dw_clock = 0;
+  g_dw_opens = 0;
+  g_dw_closes = 0;
+  g_dw_bad_closes = 0;
+  g_dw_open_fail = false;
 }
 
 }  // namespace
@@ -2568,6 +2644,185 @@ int SelftestMain() {
     CHECK("rt5-cursor-stopped-after-last-detach", !cm.running());
     rt.Shutdown();
     g_input_rec = nullptr;
+  }
+  // ---- M2-Slice1 Task 1:DesktopWatch 状态机(纯转移函数,表驱动)----
+  {
+    CHECK("dw-state-name", std::strcmp(xnc::DesktopStateName(xnc::DesktopState::kDefault), "Default") == 0 &&
+                              std::strcmp(xnc::DesktopStateName(xnc::DesktopState::kTransition), "Transition") == 0 &&
+                              std::strcmp(xnc::DesktopStateName(xnc::DesktopState::kWinlogon), "Winlogon") == 0);
+    CHECK("dw-is-default", xnc::IsDefaultDesktopName("Default") &&
+                               xnc::IsDefaultDesktopName("default") &&
+                               !xnc::IsDefaultDesktopName("Winlogon") &&
+                               !xnc::IsDefaultDesktopName(""));
+    // 表驱动:观察序列 (t, name) → 期望事件 (at, name, from, to, reason)
+    struct Ev {
+      uint64_t at;
+      const char* name;
+      xnc::DesktopState from, to;
+      const char* reason;
+    };
+    struct Case {
+      const char* name;
+      uint64_t timeout;
+      std::vector<std::pair<uint64_t, const char*>> obs;
+      std::vector<Ev> want;
+    };
+    const std::vector<Case> cases = {
+        // 1 全 Default:无事件
+        {"stay-default", 2000,
+         {{0, "Default"}, {500, "Default"}, {5000, "Default"}}, {}},
+        // 2 UAC 型:Default→Winlogon 稳态;TRANSITION 立即,2s 超时升 WINLOGON,回 Default
+        {"uac-enter-leave", 2000,
+         {{0, "Default"}, {500, "Winlogon"}, {1000, "Winlogon"},
+          {1500, "Winlogon"}, {2000, "Winlogon"}, {2500, "Winlogon"},
+          {3000, "Default"}},
+         {{500, "Winlogon", xnc::DesktopState::kDefault, xnc::DesktopState::kTransition, "name_change"},
+          {2500, "Winlogon", xnc::DesktopState::kTransition, xnc::DesktopState::kWinlogon, "transition_timeout"},
+          {3000, "Default", xnc::DesktopState::kWinlogon, xnc::DesktopState::kDefault, "back_to_default"}}},
+        // 3 短毛刺(<2s):TRANSITION→DEFAULT,绝不进 WINLOGON
+        {"blip-under-timeout", 2000,
+         {{0, "Default"}, {500, "Winlogon"}, {1000, "Default"}, {5000, "Default"}},
+         {{500, "Winlogon", xnc::DesktopState::kDefault, xnc::DesktopState::kTransition, "name_change"},
+          {1000, "Default", xnc::DesktopState::kTransition, xnc::DesktopState::kDefault, "back_to_default"}}},
+        // 4 超时边界:elapsed 1999 不升,2000 升
+        {"timeout-boundary", 2000,
+         {{0, "Default"}, {1000, "Winlogon"}, {2999, "Winlogon"}, {3000, "Winlogon"}},
+         {{1000, "Winlogon", xnc::DesktopState::kDefault, xnc::DesktopState::kTransition, "name_change"},
+          {3000, "Winlogon", xnc::DesktopState::kTransition, xnc::DesktopState::kWinlogon, "transition_timeout"}}},
+        // 5 非默认期间换名:计时器重启(TRANSITION→TRANSITION 也发事件)
+        {"name-change-restarts-timer", 2000,
+         {{0, "Default"}, {1000, "Winlogon"}, {2500, "OtherDesk"},
+          {3500, "OtherDesk"}, {4499, "OtherDesk"}, {4500, "OtherDesk"}},
+         {{1000, "Winlogon", xnc::DesktopState::kDefault, xnc::DesktopState::kTransition, "name_change"},
+          {2500, "OtherDesk", xnc::DesktopState::kTransition, xnc::DesktopState::kTransition, "name_change"},
+          {4500, "OtherDesk", xnc::DesktopState::kTransition, xnc::DesktopState::kWinlogon, "transition_timeout"}}},
+        // 6 WINLOGON 期间换名:退回 TRANSITION 重新计时
+        {"winlogon-new-name-demotes", 2000,
+         {{0, "Default"}, {500, "Winlogon"}, {2500, "Winlogon"},
+          {3000, "Screen-0"}, {5000, "Screen-0"}},
+         {{500, "Winlogon", xnc::DesktopState::kDefault, xnc::DesktopState::kTransition, "name_change"},
+          {2500, "Winlogon", xnc::DesktopState::kTransition, xnc::DesktopState::kWinlogon, "transition_timeout"},
+          {3000, "Screen-0", xnc::DesktopState::kWinlogon, xnc::DesktopState::kTransition, "name_change"},
+          {5000, "Screen-0", xnc::DesktopState::kTransition, xnc::DesktopState::kWinlogon, "transition_timeout"}}},
+        // 7 轮询失败合成名 (open_failed) 同样是状态机输入(证据:安全桌面可能拒绝打开)
+        {"open-failed-is-input", 2000,
+         {{0, "Default"}, {500, "(open_failed)"}, {2500, "(open_failed)"},
+          {3000, "Default"}},
+         {{500, "(open_failed)", xnc::DesktopState::kDefault, xnc::DesktopState::kTransition, "name_change"},
+          {2500, "(open_failed)", xnc::DesktopState::kTransition, xnc::DesktopState::kWinlogon, "transition_timeout"},
+          {3000, "Default", xnc::DesktopState::kWinlogon, xnc::DesktopState::kDefault, "back_to_default"}}},
+        // 8 自定义超时(300ms)+ 小写 default 等价回退
+        {"custom-timeout-lowercase", 300,
+         {{0, "Default"}, {500, "Winlogon"}, {799, "Winlogon"},
+          {800, "Winlogon"}, {900, "default"}},
+         {{500, "Winlogon", xnc::DesktopState::kDefault, xnc::DesktopState::kTransition, "name_change"},
+          {800, "Winlogon", xnc::DesktopState::kTransition, xnc::DesktopState::kWinlogon, "transition_timeout"},
+          {900, "default", xnc::DesktopState::kWinlogon, xnc::DesktopState::kDefault, "back_to_default"}}},
+    };
+    for (const Case& c : cases) {
+      const std::string tag = std::string("dw-") + c.name;
+      xnc::DesktopMachineState st;
+      std::vector<xnc::DesktopTransition> got;
+      for (const auto& o : c.obs) {
+        xnc::DesktopTransition ev;
+        if (xnc::DesktopStep(&st, o.second, o.first, c.timeout, &ev))
+          got.push_back(ev);
+      }
+      CHECK((tag + "-count").c_str(), got.size() == c.want.size());
+      const size_t n = got.size() < c.want.size() ? got.size() : c.want.size();
+      for (size_t i = 0; i < n; ++i) {
+        const bool eq = got[i].at_ms == c.want[i].at &&
+                        std::strcmp(got[i].name, c.want[i].name) == 0 &&
+                        got[i].from == c.want[i].from && got[i].to == c.want[i].to &&
+                        std::strcmp(got[i].reason, c.want[i].reason) == 0;
+        CHECK((tag + "-ev" + std::to_string(i)).c_str(), eq);
+      }
+    }
+    // 空/空指针观察:忽略,状态不动
+    {
+      xnc::DesktopMachineState st;
+      xnc::DesktopTransition ev;
+      CHECK("dw-empty-name-ignored", !xnc::DesktopStep(&st, "", 100, 2000, &ev));
+      CHECK("dw-null-name-ignored", !xnc::DesktopStep(&st, nullptr, 100, 2000, &ev));
+      CHECK("dw-null-state-ignored", !xnc::DesktopStep(nullptr, "Default", 100, 2000, &ev));
+      CHECK("dw-state-untouched", st.state == xnc::DesktopState::kDefault);
+    }
+  }
+  // ---- M2-Slice1 Task 1:DesktopWatch 线程版(fake seams:句柄配对 + 事件序列)----
+  {
+    // 脚本:t=500 Default;t=1000..3000 Winlogon(TRANSITION@1000,WINLOGON@3000,
+    // 3000-1000=2000);t=3500+ Default(回退)。队列耗尽后重复最后样本(稳态)。
+    std::vector<xnc::DesktopTransition> fired;
+    ResetWatchSeams({"Default", "Winlogon", "Winlogon", "Winlogon", "Winlogon",
+                     "Winlogon", "Default", "Default"});
+    xnc::DesktopWatch w(TestWatchOpts([&](const xnc::DesktopTransition& t) {
+      std::lock_guard<std::mutex> lk(g_dw_ev_mu);
+      fired.push_back(t);
+    }));
+    CHECK("dw-watch-start", w.Start());
+    CHECK("dw-watch-running", w.running());
+    const bool done = WaitUntil([&fired] {
+      std::lock_guard<std::mutex> lk(g_dw_ev_mu);
+      return fired.size() >= 3;
+    }, 5000);
+    w.Stop();
+    CHECK("dw-watch-stopped", !w.running());
+    CHECK("dw-watch-events", done && fired.size() == 3);
+    {
+      std::lock_guard<std::mutex> lk(g_dw_ev_mu);
+      if (fired.size() == 3) {
+        CHECK("dw-watch-ev0",
+              fired[0].from == xnc::DesktopState::kDefault &&
+                  fired[0].to == xnc::DesktopState::kTransition &&
+                  std::strcmp(fired[0].reason, "name_change") == 0 &&
+                  std::strcmp(fired[0].name, "Winlogon") == 0 &&
+                  fired[0].at_ms == 1000);
+        CHECK("dw-watch-ev1",
+              fired[1].from == xnc::DesktopState::kTransition &&
+                  fired[1].to == xnc::DesktopState::kWinlogon &&
+                  std::strcmp(fired[1].reason, "transition_timeout") == 0 &&
+                  fired[1].at_ms == 3000);  // 3000-1000 = 2000 = timeout
+        CHECK("dw-watch-ev2",
+              fired[2].from == xnc::DesktopState::kWinlogon &&
+                  fired[2].to == xnc::DesktopState::kDefault &&
+                  std::strcmp(fired[2].reason, "back_to_default") == 0);
+      }
+    }
+    CHECK("dw-watch-final-state", w.Snapshot().state == xnc::DesktopState::kDefault);
+    char nbuf[xnc::kDesktopNameMax];
+    w.CurrentName(nbuf, sizeof(nbuf));
+    CHECK("dw-watch-current-name", std::strcmp(nbuf, "Default") == 0);
+    // 每次 open 都配对 close,且句柄哨兵正确(无泄漏/无双重 close)
+    CHECK("dw-watch-handle-pairing",
+          g_dw_opens == g_dw_closes && g_dw_bad_closes == 0 && g_dw_opens >= 7);
+    CHECK("dw-watch-polls", w.polls() >= 7);
+    CHECK("dw-watch-no-failures", w.poll_failures() == 0);
+    w.Stop();  // idempotent
+    CHECK("dw-watch-stop-idempotent", !w.running());
+  }
+  {
+    // 轮询失败路径:OpenInputDesktop 拒绝 → 合成名 (open_failed) 进入状态机;
+    // close 永不被调(null 句柄),失败计数可见
+    std::vector<xnc::DesktopTransition> fired;
+    ResetWatchSeams({"Default", "Winlogon"});
+    g_dw_open_fail = true;
+    xnc::DesktopWatch w(TestWatchOpts([&](const xnc::DesktopTransition& t) {
+      std::lock_guard<std::mutex> lk(g_dw_ev_mu);
+      fired.push_back(t);
+    }));
+    CHECK("dw-fail-start", w.Start());
+    const bool done = WaitUntil([&fired] {
+      std::lock_guard<std::mutex> lk(g_dw_ev_mu);
+      return fired.size() >= 2;
+    }, 5000);
+    w.Stop();
+    CHECK("dw-fail-events",
+          done && fired.size() == 2 &&
+              std::strcmp(fired[0].name, xnc::kDesktopOpenFailedName) == 0 &&
+              fired[1].to == xnc::DesktopState::kWinlogon);
+    CHECK("dw-fail-counted", w.polls() >= 2 && w.poll_failures() == w.polls());
+    CHECK("dw-fail-no-close", g_dw_closes == 0 && g_dw_bad_closes == 0);
+    CHECK("dw-fail-state", w.Snapshot().state == xnc::DesktopState::kWinlogon);
   }
   if (fails == 0) std::printf("selftest ok\n");
   return fails == 0 ? 0 : 1;

@@ -306,14 +306,29 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
     const uint32_t elapsed_s = static_cast<uint32_t>((NowMs() - t0) / 1000);
     if (elapsed_s >= next_beat_s) {
       const FrameCacheCounters& c = cache.counters();
-      XNC_LOG_INFO("diag_pipeline elapsed=%us captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu rebuilds=%u w=%u h=%u aus=%llu bytes=%llu",
-                   elapsed_s, static_cast<unsigned long long>(c.captured),
-                   static_cast<unsigned long long>(c.encoded),
-                   static_cast<unsigned long long>(c.keyframes),
-                   static_cast<unsigned long long>(c.timeouts),
-                   static_cast<unsigned long long>(c.warmup_feeds), c.rebuilds, res.width,
-                   res.height, static_cast<unsigned long long>(res.aus_written),
-                   static_cast<unsigned long long>(res.bytes_written));
+      const char* desktop =
+          opt.desktop_name_fn != nullptr
+              ? opt.desktop_name_fn(opt.desktop_name_ctx)
+              : nullptr;
+      if (desktop != nullptr && *desktop != '\0') {
+        XNC_LOG_INFO("diag_pipeline elapsed=%us captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu rebuilds=%u w=%u h=%u aus=%llu bytes=%llu desktop=%s",
+                     elapsed_s, static_cast<unsigned long long>(c.captured),
+                     static_cast<unsigned long long>(c.encoded),
+                     static_cast<unsigned long long>(c.keyframes),
+                     static_cast<unsigned long long>(c.timeouts),
+                     static_cast<unsigned long long>(c.warmup_feeds), c.rebuilds, res.width,
+                     res.height, static_cast<unsigned long long>(res.aus_written),
+                     static_cast<unsigned long long>(res.bytes_written), desktop);
+      } else {
+        XNC_LOG_INFO("diag_pipeline elapsed=%us captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu rebuilds=%u w=%u h=%u aus=%llu bytes=%llu",
+                     elapsed_s, static_cast<unsigned long long>(c.captured),
+                     static_cast<unsigned long long>(c.encoded),
+                     static_cast<unsigned long long>(c.keyframes),
+                     static_cast<unsigned long long>(c.timeouts),
+                     static_cast<unsigned long long>(c.warmup_feeds), c.rebuilds, res.width,
+                     res.height, static_cast<unsigned long long>(res.aus_written),
+                     static_cast<unsigned long long>(res.bytes_written));
+      }
       next_beat_s = elapsed_s + 1;
     }
   }

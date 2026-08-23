@@ -275,6 +275,8 @@ int RtServer::Serve(ICapture& cap, MfSoftEncoder& enc, const Opts& o) {
   popt.fps = o.fps;
   popt.target_bitrate_bps = o.bitrate_bps;
   popt.stop = &stop_;
+  popt.desktop_name_fn = o.desktop_name_fn;      // DesktopWatch beat (M2-S1 T1)
+  popt.desktop_name_ctx = o.desktop_name_ctx;
   const PipelineResult res = Pipeline::Run(cap, enc, *this, popt);
 
   SetConsoleCtrlHandler(OnRtCtrlEvent, FALSE);

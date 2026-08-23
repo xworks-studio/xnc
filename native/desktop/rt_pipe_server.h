@@ -421,6 +421,11 @@ class RtServer : public AuSink {
     // Slice2 video server). Both must outlive Start..Shutdown.
     InputManager* input = nullptr;
     CursorManager* cursor = nullptr;
+    // M2-Slice1 Task 1: optional DesktopWatch name provider forwarded into
+    // PipelineOpts (per-second diag_pipeline beat gains ` desktop=<name>`);
+    // pure observation, no behavior change.
+    const char* (*desktop_name_fn)(void*) = nullptr;
+    void* desktop_name_ctx = nullptr;
   };
 
   struct Stats {

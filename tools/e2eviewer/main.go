@@ -76,6 +76,7 @@ type config struct {
 	keyframeRetryAfter  time.Duration // 0=off;server 模式无帧到达超过此时长发 keyframe-req(丢包自救)
 	pliRetryAfter       time.Duration // 0=off;待验证 PLI 超时重发(frames>0 亦触发,上限 3 发/轮)
 	inputScript         string        // server 模式:连接+首关键帧后按 JSON 步骤注入输入
+	inputBeforeKeyframe bool          // 探针:跳过首关键帧门(锁屏静止场景注入)
 	jsonOnly            bool
 }
 
@@ -103,6 +104,8 @@ func parseFlags() *config {
 		"re-send a pending (unanswered) PLI after this long — even while frames flow (bounded: 3 sends per episode; 0=off)")
 	flag.StringVar(&c.inputScript, "input-script", "",
 		"server mode: JSON step file (lease/move/button/wheel/key/text/wait) run after connect + first keyframe; results land in the summary JSON (schema: inputscript.go)")
+	flag.BoolVar(&c.inputBeforeKeyframe, "input-before-keyframe", false,
+		"probe only: run the input script without waiting for the first decoded keyframe (e.g. static locked-screen scenarios where no IDR ever emerges)")
 	flag.BoolVar(&c.jsonOnly, "json", false, "print only the JSON summary")
 	flag.Parse()
 	return c
@@ -853,7 +856,8 @@ func runServer(c *config) (*summary, error) {
 	// --expect-* 断言 —— 场景期望由 e2e 脚本对 steps 自行判定)。
 	var inputRes *scriptResult
 	if steps != nil {
-		inputRes = runServerScript(ctx, steps, v, chs, leaseCh, leaseState, ws, log)
+		inputRes = runServerScript(ctx, steps, v, chs, leaseCh, leaseState, ws, log,
+			c.inputBeforeKeyframe)
 	}
 	// 观察尾段:脚本结束后至少 3s(cursor 事件/PLI-IDR 余波可见),
 	// 且不短于 --duration。
