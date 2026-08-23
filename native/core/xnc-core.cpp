@@ -30,6 +30,7 @@
 #include "../common/handshake.h"
 #include "../common/log.h"
 #include "pipe_server.h"
+#include "service.h"
 #include "spawn.h"
 #include "token_manager.h"
 
@@ -45,7 +46,17 @@ void Usage(FILE* out) {
       L"usage: xnc-core.exe --console --smoke-secret <hex> [--pipe-name <name>]\n"
       L"       xnc-core.exe --console --smoke-secret <hex> --sas-probe [reason]\n"
       L"       xnc-core.exe --console --diag-spawn <exe> <args...>\n"
+      L"       xnc-core.exe --service <name> [--smoke-secret <hex>] "
+      L"[--pipe-name <name>]\n"
       L"       xnc-core.exe --selftest\n"
+      L"  --service <name>  run as Windows service <name> (SCM dispatch;\n"
+      L"                  name must match the registered service). Pipe\n"
+      L"                  credentials: --pipe-name/--smoke-secret argv (dev;\n"
+      L"                  plaintext binPath precedent) or the env fallback\n"
+      L"                  XNC_CORE_PIPE_NAME / XNC_CORE_SECRET_HEX. Service\n"
+      L"                  mode opens the SAS gate (M2-Slice3 ruling: the\n"
+      L"                  server capability ticket gates upstream). SCM stop\n"
+      L"                  drains exactly like console Ctrl+C\n"
       L"  --console       foreground: serve the XNIP pipe (DACL SYSTEM+Admins)\n"
       L"  --pipe-name     pipe name (default %s)\n"
       L"  --smoke-secret  hex pipe secret (nominal 32B = 64 hex chars);\n"
@@ -66,8 +77,7 @@ void Usage(FILE* out) {
       L"                  the active console session via TokenManager, wait\n"
       L"                  for it and propagate its exit code; remaining args\n"
       L"                  go to the child verbatim; no pipe server here\n"
-      L"  --selftest      frame + handshake selftest\n"
-      L"service mode (SCM) is not implemented yet - arrives in M2\n",
+      L"  --selftest      frame + handshake selftest\n",
       kDefaultPipe);
 }
 
@@ -240,7 +250,8 @@ int RunSasProbe(const wchar_t* pipe_name, const uint8_t* secret,
 
 int wmain(int argc, wchar_t** argv) {
   bool console = false, selftest = false, diag_spawn = false;
-  bool allow_sas = false, sas_probe = false;
+  bool allow_sas = false, sas_probe = false, service_mode = false;
+  const wchar_t* service_name = nullptr;
   const wchar_t* pipe_name = kDefaultPipe;
   const wchar_t* secret_hex = nullptr;
   const wchar_t* sas_reason = L"diag";
@@ -249,6 +260,9 @@ int wmain(int argc, wchar_t** argv) {
   for (int i = 1; i < argc; i++) {
     if (std::wcscmp(argv[i], L"--console") == 0) {
       console = true;
+    } else if (std::wcscmp(argv[i], L"--service") == 0 && i + 1 < argc) {
+      service_mode = true;
+      service_name = argv[++i];
     } else if (std::wcscmp(argv[i], L"--selftest") == 0) {
       selftest = true;
     } else if (std::wcscmp(argv[i], L"--pipe-name") == 0 && i + 1 < argc) {
@@ -290,6 +304,49 @@ int wmain(int argc, wchar_t** argv) {
   }
 
   if (selftest) return SelftestMain();
+  if (service_mode) {
+    if (console || diag_spawn || sas_probe || allow_sas) {
+      std::fwprintf(stderr,
+          L"xnc-core: --service is a standalone mode (no --console/"
+          L"--diag-spawn/--sas-probe/--allow-sas; the SAS gate is OPEN in "
+          L"service mode by the M2-Slice3 ruling)\n");
+      return 2;
+    }
+    if (!service_name || !service_name[0]) {
+      std::fwprintf(stderr, L"xnc-core: --service requires a service <name>\n");
+      return 2;
+    }
+    std::string secret;
+    if (secret_hex) {
+      if (!ParseSecretHex(secret_hex, secret)) {
+        std::fwprintf(stderr, L"xnc-core: bad --smoke-secret hex\n");
+        return 2;
+      }
+    } else {
+      // Env fallback (SCM services carry no stdin credential channel yet).
+      wchar_t env_hex[2 * xnc::kMaxPipeSecretBytes + 1];
+      DWORD n = GetEnvironmentVariableW(L"XNC_CORE_SECRET_HEX", env_hex,
+                                        sizeof(env_hex) / sizeof(wchar_t));
+      if (n == 0 || n >= sizeof(env_hex) / sizeof(wchar_t) ||
+          !ParseSecretHex(env_hex, secret)) {
+        std::fwprintf(stderr,
+            L"xnc-core: --service needs --smoke-secret <hex> or a valid "
+            L"XNC_CORE_SECRET_HEX env (dev argv carries the plaintext "
+            L"precedent; the SCM credential channel is a later slice)\n");
+        return 2;
+      }
+    }
+    wchar_t env_pipe[256];
+    if (pipe_name == kDefaultPipe &&
+        GetEnvironmentVariableW(L"XNC_CORE_PIPE_NAME", env_pipe,
+                                sizeof(env_pipe) / sizeof(wchar_t)) > 0 &&
+        env_pipe[0]) {
+      pipe_name = env_pipe;
+    }
+    return xnc::RunService(service_name, pipe_name,
+                           reinterpret_cast<const uint8_t*>(secret.data()),
+                           secret.size());
+  }
   if (diag_spawn) {
     if (!console) {
       std::fwprintf(stderr, L"xnc-core: --diag-spawn is only valid with --console\n");

@@ -1143,6 +1143,12 @@ void ServeFrames(TimedIo& io, Watchdog* wd, uint32_t client_pid) {
 
 }  // namespace
 
+void RequestCoreStop() {
+  // SCM stop path (M2-Slice3 Task 1): same flag, same drain as Ctrl+C.
+  XNC_LOG_INFO("core stop requested (service), stopping");
+  g_stop = true;
+}
+
 // ---- M2-Slice1 Task 4 public surface (pipe_server.h declarations) ----
 
 WtsMonitor& CoreWts() { return g_wts; }

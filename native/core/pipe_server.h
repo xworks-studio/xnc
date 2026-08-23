@@ -144,6 +144,12 @@ void SetShellSpawnForTest(ShellSpawnFn fn);
 // process lifetime; returns the process exit code (0 on Ctrl+C, 1 on fatal).
 int RunPipeServer(const wchar_t* pipe_name, const uint8_t* secret, size_t secret_len);
 
+// Set the same stop flag the console Ctrl+C handler sets (M2-Slice3 Task 1:
+// the SCM Stop/Shutdown handler calls this). The serve loop then drains:
+// accept stops, capture/shell children are terminated scoped by stored
+// handle, the WTS monitor stops, RunPipeServer returns 0.
+void RequestCoreStop();
+
 // Serve a single already-accepted overlapped pipe instance: handshake
 // (spec 9.3) then the frame loop until disconnect. RunPipeServer's exact
 // per-connection path, exposed for the in-process loopback selftest (which
