@@ -229,3 +229,25 @@ func TestDrainSasReplies(t *testing.T) {
 	default:
 	}
 }
+
+// TestDisplayResumeDelta(M2-Slice1 Task 6 门③):displayResumeMs 是「事件→
+// 下一帧」的差值(非绝对时刻);事件后无帧 = -1。run-3 gate-3 曾把绝对
+// AU 时刻当差值(16758ms 假失败,真值 1052ms)。
+func TestDisplayResumeDelta(t *testing.T) {
+	v := &viewer{start: time.Now().Add(-10 * time.Second)}
+	v.recordDisplay(1, 1920, 1080, "access_lost")
+	time.Sleep(30 * time.Millisecond)
+	v.recordAu(true)
+	time.Sleep(25 * time.Millisecond) // distinct ms bucket: the AU is BEFORE event 2
+	v.recordDisplay(2, 1024, 768, "access_lost")
+	s := v.collect("server", "", 0)
+	if len(s.DisplayResumeMs) != 2 {
+		t.Fatalf("displayResumeMs = %v, want 2 entries", s.DisplayResumeMs)
+	}
+	if s.DisplayResumeMs[0] < 0 || s.DisplayResumeMs[0] > 5000 {
+		t.Errorf("first delta = %dms, want a small positive delta", s.DisplayResumeMs[0])
+	}
+	if s.DisplayResumeMs[1] != -1 {
+		t.Errorf("second delta = %dms, want -1 (no AU after the second event)", s.DisplayResumeMs[1])
+	}
+}

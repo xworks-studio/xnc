@@ -207,6 +207,13 @@ type viewer struct {
 	stateEvents  uint64
 	stateSamples []stateSample
 
+	// AU/IDR 到达环(M2-Slice1 Task 6 门时序证据):解码 AU(与其中关键
+	// 帧)的相对到达 ms,截尾保留最近一段;collect 时导出 + 计算
+	// DISPLAY_CHANGED 后首帧间隔(门③ ≤2s)与窗口内 fps/IDR(门④)。
+	auMu     sync.Mutex
+	auTimes  []int64
+	keyTimes []int64
+
 	// --sas(--input-script sas op 同路)结果记录(M2-Slice1 Task 5):
 	// 请求发出时刻 + 回执(ok/hr/code)+ rtt;summary.sas。
 	sasMu     sync.Mutex
@@ -337,6 +344,55 @@ func (v *viewer) stateStats() (uint64, []stateSample) {
 	return v.stateEvents, out
 }
 
+// auRingCap / auRingKeep:到达环上限与截尾保留量(超限丢最旧的一半)。
+const (
+	auRingCap  = 8192
+	auRingKeep = 4096
+	keyRingCap = 2048
+	keyRingKeep = 1024
+)
+
+// recordAu 记一个解码 AU 的到达时刻(关键帧另记 keyTimes)。
+func (v *viewer) recordAu(isKey bool) {
+	t := time.Since(v.start).Milliseconds()
+	v.auMu.Lock()
+	defer v.auMu.Unlock()
+	v.auTimes = append(v.auTimes, t)
+	if len(v.auTimes) > auRingCap {
+		v.auTimes = append(v.auTimes[:0], v.auTimes[len(v.auTimes)-auRingKeep:]...)
+	}
+	if isKey {
+		v.keyTimes = append(v.keyTimes, t)
+		if len(v.keyTimes) > keyRingCap {
+			v.keyTimes = append(v.keyTimes[:0], v.keyTimes[len(v.keyTimes)-keyRingKeep:]...)
+		}
+	}
+}
+
+// firstAuAfter 返回 t(相对 ms)之后首个解码 AU 的相对 ms;无 = -1。
+// 仅到达环内可搜(截尾后最旧可能缺失,调用方知界)。
+func (v *viewer) firstAuAfter(t int64) int64 {
+	v.auMu.Lock()
+	defer v.auMu.Unlock()
+	for _, at := range v.auTimes {
+		if at >= t {
+			return at
+		}
+	}
+	return -1
+}
+
+// auRingSnapshot 返回(auTimes, keyTimes)副本。
+func (v *viewer) auRingSnapshot() ([]int64, []int64) {
+	v.auMu.Lock()
+	defer v.auMu.Unlock()
+	a := make([]int64, len(v.auTimes))
+	copy(a, v.auTimes)
+	k := make([]int64, len(v.keyTimes))
+	copy(k, v.keyTimes)
+	return a, k
+}
+
 // recordCursor 记一条 cursor 通道事件(server 模式 OnDataChannel 调用)。
 func (v *viewer) recordCursor(x, y int32, visible bool) {
 	v.cursorMu.Lock()
@@ -417,10 +473,12 @@ func newViewer(c *config, ice []webrtc.ICEServer, relay bool, log *slog.Logger) 
 				v.bytes.Add(uint64(len(smp.Data)))
 				now := time.Now().UnixNano()
 				v.lastAUAt.Store(now)
+				isKey := desktop.IsKeyframeAU(smp.Data)
+				v.recordAu(isKey)
 				if v.firstAt.CompareAndSwap(0, now) {
-					v.firstKey.Store(desktop.IsKeyframeAU(smp.Data))
+					v.firstKey.Store(isKey)
 				}
-				if desktop.IsKeyframeAU(smp.Data) {
+				if isKey {
 					if t := v.pliMu.Swap(0); t != 0 {
 						// PLI→IDR 从本轮首 PLI 起算(重发不重置表尺:
 						// 慢就是慢,门④不能被 retry 稀释)。
@@ -512,8 +570,11 @@ type summary struct {
 	CursorSamples    []cursorSample  `json:"cursorSamples,omitempty"`
 	DisplayEvents    uint64          `json:"displayEvents"`
 	DisplaySamples   []displaySample `json:"displaySamples,omitempty"`
+	DisplayResumeMs  []int64         `json:"displayResumeMs,omitempty"`
 	StateEvents      uint64          `json:"stateEvents"`
 	StateSamples     []stateSample   `json:"stateSamples,omitempty"`
+	AuTimesMs        []int64         `json:"auTimesMs,omitempty"`
+	KeyTimesMs       []int64         `json:"keyTimesMs,omitempty"`
 	Sas              *sasOutcome     `json:"sas,omitempty"`
 	Input            *scriptResult   `json:"input,omitempty"`
 	DurationMs       int64           `json:"durationMs"`
@@ -525,6 +586,18 @@ func (v *viewer) collect(mode, dump string, ran time.Duration) *summary {
 	cur, samples := v.cursorStats()
 	dEvents, dSamples := v.displayStats()
 	sEvents, sSamples := v.stateStats()
+	auTimes, keyTimes := v.auRingSnapshot()
+	// displayResumeMs[i] = ms from displaySamples[i].TMs to the NEXT decoded
+	// AU (-1 = none after; only ring-searchable - collect runs late, usually
+	// in-window). Delta, not the absolute AU time (run-3 gate-3 finding).
+	resume := make([]int64, 0, len(dSamples))
+	for _, d := range dSamples {
+		if at := v.firstAuAfter(d.TMs); at >= 0 {
+			resume = append(resume, at-d.TMs)
+		} else {
+			resume = append(resume, -1)
+		}
+	}
 	s := &summary{
 		Mode: mode, Relay: v.relay, DumpFile: dump,
 		StartUnixMs: v.start.UnixMilli(),
@@ -534,9 +607,12 @@ func (v *viewer) collect(mode, dump string, ran time.Duration) *summary {
 		KeyframeReqs: v.keyframeReqs.Load(), PliToIdrMaxMs: v.pliIDRMax.Load(),
 		CursorEvents: cur, CursorSamples: samples,
 		DisplayEvents: dEvents, DisplaySamples: dSamples,
-		StateEvents: sEvents, StateSamples: sSamples,
-		Sas:         v.sasSnapshot(),
-		DurationMs:  ran.Milliseconds(),
+		DisplayResumeMs: resume,
+		StateEvents:     sEvents, StateSamples: sSamples,
+		AuTimesMs:  auTimes,
+		KeyTimesMs: keyTimes,
+		Sas:        v.sasSnapshot(),
+		DurationMs: ran.Milliseconds(),
 	}
 	if t := v.firstAt.Load(); t != 0 {
 		s.FirstFrameMs = time.Unix(0, t).Sub(v.start).Milliseconds()

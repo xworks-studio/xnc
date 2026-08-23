@@ -35,8 +35,10 @@ Remove-Item -Force -ErrorAction SilentlyContinue $Marker
 # answered (uac-probe run-1 finding).
 $job = Start-Job -ScriptBlock {
   try {
+    # NOTE: no space before '>' — cmd echoes it into the file and the
+    # orchestrator's exact-match on the marker would see it.
     Start-Process -Verb RunAs -FilePath 'C:\xnc-dev\xnc-uac-child.exe' `
-      -ArgumentList '/c', "net session >nul 2>&1 && echo ELEVATED-OK> $using:Marker & ping -n $using:HoldSec 127.0.0.1 >nul" `
+      -ArgumentList '/c', "net session >nul 2>&1 && echo ELEVATED-OK>$using:Marker & ping -n $using:HoldSec 127.0.0.1 >nul" `
       -ErrorAction Stop
     'spawned'
   } catch {
