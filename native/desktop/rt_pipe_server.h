@@ -5,7 +5,7 @@
 // (common/handshake.h) and get HOST_HELLO immediately.
 //
 // Message set (plan Global Constraints - fixed-binary subset of spec §9.4,
-// protobuf migration is Slice3; all payloads little-endian):
+// protobuf migration is deferred to M2; all payloads little-endian):
 //   MSG_ATTACH      0x0102 req  [u32 sub_id][u32 max_fps][u32 max_w][u32 bitrate]
 //   MSG_DETACH      0x0103 req  [u32 sub_id]
 //   MSG_KEYFRAME_REQ 0x0104 req [u32 sub_id][char reason[32]] (NUL padded)
@@ -13,6 +13,11 @@
 //                               [u8 key][u32 len][au bytes]
 //   MSG_HOST_HELLO  0x0106 event [u32 gen][u32 w][u32 h][u32 fps][u32 max_subs]
 //   MSG_STATE       0x0107 event [char code[32]][u8 recoverable]
+//   MSG_INPUT       0x0108 req  [u32 sub_id][u64 seq][u8 type][payload']
+//                               (M1-Slice3; see InputMsg below for the six
+//                               payload' layouts MOVE/BUTTON/WHEEL/KEY/TEXT/LOCK)
+//   MSG_CURSOR      0x0109 event [s32 x][s32 y][u8 visible]
+//                               (M1-Slice3; HOST_HELLO-space logical px)
 //
 // sub_ids are client-chosen (non-zero, unique per server). IDR semantics
 // (spec §7.5 + Slice1 carry-over): attach/queue-overflow/explicit requests
@@ -20,6 +25,19 @@
 // MfSoftEncoder::ForceNextIdr at most once per 500ms and, on a static
 // screen, re-feeds the cached base frame (bounded, never re-forcing) until
 // the IDR AU emerges - the on-demand warm-up.
+//
+// Input/cursor wiring (M1-Slice3 Task 1): RtServer.Opts carries OPTIONAL
+// pointers to an externally-owned InputManager and CursorManager. 0x0108
+// frames from an attached connection are decoded here and forwarded to
+// InputManager::Inject (the payload sub_id must equal the connection's own
+// sub_id; per-sub_id strictly-increasing seq is enforced INSIDE the
+// InputManager next to the state it guards - see input_manager.h). The
+// CursorManager polls GetCursorInfo while subscribers exist and pushes
+// 0x0109 events back through RtServer::BroadcastCursor. When the LAST
+// subscriber detaches the cursor poller stops and InputManager::ReleaseAll
+// force-releases every recorded key/button (keys are session-global OS
+// state: releasing on ANY single detach would disrupt the other viewers'
+// in-flight input - ReleaseAll fires on last-detach / DRAIN only).
 //
 // Payload codecs below are pure header-only functions so the selftest can
 // assert exact wire bytes without a pipe; RtServer itself is implemented
@@ -47,9 +65,13 @@
 
 namespace xnc {
 
+class InputManager;   // input_manager.h (opts pointers only in this header)
+class CursorManager;  // cursor_manager.h
+
 // ---- message types (plan Task 2; 0x0100/0x0101 are core's capture RPCs) ----
 constexpr uint16_t kMsgAttach = 0x0102, kMsgDetach = 0x0103, kMsgKeyframeReq = 0x0104,
-                   kMsgFrame = 0x0105, kMsgHostHello = 0x0106, kMsgState = 0x0107;
+                   kMsgFrame = 0x0105, kMsgHostHello = 0x0106, kMsgState = 0x0107,
+                   kMsgInput = 0x0108, kMsgCursor = 0x0109;
 
 // AU payload bound (proto.MaxSessionFrameBytes).
 inline constexpr size_t kMaxAuBytes = size_t(8) << 20;
@@ -76,6 +98,9 @@ inline uint16_t GetU16(const uint8_t* p) {
 inline uint32_t GetU32(const uint8_t* p) {
   return static_cast<uint32_t>(p[0]) | static_cast<uint32_t>(p[1]) << 8 |
          static_cast<uint32_t>(p[2]) << 16 | static_cast<uint32_t>(p[3]) << 24;
+}
+inline int32_t GetS32(const uint8_t* p) {
+  return static_cast<int32_t>(GetU32(p));
 }
 inline uint64_t GetU64(const uint8_t* p) {
   uint64_t v = 0;
@@ -212,6 +237,170 @@ inline bool DecodeStateEvent(const Frame& f, StateEventPayload* out) {
   return true;
 }
 
+// ---- 0x0108 MSG_INPUT (plan M1-Slice3 Global Constraints; LE) ----
+//
+//   [u32 sub_id][u64 seq][u8 type][payload'], type:
+//     1 MOVE   [s32 x][s32 y][u16 buttons]      buttons bit 1L 2R 4M 8X1 16X2
+//     2 BUTTON [u8 btn][u8 down]                btn = the mask value 1/2/4/8/16
+//     3 WHEEL  [s32 dx][s32 dy][u8 trackpad]    dy vertical, dx horizontal
+//     4 KEY    [u16 scan][u8 down][u8 extended] scan = Windows scan code (set 1)
+//     5 TEXT   [u16 len][utf16le units]         surrogate pairs ride as units
+//     6 LOCK   [u8 caps][u8 num]                desired toggle states 0/1
+//
+// x/y are logical px in the HOST_HELLO w/h stream space (spec 11.3 maps them
+// to the virtual desktop inside InputManager). MOVE is ABSOLUTE only -
+// MOVE_RELATIVE (spec 11.3, delta clamp +-10000) is deferred to M2.
+// Wire-shape/域 validation lives HERE (DecodeInputMsg); per-sub seq
+// monotonicity and injection semantics live in InputManager::Inject.
+
+inline constexpr uint8_t kInputMove = 1, kInputButton = 2, kInputWheel = 3,
+                         kInputKey = 4, kInputText = 5, kInputLock = 6;
+// Mouse button bitmask (spec 11.2 PointerMove.buttons).
+inline constexpr uint16_t kBtnL = 1, kBtnR = 2, kBtnM = 4, kBtnX1 = 8,
+                          kBtnX2 = 16, kBtnMaskAny = 31;
+// TEXT unit bound: 512 UTF-16 units per message (desktop-side defensive cap;
+// the agent enforces the <=2KiB message budget, spec 11.7).
+inline constexpr uint16_t kMaxTextUnits = 512;
+
+struct InputMsg {
+  uint32_t sub_id = 0;
+  uint64_t seq = 0;
+  uint8_t type = 0;               // kInputMove..kInputLock
+  int32_t x = 0, y = 0;           // MOVE logical px / WHEEL dx,dy
+  uint16_t buttons = 0;           // MOVE button bitmask
+  uint8_t btn = 0, down = 0;      // BUTTON (mask value / 0|1); down reused by KEY
+  uint8_t trackpad = 0;           // WHEEL granularity selector
+  uint16_t scan = 0;              // KEY scan code
+  uint8_t extended = 0;           // KEY E0-prefix flag
+  std::vector<uint16_t> text;     // TEXT UTF-16 code units
+  uint8_t caps = 0, num = 0;      // LOCK desired states
+};
+
+// True when m is exactly one of the five valid button mask bits.
+inline bool IsButtonMask(uint8_t mask) {
+  return mask == kBtnL || mask == kBtnR || mask == kBtnM || mask == kBtnX1 ||
+         mask == kBtnX2;
+}
+
+inline std::vector<uint8_t> EncodeInputMsg(const InputMsg& m) {
+  std::vector<uint8_t> p;
+  switch (m.type) {
+    case kInputMove:
+      p.resize(23, 0);
+      rt_detail::PutU32(p.data() + 13, static_cast<uint32_t>(m.x));
+      rt_detail::PutU32(p.data() + 17, static_cast<uint32_t>(m.y));
+      rt_detail::PutU16(p.data() + 21, m.buttons);
+      break;
+    case kInputButton:
+      p.resize(15, 0);
+      p[13] = m.btn;
+      p[14] = m.down;
+      break;
+    case kInputWheel:
+      p.resize(22, 0);
+      rt_detail::PutU32(p.data() + 13, static_cast<uint32_t>(m.x));
+      rt_detail::PutU32(p.data() + 17, static_cast<uint32_t>(m.y));
+      p[21] = m.trackpad;
+      break;
+    case kInputKey:
+      p.resize(17, 0);
+      rt_detail::PutU16(p.data() + 13, m.scan);
+      p[15] = m.down;
+      p[16] = m.extended;
+      break;
+    case kInputText:
+      p.resize(size_t(15) + 2 * m.text.size(), 0);
+      rt_detail::PutU16(p.data() + 13, static_cast<uint16_t>(m.text.size()));
+      for (size_t i = 0; i < m.text.size(); ++i)
+        rt_detail::PutU16(p.data() + 15 + 2 * i, m.text[i]);
+      break;
+    case kInputLock:
+      p.resize(15, 0);
+      p[13] = m.caps;
+      p[14] = m.num;
+      break;
+    default:
+      return {};
+  }
+  rt_detail::PutU32(p.data(), m.sub_id);
+  rt_detail::PutU64(p.data() + 4, m.seq);
+  p[12] = m.type;
+  return p;
+}
+
+inline bool DecodeInputMsg(const Frame& f, InputMsg* out) {
+  if (out == nullptr || f.payload.size() < 13) return false;
+  const uint8_t* p = f.payload.data();
+  const size_t rest = f.payload.size() - 13;
+  out->sub_id = rt_detail::GetU32(p);
+  out->seq = rt_detail::GetU64(p + 4);
+  out->type = p[12];
+  if (out->sub_id == 0) return false;
+  switch (out->type) {
+    case kInputMove:
+      if (rest != 10) return false;
+      out->x = rt_detail::GetS32(p + 13);
+      out->y = rt_detail::GetS32(p + 17);
+      out->buttons = rt_detail::GetU16(p + 21);
+      return (out->buttons & ~kBtnMaskAny) == 0;
+    case kInputButton:
+      if (rest != 2) return false;
+      out->btn = p[13];
+      out->down = p[14];
+      return IsButtonMask(out->btn) && out->down <= 1;
+    case kInputWheel:
+      if (rest != 9) return false;
+      out->x = rt_detail::GetS32(p + 13);
+      out->y = rt_detail::GetS32(p + 17);
+      out->trackpad = p[21];
+      return out->trackpad <= 1;
+    case kInputKey:
+      if (rest != 4) return false;
+      out->scan = rt_detail::GetU16(p + 13);
+      out->down = p[15];
+      out->extended = p[16];
+      return out->scan != 0 && out->down <= 1 && out->extended <= 1;
+    case kInputText: {
+      if (rest < 4) return false;
+      const uint16_t len = rt_detail::GetU16(p + 13);
+      if (len == 0 || len > kMaxTextUnits) return false;
+      if (rest != size_t(2) + size_t(2) * len) return false;
+      out->text.resize(len);
+      for (uint16_t i = 0; i < len; ++i)
+        out->text[i] = rt_detail::GetU16(p + 15 + 2 * i);
+      return true;
+    }
+    case kInputLock:
+      if (rest != 2) return false;
+      out->caps = p[13];
+      out->num = p[14];
+      return out->caps <= 1 && out->num <= 1;
+    default:
+      return false;
+  }
+}
+
+// ---- 0x0109 MSG_CURSOR event: [s32 x][s32 y][u8 visible] ----
+// Coordinates are logical px in the HOST_HELLO w/h stream space (the
+// InputManager's inverse mapping; see cursor_manager.h).
+
+inline std::vector<uint8_t> EncodeCursorEvent(int32_t x, int32_t y, uint8_t visible) {
+  std::vector<uint8_t> p(9, 0);
+  rt_detail::PutU32(p.data(), static_cast<uint32_t>(x));
+  rt_detail::PutU32(p.data() + 4, static_cast<uint32_t>(y));
+  p[8] = visible != 0 ? 1 : 0;
+  return p;
+}
+inline bool DecodeCursorEvent(const Frame& f, int32_t* x, int32_t* y,
+                              uint8_t* visible) {
+  if (x == nullptr || y == nullptr || visible == nullptr || f.payload.size() != 9)
+    return false;
+  *x = rt_detail::GetS32(f.payload.data());
+  *y = rt_detail::GetS32(f.payload.data() + 4);
+  *visible = f.payload[8];
+  return true;
+}
+
 // ---- server ----
 
 class RtServer : public AuSink {
@@ -227,6 +416,11 @@ class RtServer : public AuSink {
     // loopback). Production DACL is built from SYSTEM+Administrators+the
     // spawning user; the pipe secret carries the real authentication.
     const wchar_t* sddl_override = nullptr;
+    // M1-Slice3: externally-owned input/cursor managers (optional - null
+    // leaves 0x0108 rejected-by-count and no cursor events, i.e. the pure
+    // Slice2 video server). Both must outlive Start..Shutdown.
+    InputManager* input = nullptr;
+    CursorManager* cursor = nullptr;
   };
 
   struct Stats {
@@ -241,6 +435,10 @@ class RtServer : public AuSink {
     uint64_t frames_oversize = 0;  // AUs above the 8MiB frame bound (dropped)
     uint64_t idr_sub_join = 0, idr_queue_overflow = 0, idr_explicit = 0,
              idr_other = 0;  // pipeline-armed IDRs by reason (accounting)
+    uint64_t input_received = 0;  // 0x0108 frames from attached connections
+    uint64_t input_rejected = 0;  // decode/shape/sub_id-mismatch rejects
+    uint64_t input_dropped = 0;   // stale seq or injection failure (Inject != ok)
+    uint64_t cursor_events = 0;   // 0x0109 events broadcast
   };
 
   RtServer() = default;
@@ -292,6 +490,14 @@ class RtServer : public AuSink {
   // Pushes a control frame to one subscriber (never dropped; backlog
   // overflow returns false = wedged connection, caller disconnects).
   bool PushControlTo(SubConn* c, const Frame& f);
+  // CursorManager sink target: encodes 0x0109 and fans it out to every
+  // attached subscriber (called on the cursor poll thread).
+  void BroadcastCursor(int32_t x, int32_t y, uint8_t visible);
+  // After a subscriber leaves the table: forgets its input seq baseline and,
+  // when it was the LAST subscriber, stops the cursor poller and runs
+  // InputManager::ReleaseAll (session-global key/button state). Callers must
+  // NOT hold mu_.
+  void OnSubscriberRemoved(uint32_t sub_id);
 
   Opts opts_;
   uint32_t src_w_ = 0, src_h_ = 0;

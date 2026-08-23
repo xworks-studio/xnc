@@ -3,14 +3,19 @@ rem build.bat - build bin/xnc-desktop.exe (native/desktop: console-diag
 rem process skeleton + Task 3 DXGI capture backend + Task 4 MF software
 rem H.264 encoder and BGRA->NV12 conversion + Task 5 FrameCache/pipeline
 rem with bitstream shaping and stats.json sidecar + M1-Slice2 Task 2
-rem real-time pipe server: subscriber fan-out with on-demand IDR) with
-rem MSVC. Requires VS2022 (vcvars64). Static CRT (/MT) so nodes need no VC
+rem real-time pipe server: subscriber fan-out with on-demand IDR + M1-Slice3
+rem Task 1 InputManager (SendInput injection) + CursorManager (GetCursorInfo
+rem poll) over 0x0108/0x0109) with MSVC. Requires VS2022 (vcvars64).
+rem Static CRT (/MT) so nodes need no VC
 rem runtime installed. Shares frame/handshake/log from ..\common (XNIP
 rem codec + M0 HMAC handshake; bcrypt.lib for CNG); dxgi_capture.cpp needs
 rem d3d11.lib (D3D11CreateDevice), mf_encoder.cpp needs mfplat.lib
 rem (MFCreate*) + mfuuid.lib (MF MediaType GUIDs) + ole32.lib
 rem (CoCreateInstance/CoInitializeEx); rt_pipe_server.cpp needs bcrypt.lib
-rem (handshake HMAC/RNG) + advapi32.lib (SDDL/user SID DACL); artifacts go
+rem (handshake HMAC/RNG) + advapi32.lib (SDDL/user SID DACL);
+rem input_manager.cpp/cursor_manager.cpp need user32.lib (SendInput/
+rem GetKeyState/GetSystemMetrics/GetCursorInfo/OpenInputDesktop/
+rem SetThreadDesktop/CloseDesktop); artifacts go
 rem to ..\..\bin (gitignored).
 rem Targets:
 rem   build.bat            build ..\..\bin\xnc-desktop.exe
@@ -24,7 +29,7 @@ if errorlevel 1 (
 cd /d "%~dp0"
 
 if not exist ..\..\bin mkdir ..\..\bin
-cl /nologo /utf-8 /W3 /MT /std:c++17 /EHsc xnc-desktop.cpp dxgi_capture.cpp mf_encoder.cpp nv12.cpp pipeline.cpp rt_pipe_server.cpp desktop_selftest.cpp ..\common\frame.cpp ..\common\handshake.cpp /Fe:..\..\bin\xnc-desktop.exe /Fo:..\..\bin\ /link d3d11.lib mfplat.lib mfuuid.lib ole32.lib bcrypt.lib advapi32.lib
+cl /nologo /utf-8 /W3 /MT /std:c++17 /EHsc xnc-desktop.cpp dxgi_capture.cpp mf_encoder.cpp nv12.cpp pipeline.cpp rt_pipe_server.cpp input_manager.cpp cursor_manager.cpp desktop_selftest.cpp ..\common\frame.cpp ..\common\handshake.cpp /Fe:..\..\bin\xnc-desktop.exe /Fo:..\..\bin\ /link d3d11.lib mfplat.lib mfuuid.lib ole32.lib bcrypt.lib advapi32.lib user32.lib
 if errorlevel 1 exit /b 1
 
 echo [desktop] built ..\..\bin\xnc-desktop.exe

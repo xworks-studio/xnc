@@ -23,9 +23,11 @@
 // xnc-desktop.cpp and reachable via `xnc-desktop.exe --selftest` /
 // `build.bat selftest`.
 #include "capture.h"
+#include "cursor_manager.h"
 #include "diag.h"
 #include "dxgi_capture.h"
 #include "frame_cache.h"
+#include "input_manager.h"
 #include "mf_encoder.h"
 #include "nv12.h"
 #include "pipeline.h"
@@ -379,6 +381,12 @@ class RtTestClient {
     return xnc::WriteFrame(h_, xnc::Frame{0, xnc::kMsgDetach, 2, xnc::EncodeDetach(sub_id)});
   }
 
+  // Raw frame send (M1-Slice3 Task 1: 0x0108 input messages from the
+  // in-process fake viewer).
+  bool SendRaw(uint16_t type, const std::vector<uint8_t>& payload) {
+    return xnc::WriteFrame(h_, xnc::Frame{0, type, 0, payload});
+  }
+
   // Reads + counts frames until stop_if() or the deadline. Never blocks
   // past deadline (PeekNamedPipe poll underneath).
   template <typename Pred>
@@ -436,6 +444,9 @@ class RtTestClient {
       xnc::StateEventPayload st;
       if (xnc::DecodeStateEvent(f, &st) && std::strcmp(st.code, "stream_end") == 0)
         saw_stream_end_ = true;
+    } else if (f.message_type == xnc::kMsgCursor) {
+      if (xnc::DecodeCursorEvent(f, &cursor_x_, &cursor_y_, &cursor_visible_))
+        cursors_++;
     }
   }
 
@@ -443,6 +454,9 @@ class RtTestClient {
   uint64_t frames_ = 0, keys_ = 0;
   uint64_t first_key_mono_us_ = 0, last_key_mono_us_ = 0;
   std::vector<uint8_t> last_key_payload_;
+  uint64_t cursors_ = 0;
+  int32_t cursor_x_ = -1, cursor_y_ = -1;
+  uint8_t cursor_visible_ = 0xFF;
   xnc::HostHelloPayload hello_{};
   bool hello_ok_ = false, saw_stream_end_ = false, frame_before_hello_ = false;
 
@@ -459,6 +473,145 @@ const wchar_t* RtPipeNameOf(int slot) {
     std::swprintf(names[slot], 96, L"\\\\.\\pipe\\xnc-desktop-rt-selftest-%lu-%d",
                   static_cast<unsigned long>(GetCurrentProcessId()), slot);
   return names[slot];
+}
+
+// ---- M1-Slice3 Task 1 fixtures: fake Win32 seams ----
+// The InputManager/CursorManager production path calls SendInput & co
+// directly; both take the raw function pointers as injectable Opts so this
+// headless selftest drives the FULL logic (state tables, janitor, lock
+// diffs, coordinate math, seq enforcement) while recording the exact INPUT
+// structs that would reach the OS. The real SendInput path stays untouched
+// and is exercised by the T6 session-1 probe.
+
+// Records every INPUT the manager built; can be told to fail SendInput
+// batches (mode 1 = fail the first batch once, mode 2 = always fail) to
+// cover the desktop-rebind-retry-once path.
+struct InputRecorder {
+  std::vector<INPUT> sent;
+  int fail_mode = 0;
+  bool failed_once = false;
+  UINT Send(UINT n, LPINPUT in, int /*cb*/) {
+    if (fail_mode == 2 || (fail_mode == 1 && !failed_once)) {
+      failed_once = true;
+      return 0;
+    }
+    for (UINT i = 0; i < n; ++i) sent.push_back(in[i]);
+    return n;
+  }
+  void Reset() {
+    sent.clear();
+    failed_once = false;
+  }
+  size_t CountMouse(DWORD flags) const {
+    size_t c = 0;
+    for (const INPUT& i : sent)
+      if (i.type == INPUT_MOUSE && i.mi.dwFlags == flags) ++c;
+    return c;
+  }
+  size_t CountKey(DWORD flags) const {
+    size_t c = 0;
+    for (const INPUT& i : sent)
+      if (i.type == INPUT_KEYBOARD && i.ki.dwFlags == flags) ++c;
+    return c;
+  }
+  const INPUT* FindMouse(DWORD flags) const {
+    for (const INPUT& i : sent)
+      if (i.type == INPUT_MOUSE && i.mi.dwFlags == flags) return &i;
+    return nullptr;
+  }
+  const INPUT* FindKey(DWORD flags) const {
+    for (const INPUT& i : sent)
+      if (i.type == INPUT_KEYBOARD && i.ki.dwFlags == flags) return &i;
+    return nullptr;
+  }
+};
+
+InputRecorder* g_input_rec = nullptr;
+std::map<int, SHORT> g_vk_state;             // fake GetKeyState table
+int g_metrics[128] = {0};                    // fake GetSystemMetrics table
+uint64_t g_fake_now = 100000;                // fake clock (janitor tests)
+int g_open_desk_calls = 0, g_set_desk_calls = 0;
+struct {
+  LONG x = 0, y = 0;
+  DWORD flags = CURSOR_SHOWING;
+  BOOL ok = TRUE;
+} g_cursor;
+
+UINT WINAPI FakeSendInput(UINT n, LPINPUT in, int cb) {
+  return g_input_rec != nullptr ? g_input_rec->Send(n, in, cb) : n;
+}
+SHORT WINAPI FakeGetKeyState(int vk) {
+  const auto it = g_vk_state.find(vk);
+  return it == g_vk_state.end() ? SHORT(0) : it->second;
+}
+int WINAPI FakeGetSystemMetrics(int i) {
+  return (i >= 0 && i < 128) ? g_metrics[i] : 0;
+}
+ULONGLONG WINAPI FakeClock() { return g_fake_now; }
+HDESK WINAPI FakeOpenInputDesktop(DWORD, BOOL, ACCESS_MASK) {
+  g_open_desk_calls++;
+  return reinterpret_cast<HDESK>(1);
+}
+BOOL WINAPI FakeSetThreadDesktop(HDESK) {
+  g_set_desk_calls++;
+  return TRUE;
+}
+BOOL WINAPI FakeGetCursorInfo(PCURSORINFO ci) {
+  if (!g_cursor.ok || ci == nullptr) return FALSE;
+  ci->flags = g_cursor.flags;
+  ci->hCursor = reinterpret_cast<HCURSOR>(1);
+  ci->ptScreenPos.x = g_cursor.x;
+  ci->ptScreenPos.y = g_cursor.y;
+  return TRUE;
+}
+
+// Standard test seams: a 200x100 host stream over a (0,0,200,100) virtual
+// desktop (single monitor degenerate case); individual cases override the
+// tables for the multi-monitor/offset variants.
+xnc::InputManager::Opts TestInputOpts(uint32_t w, uint32_t h) {
+  xnc::InputManager::Opts o;
+  o.hello_w = w;
+  o.hello_h = h;
+  o.send_input = &FakeSendInput;
+  o.get_key_state = &FakeGetKeyState;
+  o.get_system_metrics = &FakeGetSystemMetrics;
+  o.clock_ms = &FakeClock;
+  o.open_input_desktop = &FakeOpenInputDesktop;
+  o.set_thread_desktop = &FakeSetThreadDesktop;
+  return o;
+}
+
+void ResetInputSeams(uint32_t w, uint32_t h) {
+  if (g_input_rec != nullptr) g_input_rec->Reset();
+  g_vk_state.clear();
+  for (int i = 0; i < 128; ++i) g_metrics[i] = 0;
+  g_metrics[SM_XVIRTUALSCREEN] = 0;
+  g_metrics[SM_YVIRTUALSCREEN] = 0;
+  g_metrics[SM_CXVIRTUALSCREEN] = static_cast<int>(w);
+  g_metrics[SM_CYVIRTUALSCREEN] = static_cast<int>(h);
+  g_fake_now = 100000;
+  g_open_desk_calls = 0;
+  g_set_desk_calls = 0;
+}
+
+xnc::CursorManager::Opts TestCursorOpts(uint32_t w, uint32_t h) {
+  xnc::CursorManager::Opts o;
+  o.hello_w = w;
+  o.hello_h = h;
+  o.get_cursor_info = &FakeGetCursorInfo;
+  o.get_system_metrics = &FakeGetSystemMetrics;
+  return o;
+}
+
+// Polls `pred` until true or the deadline (ms); reader threads are async.
+template <typename Pred>
+bool WaitUntil(Pred pred, DWORD timeout_ms) {
+  const ULONGLONG dl = GetTickCount64() + timeout_ms;
+  for (;;) {
+    if (pred()) return true;
+    if (GetTickCount64() >= dl) return pred();
+    Sleep(10);
+  }
 }
 
 }  // namespace
@@ -1678,6 +1831,720 @@ int SelftestMain() {
       std::printf("SELFTEST NOTE: rt4 frames=%llu detaches=%u\n",
                   (unsigned long long)a.frames_, st.detaches);
     }
+  }
+  // ---- M1-Slice3 Task 1:0x0108/0x0109 固定二进制 codec(精确字节) ----
+  {
+    // MOVE: [u32 sub][u64 seq][u8 1][s32 x][s32 y][u16 buttons]
+    xnc::InputMsg m;
+    m.sub_id = 7;
+    m.seq = 0x0102030405ull;
+    m.type = xnc::kInputMove;
+    m.x = -100;
+    m.y = 200;
+    m.buttons = 0x0013;  // L+M+X2
+    const std::vector<uint8_t> w = xnc::EncodeInputMsg(m);
+    const uint8_t want_move[23] = {7, 0, 0, 0, 5, 4, 3, 2, 1, 0, 0, 0, 1, 0x9C,
+                                   0xFF, 0xFF, 0xFF, 0xC8, 0, 0, 0, 0x13, 0};
+    CHECK("incodec-move-bytes",
+          w.size() == 23 && std::equal(w.begin(), w.end(), want_move));
+    xnc::InputMsg r;
+    CHECK("incodec-move-rt",
+          xnc::DecodeInputMsg(xnc::Frame{0, xnc::kMsgInput, 0, w}, &r) &&
+                r.sub_id == 7 && r.seq == 0x0102030405ull && r.type == xnc::kInputMove &&
+                r.x == -100 && r.y == 200 && r.buttons == 0x13);
+    // BUTTON: [u32][u64][u8 2][u8 btn=4(X1)][u8 down=1]
+    xnc::InputMsg b;
+    b.sub_id = 7;
+    b.seq = 6;
+    b.type = xnc::kInputButton;
+    b.btn = 8;
+    b.down = 1;
+    const std::vector<uint8_t> wb = xnc::EncodeInputMsg(b);
+    const uint8_t want_btn[15] = {7, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 2, 8, 1};
+    CHECK("incodec-button-bytes",
+          wb.size() == 15 && std::equal(wb.begin(), wb.end(), want_btn));
+    xnc::InputMsg rb;
+    CHECK("incodec-button-rt",
+          xnc::DecodeInputMsg(xnc::Frame{0, xnc::kMsgInput, 0, wb}, &rb) &&
+                rb.type == xnc::kInputButton && rb.btn == 8 && rb.down == 1);
+    // WHEEL: [u32][u64][u8 3][s32 dx][s32 dy][u8 trackpad]
+    xnc::InputMsg h;
+    h.sub_id = 7;
+    h.seq = 7;
+    h.type = xnc::kInputWheel;
+    h.x = -2;   // dx
+    h.y = -3;   // dy
+    h.trackpad = 1;
+    const std::vector<uint8_t> wh = xnc::EncodeInputMsg(h);
+    const uint8_t want_wh[22] = {7, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 3, 0xFE, 0xFF,
+                                 0xFF, 0xFF, 0xFD, 0xFF, 0xFF, 0xFF, 1};
+    CHECK("incodec-wheel-bytes",
+          wh.size() == 22 && std::equal(wh.begin(), wh.end(), want_wh));
+    xnc::InputMsg rh;
+    CHECK("incodec-wheel-rt",
+          xnc::DecodeInputMsg(xnc::Frame{0, xnc::kMsgInput, 0, wh}, &rh) &&
+                rh.type == xnc::kInputWheel && rh.x == -2 && rh.y == -3 &&
+                rh.trackpad == 1);
+    // KEY: [u32][u64][u8 4][u16 scan][u8 down][u8 extended]
+    xnc::InputMsg k;
+    k.sub_id = 7;
+    k.seq = 8;
+    k.type = xnc::kInputKey;
+    k.scan = 0x1D;
+    k.down = 1;
+    k.extended = 0;
+    const std::vector<uint8_t> wk = xnc::EncodeInputMsg(k);
+    const uint8_t want_key[17] = {7, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 4, 0x1D, 0, 1, 0};
+    CHECK("incodec-key-bytes",
+          wk.size() == 17 && std::equal(wk.begin(), wk.end(), want_key));
+    xnc::InputMsg rk;
+    CHECK("incodec-key-rt",
+          xnc::DecodeInputMsg(xnc::Frame{0, xnc::kMsgInput, 0, wk}, &rk) &&
+                rk.type == xnc::kInputKey && rk.scan == 0x1D && rk.down == 1 &&
+                rk.extended == 0);
+    // TEXT: [u32][u64][u8 5][u16 len][utf16le units] (surrogate pair U+1D11E)
+    xnc::InputMsg t;
+    t.sub_id = 7;
+    t.seq = 9;
+    t.type = xnc::kInputText;
+    t.text = {0xD834, 0xDD1E, 0x0041};
+    const std::vector<uint8_t> wt = xnc::EncodeInputMsg(t);
+    const uint8_t want_tx[21] = {7, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 5,
+                                 3, 0, 0x34, 0xD8, 0x1E, 0xDD, 0x41, 0x00};
+    CHECK("incodec-text-bytes",
+          wt.size() == 21 && std::equal(wt.begin(), wt.end(), want_tx));
+    xnc::InputMsg rt2;
+    CHECK("incodec-text-rt",
+          xnc::DecodeInputMsg(xnc::Frame{0, xnc::kMsgInput, 0, wt}, &rt2) &&
+                rt2.type == xnc::kInputText && rt2.text.size() == 3 &&
+                rt2.text[0] == 0xD834 && rt2.text[1] == 0xDD1E && rt2.text[2] == 0x0041);
+    // LOCK: [u32][u64][u8 6][u8 caps][u8 num]
+    xnc::InputMsg l;
+    l.sub_id = 7;
+    l.seq = 10;
+    l.type = xnc::kInputLock;
+    l.caps = 1;
+    l.num = 0;
+    const std::vector<uint8_t> wl = xnc::EncodeInputMsg(l);
+    const uint8_t want_lk[15] = {7, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 6, 1, 0};
+    CHECK("incodec-lock-bytes",
+          wl.size() == 15 && std::equal(wl.begin(), wl.end(), want_lk));
+    xnc::InputMsg rl;
+    CHECK("incodec-lock-rt",
+          xnc::DecodeInputMsg(xnc::Frame{0, xnc::kMsgInput, 0, wl}, &rl) &&
+                rl.type == xnc::kInputLock && rl.caps == 1 && rl.num == 0);
+    // 拒绝矩阵:形状/类型/域校验
+    auto dec = [](const std::vector<uint8_t>& p) {
+      xnc::InputMsg o;
+      return xnc::DecodeInputMsg(xnc::Frame{0, xnc::kMsgInput, 0, p}, &o);
+    };
+    CHECK("incodec-short-header", !dec({1, 2, 3, 4, 5}));
+    CHECK("incodec-type-zero", !dec(std::vector<uint8_t>{7, 0, 0, 0, 1, 0, 0, 0,
+                                                         0, 0, 0, 0, 0}));
+    CHECK("incodec-type-unknown", !dec(std::vector<uint8_t>{7, 0, 0, 0, 1, 0, 0, 0,
+                                                            0, 0, 0, 0, 7, 0, 0}));
+    CHECK("incodec-zero-sub", !dec(std::vector<uint8_t>{0, 0, 0, 0, 1, 0, 0, 0,
+                                                        0, 0, 0, 0, 6, 0, 0}));
+    CHECK("incodec-move-bad-size", !dec(std::vector<uint8_t>(22, 0)));
+    {
+      std::vector<uint8_t> p = w;  // MOVE with an illegal button bit (0x20)
+      p[21] = 0x20;
+      CHECK("incodec-move-bad-button-bit", !dec(p));
+    }
+    {
+      std::vector<uint8_t> p = wb;  // btn 3 is not a single valid mask bit
+      p[13] = 3;
+      CHECK("incodec-button-bad-mask", !dec(p));
+      p[13] = 32;  // 0x20 not in 1/2/4/8/16
+      CHECK("incodec-button-bad-high", !dec(p));
+      p[13] = 0;
+      CHECK("incodec-button-zero", !dec(p));
+      p = wb;
+      p[14] = 2;  // down must be 0/1
+      CHECK("incodec-button-bad-down", !dec(p));
+    }
+    {
+      std::vector<uint8_t> p = wk;
+      p[13] = 0;  // scan 0
+      CHECK("incodec-key-zero-scan", !dec(p));
+      p = wk;
+      p[15] = 2;  // down not 0/1
+      CHECK("incodec-key-bad-down", !dec(p));
+      p = wk;
+      p[16] = 2;  // extended not 0/1
+      CHECK("incodec-key-bad-ext", !dec(p));
+    }
+    {
+      std::vector<uint8_t> p = wh;
+      p[21] = 2;  // trackpad not 0/1
+      CHECK("incodec-wheel-bad-trackpad", !dec(p));
+    }
+    CHECK("incodec-text-len-zero",
+          !dec(std::vector<uint8_t>{7, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0}));
+    {
+      std::vector<uint8_t> p = wt;
+      p[13] = 4;  // len 4 but only 3 units on the wire
+      CHECK("incodec-text-len-mismatch", !dec(p));
+      std::vector<uint8_t> big(13 + 2 + 2 * (xnc::kMaxTextUnits + 1), 0);
+      big[12] = 5;
+      big[13] = static_cast<uint8_t>((xnc::kMaxTextUnits + 1) & 0xFF);
+      big[14] = static_cast<uint8_t>((xnc::kMaxTextUnits + 1) >> 8);
+      CHECK("incodec-text-over-bound", !dec(big));
+    }
+    {
+      std::vector<uint8_t> p = wl;
+      p[13] = 2;  // caps not 0/1
+      CHECK("incodec-lock-bad-caps", !dec(p));
+    }
+    // 光标 0x0109:[s32 x][s32 y][u8 visible]
+    const std::vector<uint8_t> wc = xnc::EncodeCursorEvent(-1920, 1079, 1);
+    const uint8_t want_cur[9] = {0x80, 0xF8, 0xFF, 0xFF, 0x37, 0x04, 0, 0, 1};
+    CHECK("incodec-cursor-bytes",
+          wc.size() == 9 && std::equal(wc.begin(), wc.end(), want_cur));
+    int32_t cx = 0, cy = 0;
+    uint8_t cv = 0;
+    CHECK("incodec-cursor-rt",
+          xnc::DecodeCursorEvent(xnc::Frame{0, xnc::kMsgCursor, 0, wc}, &cx, &cy,
+                                 &cv) &&
+                cx == -1920 && cy == 1079 && cv == 1);
+    CHECK("incodec-cursor-bad-size",
+          !xnc::DecodeCursorEvent(xnc::Frame{0, xnc::kMsgCursor, 0, {1, 2}}, &cx, &cy,
+                                  &cv));
+    CHECK("incodec-cursor-null", !xnc::DecodeCursorEvent(
+                                     xnc::Frame{0, xnc::kMsgCursor, 0, wc}, nullptr,
+                                     &cy, &cv));
+  }
+  // ---- M1-Slice3 Task 1:坐标归一化数学(伪虚拟桌面指标) ----
+  {
+    // 单显示器退化:hello == 虚拟桌面 → abs = nx*65536(钳 65535)
+    CHECK("map-abs-origin", xnc::MapMoveToAbs(0, 1920, 0, 1920) == 0);
+    CHECK("map-abs-mid", xnc::MapMoveToAbs(960, 1920, 0, 1920) == 32768);
+    CHECK("map-abs-max-clamped", xnc::MapMoveToAbs(1920, 1920, 0, 1920) == 65535);
+    CHECK("map-abs-last-pixel",
+          xnc::MapMoveToAbs(1919, 1920, 0, 1920) == 65502);  // 65536-34.13 → 65502
+    CHECK("map-abs-neg-clamped", xnc::MapMoveToAbs(-5, 1920, 0, 1920) == 0);
+    CHECK("map-abs-over-clamped", xnc::MapMoveToAbs(5000, 1920, 0, 1920) == 65535);
+    // 虚拟桌面起点为负(多屏):归一化穿过起点,原点抵消
+    CHECK("map-abs-negative-origin",
+          xnc::MapMoveToAbs(960, 1920, -1920, 3840) == 32768);
+    CHECK("map-abs-negative-origin-left",
+          xnc::MapMoveToAbs(0, 1920, -1920, 3840) == 0);
+    // 流宽 != 虚拟桌面宽:按归一化等比缩放
+    CHECK("map-abs-scaled", xnc::MapMoveToAbs(25, 100, 0, 200) == 16384);
+    CHECK("map-abs-quarter",
+          xnc::MapMoveToAbs(480, 1920, 0, 3840) == 16384);  // nx=.25
+    // 退化护栏
+    CHECK("map-abs-zero-dims", xnc::MapMoveToAbs(10, 0, 0, 1920) == 0 &&
+                                   xnc::MapMoveToAbs(10, 1920, 0, 0) == 0);
+    // 光标逆映射:虚拟桌面 px → HOST_HELLO 流 px
+    CHECK("map-cursor-left-edge", xnc::MapCursorToStream(-1920, 3840, -1920, 3840) == 0);
+    CHECK("map-cursor-mid", xnc::MapCursorToStream(0, 3840, -1920, 3840) == 1920);
+    CHECK("map-cursor-right-clamped",
+          xnc::MapCursorToStream(9999, 3840, -1920, 3840) == 3840);
+    CHECK("map-cursor-left-clamped",
+          xnc::MapCursorToStream(-9999, 3840, -1920, 3840) == 0);
+    CHECK("map-cursor-third", xnc::MapCursorToStream(66, 100, 0, 200) == 33);
+    CHECK("map-cursor-zero-dims",
+          xnc::MapCursorToStream(10, 0, 0, 100) == 0 &&
+                xnc::MapCursorToStream(10, 100, 0, 0) == 0);
+  }
+  // ---- M1-Slice3 Task 1:InputManager 注入逻辑(fake SendInput 记录器) ----
+  {
+    ResetInputSeams(200, 100);
+    InputRecorder rec;
+    g_input_rec = &rec;
+    xnc::InputManager im(TestInputOpts(200, 100));
+    CHECK("im-marker-const", xnc::kInputExtraInfoMarker == 0x584E4301ull);
+    // MOVE:绝对虚拟桌面 + buttons 位 → DOWN/UP 状态差
+    xnc::InputMsg mv;
+    mv.sub_id = 7;
+    mv.seq = 1;
+    mv.type = xnc::kInputMove;
+    mv.x = 100;
+    mv.y = 50;
+    mv.buttons = xnc::kBtnL;
+    CHECK("im-move-ok",
+          im.Inject(mv) == xnc::InputManager::Result::kInjected);
+    CHECK("im-move-recorded", rec.CountMouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE |
+                                                 MOUSEEVENTF_VIRTUALDESK) == 1);
+    const INPUT* mi = rec.FindMouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE |
+                                    MOUSEEVENTF_VIRTUALDESK);
+    CHECK("im-move-abs-coords",
+          mi != nullptr && mi->mi.dx == 32768 && mi->mi.dy == 32768);
+    CHECK("im-move-marker", mi != nullptr &&
+                                  mi->mi.dwExtraInfo == xnc::kInputExtraInfoMarker);
+    CHECK("im-move-leftdown-after-move",
+          rec.CountMouse(MOUSEEVENTF_LEFTDOWN) == 1 &&
+                rec.sent.size() == 2 &&
+                rec.sent[0].mi.dwFlags == (MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE |
+                                           MOUSEEVENTF_VIRTUALDESK) &&
+                rec.sent[1].mi.dwFlags == MOUSEEVENTF_LEFTDOWN);
+    CHECK("im-held-buttons", im.HeldButtons() == 1);
+    // 释放:UP 事件在 MOVE 之前(在旧位置释放,再到新位置按下)
+    rec.Reset();
+    mv.seq = 2;
+    mv.buttons = 0;
+    mv.x = 0;
+    mv.y = 0;
+    CHECK("im-move-release-ok", im.Inject(mv) == xnc::InputManager::Result::kInjected);
+    CHECK("im-move-leftup-before-move",
+          rec.CountMouse(MOUSEEVENTF_LEFTUP) == 1 && rec.sent.size() == 2 &&
+                rec.sent[0].mi.dwFlags == MOUSEEVENTF_LEFTUP &&
+                rec.sent[1].mi.dwFlags == (MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE |
+                                           MOUSEEVENTF_VIRTUALDESK));
+    CHECK("im-held-buttons-zero", im.HeldButtons() == 0);
+    // 多按钮位一次 MOVE 差分:M+X1 按下 + L 保持 0
+    rec.Reset();
+    mv.seq = 3;
+    mv.buttons = xnc::kBtnM | xnc::kBtnX1;
+    im.Inject(mv);
+    CHECK("im-move-multi-down",
+          rec.CountMouse(MOUSEEVENTF_MIDDLEDOWN) == 1 &&
+                rec.CountMouse(MOUSEEVENTF_XDOWN) == 1);
+    const INPUT* xd = rec.FindMouse(MOUSEEVENTF_XDOWN);
+    CHECK("im-move-xdown-data", xd != nullptr && xd->mi.mouseData == XBUTTON1);
+    CHECK("im-held-buttons-two", im.HeldButtons() == 2);
+    // BUTTON 消息:显式 down/up,重复幂等(seq 仍须递增)
+    rec.Reset();
+    xnc::InputMsg bt;
+    bt.sub_id = 7;
+    bt.seq = 4;
+    bt.type = xnc::kInputButton;
+    bt.btn = xnc::kBtnR;
+    bt.down = 1;
+    CHECK("im-button-down", im.Inject(bt) == xnc::InputManager::Result::kInjected &&
+                                  rec.CountMouse(MOUSEEVENTF_RIGHTDOWN) == 1);
+    rec.Reset();
+    bt.seq = 5;
+    CHECK("im-button-down-idempotent",
+          im.Inject(bt) == xnc::InputManager::Result::kInjected &&
+                rec.sent.empty());  // 重复 down 不再注入(保持原按住时间)
+    bt.down = 0;
+    bt.seq = 6;
+    rec.Reset();
+    CHECK("im-button-up", im.Inject(bt) == xnc::InputManager::Result::kInjected &&
+                                 rec.CountMouse(MOUSEEVENTF_RIGHTUP) == 1);
+    rec.Reset();
+    bt.seq = 7;
+    CHECK("im-button-up-idempotent",
+          im.Inject(bt) == xnc::InputManager::Result::kInjected && rec.sent.empty());
+    // WHEEL:notch × WHEEL_DELTA / trackpad 原样;水平 HWHEEL
+    rec.Reset();
+    xnc::InputMsg wh;
+    wh.sub_id = 7;
+    wh.seq = 8;
+    wh.type = xnc::kInputWheel;
+    wh.y = -2;  // 2 notches down
+    wh.x = 0;
+    CHECK("im-wheel-notch",
+          im.Inject(wh) == xnc::InputManager::Result::kInjected &&
+                rec.CountMouse(MOUSEEVENTF_WHEEL) == 1);
+    {
+      const INPUT* e = rec.FindMouse(MOUSEEVENTF_WHEEL);
+      CHECK("im-wheel-notch-scaled",
+            e != nullptr && e->mi.mouseData == static_cast<DWORD>(-2 * WHEEL_DELTA));
+    }
+    rec.Reset();
+    wh.seq = 9;
+    wh.y = 0;
+    wh.x = 3;  // horizontal, trackpad granularity
+    wh.trackpad = 1;
+    CHECK("im-wheel-trackpad-hwheel",
+          im.Inject(wh) == xnc::InputManager::Result::kInjected &&
+                rec.CountMouse(MOUSEEVENTF_HWHEEL) == 1);
+    {
+      const INPUT* e = rec.FindMouse(MOUSEEVENTF_HWHEEL);
+      CHECK("im-wheel-trackpad-raw", e != nullptr && e->mi.mouseData == 3u);
+    }
+    rec.Reset();
+    wh.seq = 10;
+    wh.x = 0;
+    wh.y = 0;
+    CHECK("im-wheel-zero-noop",
+          im.Inject(wh) == xnc::InputManager::Result::kInjected && rec.sent.empty());
+    // KEY:SCANCODE + extended;重复 down 幂等;UP 带 KEYUP
+    rec.Reset();
+    xnc::InputMsg key;
+    key.sub_id = 7;
+    key.seq = 11;
+    key.type = xnc::kInputKey;
+    key.scan = 0x1D;  // Ctrl
+    key.down = 1;
+    CHECK("im-key-down",
+          im.Inject(key) == xnc::InputManager::Result::kInjected &&
+                rec.CountKey(KEYEVENTF_SCANCODE) == 1);
+    {
+      const INPUT* e = rec.FindKey(KEYEVENTF_SCANCODE);
+      CHECK("im-key-down-fields",
+            e != nullptr && e->ki.wScan == 0x1D && e->ki.wVk == 0 &&
+                  e->ki.dwExtraInfo == xnc::kInputExtraInfoMarker);
+    }
+    CHECK("im-held-keys", im.HeldKeys() == 1);
+    rec.Reset();
+    key.seq = 12;
+    CHECK("im-key-down-idempotent",
+          im.Inject(key) == xnc::InputManager::Result::kInjected && rec.sent.empty());
+    rec.Reset();
+    key.seq = 13;
+    key.scan = 0x47;  // NumpadHome-ish; E0-prefixed variant needs extended
+    key.extended = 1;
+    CHECK("im-key-ext-down",
+          im.Inject(key) == xnc::InputManager::Result::kInjected &&
+                rec.CountKey(KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY) == 1);
+    CHECK("im-held-keys-two", im.HeldKeys() == 2);
+    rec.Reset();
+    key.seq = 14;
+    key.down = 0;
+    CHECK("im-key-ext-up",
+          im.Inject(key) == xnc::InputManager::Result::kInjected &&
+                rec.CountKey(KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY |
+                             KEYEVENTF_KEYUP) == 1);
+    CHECK("im-held-keys-one", im.HeldKeys() == 1);
+    // TEXT:KEYEVENTF_UNICODE 每码位 down+up;代理对 = 两个码元
+    rec.Reset();
+    xnc::InputMsg tx;
+    tx.sub_id = 7;
+    tx.seq = 15;
+    tx.type = xnc::kInputText;
+    tx.text = {0xD834, 0xDD1E};
+    CHECK("im-text-ok",
+          im.Inject(tx) == xnc::InputManager::Result::kInjected &&
+                rec.sent.size() == 4);
+    if (rec.sent.size() == 4) {
+      bool ok = true;
+      const WORD want_scans[4] = {0xD834, 0xD834, 0xDD1E, 0xDD1E};
+      const DWORD want_flags[4] = {KEYEVENTF_UNICODE,
+                                   KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
+                                   KEYEVENTF_UNICODE,
+                                   KEYEVENTF_UNICODE | KEYEVENTF_KEYUP};
+      for (int i = 0; i < 4; ++i)
+        if (rec.sent[i].type != INPUT_KEYBOARD ||
+            rec.sent[i].ki.wScan != want_scans[i] ||
+            rec.sent[i].ki.dwFlags != want_flags[i] ||
+            rec.sent[i].ki.dwExtraInfo != xnc::kInputExtraInfoMarker)
+          ok = false;
+      CHECK("im-text-surrogate-events", ok);
+    }
+    // LOCK:与 fake GetKeyState 差异才注入;CapsLock 0x3A / NumLock E0 0x45
+    rec.Reset();
+    g_vk_state[VK_CAPITAL] = 0;
+    g_vk_state[VK_NUMLOCK] = 0;
+    xnc::InputMsg lk;
+    lk.sub_id = 7;
+    lk.seq = 16;
+    lk.type = xnc::kInputLock;
+    lk.caps = 1;
+    lk.num = 1;
+    CHECK("im-lock-both",
+          im.Inject(lk) == xnc::InputManager::Result::kInjected &&
+                rec.CountKey(KEYEVENTF_SCANCODE) == 1 &&           // caps down
+                rec.CountKey(KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP) == 1);  // caps up
+    {
+      const INPUT* nd = rec.FindKey(KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY);
+      CHECK("im-lock-numlock-ext", nd != nullptr && nd->ki.wScan == 0x45);
+      const INPUT* cd = rec.FindKey(KEYEVENTF_SCANCODE);
+      CHECK("im-lock-capslock-scan", cd != nullptr && cd->ki.wScan == 0x3A);
+    }
+    rec.Reset();
+    lk.seq = 17;
+    g_vk_state[VK_CAPITAL] = 1;  // 注入已生效(fake 表模拟真实翻转)
+    g_vk_state[VK_NUMLOCK] = 1;
+    CHECK("im-lock-match-noop",
+          im.Inject(lk) == xnc::InputManager::Result::kInjected && rec.sent.empty());
+    rec.Reset();
+    lk.seq = 18;
+    lk.caps = 0;
+    lk.num = 0;
+    CHECK("im-lock-off-diff",
+          im.Inject(lk) == xnc::InputManager::Result::kInjected &&
+                rec.sent.size() == 4);
+    g_input_rec = nullptr;
+  }
+  // ---- M1-Slice3 Task 1:seq 单调(每 sub_id 严格递增) ----
+  {
+    ResetInputSeams(200, 100);
+    InputRecorder rec;
+    g_input_rec = &rec;
+    xnc::InputManager im(TestInputOpts(200, 100));
+    xnc::InputMsg m;
+    m.sub_id = 7;
+    m.type = xnc::kInputButton;
+    m.btn = xnc::kBtnL;
+    m.down = 1;
+    m.seq = 5;
+    CHECK("seq-first-ok", im.Inject(m) == xnc::InputManager::Result::kInjected);
+    m.seq = 5;  // 重放
+    CHECK("seq-replay-dropped",
+          im.Inject(m) == xnc::InputManager::Result::kStaleSeq && rec.sent.size() == 1);
+    m.seq = 4;  // 回退
+    CHECK("seq-backward-dropped",
+          im.Inject(m) == xnc::InputManager::Result::kStaleSeq);
+    m.seq = 6;
+    CHECK("seq-next-ok", im.Inject(m) == xnc::InputManager::Result::kInjected);
+    // 不同 sub_id 独立基线
+    m.sub_id = 8;
+    m.seq = 1;
+    CHECK("seq-per-sub-independent",
+          im.Inject(m) == xnc::InputManager::Result::kInjected);
+    // ForgetSub 清基线:同 sub_id 重连后 seq 从头可接受
+    im.ForgetSub(8);
+    CHECK("seq-forgotten-restart",
+          im.Inject(m) == xnc::InputManager::Result::kInjected);
+    im.ForgetSub(99);  // 未知 sub:无害
+    CHECK("seq-forget-unknown-ok", true);
+    // 非法类型(解码层之后防御)
+    xnc::InputMsg bad;
+    bad.sub_id = 7;
+    bad.seq = 100;
+    bad.type = 42;
+    CHECK("seq-invalid-type",
+          im.Inject(bad) == xnc::InputManager::Result::kInvalid);
+    xnc::InputManager::Stats st = im.stats();
+    CHECK("seq-stats", st.stale_seq == 2 && st.invalid == 1 && st.injected == 4);
+    g_input_rec = nullptr;
+  }
+  // ---- M1-Slice3 Task 1:卡键 janitor(注入时钟:10s 扫描 / 30s 强制释放) ----
+  {
+    CHECK("janitor-consts", xnc::kJanitorScanMs == 10000 && xnc::kStuckReleaseMs == 30000);
+    ResetInputSeams(200, 100);
+    InputRecorder rec;
+    g_input_rec = &rec;
+    xnc::InputManager im(TestInputOpts(200, 100));
+    xnc::InputMsg key;
+    key.sub_id = 7;
+    key.seq = 1;
+    key.type = xnc::kInputKey;
+    key.scan = 0x2A;  // left shift
+    key.down = 1;
+    im.Inject(key);
+    xnc::InputMsg bt;
+    bt.sub_id = 7;
+    bt.seq = 2;
+    bt.type = xnc::kInputButton;
+    bt.btn = xnc::kBtnM;
+    bt.down = 1;
+    im.Inject(bt);
+    rec.Reset();
+    im.JanitorSweep(g_fake_now + 29000);  // 未到 30s:不动
+    CHECK("janitor-under-30s-held",
+          rec.sent.empty() && im.HeldKeys() == 1 && im.HeldButtons() == 1);
+    im.JanitorSweep(g_fake_now + 31000);  // 超时:强制 KeyUp/按钮 UP
+    CHECK("janitor-forced-release",
+          rec.CountKey(KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP) == 1 &&
+                rec.CountMouse(MOUSEEVENTF_MIDDLEUP) == 1 && im.HeldKeys() == 0 &&
+                im.HeldButtons() == 0);
+    CHECK("janitor-stats", im.stats().janitor_released == 2);
+    // ReleaseAll:混合键钮全部强制释放(断连/drain 语义)
+    rec.Reset();
+    g_fake_now += 40000;
+    key.seq = 3;
+    bt.seq = 4;
+    im.Inject(key);
+    im.Inject(bt);
+    im.ReleaseAll();
+    CHECK("release-all-sends-ups",
+          rec.CountKey(KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP) == 1 &&
+                rec.CountMouse(MOUSEEVENTF_MIDDLEUP) == 1 && im.HeldKeys() == 0 &&
+                im.HeldButtons() == 0);
+    CHECK("release-all-stats", im.stats().release_all == 1);
+    rec.Reset();
+    im.ReleaseAll();  // 空表幂等
+    CHECK("release-all-idempotent", rec.sent.empty());
+    g_input_rec = nullptr;
+  }
+  // ---- M1-Slice3 Task 1:SendInput 失败 → 重绑 input desktop → 重试一次 ----
+  {
+    ResetInputSeams(200, 100);
+    InputRecorder rec;
+    g_input_rec = &rec;
+    xnc::InputManager im(TestInputOpts(200, 100));
+    rec.fail_mode = 1;  // 首批失败,重试成功
+    xnc::InputMsg key;
+    key.sub_id = 7;
+    key.seq = 1;
+    key.type = xnc::kInputKey;
+    key.scan = 0x1E;
+    key.down = 1;
+    CHECK("rebind-retry-ok",
+          im.Inject(key) == xnc::InputManager::Result::kInjected);
+    CHECK("rebind-calls", g_open_desk_calls == 1 && g_set_desk_calls == 1);
+    CHECK("rebind-retried-batch",
+          rec.CountKey(KEYEVENTF_SCANCODE) == 1);  // 重试批次送达
+    rec.Reset();
+    rec.fail_mode = 2;  // 永远失败
+    key.seq = 2;
+    key.scan = 0x1F;
+    CHECK("rebind-still-fails",
+          im.Inject(key) == xnc::InputManager::Result::kSendFailed);
+    xnc::InputManager::Stats st = im.stats();
+    CHECK("rebind-stats",
+          st.desktop_rebinds == 2 && st.desktop_mismatch == 1 && st.send_failures == 1);
+    g_input_rec = nullptr;
+  }
+  // ---- M1-Slice3 Task 1:CursorManager(8ms 轮询,变化才发) ----
+  {
+    ResetInputSeams(200, 100);
+    xnc::CursorManager cm(TestCursorOpts(200, 100));
+    CHECK("cursor-not-running", !cm.running());
+    int32_t ev_x = -1, ev_y = -1;
+    uint8_t ev_vis = 0xFF;
+    int fired = 0;
+    auto sink = [&](int32_t x, int32_t y, uint8_t v) {
+      ev_x = x;
+      ev_y = y;
+      ev_vis = v;
+      fired++;
+    };
+    g_cursor.x = 100;
+    g_cursor.y = 50;
+    g_cursor.flags = CURSOR_SHOWING;
+    g_cursor.ok = TRUE;
+    cm.SetSink(sink);
+    CHECK("cursor-first-sample-fires", cm.PollOnce() && fired == 1 &&
+                                             ev_x == 100 && ev_y == 50 && ev_vis == 1);
+    CHECK("cursor-unchanged-quiet", !cm.PollOnce() && fired == 1);
+    g_cursor.x = 150;
+    CHECK("cursor-move-fires", cm.PollOnce() && fired == 2 && ev_x == 150);
+    g_cursor.flags = 0;  // hidden
+    CHECK("cursor-visibility-fires",
+          cm.PollOnce() && fired == 3 && ev_vis == 0);
+    g_cursor.ok = FALSE;  // GetCursorInfo 失败(如无桌面):静默跳过
+    CHECK("cursor-fail-quiet", !cm.PollOnce() && fired == 3);
+    g_cursor.ok = TRUE;
+    g_cursor.flags = CURSOR_SHOWING;
+    g_cursor.x = -400;  // 虚拟桌面外 → 钳到 0
+    CHECK("cursor-clamped", cm.PollOnce() && fired == 4 && ev_x == 0);
+    // 多屏指标:vd (-1920,3840),hello 3840 → 中点 1920
+    g_metrics[SM_XVIRTUALSCREEN] = -1920;
+    g_metrics[SM_CXVIRTUALSCREEN] = 3840;
+    g_metrics[SM_YVIRTUALSCREEN] = 0;
+    g_metrics[SM_CYVIRTUALSCREEN] = 1080;
+    xnc::CursorManager::Opts mo = TestCursorOpts(3840, 1080);
+    xnc::CursorManager cm2(mo);
+    g_cursor.x = 0;
+    g_cursor.y = 540;
+    int fired2 = 0;
+    int32_t x2 = -1, y2 = -1;
+    auto sink2 = [&](int32_t x, int32_t y, uint8_t) {
+      x2 = x;
+      y2 = y;
+      fired2++;
+    };
+    cm2.SetSink(sink2);
+    CHECK("cursor-multi-monitor-map", cm2.PollOnce() && fired2 == 1 &&
+                                          x2 == 1920 && y2 == 540);
+    CHECK("cursor-poll-default-8ms", xnc::CursorManager::Opts().poll_ms == 8);
+    // 真线程生命周期冒烟:Start → running → Stop(无桌面时轮询静默失败)
+    xnc::CursorManager cm3(TestCursorOpts(200, 100));
+    int smoked = 0;
+    cm3.Start([&smoked](int32_t, int32_t, uint8_t) { smoked++; });
+    CHECK("cursor-start-running", cm3.running());
+    Sleep(50);
+    cm3.Start([&smoked](int32_t, int32_t, uint8_t) { smoked++; });  // 幂等
+    cm3.Stop();
+    CHECK("cursor-stopped", !cm3.running());
+    cm3.Stop();  // 幂等
+  }
+  // ---- M1-Slice3 Task 1:端到端(fake 订阅者 → 0x0108 → InputManager;
+  //      CursorManager → 0x0109 → fake 订阅者)----
+  {
+    ResetInputSeams(200, 100);
+    InputRecorder rec;
+    g_input_rec = &rec;
+    xnc::InputManager im(TestInputOpts(200, 100));
+    xnc::CursorManager cm(TestCursorOpts(200, 100));
+    g_cursor.x = 100;
+    g_cursor.y = 50;
+    g_cursor.flags = CURSOR_SHOWING;
+    g_cursor.ok = TRUE;
+    xnc::RtServer rt;
+    xnc::RtServer::Opts ro;
+    ro.pipe_name = RtPipeNameOf(4);
+    ro.secret = kRtSecret;
+    ro.secret_len = sizeof(kRtSecret);
+    ro.max_subs = 4;
+    ro.fps = 15;
+    ro.bitrate_bps = 500000;
+    ro.sddl_override = L"D:P(A;;GA;;;WD)";
+    ro.input = &im;
+    ro.cursor = &cm;
+    CHECK("rt5-start", rt.Start(ro, 200, 100));
+    RtTestClient a;
+    CHECK("rt5-connect", a.Connect(ro.pipe_name.c_str(), kRtSecret, sizeof(kRtSecret)));
+    CHECK("rt5-attach", a.Attach(11));
+    // 光标:首个订阅者 → 轮询启动 → 初始事件(映射到 HOST_HELLO 空间)
+    a.Pump(1000, [&a] { return a.cursors_ >= 1; });
+    CHECK("rt5-cursor-initial-event",
+          a.cursors_ >= 1 && a.cursor_x_ == 100 && a.cursor_y_ == 50 &&
+              a.cursor_visible_ == 1);
+    uint64_t cur_first = a.cursors_;
+    g_cursor.x = 150;
+    g_cursor.y = 60;
+    a.Pump(1000, [&a, cur_first] { return a.cursors_ >= cur_first + 1; });
+    CHECK("rt5-cursor-move-event",
+          a.cursors_ >= cur_first + 1 && a.cursor_x_ == 150 && a.cursor_y_ == 60);
+    // 输入:MOVE 注入到 InputManager(seq 1)
+    xnc::InputMsg mv;
+    mv.sub_id = 11;
+    mv.seq = 1;
+    mv.type = xnc::kInputMove;
+    mv.x = 100;
+    mv.y = 50;
+    CHECK("rt5-input-send", a.SendRaw(xnc::kMsgInput, xnc::EncodeInputMsg(mv)));
+    CHECK("rt5-input-injected",
+          WaitUntil([&rec] {
+            return rec.CountMouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE |
+                                  MOUSEEVENTF_VIRTUALDESK) >= 1;
+          }, 2000));
+    {
+      const INPUT* e = rec.FindMouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE |
+                                     MOUSEEVENTF_VIRTUALDESK);
+      CHECK("rt5-input-abs", e != nullptr && e->mi.dx == 32768 && e->mi.dy == 32768);
+    }
+    // seq 重放 → 服务端丢弃计数
+    CHECK("rt5-input-replay-send", a.SendRaw(xnc::kMsgInput, xnc::EncodeInputMsg(mv)));
+    // 非法按钮 → 解码拒绝
+    xnc::InputMsg bad;
+    bad.sub_id = 11;
+    bad.seq = 2;
+    bad.type = xnc::kInputButton;
+    bad.btn = 3;
+    bad.down = 1;
+    CHECK("rt5-input-badbtn-send", a.SendRaw(xnc::kMsgInput, xnc::EncodeInputMsg(bad)));
+    // sub_id 不匹配(他人 sub)→ 拒绝
+    xnc::InputMsg alien;
+    alien.sub_id = 99;
+    alien.seq = 1;
+    alien.type = xnc::kInputButton;
+    alien.btn = xnc::kBtnL;
+    alien.down = 1;
+    CHECK("rt5-input-alien-send",
+          a.SendRaw(xnc::kMsgInput, xnc::EncodeInputMsg(alien)));
+    CHECK("rt5-input-stats",
+          WaitUntil([&rt] {
+            const xnc::RtServer::Stats st = rt.stats();
+            return st.input_received >= 4 && st.input_dropped >= 1 &&
+                   st.input_rejected >= 2;
+          }, 2000));
+    // 按住键 → 断开(最后一个订阅者)→ ReleaseAll 强制释放
+    xnc::InputMsg key;
+    key.sub_id = 11;
+    key.seq = 3;
+    key.type = xnc::kInputKey;
+    key.scan = 0x1D;
+    key.down = 1;
+    CHECK("rt5-key-send", a.SendRaw(xnc::kMsgInput, xnc::EncodeInputMsg(key)));
+    CHECK("rt5-key-held",
+          WaitUntil([&im] { return im.HeldKeys() == 1; }, 2000));
+    CHECK("rt5-detach", a.SendDetach(11));
+    CHECK("rt5-release-all",
+          WaitUntil([&rec] {
+            return rec.CountKey(KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP) >= 1;
+          }, 2000));
+    CHECK("rt5-released-state", im.HeldKeys() == 0 && im.HeldButtons() == 0);
+    CHECK("rt5-cursor-stopped-after-last-detach", !cm.running());
+    rt.Shutdown();
+    g_input_rec = nullptr;
   }
   if (fails == 0) std::printf("selftest ok\n");
   return fails == 0 ? 0 : 1;

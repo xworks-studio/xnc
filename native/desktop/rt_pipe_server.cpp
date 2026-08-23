@@ -34,6 +34,8 @@
 
 #include "../common/handshake.h"
 #include "../common/log.h"
+#include "cursor_manager.h"
+#include "input_manager.h"
 
 namespace xnc {
 namespace {
@@ -308,6 +310,11 @@ void RtServer::Shutdown() {
   for (auto& t : readers_)
     if (t.joinable()) t.join();
   readers_.clear();
+  // DRAIN: readers are gone, so no more input can arrive - stop the cursor
+  // poller and force-release every recorded key/button (session-global
+  // state; the process may be about to exit).
+  if (opts_.cursor != nullptr) opts_.cursor->Stop();
+  if (opts_.input != nullptr) opts_.input->ReleaseAll();
   std::lock_guard<std::mutex> lk(mu_);
   conns_.clear();  // readers erase themselves; any stragglers are dead
   XNC_LOG_INFO("rt_server stopped");
@@ -424,6 +431,7 @@ void RtServer::ReaderLoop(std::shared_ptr<SubConn> c) {
     }
     enum class AttachReject { kNone, kMaxSubs, kDup };
     AttachReject reject = AttachReject::kNone;
+    bool first_sub = false;
     {
       std::lock_guard<std::mutex> lk(mu_);
       if (table_.size() >= opts_.max_subs) {
@@ -441,6 +449,7 @@ void RtServer::ReaderLoop(std::shared_ptr<SubConn> c) {
         conns_[ap.sub_id] = c;
         stats_.attaches++;
         attached = true;
+        first_sub = table_.size() == 1;
       }
     }
     if (reject == AttachReject::kMaxSubs) {
@@ -463,6 +472,13 @@ void RtServer::ReaderLoop(std::shared_ptr<SubConn> c) {
     const HostHelloPayload hh{gen_.load(), src_w_, src_h_, opts_.fps, opts_.max_subs};
     if (!PushControlTo(c.get(), Frame{kFlagEvent, kMsgHostHello, 0, EncodeHostHello(hh)}))
       break;  // control backlog: wedged connection
+    // First subscriber: the cursor poller runs only while someone watches
+    // (8ms GetCursorInfo cadence, change-only 0x0109 events).
+    if (first_sub && opts_.cursor != nullptr) {
+      opts_.cursor->Start([this](int32_t x, int32_t y, uint8_t visible) {
+        BroadcastCursor(x, y, visible);
+      });
+    }
     c->sender = std::thread(&RtServer::SenderLoop, this, c);
 
     // Request loop.
@@ -479,14 +495,42 @@ void RtServer::ReaderLoop(std::shared_ptr<SubConn> c) {
                                          f.request_id, {}});
             break;
           }
-          std::lock_guard<std::mutex> lk(mu_);
-          table_.Detach(c->sub_id);
-          conns_.erase(c->sub_id);
-          stats_.detaches++;
+          {
+            std::lock_guard<std::mutex> lk(mu_);
+            table_.Detach(c->sub_id);
+            conns_.erase(c->sub_id);
+            stats_.detaches++;
+          }
           XNC_LOG_INFO("rt detach sub=%u pid=%lu", c->sub_id,
                        static_cast<unsigned long>(client_pid));
           attached = false;  // reader loop ends; sender drains then exits
+          OnSubscriberRemoved(c->sub_id);
           goto conn_done;
+        }
+        case kMsgInput: {
+          // 0x0108: wire-shape validation + own-sub_id check here, seq
+          // monotonicity + SendInput inside InputManager (see header).
+          InputMsg im;
+          {
+            std::lock_guard<std::mutex> lk(mu_);
+            stats_.input_received++;
+          }
+          if (opts_.input != nullptr && DecodeInputMsg(f, &im) &&
+              im.sub_id == c->sub_id) {
+            const InputManager::Result r = opts_.input->Inject(im);
+            if (r != InputManager::Result::kInjected) {
+              std::lock_guard<std::mutex> lk(mu_);
+              stats_.input_dropped++;
+              XNC_LOG_INFO("rt input dropped sub=%u seq=%llu type=%u", c->sub_id,
+                           static_cast<unsigned long long>(im.seq), im.type);
+            }
+          } else {
+            std::lock_guard<std::mutex> lk(mu_);
+            stats_.input_rejected++;
+            XNC_LOG_INFO("rt input rejected sub=%u pid=%lu", c->sub_id,
+                         static_cast<unsigned long>(client_pid));
+          }
+          break;
         }
         case kMsgKeyframeReq: {
           KeyframeReqPayload kr;
@@ -526,9 +570,12 @@ void RtServer::ReaderLoop(std::shared_ptr<SubConn> c) {
   } while (false);
 conn_done:
   if (attached) {  // non-DETACH exit: still registered
-    std::lock_guard<std::mutex> lk(mu_);
-    table_.Detach(c->sub_id);
-    conns_.erase(c->sub_id);
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      table_.Detach(c->sub_id);
+      conns_.erase(c->sub_id);
+    }
+    OnSubscriberRemoved(c->sub_id);
   }
   c->dead.store(true);
   c->cv.notify_all();
@@ -668,6 +715,41 @@ bool RtServer::PushControlTo(SubConn* c, const Frame& f) {
   if (!c->q->PushControl(f)) return false;
   c->cv.notify_all();
   return true;
+}
+
+// CursorManager sink target (cursor poll thread): one 0x0109 event to
+// every attached subscriber. Cursor events are control frames - they must
+// never be dropped by the video-queue policy, and at 8ms cadence worst
+// case they share the bounded control backlog with STATE/PONG.
+void RtServer::BroadcastCursor(int32_t x, int32_t y, uint8_t visible) {
+  const Frame ev{kFlagEvent, kMsgCursor, 0, EncodeCursorEvent(x, y, visible)};
+  std::lock_guard<std::mutex> lk(mu_);
+  if (conns_.empty()) return;
+  for (auto& kv : conns_) {
+    std::lock_guard<std::mutex> clk(kv.second->mu);
+    kv.second->q->PushControl(ev);
+    kv.second->cv.notify_all();
+  }
+  stats_.cursor_events++;
+}
+
+// Post-detach bookkeeping: the sub's input seq baseline dies with its
+// identity; the LAST subscriber leaving also stops the cursor poller and
+// force-releases every injected key/button still held (keys are
+// session-global OS state - releasing on any single detach would disrupt
+// the other viewers' in-flight drags/shortcuts).
+void RtServer::OnSubscriberRemoved(uint32_t sub_id) {
+  bool empty = false;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    empty = table_.size() == 0;
+  }
+  if (opts_.input != nullptr) opts_.input->ForgetSub(sub_id);
+  if (empty) {
+    if (opts_.cursor != nullptr) opts_.cursor->Stop();
+    if (opts_.input != nullptr) opts_.input->ReleaseAll();
+    XNC_LOG_INFO("rt last subscriber gone: cursor stopped, inputs released");
+  }
 }
 
 RtServer::Stats RtServer::stats() {

@@ -37,8 +37,10 @@
 
 #include "../common/log.h"
 #include "capture.h"       // capture contract (ICapture/FrameBlob)
+#include "cursor_manager.h"  // CursorManager (M1-Slice3)
 #include "diag.h"
 #include "dxgi_capture.h"  // TryCreateDxgiCapture, DxgiErrIsDesktopAccessDenied
+#include "input_manager.h"  // InputManager (M1-Slice3)
 #include "mf_encoder.h"    // MfSoftEncoder
 #include "pipeline.h"      // Pipeline::Run + stats.json sidecar
 #include "rt_pipe_server.h"  // RtServer (real-time fan-out)
@@ -340,10 +342,23 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
   }
 
   // Optional rt server on the same run (--console-diag --pipe --secret):
-  // one pipeline, two sinks (file dump + subscriber fan-out).
+  // one pipeline, two sinks (file dump + subscriber fan-out). M1-Slice3:
+  // the same server also carries 0x0108 input (SendInput) and 0x0109 cursor
+  // events; both managers are owned here and outlive the server (their
+  // dimensions come from the live capture, hence the late construction).
   xnc::RtServer rt;
+  std::unique_ptr<xnc::InputManager> input;
+  std::unique_ptr<xnc::CursorManager> cursor;
   const bool rt_extra = !opt.secret.empty() && !opt.pipe_name.empty();
   if (rt_extra) {
+    xnc::InputManager::Opts iopt;
+    iopt.hello_w = capture->Width();  // MOVE coords are HOST_HELLO-space
+    iopt.hello_h = capture->Height();
+    input = std::make_unique<xnc::InputManager>(iopt);
+    xnc::CursorManager::Opts copt;
+    copt.hello_w = capture->Width();
+    copt.hello_h = capture->Height();
+    cursor = std::make_unique<xnc::CursorManager>(copt);
     xnc::RtServer::Opts ro;
     ro.pipe_name = opt.pipe_name;
     ro.secret = opt.secret.data();
@@ -351,6 +366,9 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
     ro.max_subs = opt.max_subs;
     ro.fps = opt.fps;
     ro.bitrate_bps = kDiagBitrateBps;
+    ro.input = input.get();
+    ro.cursor = cursor.get();
+    input->StartJanitor();
     if (!rt.Start(ro, capture->Width(), capture->Height())) {
       write_stats(fail_result("rt_server_start_failed"));
       std::fclose(out);
@@ -361,7 +379,10 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
   const xnc::PipelineResult res = rt_extra
       ? xnc::Pipeline::Run(*capture, encoder, out, rt, popt)
       : xnc::Pipeline::Run(*capture, encoder, out, popt);
-  if (rt_extra) rt.Shutdown();
+  if (rt_extra) {
+    rt.Shutdown();  // drain: stops the cursor poller, ReleaseAll on inputs
+    input->StopJanitor();
+  }
   write_stats(res);
   const xnc::FrameCacheCounters& c = res.counters;
   XNC_LOG_INFO("console_diag_stop duration=%us captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu rebuilds=%u aus=%llu ok=%d",
@@ -376,7 +397,9 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
 }
 
 // Real-time mode (M1-Slice2 Task 2): same capture/encode pipeline, AUs
-// fanned out to pipe subscribers until Ctrl+C. Capture/encoder init
+// fanned out to pipe subscribers until Ctrl+C. M1-Slice3 adds the input
+// path (0x0108 -> SendInput, stuck-key janitor) and the cursor channel
+// (GetCursorInfo -> 0x0109) on the same server. Capture/encoder init
 // failures mirror the diag markers (no stats.json in this mode).
 int RunConsoleRt(const xnc::DiagOptions& opt) {
   XNC_LOG_INFO("console_rt_boot pipe=%ls max_subs=%u fps=%u bitrate=%u",
@@ -401,6 +424,16 @@ int RunConsoleRt(const xnc::DiagOptions& opt) {
     return 1;
   }
 
+  xnc::InputManager::Opts iopt;
+  iopt.hello_w = capture->Width();  // MOVE coords are HOST_HELLO-space px
+  iopt.hello_h = capture->Height();
+  xnc::InputManager input(iopt);
+  input.StartJanitor();
+  xnc::CursorManager::Opts copt;
+  copt.hello_w = capture->Width();
+  copt.hello_h = capture->Height();
+  xnc::CursorManager cursor(copt);
+
   xnc::RtServer::Opts ro;
   ro.pipe_name = opt.pipe_name;
   ro.secret = opt.secret.data();
@@ -408,8 +441,12 @@ int RunConsoleRt(const xnc::DiagOptions& opt) {
   ro.max_subs = opt.max_subs;
   ro.fps = opt.fps;
   ro.bitrate_bps = kDiagBitrateBps;
+  ro.input = &input;
+  ro.cursor = &cursor;
   xnc::RtServer server;
-  return server.Serve(*capture, encoder, ro);
+  const int rc = server.Serve(*capture, encoder, ro);
+  input.StopJanitor();  // ReleaseAll already ran in RtServer::Shutdown
+  return rc;
 }
 
 }  // namespace
