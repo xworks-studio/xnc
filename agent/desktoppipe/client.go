@@ -13,6 +13,10 @@
 //	                            [u8 key][u32 len][au bytes]
 //	MSG_HOST_HELLO   0x0106 event [u32 gen][u32 w][u32 h][u32 fps][u32 max_subs]
 //	MSG_STATE        0x0107 event [char code[32]][u8 recoverable]
+//	MSG_INPUT        0x0108 req   [u32 sub_id][u64 seq][u8 type][payload']
+//	                            (M1-Slice3 出站;payload' 布局见 InputMsg)
+//	MSG_CURSOR       0x0109 event [s32 x][s32 y][u8 visible]
+//	                            (M1-Slice3 入站;HOST_HELLO 流空间逻辑 px)
 //
 // sub_id 由调用方选定(非 0、每 host 唯一——core 侧 StartCapture 每次会话
 // 一连接,随机 u32 即可)。ATTACH 成功无显式响应:HOST_HELLO 即确认
@@ -37,7 +41,7 @@ import (
 	"xnc/proto/ipc"
 )
 
-// 消息类型(0x0102-0x0107;native/desktop/rt_pipe_server.h 镜像)。
+// 消息类型(0x0102-0x0109;native/desktop/rt_pipe_server.h 镜像)。
 const (
 	msgAttach      uint16 = 0x0102
 	msgDetach      uint16 = 0x0103
@@ -45,7 +49,22 @@ const (
 	msgFrame       uint16 = 0x0105
 	msgHostHello   uint16 = 0x0106
 	msgState       uint16 = 0x0107
+	msgInput       uint16 = 0x0108
+	msgCursor      uint16 = 0x0109
 )
+
+// 0x0108 type 值(C++ kInput* 镜像)。
+const (
+	InputMove   uint8 = 1
+	InputButton uint8 = 2
+	InputWheel  uint8 = 3
+	InputKey    uint8 = 4
+	InputText   uint8 = 5
+	InputLock   uint8 = 6
+)
+
+// kMaxTextUnits 镜像(desktop 侧防御上限;agent 侧另有 ≤2KiB 预算)。
+const maxInputTextUnits = 512
 
 const (
 	// handshakeTimeout 覆盖拨号与三步握手。
@@ -58,6 +77,9 @@ const (
 	frameChDepth = 16
 	// stateChDepth 覆盖 capture_rebuilt 等稀疏事件。
 	stateChDepth = 8
+	// cursorChDepth 覆盖 8ms 轮询突发;满时丢弃(不可靠通道语义,
+	// 下一事件最多 8ms 后到)。
+	cursorChDepth = 8
 	// reasonLen 是 KEYFRAME_REQ reason 字段宽度(NUL 填充,有效 31)。
 	reasonLen = 32
 )
@@ -90,6 +112,30 @@ type StateEvent struct {
 	Recoverable bool
 }
 
+// InputMsg 是 0x0108 消息的解码形态(payload' 字段逐 type 复用,镜像
+// native InputMsg)。EncodeInputMsg 用 SubID/Seq/Type + 载荷字段产线。
+type InputMsg struct {
+	SubID    uint32
+	Seq      uint64
+	Type     uint8
+	X, Y     int32 // MOVE 坐标 / WHEEL dx,dy
+	Buttons  uint16
+	Btn      uint8
+	Down     uint8 // BUTTON/KEY 共用
+	Trackpad uint8
+	Scan     uint16
+	Extended uint8
+	Text     []uint16
+	Caps     uint8
+	Num      uint8
+}
+
+// CursorEvent 是 0x0109 事件(HOST_HELLO 流空间逻辑 px)。
+type CursorEvent struct {
+	X, Y    int32
+	Visible bool
+}
+
 // Sub 是一条已 ATTACH 的订阅连接。读侧由泵 goroutine 独占,控制帧写
 // 由 writeMu 串行;Close 后各通道随泵退出而关闭。
 type Sub struct {
@@ -108,6 +154,7 @@ type Sub struct {
 
 	frameCh  chan Frame
 	stateCh  chan StateEvent
+	cursorCh chan CursorEvent
 	done     chan struct{}
 	doneOnce sync.Once
 }
@@ -141,9 +188,10 @@ func Dial(pipe, secret string, subID uint32, opts SubOpts) (*Sub, error) {
 
 	s := &Sub{
 		conn: conn, subID: subID,
-		frameCh: make(chan Frame, frameChDepth),
-		stateCh: make(chan StateEvent, stateChDepth),
-		done:    make(chan struct{}),
+		frameCh:  make(chan Frame, frameChDepth),
+		stateCh:  make(chan StateEvent, stateChDepth),
+		cursorCh: make(chan CursorEvent, cursorChDepth),
+		done:     make(chan struct{}),
 	}
 	// ATTACH 窗口内同步等待 HOST_HELLO;期间到达的 STATE 先入通道
 	// (too_many_subs 升格为 Dial 错误)。
@@ -199,6 +247,27 @@ func (s *Sub) FrameCh() <-chan Frame { return s.frameCh }
 // 多为瞬时提示;capture_rebuilt 语义由 Hello().Gen 承载)。
 func (s *Sub) StateCh() <-chan StateEvent { return s.stateCh }
 
+// CursorCh 交付 0x0109 光标事件;连接终结后关闭。满时丢弃(位置语义
+// 最新即准;host 仅在变化时发送)。
+func (s *Sub) CursorCh() <-chan CursorEvent { return s.cursorCh }
+
+// SendInput 发送一条 0x0108 输入消息(SubID 自动填充本订阅 id;预校验
+// 由调用方——agent/desktop——负责,本层只编码)。写失败/已关返回错误。
+func (s *Sub) SendInput(m *InputMsg) error {
+	m.SubID = s.subID
+	p := EncodeInputMsg(m)
+	if p == nil {
+		return fmt.Errorf("desktoppipe: encode input type %d", m.Type)
+	}
+	return s.SendInputPayload(p)
+}
+
+// SendInputPayload 发送已编码的 0x0108 payload(调用方保证布局与
+// sub_id;EncodeInputMsg 的产物或 agent 侧等价编码)。
+func (s *Sub) SendInputPayload(p []byte) error {
+	return s.writeCtrl(&ipc.Frame{MessageType: msgInput, Payload: p})
+}
+
 // Hello 返回最近一次 HOST_HELLO(副本);Dial 成功后恒非 nil。
 func (s *Sub) Hello() *HelloInfo {
 	s.mu.Lock()
@@ -209,6 +278,9 @@ func (s *Sub) Hello() *HelloInfo {
 	h := *s.hello
 	return &h
 }
+
+// SubID 返回本订阅的 sub_id(0x0108 输入消息必须携带本值)。
+func (s *Sub) SubID() uint32 { return s.subID }
 
 // Done 在泵退出(连接终结)时关闭;Err 返回终结原因(Close 主动关闭
 // 时为 nil)。
@@ -330,13 +402,26 @@ func (s *Sub) pump() {
 				s.teardown(err)
 				return
 			}
-			select {
-			case s.stateCh <- ev:
-			case <-s.done:
-				s.teardown(nil)
-				return
-			default: // 满则丢弃(见 StateCh 注释)
-			}
+		select {
+		case s.stateCh <- ev:
+		case <-s.done:
+			s.teardown(nil)
+			return
+		default: // 满则丢弃(见 StateCh 注释)
+		}
+	case msgCursor:
+		ev, err := decodeCursor(f.Payload)
+		if err != nil {
+			s.teardown(err)
+			return
+		}
+		select {
+		case s.cursorCh <- ev:
+		case <-s.done:
+			s.teardown(nil)
+			return
+		default: // 满则丢弃(见 CursorCh 注释)
+		}
 		default:
 			// PONG / 迟到的 ATTACH 应答等:忽略。
 		}
@@ -356,6 +441,7 @@ func (s *Sub) teardown(err error) {
 	s.closeDone()
 	close(s.frameCh)
 	close(s.stateCh)
+	close(s.cursorCh)
 }
 
 // ---- 握手与 payload 编解码 ----
@@ -445,6 +531,7 @@ func decodeHostHello(p []byte) (*HelloInfo, error) {
 	}, nil
 }
 
+// decodeState 解码 STATE 事件 [char code[32]][u8 recoverable]。
 func decodeState(p []byte) (StateEvent, error) {
 	if len(p) != 33 {
 		return StateEvent{}, fmt.Errorf("desktoppipe: state payload %d bytes, want 33", len(p))
@@ -454,6 +541,62 @@ func decodeState(p []byte) (StateEvent, error) {
 		code = code[:i]
 	}
 	return StateEvent{Code: string(code), Recoverable: p[32] != 0}, nil
+}
+
+// decodeCursor 解码 0x0109 光标事件 [s32 x][s32 y][u8 visible]。
+func decodeCursor(p []byte) (CursorEvent, error) {
+	if len(p) != 9 {
+		return CursorEvent{}, fmt.Errorf("desktoppipe: cursor payload %d bytes, want 9", len(p))
+	}
+	return CursorEvent{
+		X:       int32(binary.LittleEndian.Uint32(p)),
+		Y:       int32(binary.LittleEndian.Uint32(p[4:])),
+		Visible: p[8] != 0,
+	}, nil
+}
+
+// EncodeInputMsg 编码 0x0108 payload `[u32 sub_id][u64 seq][u8 type]
+// [payload']`(与 native rt_pipe_server.h EncodeInputMsg 逐字节一致);
+// 非法 type 返回 nil。不做语义校验(域校验在 agent 预校验层)。
+func EncodeInputMsg(m *InputMsg) []byte {
+	var p []byte
+	switch m.Type {
+	case InputMove:
+		p = make([]byte, 23)
+		binary.LittleEndian.PutUint32(p[13:], uint32(m.X))
+		binary.LittleEndian.PutUint32(p[17:], uint32(m.Y))
+		binary.LittleEndian.PutUint16(p[21:], m.Buttons)
+	case InputButton:
+		p = make([]byte, 15)
+		p[13], p[14] = m.Btn, m.Down
+	case InputWheel:
+		p = make([]byte, 22)
+		binary.LittleEndian.PutUint32(p[13:], uint32(m.X))
+		binary.LittleEndian.PutUint32(p[17:], uint32(m.Y))
+		p[21] = m.Trackpad
+	case InputKey:
+		p = make([]byte, 17)
+		binary.LittleEndian.PutUint16(p[13:], m.Scan)
+		p[15], p[16] = m.Down, m.Extended
+	case InputText:
+		if len(m.Text) > maxInputTextUnits {
+			return nil
+		}
+		p = make([]byte, 15+2*len(m.Text))
+		binary.LittleEndian.PutUint16(p[13:], uint16(len(m.Text)))
+		for i, u := range m.Text {
+			binary.LittleEndian.PutUint16(p[15+2*i:], u)
+		}
+	case InputLock:
+		p = make([]byte, 15)
+		p[13], p[14] = m.Caps, m.Num
+	default:
+		return nil
+	}
+	binary.LittleEndian.PutUint32(p, m.SubID)
+	binary.LittleEndian.PutUint64(p[4:], m.Seq)
+	p[12] = m.Type
+	return p
 }
 
 // respText 提取 FlagError 帧的 ASCII 错误码(不可打印则给字节数)。

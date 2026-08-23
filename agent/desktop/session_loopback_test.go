@@ -106,6 +106,21 @@ func (s *fakeSource) RequestKeyframe(reason string) error {
 	return nil
 }
 
+// SubID/SendInput/RecvCursor:Slice3 Source 接口扩展的最小实现(视频回环
+// 用例不驱动输入/光标;输入路径的真实验证在 input_loopback_test.go)。
+func (s *fakeSource) SubID() uint32 { return 7 }
+
+func (s *fakeSource) SendInput(_ []byte) error { return nil }
+
+func (s *fakeSource) RecvCursor(ctx context.Context) (CursorEvent, bool) {
+	select {
+	case <-ctx.Done():
+		return CursorEvent{}, false
+	case <-s.done:
+		return CursorEvent{}, false
+	}
+}
+
 func (s *fakeSource) Close() error {
 	s.closeOnce.Do(func() {
 		s.mu.Lock()

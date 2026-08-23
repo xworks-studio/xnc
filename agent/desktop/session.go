@@ -22,12 +22,21 @@
 //
 //	{"type":"offer","sdp":"v=0..."}             恰一次;触发建 PC + answer。
 //	{"type":"ice","candidate":{...}|null}       trickle 候选;null(浏览器
-//	    end-of-candidates)忽略——pion 自行完成收集。
+//	end-of-candidates)忽略——pion 自行完成收集。
 //	{"type":"keyframe-req"}                     显式关键帧请求(T6 加:浏览器无
-//	    法从 JS 发 RTCP PLI,实验页 PLI 按钮走此帧;映射到与真 PLI 同一条
-//	    RequestKeyframe 路径,reason="viewer-pli")。
+//	法从 JS 发 RTCP PLI,实验页 PLI 按钮走此帧;映射到与真 PLI 同一条
+//	RequestKeyframe 路径,reason="viewer-pli")。
+//	{"type":"lease_request"}                    输入控制权请求(M1-Slice3;
+//	                                            见 input.go 头注释)。
 //
-// 二进制帧:本 kind 无。未知 type 一律忽略(向后兼容)。
+// agent → viewer(Slice3 追加 lease 三帧,词汇见 input.go):
+//
+//	{"type":"lease_granted","leaseId":"<16 hex>"}
+//	{"type":"lease_denied","reason":"held"}
+//	{"type":"lease_revoked","reason":"idle"|"disconnect"}
+//
+// 二进制帧:本 kind 无(输入/光标走 DataChannel,见 input.go)。未知 type
+// 一律忽略(向后兼容)。
 //
 // 生命周期:SESSION_OPEN params 见 proto.DesktopParams;会话关闭(ctx 取消 /
 // WS 断开)→ Publisher.Close + Source.Close + Starter.Stop(引用计数,最后
@@ -51,13 +60,17 @@ import (
 
 // 信令帧 type 词汇(与文件头注释一一对应;T5/T6 契约)。
 const (
-	vocabReady       = "ready"
-	vocabOffer       = "offer"
-	vocabAnswer      = "answer"
-	vocabICE         = "ice"
-	vocabState       = "state"
-	vocabError       = "error"
-	vocabKeyframeReq = "keyframe-req"
+	vocabReady        = "ready"
+	vocabOffer        = "offer"
+	vocabAnswer       = "answer"
+	vocabICE          = "ice"
+	vocabState        = "state"
+	vocabError        = "error"
+	vocabKeyframeReq  = "keyframe-req"
+	vocabLeaseRequest = "lease_request"
+	vocabLeaseGranted = "lease_granted"
+	vocabLeaseDenied  = "lease_denied"
+	vocabLeaseRevoked = "lease_revoked"
 )
 
 const (
@@ -69,10 +82,24 @@ const (
 )
 
 // Handler 实现 session.Handler(kind=desktop)。Starter 决定帧源;nil 时
-// Handle 直接报错(注册侧应保证非 nil)。
+// Handle 直接报错(注册侧应保证非 nil)。lease 表惰性建立:每 Handler
+// 一份 = 一个 Starter = 一个采集实例(多 viewer 会话共享仲裁;测试可
+// 预置 h.leases 注入短 idle)。
 type Handler struct {
 	Log     *slog.Logger
 	Starter Starter
+
+	leaseOnce sync.Once
+	leases    *leaseTable
+}
+
+func (h *Handler) leaseTable() *leaseTable {
+	h.leaseOnce.Do(func() {
+		if h.leases == nil {
+			h.leases = newLeaseTable()
+		}
+	})
+	return h.leases
 }
 
 // compactFrame 是全部入站信令帧的宽松解析形态。
@@ -143,6 +170,12 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 	}
 	defer closeAll()
 
+	// ①b 输入/lease 控制器(本会话一条;close 合成卡键释放并释放 lease,
+	// defer LIFO:在 pub.Close 之后、src/closeAll 之前运行——键释放需要
+	// pipe 仍开)。
+	ictl := newInputController(src, h.leaseTable(), log)
+	defer ictl.close()
+
 	// ② ready(HOST_HELLO 维度 + fps→默认帧时长)。
 	hello := src.Hello()
 	defDur := 33 * time.Millisecond
@@ -206,7 +239,7 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 			if pub != nil {
 				continue // 重复 offer:忽略(已应答)
 			}
-			pub, err = h.setupPublisher(ctx, w, src, &p, f.SDP, defDur, log)
+			pub, err = h.setupPublisher(ctx, w, src, &p, f.SDP, defDur, ictl, log)
 			if err != nil {
 				log.Warn("desktop webrtc setup failed", "err", err)
 				w.write(ctx, errorFrame{Type: vocabError, Code: "webrtc_failed", Message: err.Error()})
@@ -225,6 +258,16 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 			if err := src.RequestKeyframe("viewer-pli"); err != nil {
 				log.Debug("viewer keyframe request failed", "err", err)
 			}
+		case vocabLeaseRequest:
+			// M1 简化仲裁(input.go):首请求者得;撤销时经 notify 回
+			// lease_revoked 帧;非持有者输入丢弃+计数(不断连)。
+			if id, ok := ictl.grantLease(func(reason string) {
+				w.write(ctx, leaseRevokedFrame{Type: vocabLeaseRevoked, Reason: reason})
+			}); ok {
+				w.write(ctx, leaseGrantedFrame{Type: vocabLeaseGranted, LeaseID: id})
+			} else {
+				w.write(ctx, leaseDeniedFrame{Type: vocabLeaseDenied, Reason: "held"})
+			}
 		default:
 			// 未知 type:忽略(向后兼容词汇演进)。
 		}
@@ -232,8 +275,11 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 }
 
 // setupPublisher 建 PeerConnection、接好回调和帧泵,并返回 answer。
+// ictl 在 offer 应答前 attach 三条输入/光标 DataChannel(必须先于
+// HandleOffer 建立),并在 answer 后启动 cursor 泵(0x0109 → cursor 通道)。
 func (h *Handler) setupPublisher(ctx context.Context, w *wsWriter, src Source,
-	p *proto.DesktopParams, offerSDP string, defDur time.Duration, log *slog.Logger) (*Publisher, error) {
+	p *proto.DesktopParams, offerSDP string, defDur time.Duration,
+	ictl *inputController, log *slog.Logger) (*Publisher, error) {
 	relay := p.IceTransportPolicy != proto.DesktopIceAll
 	var ice []webrtc.ICEServer
 	if p.Turn != nil {
@@ -265,6 +311,12 @@ func (h *Handler) setupPublisher(ctx context.Context, w *wsWriter, src Source,
 	pub.OnICECandidate(func(c webrtc.ICECandidateInit) {
 		w.write(ctx, iceFrame{Type: vocabICE, Candidate: &c})
 	})
+	// 输入/光标通道(input.go):input 可靠、mouse/cursor 不可靠;必须在
+	// HandleOffer 之前创建(answer 需含 SCTP;通道本体经 in-band 协商)。
+	if err := ictl.attach(pub); err != nil {
+		_ = pub.Close()
+		return nil, fmt.Errorf("input channels: %w", err)
+	}
 	answerSDP, err := pub.HandleOffer(offerSDP)
 	if err != nil {
 		_ = pub.Close()
@@ -284,6 +336,17 @@ func (h *Handler) setupPublisher(ctx context.Context, w *wsWriter, src Source,
 				log.Info("desktop frame pump stopped", "err", err)
 				return
 			}
+		}
+	}()
+
+	// cursor 泵:pipe 0x0109 → cursor DataChannel(不可靠,最新即准)。
+	go func() {
+		for {
+			ev, ok := src.RecvCursor(ctx)
+			if !ok {
+				return
+			}
+			ictl.forwardCursor(ev)
 		}
 	}()
 	return pub, nil
@@ -325,4 +388,20 @@ type errorFrame struct {
 	Type    string `json:"type"`
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+// lease 三帧(M1-Slice3;形态契约见 input.go 头注释,T4/T5 消费)。
+type leaseGrantedFrame struct {
+	Type    string `json:"type"`
+	LeaseID string `json:"leaseId"`
+}
+
+type leaseDeniedFrame struct {
+	Type   string `json:"type"`
+	Reason string `json:"reason"`
+}
+
+type leaseRevokedFrame struct {
+	Type   string `json:"type"`
+	Reason string `json:"reason"`
 }

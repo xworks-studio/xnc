@@ -23,6 +23,8 @@ import (
 // ---- 测试侧编码器(布局 = C++ rt_pipe_server.h)----
 
 func tPut32(p []byte, off int, v uint32) { binary.LittleEndian.PutUint32(p[off:], v) }
+// s32u:负常量直接转 uint32 是编译错(常量溢出),经变量转即可。
+func s32u(v int32) uint32 { return uint32(v) }
 func tPut64(p []byte, off int, v uint64) { binary.LittleEndian.PutUint64(p[off:], v) }
 
 func tEncHostHello(gen, w, h, fps, maxSubs uint32) []byte {
@@ -56,14 +58,19 @@ func tEncState(code string, recoverable bool) []byte {
 	return p
 }
 
-// fakeHost 观察:ATTACH payload / KEYFRAME_REQ reason / DETACH sub_id。
+// fakeHost 观察:ATTACH payload / KEYFRAME_REQ reason / DETACH sub_id /
+// INPUT 0x0108 原始 payload;pushCursor 可主动下发 0x0109。
 type fakeHost struct {
 	ln        net.Listener
 	secret    []byte
 	attachCh  chan []byte // 原始 ATTACH payload
 	kfCh      chan string // KEYFRAME_REQ reason
 	detachCh  chan uint32 // DETACH sub_id
+	inputCh   chan []byte // MSG_INPUT 原始 payload(Slice3)
 	rejectSub bool        // true: ATTACH 后回 STATE{too_many_subs} 并断连
+
+	wmu  sync.Mutex // 串行化事件写(burst 与 cursor)
+	conn net.Conn
 }
 
 func startFakeHost(t *testing.T, secret string, rejectSub bool) *fakeHost {
@@ -78,12 +85,29 @@ func startFakeHost(t *testing.T, secret string, rejectSub bool) *fakeHost {
 		attachCh: make(chan []byte, 1),
 		kfCh:     make(chan string, 1),
 		detachCh: make(chan uint32, 1),
+		inputCh:  make(chan []byte, 8),
 	}
 	go h.serve()
 	return h
 }
 
 func (h *fakeHost) name() string { return h.ln.Addr().String() }
+
+// pushCursor 下发一条 0x0109 事件(HOST_HELLO 后任意时刻)。
+func (h *fakeHost) pushCursor(x, y int32, visible bool) {
+	p := make([]byte, 9)
+	tPut32(p, 0, uint32(x))
+	tPut32(p, 4, uint32(y))
+	if visible {
+		p[8] = 1
+	}
+	h.wmu.Lock()
+	defer h.wmu.Unlock()
+	if h.conn == nil {
+		return
+	}
+	_ = ipc.WriteFrame(h.conn, &ipc.Frame{Flags: ipc.FlagEvent, MessageType: msgCursor, Payload: p})
+}
 
 // serve 走生产时序:握手 → ATTACH → HOST_HELLO → 两帧(key+delta)+ STATE
 // → 请求循环(KEYFRAME_REQ 回一个新 key 帧;DETACH/BYE 结束)。
@@ -93,6 +117,9 @@ func (h *fakeHost) serve() {
 		return
 	}
 	defer conn.Close()
+	h.wmu.Lock()
+	h.conn = conn
+	h.wmu.Unlock()
 	if err := coreclient.ServerHandshake(conn, h.secret); err != nil {
 		return // 客户端证明失败即断(secret 不一致用例)
 	}
@@ -120,6 +147,10 @@ func (h *fakeHost) serve() {
 			return
 		}
 		switch f.MessageType {
+		case msgInput:
+			if len(f.Payload) >= 13 {
+				h.inputCh <- append([]byte(nil), f.Payload...)
+			}
 		case msgKeyframeReq:
 			if len(f.Payload) != 36 {
 				return
@@ -258,6 +289,76 @@ func TestDialTooManySubs(t *testing.T) {
 func TestDialRejectsZeroSubID(t *testing.T) {
 	if _, err := Dial(`\\.\pipe\xnc-desktoppipe-none`, "s", 0, SubOpts{}); err == nil {
 		t.Fatal("Dial must reject subID 0")
+	}
+}
+
+// TestInputEncodeAndCursor(M1-Slice3 Task 3):0x0108 出站 —— SendInput 自动
+// 填 sub_id,host 侧逐字节黄金比对(布局 = C++ EncodeInputMsg 的第二实
+// 现);EncodeInputMsg 黄金字节 + 非法 type 拒绝;0x0109 入站 → CursorCh。
+func TestInputEncodeAndCursor(t *testing.T) {
+	h := startFakeHost(t, "desktop-pipe-secret", false)
+	sub, err := Dial(h.name(), "desktop-pipe-secret", 7, SubOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	// MOVE:host 收到的 payload 与手写镜像逐字节一致。
+	if err := sub.SendInput(&InputMsg{Seq: 1, Type: InputMove, X: -10, Y: 20, Buttons: 3}); err != nil {
+		t.Fatal(err)
+	}
+	got := recvOrFatal[[]byte](t, h.inputCh, "MOVE payload")
+	want := make([]byte, 23)
+	tPut32(want, 0, 7) // sub_id 由 Sub.SendInput 填充
+	tPut64(want, 4, 1)
+	want[12] = InputMove
+	tPut32(want, 13, s32u(-10))
+	tPut32(want, 17, 20)
+	want[21], want[22] = 3, 0
+	if string(got) != string(want) {
+		t.Fatalf("MOVE payload = %x, want %x", got, want)
+	}
+
+	// TEXT(代理对按 unit)与 KEY:EncodeInputMsg 黄金字节。
+	enc := EncodeInputMsg(&InputMsg{SubID: 7, Seq: 2, Type: InputText, Text: []uint16{0x68, 0x4E2D}})
+	wantText := make([]byte, 19)
+	tPut32(wantText, 0, 7)
+	tPut64(wantText, 4, 2)
+	wantText[12] = InputText
+	binary.LittleEndian.PutUint16(wantText[13:], 2)
+	binary.LittleEndian.PutUint16(wantText[15:], 0x68)
+	binary.LittleEndian.PutUint16(wantText[17:], 0x4E2D)
+	if string(enc) != string(wantText) {
+		t.Fatalf("TEXT encode = %x, want %x", enc, wantText)
+	}
+	if err := sub.SendInputPayload(enc); err != nil {
+		t.Fatal(err)
+	}
+	if got := recvOrFatal[[]byte](t, h.inputCh, "TEXT payload"); string(got) != string(wantText) {
+		t.Fatalf("TEXT payload = %x", got)
+	}
+
+	// 非法 type:Encode 拒绝 + SendInput 报错。
+	if EncodeInputMsg(&InputMsg{SubID: 7, Type: 99}) != nil {
+		t.Fatal("EncodeInputMsg must reject unknown type")
+	}
+	if err := sub.SendInput(&InputMsg{Type: 99}); err == nil {
+		t.Fatal("SendInput must fail on unknown type")
+	}
+	if err := sub.SendInput(&InputMsg{Type: InputText, Text: make([]uint16, maxInputTextUnits+1)}); err == nil {
+		t.Fatal("SendInput must fail on oversized TEXT")
+	}
+
+	// 0x0109 入站 → CursorCh。
+	h.pushCursor(100, -50, true)
+	ev := recvOrFatal[CursorEvent](t, sub.CursorCh(), "cursor event 1")
+	if ev.X != 100 || ev.Y != -50 || !ev.Visible {
+		t.Fatalf("cursor = %+v", ev)
+	}
+	h.pushCursor(-1, 2, false)
+	ev = recvOrFatal[CursorEvent](t, sub.CursorCh(), "cursor event 2")
+	if ev.X != -1 || ev.Y != 2 || ev.Visible {
+		t.Fatalf("cursor 2 = %+v", ev)
 	}
 }
 

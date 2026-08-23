@@ -34,16 +34,30 @@ type StateEvent struct {
 	Recoverable bool
 }
 
+// CursorEvent 是 0x0109 光标事件镜像(HOST_HELLO 流空间逻辑像素;
+// M1-Slice3 Task 3)。
+type CursorEvent struct {
+	X, Y    int32
+	Visible bool
+}
+
 // Source 是一条已 ATTACH 的桌面帧订阅(见 desktoppipe.Sub)。
 type Source interface {
 	// RecvFrame 阻塞取下一视频帧;ok=false = 源终结(关闭/断连/ctx 取消)。
 	RecvFrame(ctx context.Context) (Frame, bool)
 	// RecvState 阻塞取下一状态事件;ok=false 同上。
 	RecvState(ctx context.Context) (StateEvent, bool)
+	// RecvCursor 阻塞取下一光标事件(0x0109);ok=false 同上。
+	RecvCursor(ctx context.Context) (CursorEvent, bool)
 	// Hello 返回最近一次 HOST_HELLO(可为 nil——测试 fake 允许)。
 	Hello() *HelloInfo
 	// RequestKeyframe 请求 host 立即产新 IDR(reason 进 host 记账)。
 	RequestKeyframe(reason string) error
+	// SubID 返回本订阅的 sub_id(0x0108 输入消息必须携带)。
+	SubID() uint32
+	// SendInput 发送一条已编码的 0x0108 payload([u32 sub_id][u64 seq]
+	// [u8 type][payload'];sub_id 由调用方经 SubID 填充)。
+	SendInput(payload []byte) error
 	Close() error
 }
 

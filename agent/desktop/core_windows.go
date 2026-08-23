@@ -201,6 +201,28 @@ func (p *pipeSource) RecvState(ctx context.Context) (StateEvent, bool) {
 	}
 }
 
+// RecvCursor 取 0x0109 光标事件(通道满时 desktoppipe 侧已丢弃,语义 =
+// 最新即准;Slice3 Task 3)。
+func (p *pipeSource) RecvCursor(ctx context.Context) (CursorEvent, bool) {
+	select {
+	case ev, ok := <-p.sub.CursorCh():
+		if !ok {
+			return CursorEvent{}, false
+		}
+		return CursorEvent{X: ev.X, Y: ev.Y, Visible: ev.Visible}, true
+	case <-ctx.Done():
+		return CursorEvent{}, false
+	case <-p.sub.Done():
+		return CursorEvent{}, false
+	}
+}
+
+// SubID 返回 ATTACH 时选定的订阅 id(0x0108 消息必须携带)。
+func (p *pipeSource) SubID() uint32 { return p.sub.SubID() }
+
+// SendInput 发送 agent 已编码的 0x0108 payload(预校验在 input.go)。
+func (p *pipeSource) SendInput(payload []byte) error { return p.sub.SendInputPayload(payload) }
+
 func (p *pipeSource) Hello() *HelloInfo {
 	h := p.sub.Hello()
 	if h == nil {
