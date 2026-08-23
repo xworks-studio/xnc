@@ -101,9 +101,13 @@ int RunDiagSpawn(const wchar_t* child_exe, int argc, wchar_t** argv, int from) {
   }
 
   std::wstring cmd;
-  if (!xnc::BuildChildCommandLine(child_exe, argc, argv, from, &cmd)) {
+  std::string cmd_err;
+  if (!xnc::BuildChildCommandLine(child_exe, argc, argv, from, &cmd,
+                                  &cmd_err)) {
     CloseHandle(token);
-    std::fwprintf(stderr, L"xnc-core: --diag-spawn could not build the child command line\n");
+    std::fwprintf(stderr,
+        L"xnc-core: --diag-spawn rejected a child argument (%hs)\n",
+        cmd_err.c_str());
     return 2;
   }
   XNC_LOG_INFO("diag_spawn cmdline=\"%ls\" (no secrets in argv per spec 4.2)",

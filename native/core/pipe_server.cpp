@@ -270,18 +270,23 @@ Frame HandleStartCapture(const Frame& req, Watchdog* wd) {
   }
 
   // Program-constructed argv only - no user input and no secret reach the
-  // command line, so the BuildChildCommandLine quoting TODO stays a Slice3
-  // must-fix; the cmdline carries nothing sensitive either way.
+  // command line, and BuildChildCommandLine additionally rejects unsafe
+  // quoting shapes (embedded quotes / trailing backslash; the slice3
+  // must-fix is resolved) as defense in depth - the cmdline carries
+  // nothing sensitive either way.
   std::vector<std::wstring> args = {L"--console-rt", L"--pipe", pipe_name,
                                     L"--secret-stdin"};
   std::vector<wchar_t*> av;
   for (auto& a : args) av.push_back(&a[0]);
   std::wstring cmd;
+  std::string cmd_err;
   if (!BuildChildCommandLine(L"xnc-desktop.exe", static_cast<int>(av.size()),
-                             av.data(), 0, &cmd)) {
+                             av.data(), 0, &cmd, &cmd_err)) {
     CloseHandle(token);
     CloseHandle(sec_rd);
     CloseHandle(sec_wr);
+    XNC_LOG_ERROR("start_capture: child cmdline rejected err=\"%s\"",
+                  cmd_err.c_str());
     return ErrorFrame(kMsgStartCapture, req.request_id, "INTERNAL");
   }
 

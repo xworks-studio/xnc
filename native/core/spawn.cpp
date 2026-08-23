@@ -36,17 +36,37 @@ std::wstring OwnModuleDir() {
 }
 
 bool BuildChildCommandLine(const wchar_t* exe, int argc, wchar_t** argv,
-                           int from, std::wstring* out) {
-  if (!exe || !*exe || !out || from < 0 || from > argc) return false;
+                           int from, std::wstring* out, std::string* err) {
+  auto reject = [err](const char* what, int argi, int pos) {
+    if (err)
+      *err = pos < 0
+                 ? std::string(what) + " at arg[" + std::to_string(argi) + "]"
+                 : std::string(what) + " in arg[" + std::to_string(argi) +
+                       "] at char " + std::to_string(pos);
+    return false;
+  };
+  if (!exe || !*exe || !out || from < 0 || from > argc) {
+    if (err) *err = "invalid exe/out/from";
+    return false;
+  }
   std::wstring cmd = exe;
   for (int i = from; i < argc; i++) {
     const wchar_t* a = argv[i];
-    if (!a || !*a) return false;  // empty args cannot be represented
-    cmd += L" ";
+    if (!a) return reject("null argument", i, -1);
+    if (!*a) return reject("empty argument", i, -1);  // cannot be represented
     // Simple quoting: whitespace-bearing args get wrapped in double
-    // quotes. Args with embedded quotes are a diag-usage error (never
-    // needed by the console-diag flag set).
-    // TODO(slice3-must-fix): reject embedded quotes and trailing backslash in args before RPC reuse (M1-Slice1 final review; ledger deferred)
+    // quotes. Unsafe shapes are REJECTED, never escaped (spec 6.4 spirit:
+    // args come from program-constructed argv only, so no caller needs
+    // escaping): an embedded '"' breaks the argument boundary, and a
+    // trailing '\' would escape the closing quote. Resolved in M1-Slice3
+    // ("fix(native/core): reject quotes and trailing backslash in child
+    // args"); was the M1-Slice1 final-review must-fix.
+    const wchar_t* q = std::wcschr(a, L'"');
+    if (q) return reject("embedded quote", i, static_cast<int>(q - a));
+    const size_t len = std::wcslen(a);
+    if (a[len - 1] == L'\\')
+      return reject("trailing backslash", i, static_cast<int>(len - 1));
+    cmd += L" ";
     if (std::wcspbrk(a, L" \t")) {
       cmd += L"\"";
       cmd += a;

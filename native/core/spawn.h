@@ -34,10 +34,19 @@ std::wstring OwnModuleDir();
 
 // Join exe + argv[from..argc) into one child command line, quoting any
 // argument that contains whitespace (pure; --diag-spawn forwards the rest
-// of its own argv verbatim). Returns false on null/empty arguments (an
-// empty string argument cannot be represented in this simple quoting).
+// of its own argv verbatim). Unsafe shapes are REJECTED, never escaped
+// (spec 6.4 spirit: args come from program-constructed argv only, so no
+// caller ever needs escaping): an argument containing an embedded '"'
+// (breaks the argument boundary) or ending in '\' (would escape the
+// closing quote) fails the build, as do null and empty arguments (an
+// empty string cannot be represented in this simple quoting) and a bad
+// exe/out/from. err (optional) receives the reason, e.g.
+// "embedded quote in arg[2] at char 5" / "trailing backslash in arg[1]
+// at char 7" / "empty argument at arg[1]" (positions are 0-based wchar
+// indices into the offending argv element).
 bool BuildChildCommandLine(const wchar_t* exe, int argc, wchar_t** argv,
-                           int from, std::wstring* out);
+                           int from, std::wstring* out,
+                           std::string* err = nullptr);
 
 // Spawn the whitelisted exe (validated and resolved next to xnc-core.exe)
 // with cmdline on the token's session and desktop ("winsta0\default").

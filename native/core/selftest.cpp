@@ -125,6 +125,49 @@ int SelftestMain() {
         CHECK("cmd-null-arg", !BuildChildCommandLine(L"xnc-desktop.exe", 2, av3, 1, &cmd));
         wchar_t* av4[] = {a0, (wchar_t*)L""};
         CHECK("cmd-empty-arg", !BuildChildCommandLine(L"xnc-desktop.exe", 2, av4, 1, &cmd));
+        // M1-Slice3 must-fix matrix: embedded quotes (incl. \" shapes) and
+        // trailing backslash are rejected, never escaped; err names the
+        // argv index and 0-based wchar position. Interior backslashes,
+        // whitespace paths and unicode args still pass; empty/null args
+        // stay rejected (pre-slice3 behavior, unchanged).
+        std::string cerr;
+        wchar_t bad_q[] = L"--title=bad\"name";
+        const wchar_t* qp = std::wcschr(bad_q, L'"');
+        wchar_t* avq[] = {a0, bad_q};
+        CHECK("cmd-quote-reject",
+              !BuildChildCommandLine(L"xnc-desktop.exe", 2, avq, 1, &cmd, &cerr));
+        CHECK("cmd-quote-err",
+              cerr.find("embedded quote in arg[1] at char " +
+                        std::to_string((int)(qp - bad_q))) != std::string::npos);
+        wchar_t bad_eq[] = L"he said \\\"hi\\\"";  // arg text: he said \"hi\"
+        wchar_t* avq2[] = {a0, bad_eq};
+        CHECK("cmd-escaped-quote-reject",
+              !BuildChildCommandLine(L"xnc-desktop.exe", 2, avq2, 1, &cmd, &cerr));
+        CHECK("cmd-escaped-quote-err",
+              cerr.find("embedded quote in arg[1] at char 9") != std::string::npos);
+        wchar_t bad_bs[] = L"C:\\dir\\";
+        wchar_t* avb[] = {a0, bad_bs};
+        CHECK("cmd-trailing-backslash-reject",
+              !BuildChildCommandLine(L"xnc-desktop.exe", 2, avb, 1, &cmd, &cerr));
+        CHECK("cmd-trailing-backslash-err",
+              cerr.find("trailing backslash in arg[1] at char 6") != std::string::npos);
+        // 合法混合路径 + unicode(内部反斜杠、空格、项目名)照常通过。
+        wchar_t uni1[] = L"C:\\proj 项目\\out file.h264", uni2[] = L"项目";
+        wchar_t* avu[] = {a0, uni1, uni2};
+        CHECK("cmd-unicode-path-ok",
+              BuildChildCommandLine(L"xnc-desktop.exe", 3, avu, 1, &cmd) &&
+              cmd == L"xnc-desktop.exe \"C:\\proj 项目\\out file.h264\" 项目");
+        // unicode 内嵌引号:位置按 wchar 计(项0 目1 \2 "3)。
+        wchar_t uq[] = L"项目\\\"";
+        wchar_t* avu2[] = {a0, uq};
+        CHECK("cmd-unicode-quote-reject",
+              !BuildChildCommandLine(L"xnc-desktop.exe", 2, avu2, 1, &cmd, &cerr));
+        CHECK("cmd-unicode-quote-err",
+              cerr.find("embedded quote in arg[1] at char 3") != std::string::npos);
+        // 空参 err 信息(行为与 slice3 之前一致,仅补上原因)。
+        CHECK("cmd-empty-arg-err",
+              !BuildChildCommandLine(L"xnc-desktop.exe", 2, av4, 1, &cmd, &cerr) &&
+              cerr.find("empty argument at arg[1]") != std::string::npos);
       }
     }
     { // M1-Slice2 Task 3 fix wave: EncodeStartCaptureOk success layout,
