@@ -211,14 +211,27 @@ loop:
 }
 
 // fileErrExit maps an agent FILE_ERROR frame to the stable exit codes:
-// FILE_NOT_FOUND→244, FILE_TOO_LARGE/HASH_MISMATCH→246, else 250.
+// FILE_NOT_FOUND→244, FILE_TOO_LARGE/HASH_MISMATCH→246, else 250
+// (ACCESS_DENIED/INTERNAL included). The agent's readable message field
+// (e.g. the OS error text for a failed rename over a locked exe) is passed
+// through when present, falling back to the code itself.
 func fileErrExit(cmd *cobra.Command, fe *proto.FileError) error {
+	msg := fe.Message
 	switch fe.Code {
 	case proto.CodeFileNotFound:
-		return failAPI(cmd, proto.Err(244, fe.Code, "file not found"))
+		if msg == "" {
+			msg = "file not found"
+		}
+		return failAPI(cmd, proto.Err(244, fe.Code, msg))
 	case proto.CodeFileTooLarge, proto.CodeHashMismatch:
-		return failAPI(cmd, proto.Err(246, fe.Code, fe.Code))
+		if msg == "" {
+			msg = fe.Code
+		}
+		return failAPI(cmd, proto.Err(246, fe.Code, msg))
 	default:
-		return failAPI(cmd, proto.Err(250, fe.Code, fe.Code))
+		if msg == "" {
+			msg = fe.Code
+		}
+		return failAPI(cmd, proto.Err(250, fe.Code, msg))
 	}
 }

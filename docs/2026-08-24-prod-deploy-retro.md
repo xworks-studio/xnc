@@ -22,7 +22,8 @@
 
 4. **put 覆盖运行中 exe 不可靠(「幽灵上传」)**
    现象:put 报 ok=true 但目标文件未更新/消失。两个叠加原因:①file 会话 `os.Rename` 覆盖被锁的 exe 失败(错误被映射为 FILE_NOT_FOUND,且 CLI 端偶发 ok);②`build.bat selftest` 只编 selftest **不重编主 exe**,put 的常常是旧二进制,看起来像「假成功」。
-   **结论:exe 更新一律走自更新通道(新 apply 停服务+换文件),put 只用于首装/脚本/数据文件。**
+   **结论(语义):exe 更新一律走自更新通道(新 apply 停服务+换文件),put 只用于首装/脚本/数据文件。**
+   **修复(2026-08-24 复盘跟进):rename/mkdir/create 失败按底层 errno 映射——权限/占用类(ERROR_ACCESS_DENIED、共享冲突、EACCES/EPERM)→ `ACCESS_DENIED`,其余 → `INTERNAL`;底层错误文本随 FILE_ERROR `message` 透传,CLI 直接展示(exit 250)。不再有「报 FILE_NOT_FOUND 掩盖目标被锁」的误导;「ok=true 但文件没变」已被消除(rename 失败必回错误终态)。**
 
 5. **TURN/coturn 配置链四个坑**(逐个修,STUN 探测是排查主线)
    - server 读 `XNC_TURN_CREDENTIAL`,compose 只给了 `XNC_TURN_PASSWORD` → 503 TURN_UNCONFIGURED
@@ -58,7 +59,7 @@
 
 ### 分发双通道职责不清
 
-3. **put(file 会话)与自更新通道职责重叠且 put 语义不完整**:覆盖已有文件/被锁文件的行为不可靠且错误码误导(FILE_NOT_FOUND 掩盖 ACCESS_DENIED)。建议:明确「exe 走自更新,put 仅首装/数据」,或修 file 会话覆盖语义(先删后写、错误透传)。
+3. **put(file 会话)与自更新通道职责重叠且 put 语义不完整**:覆盖已有文件/被锁文件的行为不可靠且错误码误导(FILE_NOT_FOUND 掩盖 ACCESS_DENIED)。**已修(2026-08-24 复盘跟进):语义定为「exe 更新走自更新通道,put 仅首装/数据/脚本」;rename 失败错误码透传(ACCESS_DENIED/INTERNAL + message),不再吞错。**
 
 ### 退役不彻底
 

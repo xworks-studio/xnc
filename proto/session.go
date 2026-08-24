@@ -72,11 +72,11 @@ type DesktopParams struct {
 
 // Desktop capability 词汇（server 下发 / agent 强制，spec §14）。
 const (
-	CapScreenView        = "screen.view"
-	CapInputMouse        = "input.mouse"
-	CapInputKeyboard     = "input.keyboard"
-	CapInputSecureAttn   = "input.secure_attention"
-	CapShellSystem       = "shell.system"
+	CapScreenView      = "screen.view"
+	CapInputMouse      = "input.mouse"
+	CapInputKeyboard   = "input.keyboard"
+	CapInputSecureAttn = "input.secure_attention"
+	CapShellSystem     = "shell.system"
 )
 
 // SessionOpen 经控制连接下发：agent 按 WsURL（含 token 的绝对 URL）拨号。
@@ -175,7 +175,8 @@ type FileResult struct {
 
 // FileError 错误终态。
 type FileError struct {
-	Code string `json:"code"` // FILE_NOT_FOUND / FILE_TOO_LARGE / HASH_MISMATCH
+	Code    string `json:"code"`              // FILE_NOT_FOUND / FILE_TOO_LARGE / HASH_MISMATCH / ACCESS_DENIED / INTERNAL
+	Message string `json:"message,omitempty"` // 可读的底层错误文本（如 rename 失败原因）；旧 agent 不发此字段，CLI 端容缺省
 }
 
 // TunnelParams SESSION_OPEN params：target 枚举（server 白名单解析为 host/port）。

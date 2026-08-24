@@ -9,11 +9,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -189,4 +191,28 @@ func TestFileDownloadNotFound(t *testing.T) {
 	var fe proto.FileError
 	require.NoError(t, m.Decode(&fe))
 	assert.Equal(t, proto.CodeFileNotFound, fe.Code)
+}
+
+// TestFileAccessErrCodeMapping：写路径失败（rename 覆盖被锁目标等）的错误码
+// 映射——权限/占用类 errno → ACCESS_DENIED，其余 → INTERNAL；绝不回误导性的
+// FILE_NOT_FOUND。覆盖真实的 os.Rename *os.LinkError 形态与裸 errno。
+func TestFileAccessErrCodeMapping(t *testing.T) {
+	access := []error{
+		&os.LinkError{Op: "rename", Old: "a.xnc-part", New: "a.exe", Err: syscall.EACCES},
+		&os.LinkError{Op: "rename", Old: "a.xnc-part", New: "a.exe", Err: syscall.EPERM},
+		&os.PathError{Op: "create", Path: "a.xnc-part", Err: syscall.EACCES},
+		&os.PathError{Op: "mkdir", Path: "a", Err: syscall.EPERM},
+		syscall.EACCES,
+	}
+	for _, err := range access {
+		assert.Equal(t, proto.CodeAccessDenied, fileAccessErrCode(err), "err=%v", err)
+	}
+	other := []error{
+		&os.LinkError{Op: "rename", Old: "a.xnc-part", New: "a.exe", Err: syscall.EXDEV}, // 跨卷
+		errors.New("disk exploded"),
+		nil,
+	}
+	for _, err := range other {
+		assert.Equal(t, proto.CodeInternal, fileAccessErrCode(err), "err=%v", err)
+	}
 }

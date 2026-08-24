@@ -200,3 +200,59 @@ func TestHashMismatchExits246(t *testing.T) {
 	})
 	assert.Equal(t, 246, code)
 }
+
+// fakeFileServerAccessDenied: upload whose rename fails on the agent side —
+// FILE_ERROR ACCESS_DENIED carrying the OS error text (locked target exe).
+func fakeFileServerAccessDenied(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/nodes" && r.Method == "GET":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(fileNodesJSON))
+		case r.URL.Path == "/api/nodes/n1/files/upload" && r.Method == "POST":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(202)
+			_, _ = w.Write([]byte(fileSession202))
+		case r.URL.Path == "/api/session/fs1":
+			c, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				defer c.CloseNow()
+				// 不读上传数据：直接终态 FILE_ERROR（错误码 + 底层错误文本透传）
+				_ = c.Write(ctx, websocket.MessageText,
+					[]byte(`{"type":"FILE_ERROR","payload":`+mustJSONStr(proto.FileError{
+						Code:    proto.CodeAccessDenied,
+						Message: `rename C:\x\app.exe.xnc-part C:\x\app.exe: Access is denied.`,
+					})+`}`))
+				_ = c.Close(websocket.StatusNormalClosure, "")
+			}()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	return srv
+}
+
+// TestAccessDeniedExits250WithMessage：覆盖被锁目标的 put（rename 失败）必须
+// 报明确错误（ACCESS_DENIED + 底层错误文本），而非 FILE_NOT_FOUND/244。
+func TestAccessDeniedExits250WithMessage(t *testing.T) {
+	srv := fakeFileServerAccessDenied(t)
+	defer srv.Close()
+	dir := t.TempDir()
+	local := filepath.Join(dir, "l.bin")
+	require.NoError(t, os.WriteFile(local, []byte("x"), 0o600))
+
+	stderr, code := captureStderr(t, func() int {
+		return runCLI(t.Context(), []string{"put", "n1", local, `C:\x\app.exe`,
+			"--server", srv.URL, "--token", "tk"})
+	})
+	assert.Equal(t, 250, code)
+	assert.Contains(t, stderr, "ACCESS_DENIED")
+	assert.Contains(t, stderr, "Access is denied.")
+	assert.NotContains(t, stderr, "FILE_NOT_FOUND")
+}

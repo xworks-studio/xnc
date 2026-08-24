@@ -20,6 +20,7 @@ const (
 	CodeHashMismatch            = "HASH_MISMATCH"
 	CodeFileNotFound            = "FILE_NOT_FOUND"
 	CodeFileTooLarge            = "FILE_TOO_LARGE"
+	CodeAccessDenied            = "ACCESS_DENIED" // 目标存在但不可写/被占用（如覆盖运行中的 exe）
 	CodeAgentVersionUnsupported = "AGENT_VERSION_UNSUPPORTED"
 	// CodeTurnUnconfigured：server 无 TURN 配置时拒绝 desktop 会话
 	// （M1-Slice2：relay-only 无 TURN 不可用，503 优于开一个必死的会话）。

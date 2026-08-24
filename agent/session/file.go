@@ -10,9 +10,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"github.com/coder/websocket"
 
@@ -49,7 +51,7 @@ func (f *File) logger() *slog.Logger {
 func (f *File) Handle(ctx context.Context, ws *websocket.Conn, sessionID string, params json.RawMessage) {
 	var p proto.FileParams
 	if err := json.Unmarshal(params, &p); err != nil || p.Path == "" {
-		f.fileError(ctx, ws, proto.CodeFileNotFound)
+		f.fileError(ctx, ws, proto.CodeFileNotFound, "")
 		return
 	}
 	switch p.Direction {
@@ -58,8 +60,21 @@ func (f *File) Handle(ctx context.Context, ws *websocket.Conn, sessionID string,
 	case "download":
 		f.handleDownload(ctx, ws, sessionID, p)
 	default:
-		f.fileError(ctx, ws, proto.CodeFileNotFound)
+		f.fileError(ctx, ws, proto.CodeFileNotFound, "")
 	}
+}
+
+// fileAccessErrCode 把写路径失败（os.MkdirAll/os.Create 的 *PathError、
+// os.Rename 的 *LinkError）映射为 FILE_ERROR 码：底层 errno 属权限/占用类
+// （ERROR_ACCESS_DENIED、共享冲突、EACCES/EPERM）→ ACCESS_DENIED；其余
+// （跨卷 EXDEV 等）→ INTERNAL。不再用 FILE_NOT_FOUND 掩盖「目标存在但写
+// 不了」——典型场景：put 覆盖运行中的 exe（Windows 返回访问被拒绝）。
+func fileAccessErrCode(err error) string {
+	var errno syscall.Errno
+	if errors.As(err, &errno) && errnoIsAccessDenied(errno) {
+		return proto.CodeAccessDenied
+	}
+	return proto.CodeInternal
 }
 
 // handleUpload upload 方向：先落 .xnc-part 临时文件并发 FILE_BEGIN，再消费
@@ -68,14 +83,15 @@ func (f *File) Handle(ctx context.Context, ws *websocket.Conn, sessionID string,
 // 通过则 rename 为目标路径并回 FILE_RESULT ok=true。
 func (f *File) handleUpload(ctx context.Context, ws *websocket.Conn, sessionID string, p proto.FileParams) {
 	if err := os.MkdirAll(filepath.Dir(p.Path), 0o755); err != nil {
-		f.fileError(ctx, ws, proto.CodeFileNotFound)
+		f.logger().Warn("file upload mkdir failed", "session", sessionID, "err", err)
+		f.fileError(ctx, ws, fileAccessErrCode(err), err.Error())
 		return
 	}
 	tmp := p.Path + ".xnc-part"
 	fp, err := os.Create(tmp)
 	if err != nil {
 		f.logger().Warn("file upload create failed", "session", sessionID, "err", err)
-		f.fileError(ctx, ws, proto.CodeFileNotFound)
+		f.fileError(ctx, ws, fileAccessErrCode(err), err.Error())
 		return
 	}
 	defer func() { // 兜底清理：任何退出路径临时文件不得残留（成功 rename 后已不存在）
@@ -103,14 +119,14 @@ func (f *File) handleUpload(ctx context.Context, ws *websocket.Conn, sessionID s
 		if total+int64(len(data)) > p.Size {
 			_ = fp.Close()
 			_ = os.Remove(tmp)
-			f.fileError(ctx, ws, proto.CodeFileTooLarge)
+			f.fileError(ctx, ws, proto.CodeFileTooLarge, "")
 			return
 		}
 		if _, we := fp.Write(data); we != nil {
 			f.logger().Warn("file upload write failed", "session", sessionID, "err", we)
 			_ = fp.Close()
 			_ = os.Remove(tmp)
-			f.fileError(ctx, ws, proto.CodeInternal)
+			f.fileError(ctx, ws, proto.CodeInternal, we.Error())
 			return
 		}
 		_, _ = h.Write(data)
@@ -121,12 +137,14 @@ func (f *File) handleUpload(ctx context.Context, ws *websocket.Conn, sessionID s
 	actual := hex.EncodeToString(h.Sum(nil))
 	if total != p.Size || actual != p.Sha256 {
 		_ = os.Remove(tmp) // 删半成品——须先于 FILE_ERROR 帧（关闭握手会阻塞返回）
-		f.fileError(ctx, ws, proto.CodeHashMismatch)
+		f.fileError(ctx, ws, proto.CodeHashMismatch, "")
 		return
 	}
 	if err := os.Rename(tmp, p.Path); err != nil {
+		// 目标被锁/占用（如运行中的 exe）→ ACCESS_DENIED，其余 → INTERNAL；
+		// 底层错误文本随 message 透传，不再误导为 FILE_NOT_FOUND。
 		f.logger().Warn("file upload rename failed", "session", sessionID, "err", err)
-		f.fileError(ctx, ws, proto.CodeFileNotFound)
+		f.fileError(ctx, ws, fileAccessErrCode(err), err.Error())
 		return
 	}
 	f.writeText(ctx, ws, typeFileResult, proto.FileResult{Bytes: total, Sha256: actual, Ok: true})
@@ -139,18 +157,18 @@ func (f *File) handleUpload(ctx context.Context, ws *websocket.Conn, sessionID s
 func (f *File) handleDownload(ctx context.Context, ws *websocket.Conn, sessionID string, p proto.FileParams) {
 	fp, err := os.Open(p.Path)
 	if err != nil {
-		f.fileError(ctx, ws, proto.CodeFileNotFound)
+		f.fileError(ctx, ws, proto.CodeFileNotFound, "")
 		return
 	}
 	defer func() { _ = fp.Close() }()
 	st, err := fp.Stat()
 	if err != nil {
-		f.fileError(ctx, ws, proto.CodeFileNotFound)
+		f.fileError(ctx, ws, proto.CodeFileNotFound, "")
 		return
 	}
 	if st.Size() > fileMaxBytes {
 		fp.Close()
-		f.fileError(ctx, ws, proto.CodeFileTooLarge)
+		f.fileError(ctx, ws, proto.CodeFileTooLarge, "")
 		return
 	}
 
@@ -192,8 +210,9 @@ func (f *File) writeText(ctx context.Context, ws *websocket.Conn, typ string, pa
 	_ = ws.Write(wctx, websocket.MessageText, b)
 }
 
-// fileError 错误终态：FILE_ERROR text 帧后以错误码关线。
-func (f *File) fileError(ctx context.Context, ws *websocket.Conn, code string) {
-	f.writeText(ctx, ws, typeFileError, proto.FileError{Code: code})
+// fileError 错误终态：FILE_ERROR text 帧（code + 可读 message，message 可为
+// 空）后以错误码关线。
+func (f *File) fileError(ctx context.Context, ws *websocket.Conn, code, msg string) {
+	f.writeText(ctx, ws, typeFileError, proto.FileError{Code: code, Message: msg})
 	_ = ws.Close(websocket.StatusInternalError, "file error")
 }
