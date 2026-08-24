@@ -1,5 +1,4 @@
 # 凭据与环境（严禁入库）
-deploy/machines.env
 *.pem
 *.key
 .env.*

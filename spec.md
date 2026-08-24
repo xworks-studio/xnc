@@ -1869,7 +1869,7 @@ Windows 自替换舞（rename 当前 exe → .old，写新 exe，.old 下次运�
 deploy/
 ├── docker-compose.yml     caddy + xnc-server + postgres 三容器
 ├── Caddyfile              :443 TLS + 短域 xnc.app 安装端点直通
-└── .env.example           域名 / PG 凭据 / Bootstrap Admin 环境变量
+└── .env.example           域名 / PG 凭据 / Bootstrap Admin + 测试设备凭据模板
 
 Internet → :443 Caddy(容器) → xnc-server(容器) → PostgreSQL(容器)
 ```
