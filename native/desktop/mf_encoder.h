@@ -1,10 +1,20 @@
-// mf_encoder.h - Media Foundation software H.264 encoder for xnc-desktop
-// (plan M1-Slice1 Task 4, spec §7.10 MfSoftwareEncoder rung). Wraps
-// CMSH264EncoderMFT (Microsoft's software H.264 encoder, ships with client
-// Windows): compact top-down BGRA in (converted to NV12 via nv12.h),
-// Annex-B access units out. COM plumbing lives in mf_encoder.cpp (pimpl, so
-// this header needs no windows.h); the Annex-B NAL helpers below are
-// header-only pure logic so the selftest covers them without any MFT.
+// mf_encoder.h - Media Foundation H.264 encoder for xnc-desktop (plan
+// M1-Slice1 Task 4, spec §7.10 MfSoftwareEncoder rung; hw-encode task
+// extends it with a hardware-first ladder). Wraps a Windows Media Foundation
+// H.264 encoder MFT with compact top-down BGRA in (converted to NV12 via
+// nv12.h), Annex-B access units out. COM plumbing lives in mf_encoder.cpp
+// (pimpl, so this header needs no windows.h); the Annex-B NAL helpers below
+// are header-only pure logic so the selftest covers them without any MFT.
+//
+// Encoder selection ladder (hw-encode): MFTEnumEx over
+// MFT_CATEGORY_VIDEO_ENCODER | MFT_ENUM_FLAG_HARDWARE with NV12-in/H264-out
+// filters picks the first hardware encoder (Intel QSV / NVENC / AMF MFTs)
+// that fully initializes AND encodes one synthetic frame successfully
+// (self-check); only when every hardware candidate fails (or the machine has
+// none) does Init fall back to CMSH264EncoderMFT - Microsoft's software
+// H.264 encoder that ships with client Windows. SetForceSoftware(true) pins
+// the software rung (diagnostic lever, --encoder software). The ladder and
+// the backend choice never change the encoder's outward contract.
 //
 // force-key contract (E2 lesson, spec §7.10, HARD):
 //   ForceNextIdr() arms a one-shot request. The ICodecAPI force-keyframe
@@ -25,6 +35,8 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+
+struct IMFTransform;  // opaque; the pimpl cpp includes mftransform.h
 
 namespace xnc {
 
@@ -104,6 +116,10 @@ inline void NalExtractTypes(const uint8_t* data, size_t len, const uint8_t* type
 
 // ---- Encoder ----
 
+// Which MFT backend Init selected (hw-encode ladder). Diagnostics only -
+// the encoder's outward contract is identical for both.
+enum class EncoderBackend : uint8_t { kHardware = 0, kSoftware = 1 };
+
 class MfSoftEncoder {
  public:
   MfSoftEncoder();
@@ -118,7 +134,31 @@ class MfSoftEncoder {
   // shaping (B-frames 0, low-delay rate control, low-latency mode, long GOP
   // - IDRs are forced on demand) is best-effort via ICodecAPI: rejections
   // are logged and Init continues. On failure *err holds "<step>: hr=0x…".
+  //
+  // Hardware-first (hw-encode): every MFT_ENUM_FLAG_HARDWARE H.264 encoder
+  // (NV12-in/H264-out) is tried in merit order - full negotiation + a
+  // 1-frame self-check (synthetic content, output non-empty = pass). The
+  // first passing candidate is kept; if all fail (or SetForceSoftware was
+  // called), Init falls back to CMSH264EncoderMFT (software). Media types
+  // are negotiated adaptively for hardware MFTs: the caller's tight-stride
+  // NV12/H.264 types are tried first, then the MFT's own enumerated types
+  // (dims/rate/bitrate overridden), and a negotiated stride != width is
+  // honored by padding the input rows. Backend + FriendlyName + self-check
+  // outcome are logged (encoder_backend=…).
   bool Init(uint32_t w, uint32_t h, uint32_t fps, uint32_t bitrate_bps, std::string* err);
+
+  // Diagnostic lever (--encoder software): bypasses the hardware-first
+  // ladder and uses the software MFT unconditionally. Sticky across Init
+  // calls; default is hardware-first with software fallback.
+  void SetForceSoftware(bool force) { force_software_ = force; }
+
+  // Backend selected by the last successful Init (kSoftware before any).
+  EncoderBackend backend() const { return backend_; }
+  const char* BackendName() const {
+    return backend_ == EncoderBackend::kHardware ? "hardware" : "software";
+  }
+  // FriendlyName of the MFT in use (diagnostic log surface; empty until Init).
+  const std::string& FriendlyName() const { return friendly_name_; }
 
   // Encodes one compact BGRA frame (len >= w*h*4): converts to NV12,
   // submits, then collects whatever the MFT produced. aus is cleared, then
@@ -155,6 +195,25 @@ class MfSoftEncoder {
   void FlushTail(std::vector<std::vector<uint8_t>>& aus);
 
  private:
+  // Full media-type negotiation + streaming start on an existing MFT (no
+  // ownership transfer). hardware=true allows the enumerated-type fallbacks.
+  // impl_ must be allocated and COM initialized. Stores the negotiated input
+  // stride into impl_->in_stride (padding buffer allocated when != w).
+  bool InitWithMft(IMFTransform* mft, const std::wstring& friendly, bool hardware,
+                   std::string* err);
+  // Hardware ladder probe: encodes up to kSelfCheckMaxFrames synthetic frames
+  // through the CURRENT impl_ MFT; true iff at least one AU came out.
+  bool SelfCheckEncode(std::string* err);
+  // Encode()'s submit half over a ready NV12 frame (stride-expands when the
+  // negotiated input stride differs from w). Applies the one-shot force-key
+  // at submission (E2 contract).
+  bool SubmitNv12(const uint8_t* nv12, size_t len, std::vector<std::vector<uint8_t>>& aus,
+                  std::string* err);
+  // Drops the current MFT/session (END_STREAMING + release + activate
+  // ShutdownObject) WITHOUT tearing down impl_/w_/h_ - used to discard
+  // hardware ladder candidates and to reset between probe/live instances.
+  // Clears stream-derived state (sps_pps_, last_was_key_, force_pending_).
+  void ReleaseMft();
   bool CollectOutputs(std::vector<std::vector<uint8_t>>& aus, std::string* err);
   void Shutdown();
 
@@ -163,6 +222,9 @@ class MfSoftEncoder {
   uint32_t w_ = 0, h_ = 0, fps_ = 0, bitrate_ = 0;
   bool last_was_key_ = false;
   bool force_pending_ = false;  // one-shot, consumed at input SUBMISSION
+  bool force_software_ = false; // --encoder software diagnostic pin
+  EncoderBackend backend_ = EncoderBackend::kSoftware;
+  std::string friendly_name_;
   std::vector<uint8_t> nv12_;   // reused conversion buffer (w*h*3/2)
   std::vector<uint8_t> sps_pps_;
 };

@@ -992,10 +992,16 @@ int SelftestMain() {
     CHECK("args-explicit-ok", p.ok);
     CHECK("args-explicit-values", p.ok && p.opt.duration_s == 3 && p.opt.fps == 15 && p.opt.out_path == L"x.h264");
   }
-  { // --encoder(M2-Slice2 Task 3 crash-loop 降参契约):software 唯一合法
-    // 值(当前唯一编码档,解析+日志不改变行为);其它值拒绝。
-    auto ok = Parse({L"--console-diag", L"--out", L"t", L"--encoder", L"software"});
-    CHECK("args-encoder-software-ok", ok.ok);
+  { // --encoder(hw-encode 梯子 + M2-Slice2 Task 3 crash-loop 降参契约):
+    // hardware(默认,硬编优先软编回退)与 software(强制软编)合法;其它值
+    // 拒绝。
+    auto hw = Parse({L"--console-diag", L"--out", L"t", L"--encoder", L"hardware"});
+    CHECK("args-encoder-hardware-ok", hw.ok);
+    auto sw = Parse({L"--console-diag", L"--out", L"t", L"--encoder", L"software"});
+    CHECK("args-encoder-software-ok", sw.ok);
+    CHECK("args-encoder-default-hardware",
+          Parse({L"--console-diag", L"--out", L"t"}).ok &&
+          Parse({L"--console-diag", L"--out", L"t"}).opt.encoder == xnc::DiagEncoder::kHardware);
     auto bad = Parse({L"--console-diag", L"--out", L"t", L"--encoder", L"nvenc"});
     CHECK("args-encoder-only-software", !bad.ok);
     CHECK("args-encoder-missing-value", !Parse({L"--console-diag", L"--out", L"t", L"--encoder"}).ok);

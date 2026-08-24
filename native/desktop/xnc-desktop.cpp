@@ -5,8 +5,10 @@
 //   --help          usage text, exit 0
 //   --console-diag [--duration <sec>] [--out <file.h264>] [--fps <n>]
 //       diagnostic capture loop in the console session: DXGI capture ->
-//       FrameCache state machine -> MF software H.264 encoder -> shaped
-//       Annex-B AUs into --out, plus a stats.json sidecar next to it
+//       FrameCache state machine -> MF H.264 encoder (hardware MFT first
+//       with software fallback; --encoder software pins the software rung)
+//       -> shaped Annex-B AUs into --out, plus a stats.json sidecar next to
+//       it
 //       (written even when capture/encoder init fails, with zeroed
 //       counters). If desktop duplication is refused (no interactive
 //       desktop, e.g. run as SYSTEM in session 0) the process logs
@@ -165,6 +167,9 @@ void Usage(FILE* out) {
       L"                  < 60 switches to GDI mid-run, a 30 s DXGI probe switches\n"
       L"                  back; every swap forces one IDR and emits STATE\n"
       L"                  backend_changed\n"
+      L"  --encoder       encoder selector (default hardware): hardware = hardware\n"
+      L"                  MFT first (Intel QSV / NVENC / AMF) with software\n"
+      L"                  fallback; software = force the software MFT (diagnostics)\n"
       L"  --console-rt    real-time pipe server mode: subscribers ATTACH over\n"
       L"                  the M0 handshake and receive FRAME events (until Ctrl+C)\n"
       L"  --secret-stdin  read the pipe secret from stdin: exactly 64 hex chars\n"
@@ -382,17 +387,19 @@ bool ParseDiagArgs(int argc, wchar_t** argv, DiagOptions* opt, std::wstring* err
         return fail(L"--max-w must be a positive integer (0 = no clamp)");
     } else if (std::wcscmp(a, L"--encoder") == 0) {
       // M2-Slice2 Task 3: crash-loop degraded-restart contract (spec 15.2)
-      // passes "--backend gdi --encoder software". The MF software encoder
-      // is the only rung today, so this parses + logs and changes nothing;
-      // anything but "software" fails (a future hardware rung slots in
-      // here without touching the spawn contract).
+      // passes "--backend gdi --encoder software". hw-encode task: the
+      // default "hardware" runs the hardware-first ladder with software
+      // fallback; "software" pins the software rung for diagnostics (a
+      // broken GPU must never block the stream).
       const wchar_t* v = value_of(L"--encoder");
       if (!v) return false;
-      if (std::wcscmp(v, L"software") == 0) {
+      if (std::wcscmp(v, L"hardware") == 0) {
+        opt->encoder = DiagEncoder::kHardware;
+      } else if (std::wcscmp(v, L"software") == 0) {
         opt->encoder = DiagEncoder::kSoftware;
-        XNC_LOG_INFO("encoder selector: software (only rung; no-op)");
+        XNC_LOG_INFO("encoder selector: software (forced; hardware ladder off)");
       } else {
-        return fail(L"--encoder must be software (only encoder rung)");
+        return fail(L"--encoder must be hardware or software");
       }
     } else {
       return fail(std::wstring(L"unknown argument: ") + a);
@@ -512,9 +519,12 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
   }
   XNC_LOG_INFO("capture_init w=%u h=%u", capture.Width(), capture.Height());
 
-  // Task 5: capture -> FrameCache -> MF software encode -> shaped Annex-B
-  // AUs into --out; encoder at the capture's dimensions, fps from args.
+  // Task 5: capture -> FrameCache -> MF encode (hardware-first ladder with
+  // software fallback) -> shaped Annex-B AUs into --out; encoder at the
+  // capture's dimensions, fps from args. --encoder software pins the
+  // software rung (diagnostic lever).
   xnc::MfSoftEncoder encoder;
+  encoder.SetForceSoftware(opt.encoder == xnc::DiagEncoder::kSoftware);
   std::string enc_err;
   if (!encoder.Init(capture.Width(), capture.Height(), opt.fps, kDiagBitrateBps,
                     &enc_err)) {
@@ -716,7 +726,11 @@ int RunConsoleRt(const xnc::DiagOptions& opt) {
     server.OnState("capture_rebuilt", true);
   }
 
+  // Encoder: hardware-first ladder with software fallback; --encoder
+  // software pins the software rung (diagnostic lever, spec 15.2 degraded
+  // restart also lands here).
   xnc::MfSoftEncoder encoder;
+  encoder.SetForceSoftware(opt.encoder == xnc::DiagEncoder::kSoftware);
   std::string enc_err;
   if (!encoder.Init(capture.Width(), capture.Height(), opt.fps, kDiagBitrateBps,
                     &enc_err)) {
