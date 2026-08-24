@@ -5,6 +5,9 @@
 # 例:bash install-turn-chn.sh 47.100.10.10 xnc.app xncdev xncdev-secret
 # 产物:coturn(systemd turnserver)+ /etc/turnserver.conf + UFW 放行 +
 #       本机 STUN 自检。完成后把本机公网 IP 加入主站 .env 的 XNC_TURN_POOL。
+# 凭据要求:password 须与主站 deploy/.env 的 XNC_TURN_CREDENTIAL 同值
+# (池内 coturn 与 server 共凭据);未传时读 TURN_USER_PASSWORD,再缺省
+# xncdev-secret(与 CREDENTIAL 默认一致)。
 set -euo pipefail
 
 PUB_IP="${1:?usage: install-turn-chn.sh <public-ip> [realm] [user] [pass]}"

@@ -64,6 +64,9 @@ services:
     # template: deploy_srv.py `up` renders ${VAR}/…:-default from deploy/.env
     # first (coturn config files have no native env expansion). Prod TURN:
     # static lt-cred user, plain turn: TCP/UDP — no TLS this round.
+    # coturn user 密码须与 XNC_TURN_CREDENTIAL 同值:deploy_srv.py 渲染
+    # turnserver.conf 时 XNC_TURN_PASSWORD 缺省取 CREDENTIAL 值(自动同步,
+    # 只改 CREDENTIAL 不错配)。
     command: ["-c", "/etc/coturn/turnserver.conf"]
     volumes:
       - ./turnserver.conf:/etc/coturn/turnserver.conf:ro

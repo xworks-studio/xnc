@@ -57,6 +57,17 @@ _TURN_VAR_RE = re.compile(r"\$\{([A-Z][A-Z0-9_]*)(?::-([^}]*))?\}")
 
 
 def _render_turn_conf(tmpl: str, env: dict) -> str:
+    # TURN 凭据单一来源闭合(2026-08-24 arch review #1):server 只读
+    # XNC_TURN_CREDENTIAL(config.go),XNC_TURN_PASSWORD 仅供 coturn 自身
+    # 用户配置(turnserver.conf user= 行)。远端 .env 只设 CREDENTIAL 时,
+    # 渲染前把 PASSWORD 缺省为 CREDENTIAL 值——用户只改 CREDENTIAL 也不
+    # 会与 coturn user 错配;两键都缺时仍走模板 ${VAR:-xncdev-secret}。
+    env = dict(env)
+    if not env.get("XNC_TURN_PASSWORD"):
+        cred = env.get("XNC_TURN_CREDENTIAL")
+        if cred:
+            env["XNC_TURN_PASSWORD"] = cred
+
     def sub(m: re.Match) -> str:
         name, default = m.group(1), m.group(2)
         v = env.get(name)

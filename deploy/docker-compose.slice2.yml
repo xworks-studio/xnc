@@ -50,7 +50,7 @@ services:
       - --realm=xnc.dev
       - --fingerprint
       - --lt-cred-mech
-      - --user=xncdev:xncdev-secret
+      - --user=xncdev:xncdev-secret  # dev 静态凭据;密码须与 server 的 XNC_TURN_CREDENTIAL 同值(默认 xncdev-secret)
       - --listening-port=3478
       - --min-port=49160
       - --max-port=49200
