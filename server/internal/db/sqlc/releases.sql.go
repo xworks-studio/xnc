@@ -38,6 +38,18 @@ func (q *Queries) CreateRelease(ctx context.Context, arg CreateReleaseParams) (R
 	return i, err
 }
 
+const deleteRelease = `-- name: DeleteRelease :execrows
+DELETE FROM releases WHERE id = $1
+`
+
+func (q *Queries) DeleteRelease(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteRelease, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getArtifact = `-- name: GetArtifact :one
 SELECT id, release_id, name, sha256, size, data, created_at FROM release_artifacts WHERE release_id = $1 AND name = $2
 `

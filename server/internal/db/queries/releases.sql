@@ -21,6 +21,9 @@ SELECT * FROM release_artifacts WHERE release_id = $1 AND name = $2;
 -- name: GetLatestReleaseByChannel :one
 SELECT * FROM releases WHERE channel = $1 ORDER BY created_at DESC LIMIT 1;
 
+-- name: DeleteRelease :execrows
+DELETE FROM releases WHERE id = $1;
+
 -- name: SetNodeTargetRelease :exec
 UPDATE nodes SET target_release = $2 WHERE id = $1;
 

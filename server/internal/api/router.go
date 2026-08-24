@@ -98,6 +98,7 @@ func NewRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		ar.Use(auth.Middleware(cfg.JWTSecret, st))
 		ar.Post("/releases", h.adminUploadRelease)
 		ar.Get("/releases", h.adminListReleases)
+		ar.Delete("/releases/{id}", h.adminDeleteRelease)
 		ar.Post("/rollout", h.adminRollout)
 	})
 	// CLI 自更新（用户 JWT）：元信息 + 二进制

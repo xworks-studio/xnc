@@ -19,6 +19,7 @@ import (
 	"io"
 	"net/http"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -206,6 +207,35 @@ func (h *handlers) adminListReleases(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	respondJSON(w, http.StatusOK, out)
+}
+
+// adminDeleteRelease — DELETE /api/admin/releases/{id}。
+// 删除 release 及其制品（release_artifacts 外键 ON DELETE CASCADE），latest
+// 由 GetLatestReleaseByChannel 按 created_at 自动回落到剩余的最新版本。
+// 删除无强约束：节点 pin（target_release 按版本字符串）指向被删版本时，
+// targetReleaseFor 的 GetReleaseByVersion 查询失败即自然回退频道最新——允许
+// 删、latest 回落是刻意语义（清理坏版本/历史版本用）。
+func (h *handlers) adminDeleteRelease(w http.ResponseWriter, r *http.Request) {
+	u := auth.UserFrom(r.Context())
+	if !isAdminUser(r.Context(), h.st, u.ID) {
+		respondError(w, proto.Err(403, proto.CodeForbidden, "admin required"))
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		respondError(w, proto.Err(404, "NOT_FOUND", "release not found"))
+		return
+	}
+	n, err := h.st.Q().DeleteRelease(r.Context(), id)
+	if err != nil {
+		respondError(w, proto.Err(500, proto.CodeInternal, err.Error()))
+		return
+	}
+	if n == 0 {
+		respondError(w, proto.Err(404, "NOT_FOUND", "release not found"))
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // adminRollout — POST /api/admin/rollout：
