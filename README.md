@@ -94,8 +94,21 @@ cd deploy && docker compose -f docker-compose.yml -f docker-compose.dev.yml up -
 (cd cli && go build -o ../bin/xnc.exe .)
 (cd agent && go build -o ../bin/xnc-agent.exe ./cmd/xnc-agent)
 (cd agent/screen-helper && go build -o ../../bin/xnc-screen-helper.exe .)
-go run scripts/build-bundle.go bin <version> bin/bundle-<version>.tar.gz
 ```
+
+## 构建带版本的 bundle（版本单一来源）
+
+版本号只在构建时经 `-ldflags` 注入（agent 自报 + bundle manifest 同一来源；
+未注入回落 `0.0.0-dev`）。`make build-prod VERSION=<v>` 或手动：
+
+```bash
+cd agent && go build -ldflags "-X xnc/agent/machineinfo.Version=<v>" -o ../bin/xnc-agent.exe ./cmd/xnc-agent
+cd .. && go run scripts/build-bundle.go bin <v> bin/bundle-<v>.tar.gz   # 校验 agent 自报 == <v>
+```
+
+server 构建版本同理（`/api/health` 上报）：`deploy/.env` 设 `XNC_VERSION=<v>`
+后 `py deploy/deploy_srv.py env && py deploy/deploy_srv.py up`，compose 经
+Dockerfile `ARG XNC_VERSION` 注入；未设回落 `0.0.0-dev`。
 
 ## 测试设备凭据
 

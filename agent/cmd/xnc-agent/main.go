@@ -9,9 +9,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"xnc/agent/updater"
 
 	"github.com/spf13/cobra"
+
+	"xnc/agent/machineinfo"
+	"xnc/agent/updater"
 )
 
 func main() {
@@ -42,7 +44,12 @@ func newRootCmd() *cobra.Command {
 		Use:          "xnc-agent",
 		Short:        "XNC Windows node agent",
 		SilenceUsage: true,
+		// --version/-v 走 cobra 内建 flag：自报 machineinfo.Version
+		// （构建时 -ldflags 注入；未注入回落 0.0.0-dev）。build-bundle.go
+		// 依赖此输出做「bundle 版本 == agent 自报版本」校验。
+		Version: machineinfo.Version,
 	}
+	root.SetVersionTemplate("{{.Version}}\n")
 	run := &cobra.Command{
 		Use:   "run",
 		Short: "run the agent (foreground debug entry; service mode when launched by the SCM)",

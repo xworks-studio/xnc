@@ -7,7 +7,13 @@ import (
 	"runtime"
 )
 
-const Version = "0.4.5" // bundle 版本（agent+helper 整体发布；自更新的比对单位）
+// Version 是 bundle 版本（agent 整体发布；自更新的比对单位），构建时经
+// ldflags 注入（版本单一来源，与发布 bundle 版本保持一致）：
+//
+//	go build -ldflags "-X xnc/agent/machineinfo.Version=0.4.6" ./cmd/xnc-agent
+//
+// 未注入（本地开发构建）回落 0.0.0-dev。
+var Version = "0.0.0-dev"
 
 type Info struct {
 	Hostname     string

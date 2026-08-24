@@ -17,6 +17,10 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+      args:
+        # server 构建版本注入（版本单一来源：构建时传入，与 agent bundle
+        # 版本一致；未设回落 0.0.0-dev）。deploy/.env 设 XNC_VERSION 即生效。
+        XNC_VERSION: ${XNC_VERSION:-0.0.0-dev}
     environment:
       XNC_DATABASE_URL: postgres://xnc:${POSTGRES_PASSWORD}@postgres:5432/xnc
       XNC_PUBLIC_URL: ${XNC_PUBLIC_URL:-https://control.xnc.app}

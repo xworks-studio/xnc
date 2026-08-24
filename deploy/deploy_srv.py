@@ -9,6 +9,9 @@
     py deploy/deploy_srv.py verify    # 容器状态 + 栈内健康检查 + 公网 HTTPS health
     py deploy/deploy_srv.py logs [svc]
     py deploy/deploy_srv.py all
+
+版本单一来源：本地 deploy/.env 设 XNC_VERSION（与 agent bundle 版本一致）时，
+`env` 会写入远端 .env，compose build 经 ARG 注入 server 版本；未设回落 0.0.0-dev。
 """
 import argparse
 import io
@@ -109,6 +112,10 @@ def cmd_env():
         "XNC_TURN_USERNAME": env.get("XNC_TURN_USERNAME", "xncdev"),
         "XNC_TURN_PASSWORD": env.get("XNC_TURN_PASSWORD", "xncdev-secret"),
     }
+    # XNC_VERSION: server 构建版本（版本单一来源，与 agent bundle 版本一致）。
+    # 仅本地 .env 显式设置时同步——未设置即回落 0.0.0-dev，不强加默认值。
+    if "XNC_VERSION" in env:
+        turn["XNC_VERSION"] = env["XNC_VERSION"]
     code, out = run(client, f"test -s {REMOTE_ROOT}/deploy/.env && echo EXISTS")
     if code == 0:
         # Append any missing TURN keys; never touch existing values.

@@ -1,8 +1,19 @@
 MODULES := proto server agent cli mockagent shellsmoke
 
-.PHONY: build test fmt sqlc
+# 版本注入（版本单一来源）：构建时经 -ldflags 注入，缺省回落 0.0.0-dev。
+# 例: make build-prod VERSION=0.4.6   （bundle 版本须与注入值一致）
+VERSION ?= 0.0.0-dev
+AGENT_LDFLAGS := -X xnc/agent/machineinfo.Version=$(VERSION)
+SERVER_LDFLAGS := -X xnc/server/internal/version.Version=$(VERSION)
+
+.PHONY: build build-prod test fmt sqlc
 build:
 	@for m in $(MODULES); do (cd $$m && go build ./...); done
+build-prod: build-agent build-server
+build-agent:
+	cd agent && go build -ldflags "$(AGENT_LDFLAGS)" -o ../bin/xnc-agent$(EXE) ./cmd/xnc-agent
+build-server:
+	cd server && go build -ldflags "$(SERVER_LDFLAGS)" -o ../bin/xnc-server$(EXE) ./cmd/xnc-server
 test:
 	@for m in $(MODULES); do (cd $$m && go test ./...); done
 fmt:

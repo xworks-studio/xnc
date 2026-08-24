@@ -1,5 +1,12 @@
 // build-bundle.go — 打包自更新 bundle（manifest + agent + helper → tar.gz）。
 // 用法: go run scripts/build-bundle.go <binDir> <version> <out.tar.gz>
+//
+// 版本单一来源：manifest 版本必须与 agent 自报版本一致（agent 构建时经
+// -ldflags 注入 xnc/agent/machineinfo.Version；未注入回落 0.0.0-dev）。
+// 例:
+//
+//	cd agent && go build -ldflags "-X xnc/agent/machineinfo.Version=0.4.6" -o ../bin/xnc-agent.exe ./cmd/xnc-agent
+//	go run scripts/build-bundle.go bin 0.4.6 bin/bundle-0.4.6.tar.gz
 package main
 
 import (
@@ -10,7 +17,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 )
 
 type manifest struct {
@@ -23,11 +32,26 @@ type manifest struct {
 
 func main() {
 	dir, version, out := os.Args[1], os.Args[2], os.Args[3]
+	// 版本单一来源校验：manifest 版本必须等于 agent 自报版本（agent 构建时
+	// 经 -ldflags 注入）。防止「bundle 版本与 agent 二进制版本脱节」复发
+	// （0.4.0 生产死循环的根因）。
+	agentExe := filepath.Join(dir, "xnc-agent.exe")
+	reported := selfReportedVersion(agentExe)
+	if reported == "" {
+		fmt.Fprintln(os.Stderr, "warning: cannot run "+agentExe+" --version on this host (non-Windows?);")
+		fmt.Fprintln(os.Stderr, "  ensure the agent was built with -ldflags \"-X xnc/agent/machineinfo.Version="+version+"\"")
+	} else if reported != version {
+		fmt.Fprintf(os.Stderr, "ERROR: bundle version %q != agent self-reported version %q\n", version, reported)
+		fmt.Fprintln(os.Stderr, "  rebuild the agent with -ldflags \"-X xnc/agent/machineinfo.Version="+version+"\" (see Makefile build-agent)")
+		os.Exit(1)
+	} else {
+		fmt.Println("agent self-reported version:", reported, "(matches bundle version)")
+	}
 	names := []string{
 		"xnc-agent.exe",
-		"xnc-core.exe",        // prod bootstrap: XNCCore service binary
-		"xnc-desktop.exe",     // capture host (spawned by core)
-		"xnc-shell.exe",       // ConPTY/oneshot host (spawned by core)
+		"xnc-core.exe",          // prod bootstrap: XNCCore service binary
+		"xnc-desktop.exe",       // capture host (spawned by core)
+		"xnc-shell.exe",         // ConPTY/oneshot host (spawned by core)
 		"xnc-screen-helper.exe", // updater manifest still requires it
 	}
 	var mf manifest
@@ -65,4 +89,14 @@ func main() {
 		tw.Write(b)
 	}
 	fmt.Println("bundle:", out)
+}
+
+// selfReportedVersion 运行已构建的 agent 读取其自报版本（--version 输出）。
+// 非 Windows 宿主无法运行 exe 时返回 ""，由调用方降级为提示。
+func selfReportedVersion(agentExe string) string {
+	out, err := exec.Command(agentExe, "--version").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }

@@ -12,6 +12,7 @@ import (
 	"xnc/server/internal/db"
 	"xnc/server/internal/registry"
 	"xnc/server/internal/session"
+	"xnc/server/internal/version"
 )
 
 type handlers struct {
@@ -41,7 +42,7 @@ func NewRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 	r := chi.NewRouter()
 
 	r.Get("/api/health", func(w http.ResponseWriter, _ *http.Request) {
-		respondJSON(w, http.StatusOK, map[string]string{"status": "ok", "version": "0.1.0"})
+		respondJSON(w, http.StatusOK, map[string]string{"status": "ok", "version": version.Version})
 	})
 
 	r.Route("/api/auth", func(ar chi.Router) {
