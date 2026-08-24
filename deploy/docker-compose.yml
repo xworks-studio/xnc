@@ -27,6 +27,7 @@ services:
       XNC_TURN_URLS: ${XNC_TURN_URLS:-turn:control.xnc.app:3478?transport=tcp}
       XNC_TURN_USERNAME: ${XNC_TURN_USERNAME:-xncdev}
       XNC_TURN_PASSWORD: ${XNC_TURN_PASSWORD:-xncdev-secret}
+      XNC_TURN_CREDENTIAL: ${XNC_TURN_CREDENTIAL:-xncdev-secret}
     depends_on:
       postgres:
         condition: service_healthy
