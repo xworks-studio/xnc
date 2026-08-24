@@ -102,7 +102,7 @@ def _write_remote_turn_conf():
     try:
         with sftp.open(f"{REMOTE_ROOT}/deploy/turnserver.conf", "w") as f:
             f.write(body)
-        sftp.chmod(f"{REMOTE_ROOT}/deploy/turnserver.conf", 0o600)
+        sftp.chmod(f"{REMOTE_ROOT}/deploy/turnserver.conf", 0o644)  # coturn 容器以 nobody 运行,0600 root 读不了(2026-08-24 生产事故)
     finally:
         sftp.close()
     print("rendered deploy/turnserver.conf from deploy/.env (template vars resolved)")
