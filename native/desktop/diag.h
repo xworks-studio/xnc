@@ -33,6 +33,19 @@ enum class DiagBackend : uint8_t { kDxgi = 0, kGdi };
 // "--backend gdi --encoder software" (spec 15.2).
 enum class DiagEncoder : uint8_t { kHardware = 0, kSoftware = 1 };
 
+// Encode bitrate by encode dims (feat/arch-clean): the H.264 target follows
+// the SCALED encode width (--max-w applied first; see rt/diag wiring), so
+// high-res feeds get enough headroom (no blur/drop) and low-res feeds don't
+// waste bandwidth at the fixed 2.3M. Keyed on width; h is reserved for a
+// future aspect-aware tier. Tiers: <=1280 -> 1.5M, <=1920 -> 2.3M,
+// <=2560 -> 3.2M, larger -> 4.2M. Pure + inline (selftest-covered).
+inline uint32_t BitrateForDims(uint32_t w, uint32_t /*h*/) {
+  if (w <= 1280) return 1500000;
+  if (w <= 1920) return 2300000;
+  if (w <= 2560) return 3200000;
+  return 4200000;
+}
+
 
 struct DiagOptions {
   bool console_diag = false;  // --console-diag

@@ -4258,6 +4258,21 @@ int SelftestMain() {
               Parse({L"--console-rt", L"--secret-stdin", L"--max-w", L"1920"}).opt.max_width == 1920);
     CHECK("maxw-rejected-elsewhere", !Parse({L"--selftest", L"--max-w", L"5"}).ok);
 
+    // feat/arch-clean: encode bitrate follows the (scaled) encode width.
+    // 表驱动:≤1280→1.5M,≤1920→2.3M,≤2560→3.2M,更大→4.2M;h 目前不影响。
+    {
+      struct BitrateCase { uint32_t w, h, want; };
+      const BitrateCase bitrate_cases[] = {
+          {1, 1, 1500000}, {1280, 720, 1500000},        // ≤1280 → 1.5M
+          {1281, 720, 2300000}, {1920, 1080, 2300000},  // ≤1920 → 2.3M
+          {1921, 1080, 3200000}, {2560, 1440, 3200000}, // ≤2560 → 3.2M
+          {2561, 1440, 4200000}, {3840, 2160, 4200000}, // 更大 → 4.2M
+          {0, 0, 1500000},                              // 退化输入落入最低档
+      };
+      for (const BitrateCase& c : bitrate_cases)
+        CHECK("bitrate-for-dims", xnc::BitrateForDims(c.w, c.h) == c.want);
+    }
+
     // Box filter: 4x2 gradient -> 2x1 (each dst cell covers a 2x2 block).
     const uint32_t sw = 4, sh = 2;
     std::vector<uint8_t> src((size_t)sw * sh * 4);

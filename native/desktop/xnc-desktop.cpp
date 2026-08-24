@@ -452,9 +452,6 @@ bool ParseDiagArgs(int argc, wchar_t** argv, DiagOptions* opt, std::wstring* err
 
 namespace {
 
-// Diag default bitrate (task 5 wiring): 2.3 Mbps.
-constexpr uint32_t kDiagBitrateBps = 2300000;
-
 int RunConsoleDiag(const xnc::DiagOptions& opt) {
   FILE* out = nullptr;
   const errno_t open_err = _wfopen_s(&out, opt.out_path.c_str(), L"wb");
@@ -462,13 +459,12 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
     XNC_LOG_ERROR("open out failed path=%ls errno=%d", opt.out_path.c_str(), open_err);
     return 1;
   }
-  XNC_LOG_INFO("console_diag_start duration=%us fps=%u bitrate=%u out=%ls",
-               opt.duration_s, opt.fps, kDiagBitrateBps, opt.out_path.c_str());
+  XNC_LOG_INFO("console_diag_start duration=%us fps=%u out=%ls",
+               opt.duration_s, opt.fps, opt.out_path.c_str());
 
   xnc::PipelineOpts popt;
   popt.duration_s = opt.duration_s;
   popt.fps = opt.fps;
-  popt.target_bitrate_bps = kDiagBitrateBps;
 
   // M2-Slice1 Task 1/2: DesktopWatch (OpenInputDesktop 500ms poll,
   // DEFAULT/TRANSITION/WINLOGON machine) + the unified CaptureReset it
@@ -539,6 +535,15 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
   }
   XNC_LOG_INFO("capture_init w=%u h=%u", capture->Width(), capture->Height());
 
+  // feat/arch-clean: encode bitrate follows the (scaled) encode width
+  // (capture is the ScaledCapture when --max-w is set, so Width() here is
+  // already the scaled width). Set once, feeds popt/encoder/rt sink alike.
+  const uint32_t bitrate_bps =
+      xnc::BitrateForDims(capture->Width(), capture->Height());
+  popt.target_bitrate_bps = bitrate_bps;
+  XNC_LOG_INFO("console_diag_bitrate w=%u h=%u bitrate=%u",
+               capture->Width(), capture->Height(), bitrate_bps);
+
   // Task 5: capture -> FrameCache -> MF encode (hardware-first ladder with
   // software fallback) -> shaped Annex-B AUs into --out; encoder at the
   // capture's dimensions, fps from args. --encoder software pins the
@@ -546,7 +551,7 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
   xnc::MfSoftEncoder encoder;
   encoder.SetForceSoftware(opt.encoder == xnc::DiagEncoder::kSoftware);
   std::string enc_err;
-  if (!encoder.Init(capture->Width(), capture->Height(), opt.fps, kDiagBitrateBps,
+  if (!encoder.Init(capture->Width(), capture->Height(), opt.fps, bitrate_bps,
                     &enc_err)) {
     XNC_LOG_ERROR("encoder_init_failed err=\"%s\"", enc_err.c_str());
     write_stats(fail_result("encoder_init_failed"));
@@ -578,7 +583,7 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
     ro.secret_len = opt.secret.size();
     ro.max_subs = opt.max_subs;
     ro.fps = opt.fps;
-    ro.bitrate_bps = kDiagBitrateBps;
+    ro.bitrate_bps = bitrate_bps;
     ro.input = input.get();
     ro.cursor = cursor.get();
     // M2-S3 Task 5: 0x0128 switch + HOST_HELLO displays[].
@@ -618,8 +623,8 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
 // (GetCursorInfo -> 0x0109) on the same server. Capture/encoder init
 // failures mirror the diag markers (no stats.json in this mode).
 int RunConsoleRt(const xnc::DiagOptions& opt) {
-  XNC_LOG_INFO("console_rt_boot pipe=%ls max_subs=%u fps=%u bitrate=%u",
-               opt.pipe_name.c_str(), opt.max_subs, opt.fps, kDiagBitrateBps);
+  XNC_LOG_INFO("console_rt_boot pipe=%ls max_subs=%u fps=%u",
+               opt.pipe_name.c_str(), opt.max_subs, opt.fps);
   // M2-Slice1 Task 1/2 + 3: desktop watch + unified reset + backend ladder
   // (same wiring as the diag mode; the ladder's swaps ride the reset and
   // surface STATE backend_changed to the subscribers via SetStateSink).
@@ -671,6 +676,11 @@ int RunConsoleRt(const xnc::DiagOptions& opt) {
   uint32_t hpw = pw, hph = ph;
   if (opt.max_width > 0 && !xnc::ScaledDims(pw, ph, opt.max_width, &hpw, &hph))
     hpw = pw, hph = ph;
+  // feat/arch-clean: encode bitrate follows the (scaled) encode width; the
+  // provisional dims already carry the max_w scale (logon-UI wait included),
+  // so the boot log / HOST_HELLO bitrate agree with the stream from t=0.
+  const uint32_t bitrate_bps = xnc::BitrateForDims(hpw, hph);
+  XNC_LOG_INFO("console_rt_bitrate w=%u h=%u bitrate=%u", hpw, hph, bitrate_bps);
 
   xnc::InputManager::Opts iopt;
   iopt.hello_w = hpw;  // MOVE coords are HOST_HELLO-space px
@@ -688,7 +698,7 @@ int RunConsoleRt(const xnc::DiagOptions& opt) {
   ro.secret_len = opt.secret.size();
   ro.max_subs = opt.max_subs;
   ro.fps = opt.fps;
-  ro.bitrate_bps = kDiagBitrateBps;
+  ro.bitrate_bps = bitrate_bps;
   ro.input = &input;
   ro.cursor = &cursor;
   // M2-Slice1 Task 1/2: DesktopWatch + unified CaptureReset (RtServer::Serve
@@ -767,11 +777,16 @@ int RunConsoleRt(const xnc::DiagOptions& opt) {
 
   // Encoder: hardware-first ladder with software fallback; --encoder
   // software pins the software rung (diagnostic lever, spec 15.2 degraded
-  // restart also lands here).
+  // restart also lands here). Bitrate re-keyed on the REAL scaled dims
+  // (logon-UI wait may have refined the provisional geometry) and pushed
+  // back into the rt opts before Serve picks them up.
+  const uint32_t enc_bitrate_bps =
+      xnc::BitrateForDims(capture->Width(), capture->Height());
+  ro.bitrate_bps = enc_bitrate_bps;
   xnc::MfSoftEncoder encoder;
   encoder.SetForceSoftware(opt.encoder == xnc::DiagEncoder::kSoftware);
   std::string enc_err;
-  if (!encoder.Init(capture->Width(), capture->Height(), opt.fps, kDiagBitrateBps,
+  if (!encoder.Init(capture->Width(), capture->Height(), opt.fps, enc_bitrate_bps,
                     &enc_err)) {
     XNC_LOG_ERROR("encoder_init_failed err=\"%s\"", enc_err.c_str());
     if (logon_wait) { server.Shutdown(); input.StopJanitor(); }
