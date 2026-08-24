@@ -10,7 +10,6 @@ import Nodes from "./pages/Nodes";
 import NodeDetail from "./pages/NodeDetail";
 import Terminal from "./pages/Terminal";
 import Users from "./pages/Users";
-import ScreenPreview from "./pages/ScreenPreview";
 import DesktopLive from "./pages/DesktopLive";
 
 createRoot(document.getElementById("root")!).render(
@@ -32,7 +31,7 @@ createRoot(document.getElementById("root")!).render(
             <Route path="/nodes" element={<Nodes />} />
             <Route path="/nodes/:id" element={<NodeDetail />} />
             <Route path="/terminal/:id" element={<Terminal />} />
-            <Route path="/screen/:id" element={<ScreenPreview />} />
+            <Route path="/screen/:nodeId" element={<DesktopLive />} />
             {/* experimental, not in the sidebar — direct URL only */}
             <Route path="/desktop/:nodeId" element={<DesktopLive />} />
             <Route path="/users" element={<Users />} />
