@@ -30,6 +30,7 @@
 #include "../common/handshake.h"
 #include "../common/log.h"
 #include "pipe_server.h"
+#include "secret_file.h"
 #include "service.h"
 #include "spawn.h"
 #include "token_manager.h"
@@ -46,8 +47,8 @@ void Usage(FILE* out) {
       L"usage: xnc-core.exe --console --smoke-secret <hex> [--pipe-name <name>]\n"
       L"       xnc-core.exe --console --smoke-secret <hex> --sas-probe [reason]\n"
       L"       xnc-core.exe --console --diag-spawn <exe> <args...>\n"
-      L"       xnc-core.exe --service <name> [--smoke-secret <hex>] "
-      L"[--pipe-name <name>]\n"
+      L"       xnc-core.exe --service <name> [--secret-file <path>] "
+      L"[--smoke-secret <hex>] [--pipe-name <name>]\n"
       L"       xnc-core.exe --selftest\n"
       L"  --service <name>  run as Windows service <name> (SCM dispatch;\n"
       L"                  name must match the registered service). Pipe\n"
@@ -60,8 +61,14 @@ void Usage(FILE* out) {
       L"  --console       foreground: serve the XNIP pipe (DACL SYSTEM+Admins)\n"
       L"  --pipe-name     pipe name (default %s)\n"
       L"  --smoke-secret  hex pipe secret (nominal 32B = 64 hex chars);\n"
-      L"                  diagnostic --console mode only (service mode reads\n"
-      L"                  the spawn channel in M1)\n"
+      L"                  diagnostic --console mode only\n"
+      L"  --secret-file   persisted pipe-secret file (hex + optional\n"
+      L"                  newline): read if present, else generate 32B,\n"
+      L"                  write hex+newline and lock the DACL to\n"
+      L"                  SYSTEM+Administrators. Service mode's prod\n"
+      L"                  credential source; also accepted in --console\n"
+      L"                  (diagnostic). Precedence: --smoke-secret >\n"
+      L"                  --secret-file > env\n"
       L"  --allow-sas     serve mode: open the MSG_SAS (0x0110) gate. Default\n"
       L"                  is DENY + sas_audit log line per attempt (the\n"
       L"                  M2-Slice1 minimum bar); the M2-Slice3 service mode\n"
@@ -254,6 +261,7 @@ int wmain(int argc, wchar_t** argv) {
   const wchar_t* service_name = nullptr;
   const wchar_t* pipe_name = kDefaultPipe;
   const wchar_t* secret_hex = nullptr;
+  const wchar_t* secret_file = nullptr;
   const wchar_t* sas_reason = L"diag";
   const wchar_t* child_exe = nullptr;
   int child_args_from = 0;
@@ -269,6 +277,8 @@ int wmain(int argc, wchar_t** argv) {
       pipe_name = argv[++i];
     } else if (std::wcscmp(argv[i], L"--smoke-secret") == 0 && i + 1 < argc) {
       secret_hex = argv[++i];
+    } else if (std::wcscmp(argv[i], L"--secret-file") == 0 && i + 1 < argc) {
+      secret_file = argv[++i];
     } else if (std::wcscmp(argv[i], L"--allow-sas") == 0) {
       allow_sas = true;
     } else if (std::wcscmp(argv[i], L"--sas-probe") == 0) {
@@ -322,6 +332,19 @@ int wmain(int argc, wchar_t** argv) {
         std::fwprintf(stderr, L"xnc-core: bad --smoke-secret hex\n");
         return 2;
       }
+    } else if (secret_file) {
+      // Prod credential channel: read-or-generate persisted secret (the
+      // file DACL is locked to SYSTEM+Administrators on generate).
+      bool generated = false;
+      std::string sf_err;
+      if (!xnc::LoadOrCreateSecretFile(secret_file, secret, generated,
+                                       sf_err)) {
+        std::fwprintf(stderr, L"xnc-core: --secret-file %ls failed: %hs\n",
+                      secret_file, sf_err.c_str());
+        return 2;
+      }
+      XNC_LOG_INFO("secret_file path=%ls generated=%d (secret never logged)",
+                   secret_file, generated ? 1 : 0);
     } else {
       // Env fallback (SCM services carry no stdin credential channel yet).
       wchar_t env_hex[2 * xnc::kMaxPipeSecretBytes + 1];
@@ -403,17 +426,33 @@ int wmain(int argc, wchar_t** argv) {
     Usage(stdout);  // no-arg run: service mode arrives in M2 (SCM)
     return 2;
   }
-  if (!secret_hex) {
-    std::fwprintf(stderr, L"xnc-core: --console requires --smoke-secret <64-hex> in M0\n");
-    Usage(stderr);
-    return 2;
-  }
   std::string secret;
-  if (!ParseSecretHex(secret_hex, secret)) {
+  if (!secret_hex && secret_file) {
+    // Console diagnostic use of the prod credential file (same loader as
+    // service mode; generate+persist is tolerated for diagnostics).
+    bool generated = false;
+    std::string sf_err;
+    if (!xnc::LoadOrCreateSecretFile(secret_file, secret, generated,
+                                     sf_err)) {
+      std::fwprintf(stderr, L"xnc-core: --secret-file %ls failed: %hs\n",
+                    secret_file, sf_err.c_str());
+      return 2;
+    }
+    XNC_LOG_INFO("secret_file path=%ls generated=%d (secret never logged)",
+                 secret_file, generated ? 1 : 0);
+  } else if (secret_hex) {
+    if (!ParseSecretHex(secret_hex, secret)) {
+      std::fwprintf(stderr,
+          L"xnc-core: --smoke-secret must be an even-count hex string "
+          L"(2..%d chars; 64 chars = nominal 32-byte secret)\n",
+          2 * (int)xnc::kMaxPipeSecretBytes);
+      return 2;
+    }
+  } else {
     std::fwprintf(stderr,
-        L"xnc-core: --smoke-secret must be an even-count hex string "
-        L"(2..%d chars; 64 chars = nominal 32-byte secret)\n",
-        2 * (int)xnc::kMaxPipeSecretBytes);
+        L"xnc-core: --console requires --smoke-secret <64-hex> "
+        L"or --secret-file <path>\n");
+    Usage(stderr);
     return 2;
   }
   xnc::SetSasAllowed(allow_sas);

@@ -15,11 +15,13 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <aclapi.h>
 #include <sddl.h>
 
 #include "../common/frame.h"
 #include "../common/handshake.h"
 #include "pipe_server.h"
+#include "secret_file.h"
 #include "spawn.h"
 #include "token_manager.h"
 #include "watchdog.h"
@@ -1026,6 +1028,94 @@ int SelftestMain() {
             ok.payload[6] == 0xFF);
       Frame empty = EncodeSnapshotResp(Frame{0, kMsgSnapshot, 1, {}}, nullptr, 0);
       CHECK("sn-resp-empty", empty.payload.size() == 4);
+    }
+    { // prod bootstrap: --secret-file round-trip + DACL lock.
+      wchar_t tmp[MAX_PATH];
+      DWORD tn = GetTempPathW(MAX_PATH, tmp);
+      CHECK("sf-tempdir", tn > 0 && tn < MAX_PATH);
+      std::wstring path = std::wstring(tmp) + L"xnc-sf-selftest-" +
+                          std::to_wstring(GetCurrentProcessId()) + L".hex";
+      DeleteFileW(path.c_str());
+      std::string s1, s2, err;
+      bool gen1 = false, gen2 = false;
+      if (!(LoadOrCreateSecretFile(path.c_str(), s1, gen1, err) &&
+            gen1 && s1.size() == 32)) {
+        std::printf("SELFTEST FAIL: sf-create err=%s\n", err.c_str());
+        ++fails;
+      }
+      // ACL: DACL must be exactly the 2 aces (SYSTEM+Admins), protected.
+      PACL dacl = nullptr;
+      PSECURITY_DESCRIPTOR sd = nullptr;
+      if (GetNamedSecurityInfoW(const_cast<LPWSTR>(path.c_str()),
+                                SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                nullptr, nullptr, &dacl, nullptr,
+                                &sd) != ERROR_SUCCESS) {
+        std::printf("SELFTEST FAIL: sf-acl read failed (skipping counts, "
+                    "note: non-elevated context)\n");
+        ++fails;
+      } else {
+        ACL_SIZE_INFORMATION asi{};
+        DWORD asi_len = sizeof(asi);
+        CHECK("sf-acl-count",
+              GetAclInformation(dacl, &asi, asi_len,
+                                AclSizeInformation) &&
+              asi.AceCount == 2);
+        // No allow ace for anyone other than SYSTEM/BA: both aces must be
+        // the SDDL pair we set (trustees SID start S-1-5-18 / S-1-5-32-544).
+        int known = 0;
+        for (DWORD i = 0; i < asi.AceCount; i++) {
+          void* ace = nullptr;
+          if (!GetAce(dacl, i, &ace)) continue;
+          PSID sid = reinterpret_cast<PSID>(
+              &reinterpret_cast<ACCESS_ALLOWED_ACE*>(ace)->SidStart);
+          if (!IsValidSid(sid)) continue;
+          // NT authority = S-1-5 (6-byte big-endian, low byte last).
+          if (GetSidIdentifierAuthority(sid)->Value[5] != 5) continue;
+          if (*GetSidSubAuthorityCount(sid) == 1 &&
+              *GetSidSubAuthority(sid, 0) == 18) {  // S-1-5-18 SYSTEM
+            ++known;
+          } else if (*GetSidSubAuthorityCount(sid) == 2 &&
+                     *GetSidSubAuthority(sid, 0) == 32 &&
+                     *GetSidSubAuthority(sid, 1) == 544) {  // ...-32-544 BA
+            ++known;
+          }
+        }
+        CHECK("sf-acl-trustees", known == 2);
+        if (sd) LocalFree(sd);
+      }
+      // Round-trip reread: the locked DACL (SY+BA only) correctly denies a
+      // non-elevated reader, so the owner (implicit WRITE_DAC) relaxes the
+      // test file's DACL first — in prod the SYSTEM core/agent read it fine.
+      {
+        PSECURITY_DESCRIPTOR relaxed = nullptr;
+        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                L"D:P(A;;FA;;;WD)", SDDL_REVISION_1, &relaxed, nullptr)) {
+          SetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION, relaxed);
+          LocalFree(relaxed);
+        }
+      }
+      if (!(LoadOrCreateSecretFile(path.c_str(), s2, gen2, err) &&
+            !gen2 && s1 == s2)) {
+        std::printf("SELFTEST FAIL: sf-reread err=%s gen2=%d\n",
+                    err.c_str(), gen2 ? 1 : 0);
+        ++fails;
+      }
+      // Garbage file content must be a hard error (never a weak fallback).
+      {
+        HANDLE g = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                               nullptr);
+        if (g != INVALID_HANDLE_VALUE) {
+          DWORD w2;
+          WriteFile(g, "zz\n", 3, &w2, nullptr);
+          CloseHandle(g);
+        }
+        std::string s3, e3;
+        bool g3 = false;
+        CHECK("sf-garbage",
+              !LoadOrCreateSecretFile(path.c_str(), s3, g3, e3));
+      }
+      DeleteFileW(path.c_str());
     }
     if (fails==0) std::printf("selftest ok\n");
     return fails==0 ? 0 : 1;
