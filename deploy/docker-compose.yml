@@ -50,7 +50,6 @@ services:
     # Prod TURN: static lt-cred user (from env, dev defaults for now), plain
     # turn: TCP/UDP — no TLS this round (REST-cred + TLS later).
     command:
-      - -n
       - --realm=xnc.app
       - --fingerprint
       - --lt-cred-mech
