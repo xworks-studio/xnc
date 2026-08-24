@@ -55,8 +55,11 @@ struct DiagOptions {
                                 // exit 0; errors exit 1
   std::wstring jpeg_path;       // --jpeg-single output path (required)
   std::wstring log_file;        // --log-file <path>: XNC_LOG also appends here
-  uint32_t max_width = 0;       // --max-w <n>: box-filter downscale clamp for
-                                // --jpeg-single (0 = no clamp)
+  uint32_t max_width = 0;       // --max-w <n>: box-filter downscale clamp.
+                                // --jpeg-single: snapshot max width; rt/diag
+                                // (feat/rt-scale): every captured frame is
+                                // downscaled before encode, encoder Init +
+                                // HOST_HELLO carry the scaled dims (0 = none)
 };
 
 // Parses argv[1..] (argv[0] is skipped). Returns true on success; on failure

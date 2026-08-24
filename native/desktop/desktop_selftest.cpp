@@ -37,6 +37,7 @@
 #include "nv12.h"
 #include "pipeline.h"
 #include "rt_pipe_server.h"
+#include "scaled_capture.h"
 #include "subscribers.h"
 
 #include "../common/handshake.h"
@@ -2097,6 +2098,49 @@ int SelftestMain() {
                   (unsigned long long)a.keys_, (unsigned long long)a.frames_,
                   (unsigned long long)st.aus_emitted, (unsigned long long)st.frames_enqueued,
                   (unsigned long long)st.frames_dropped, (unsigned long long)st.idr_sub_join);
+    }
+  }
+  { // feat/rt-scale 场景①s:rt 管线 + ScaledCapture(合成 2880x1800 源 →
+    // 1920x1200 流)。编码器按缩放尺寸 Init;HOST_HELLO 携带缩放尺寸
+    // (1920x1200);管线宽度/编码计数以缩放帧为准。
+    const uint32_t kRsW = 2880, kRsH = 1800, kRsw = 1920, kRsh = 1200;
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(kRsw, kRsh, kRtFps, kRtBitrate, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: rts-init err=%s\n", err.c_str());
+    CHECK("rts-init", init_ok);
+    if (init_ok) {
+      xnc::RtServer rt;
+      const xnc::RtServer::Opts ro = rt_opts(6);
+      CHECK("rts-start", rt.Start(ro, kRsw, kRsh));
+      xnc::ScaledCapture sc(std::make_unique<ScriptedCapture>(kRsW, kRsH, 3), kRsw);
+      CHECK("rts-sc-dims", sc.Width() == kRsw && sc.Height() == kRsh);
+      xnc::PipelineOpts po;
+      po.duration_s = 3;
+      po.fps = kRtFps;
+      po.target_bitrate_bps = kRtBitrate;
+      xnc::PipelineResult res;
+      std::thread pipe_th([&] { res = xnc::Pipeline::Run(sc, enc, rt, po); });
+      RtTestClient a;
+      CHECK("rts-connect", a.Connect(ro.pipe_name.c_str(), kRtSecret, sizeof(kRtSecret)));
+      CHECK("rts-attach-hello", a.Attach(8));
+      CHECK("rts-hello-fields",
+            a.hello_ok_ && a.hello_.w == kRsw && a.hello_.h == kRsh &&
+                a.hello_.fps == kRtFps && a.hello_.gen == 1);
+      a.Pump(2800, [&a] { return a.keys_ >= 1; });
+      pipe_th.join();
+      a.Pump(700);
+      rt.Shutdown();
+      CHECK("rts-first-key", a.keys_ >= 1);
+      CHECK("rts-frames-received", a.frames_ >= 1);
+      CHECK("rts-pipeline-ok", res.ok);
+      CHECK("rts-pipeline-dims", res.width == kRsw && res.height == kRsh);
+      CHECK("rts-encoded-invariant",
+            res.counters.encoded == res.counters.captured + res.counters.warmup_feeds);
+      std::printf("SELFTEST NOTE: rts w=%ux%u keys=%llu frames=%llu encoded=%llu captured=%llu\n",
+                  kRsw, kRsh, (unsigned long long)a.keys_, (unsigned long long)a.frames_,
+                  (unsigned long long)res.counters.encoded,
+                  (unsigned long long)res.counters.captured);
     }
   }
   { // 场景 ②(承接语义回归):静止桌面 + 第二订阅者 → 管线重喂 base 产出
@@ -4204,7 +4248,15 @@ int SelftestMain() {
     CHECK("js-maxw-zero-ok", Parse({L"--jpeg-single", L"s.jpg", L"--max-w", L"0"}).ok);
     CHECK("js-no-path", !Parse({L"--jpeg-single"}).ok);
     CHECK("js-exclusive-with-diag", !Parse({L"--jpeg-single", L"s.jpg", L"--console-diag", L"--out", L"t"}).ok);
-    CHECK("js-maxw-needs-js", !Parse({L"--console-diag", L"--out", L"t", L"--max-w", L"10"}).ok);
+    // feat/rt-scale (hw-encode task 2 Part B): --max-w also applies to the
+    // rt and diag modes (downscale before encode); rejected elsewhere.
+    CHECK("maxw-diag-ok",
+          Parse({L"--console-diag", L"--out", L"t", L"--max-w", L"10"}).ok &&
+              Parse({L"--console-diag", L"--out", L"t", L"--max-w", L"10"}).opt.max_width == 10);
+    CHECK("maxw-rt-ok",
+          Parse({L"--console-rt", L"--secret-stdin", L"--max-w", L"1920"}).ok &&
+              Parse({L"--console-rt", L"--secret-stdin", L"--max-w", L"1920"}).opt.max_width == 1920);
+    CHECK("maxw-rejected-elsewhere", !Parse({L"--selftest", L"--max-w", L"5"}).ok);
 
     // Box filter: 4x2 gradient -> 2x1 (each dst cell covers a 2x2 block).
     const uint32_t sw = 4, sh = 2;
@@ -4229,6 +4281,40 @@ int SelftestMain() {
     CHECK("ds-identity", xnc::DownscaleBgra(src.data(), sw, sh, sw, &id, &ow, &oh) &&
           ow == sw && oh == sh && id == src);
     CHECK("ds-identity-zero-clamp", xnc::DownscaleBgra(src.data(), sw, sh, 0, &id, &ow, &oh) && id == src);
+
+    // feat/rt-scale (hw-encode task 2 Part B): ScaledDims pure helper +
+    // ScaledCapture wrapper over a synthetic capture (2880x1800 -> 1920x1200).
+    uint32_t sdw = 0, sdh = 0;
+    CHECK("sd-2880x1800", xnc::ScaledDims(2880, 1800, 1920, &sdw, &sdh) &&
+          sdw == 1920 && sdh == 1200);
+    CHECK("sd-3440x1440", xnc::ScaledDims(3440, 1440, 1920, &sdw, &sdh) &&
+          sdw == 1920 && sdh == 804);
+    CHECK("sd-identity", xnc::ScaledDims(1280, 720, 1920, &sdw, &sdh) &&
+          sdw == 1280 && sdh == 720);
+    CHECK("sd-zero-clamp", xnc::ScaledDims(2880, 1800, 0, &sdw, &sdh) &&
+          sdw == 2880 && sdh == 1800);
+    CHECK("sd-even-snap-h", xnc::ScaledDims(1920, 1081, 1920, &sdw, &sdh) &&
+          sdw == 1920 && sdh == 1080);
+    CHECK("sd-even-snap-w", xnc::ScaledDims(1365, 768, 1920, &sdw, &sdh) &&
+          sdw == 1364 && sdh == 768);
+    CHECK("sd-reject-zero", !xnc::ScaledDims(0, 100, 1920, &sdw, &sdh));
+    {
+      xnc::ScaledCapture sc(std::make_unique<ScriptedCapture>(2880, 1800, 2), 1920);
+      CHECK("sc-dims", sc.Width() == 1920 && sc.Height() == 1200);
+      xnc::FrameBlob b;
+      std::string serr;
+      CHECK("sc-acquire1", sc.Acquire(b, &serr));
+      CHECK("sc-blob-dims", b.w == 1920 && b.h == 1200 &&
+            b.bgra.size() == (size_t)1920 * 1200 * 4);
+      CHECK("sc-acquire2", sc.Acquire(b, &serr));
+      CHECK("sc-blob-dims2", b.w == 1920 && b.h == 1200);
+      CHECK("sc-timeout-passthrough", !sc.Acquire(b, &serr) && serr == "err_timeout");
+      // identity wrapper: <= max_w hands the inner frame through untouched
+      xnc::ScaledCapture sci(std::make_unique<ScriptedCapture>(800, 600, 1), 1920);
+      CHECK("sci-dims", sci.Width() == 800 && sci.Height() == 600);
+      CHECK("sci-acquire", sci.Acquire(b, &serr) && b.w == 800 && b.h == 600 &&
+            b.bgra.size() == (size_t)800 * 600 * 4);
+    }
 
     // WIC round trip: synthetic 64x48 BGRA -> JPEG -> JFIF magic + SOF dims.
     const uint32_t jw = 64, jh = 48;

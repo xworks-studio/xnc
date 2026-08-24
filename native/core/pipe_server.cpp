@@ -613,6 +613,11 @@ CaptureSpawnResult RealCaptureSpawn(uint32_t session, const wchar_t* pipe_name,
   // nothing sensitive either way.
   std::vector<std::wstring> args = {L"--console-rt", L"--pipe", pipe_name,
                                     L"--secret-stdin"};
+  // feat/rt-scale (hw-encode task 2 Part B): downscale wide sources to
+  // 1920 before encode - the software MFT ceiling at 3440x1440 is ~20 fps,
+  // at 1920 it clears 30 fps; the hardware ladder stays in front either way.
+  args.push_back(L"--max-w");
+  args.push_back(L"1920");
   // --log-file: desktop opens its own log (service spawns have no console;
   // inherited-stdio redirection proved unreliable — 2026-08-24 incident).
   args.push_back(L"--log-file");
