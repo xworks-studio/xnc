@@ -6,9 +6,12 @@
 //   hardware ladder: MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
 //     MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER, NV12-in, H264-out)
 //     -> per candidate: ActivateObject -> SetOutputType(H264: frame size,
-//     frame rate = caller fps, bitrate) -> SetInputType(NV12: tight stride
-//     = width; enumerated-type fallback + negotiated-stride padding for
-//     hardware MFTs) -> ICodecAPI best-effort shaping (GOP / B-frames=0 /
+//     frame rate = caller fps, bitrate; enumerated H264-type fallback) ->
+//     SetInputType(NV12: tight stride = width, one standard attempt; the
+//     Part A variant ladder was dead code on Arc — every CPU-NV12 variant
+//     was rejected 0xC00D6D77, D3D11 textures are M4 — and was removed in
+//     feat/arch-clean; negotiated-stride padding stays for MFTs that widen
+//     the input stride) -> ICodecAPI best-effort shaping (GOP / B-frames=0 /
 //     low-delay RC / low-latency) -> GetOutputStreamInfo -> Begin/StartOfStream
 //     -> SELF-CHECK: 1..8 synthetic frames through the real submit path,
 //     first candidate whose output is non-empty wins; a pristine second
@@ -99,9 +102,10 @@ HRESULT MakeH264OutputType(uint32_t w, uint32_t h, uint32_t fps, uint32_t bitrat
   return hr;
 }
 
-// The caller's NV12 input type (tight stride = width; the software MFT and
-// most hardware MFTs honor it, hardware MFTs that cannot are re-negotiated
-// through their enumerated types in InitWithMft).
+// The caller's NV12 input type (tight stride = width) — the ONE standard
+// input attempt for both rungs. Hardware MFTs that reject CPU NV12 (QSV
+// needs D3D11 textures, M4) log the failure and the ladder falls back to
+// the next candidate / the software rung.
 HRESULT MakeNv12InputType(uint32_t w, uint32_t h, uint32_t fps, IMFMediaType** out) {
   const uint64_t frame_size = (static_cast<uint64_t>(w) << 32) | h;
   const uint64_t frame_rate = (static_cast<uint64_t>(fps) << 32) | 1;
@@ -113,64 +117,6 @@ HRESULT MakeNv12InputType(uint32_t w, uint32_t h, uint32_t fps, IMFMediaType** o
   if (SUCCEEDED(hr)) hr = mt->SetUINT64(MF_MT_FRAME_SIZE, frame_size);
   if (SUCCEEDED(hr)) hr = mt->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
   if (SUCCEEDED(hr)) hr = mt->SetUINT64(MF_MT_FRAME_RATE, frame_rate);
-  if (SUCCEEDED(hr)) *out = mt.Detach();
-  return hr;
-}
-
-// NV12 input-type negotiation ladder (hw-encode task 2 Part A). Hardware
-// MFTs differ in what they accept for CPU (system-memory) NV12; the probe
-// evidence on Arc 140T/130T: the tight type is rejected (0xC00D6D77) and
-// GetInputAvailableType yields nothing, so the ladder tries, in the mission
-// order, (1) no MF_MT_DEFAULT_STRIDE (MFT picks), (2) a 32-aligned stride,
-// (3) tight stride + MF_MT_SAMPLE_SIZE + MF_MT_AVG_BITRATE, then the MFT's
-// own enumerated NV12 types (verbatim, then with our frame size). Every
-// attempt logs encoder_input_attempt so the ladder stays diagnosable.
-enum class Nv12Variant : uint8_t {
-  kNoStride = 0,
-  kStride32Aligned,
-  kStrideWPlusSampleSize,
-  kTight,  // tight stride = width (the original caller type; kept last)
-};
-
-const char* Nv12VariantName(Nv12Variant v) {
-  switch (v) {
-    case Nv12Variant::kNoStride: return "no_stride";
-    case Nv12Variant::kStride32Aligned: return "stride_32aligned";
-    case Nv12Variant::kStrideWPlusSampleSize: return "stride_w+sample_size+bitrate";
-    case Nv12Variant::kTight: return "tight_stride_w";
-    default: return "?";
-  }
-}
-
-HRESULT MakeNv12InputTypeVariant(uint32_t w, uint32_t h, uint32_t fps,
-                                 uint32_t bitrate, Nv12Variant v,
-                                 IMFMediaType** out) {
-  const uint64_t frame_size = (static_cast<uint64_t>(w) << 32) | h;
-  const uint64_t frame_rate = (static_cast<uint64_t>(fps) << 32) | 1;
-  ComPtr<IMFMediaType> mt;
-  HRESULT hr = MFCreateMediaType(mt.GetAddressOf());
-  if (SUCCEEDED(hr)) hr = mt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-  if (SUCCEEDED(hr)) hr = mt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-  if (SUCCEEDED(hr)) hr = mt->SetUINT64(MF_MT_FRAME_SIZE, frame_size);
-  if (SUCCEEDED(hr)) hr = mt->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-  if (SUCCEEDED(hr)) hr = mt->SetUINT64(MF_MT_FRAME_RATE, frame_rate);
-  switch (v) {
-    case Nv12Variant::kNoStride:
-      break;  // omit MF_MT_DEFAULT_STRIDE entirely: MFT picks
-    case Nv12Variant::kStride32Aligned:
-      if (SUCCEEDED(hr)) hr = mt->SetUINT32(MF_MT_DEFAULT_STRIDE, (w + 31u) & ~31u);
-      break;
-    case Nv12Variant::kStrideWPlusSampleSize:
-      if (SUCCEEDED(hr)) hr = mt->SetUINT32(MF_MT_DEFAULT_STRIDE, w);
-      if (SUCCEEDED(hr)) hr = mt->SetUINT32(MF_MT_SAMPLE_SIZE, w * h * 3u / 2u);
-      if (SUCCEEDED(hr)) hr = mt->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
-      break;
-    case Nv12Variant::kTight:
-      if (SUCCEEDED(hr)) hr = mt->SetUINT32(MF_MT_DEFAULT_STRIDE, w);
-      break;
-    default:
-      return E_INVALIDARG;
-  }
   if (SUCCEEDED(hr)) *out = mt.Detach();
   return hr;
 }
@@ -284,11 +230,13 @@ void MfSoftEncoder::Shutdown() {
 }
 
 // Full negotiation + streaming start on a given MFT instance. Owns no
-// pointers; impl_ must exist. For hardware MFTs the caller's media types are
-// tried first and the MFT's own enumerated types (dims/rate/bitrate
-// overridden) act as fallback, and the negotiated input stride is read back
-// (padding buffer allocated when wider than w) - the "以枚举返回的输入类型
-// 为准" adaptation for MFTs that demand aligned strides/formats.
+// pointers; impl_ must exist. Output type: caller's H.264 first, the MFT's
+// own enumerated H.264 types as fallback (hardware MFTs may not accept the
+// caller's verbatim type). Input type: ONE standard tight-NV12 attempt —
+// the Part A variant ladder was removed (feat/arch-clean) because every
+// CPU-NV12 variant was rejected on Arc (QSV needs D3D11 textures, M4); a
+// rejection just logs and the ladder falls back. The negotiated input
+// stride is read back (padding buffer allocated when wider than w).
 bool MfSoftEncoder::InitWithMft(IMFTransform* mft, const std::wstring& friendly,
                                 bool hardware, std::string* err) {
   if (mft == nullptr) {
@@ -325,66 +273,17 @@ bool MfSoftEncoder::InitWithMft(IMFTransform* mft, const std::wstring& friendly,
     return false;
   }
 
-  // Input type. Software MFT: the caller's tight NV12 (works, and the
-  // historical path). Hardware MFTs: the attribute ladder first (hw-encode
-  // task 2 Part A - QSV rejects the tight type with MF_E_INVALID_MEDIA_TYPE
-  // 0xC00D6D77 on Arc; each attempt is logged), then the MFT's own
-  // enumerated NV12 types.
+  // Input type: the caller's tight NV12 (stride = width), ONE standard
+  // attempt for both rungs. A hardware MFT that rejects CPU NV12 logs the
+  // rejection and the ladder falls back (next candidate, then software) —
+  // no variant ladder: the Part A attempts were dead code on Arc (all
+  // rejected 0xC00D6D77; QSV CPU-NV12 needs D3D11 textures, M4).
   ComPtr<IMFMediaType> in_mt;
-  if (hardware) {
-    const Nv12Variant variants[] = {Nv12Variant::kNoStride,
-                                    Nv12Variant::kStride32Aligned,
-                                    Nv12Variant::kStrideWPlusSampleSize,
-                                    Nv12Variant::kTight};
-    for (Nv12Variant v : variants) {
-      ComPtr<IMFMediaType> t;
-      hr = MakeNv12InputTypeVariant(w_, h_, fps_, bitrate_, v, t.GetAddressOf());
-      if (SUCCEEDED(hr)) hr = mft->SetInputType(0, t.Get(), 0);
-      XNC_LOG_INFO("encoder_input_attempt backend=hardware attempt=%s hr=0x%08x",
-                   Nv12VariantName(v), static_cast<unsigned int>(hr));
-      if (SUCCEEDED(hr)) {
-        in_mt = t;
-        break;
-      }
-    }
-  } else {
-    hr = MakeNv12InputType(w_, h_, fps_, in_mt.GetAddressOf());
-    if (SUCCEEDED(hr)) hr = mft->SetInputType(0, in_mt.Get(), 0);
-    if (FAILED(hr)) {
-      if (err) *err = HrStep("SetInputType", hr);
-      return false;
-    }
-  }
-  if (FAILED(hr) && hardware) {
-    for (DWORD i = 0;; ++i) {
-      ComPtr<IMFMediaType> t;
-      hr = mft->GetInputAvailableType(0, i, t.GetAddressOf());
-      if (FAILED(hr)) break;
-      GUID sub{};
-      if (FAILED(t->GetGUID(MF_MT_SUBTYPE, &sub)) || sub != MFVideoFormat_NV12) continue;
-      // Verbatim first (the MFT's own attribute set - stride, color info,
-      // interlace etc. as offered), then with our frame size/rate stamped
-      // on top for capture sizes that differ from the MFT's default.
-      HRESULT hr_v = mft->SetInputType(0, t.Get(), 0);
-      XNC_LOG_INFO("encoder_input_attempt backend=hardware attempt=enumerated_verbatim idx=%lu hr=0x%08x",
-                   static_cast<unsigned long>(i), static_cast<unsigned int>(hr_v));
-      if (SUCCEEDED(hr_v)) {
-        in_mt = t;
-        hr = S_OK;
-        break;
-      }
-      hr = t->SetUINT64(MF_MT_FRAME_SIZE, frame_size);
-      if (SUCCEEDED(hr)) hr = t->SetUINT64(MF_MT_FRAME_RATE, frame_rate);
-      if (SUCCEEDED(hr)) hr = mft->SetInputType(0, t.Get(), 0);
-      XNC_LOG_INFO("encoder_input_attempt backend=hardware attempt=enumerated_framesize_ours idx=%lu hr=0x%08x",
-                   static_cast<unsigned long>(i), static_cast<unsigned int>(hr));
-      if (SUCCEEDED(hr)) {
-        in_mt = t;
-        break;
-      }
-    }
-  }
+  hr = MakeNv12InputType(w_, h_, fps_, in_mt.GetAddressOf());
+  if (SUCCEEDED(hr)) hr = mft->SetInputType(0, in_mt.Get(), 0);
   if (FAILED(hr)) {
+    XNC_LOG_INFO("encoder_input_attempt backend=%s hr=0x%08x (rejected, falling back)",
+                 hardware ? "hardware" : "software", static_cast<unsigned int>(hr));
     if (err) *err = HrStep(hardware ? "SetInputType(hw)" : "SetInputType", hr);
     return false;
   }
