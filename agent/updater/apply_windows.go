@@ -2,10 +2,8 @@
 
 // apply_windows.go — Windows 自更新之舞（设计文档核心路径）。
 //
-// apply：杀运行中的 screen-helper（消灭孤儿）→ 删除已提取的 DLL 缓存
-// （消灭陈旧 DLL——本 session 三次事故的教训）→ spawn 自身子进程
-// `xnc-agent.exe --apply-update <stageDir> <parentPID>`（脱离服务生命周
-// 期）→ 主进程 os.Exit(0)。
+// apply：spawn 自身子进程 `xnc-agent.exe --apply-update <stageDir>
+// <parentPID>`（脱离服务生命周期）→ 主进程 os.Exit(0)。
 //
 // 子进程（RunApply）：等父进程退出 → 备份换文件 → StartService →
 // 等待 connected.ok 标记（新 agent 首次控制连接成功后写）→ 成功删 .old
@@ -32,7 +30,7 @@ func ConnectedMarkerPath(stateDir string) string {
 	return filepath.Join(stateDir, "update-connected.ok")
 }
 
-// apply 平台入口：Windows 杀 helper/删 DLL/spawn 子进程。
+// apply 平台入口：Windows spawn 换文件子进程（换文件在子进程内完成）。
 func (u *Updater) apply(stageDir string) error {
 	agentPath, err := os.Executable()
 	if err != nil {
@@ -40,22 +38,13 @@ func (u *Updater) apply(stageDir string) error {
 	}
 	agentDir := filepath.Dir(agentPath)
 
-	// 1. 杀运行中的 helper（taskkill by image name——SYSTEM 有权）。
-	if out, err := exec.Command("taskkill", "/F", "/IM", helperExe).CombinedOutput(); err == nil {
-		u.Log.Info("update: killed running helpers", "out", string(out))
-	}
-	time.Sleep(500 * time.Millisecond) // 句柄释放窗口
-
-	// 2. 删除已提取 DLL 缓存（新 helper 首启重新提取内嵌副本）。
-	_ = os.Remove(filepath.Join(agentDir, "xnc-dda.dll"))
-
-	// 3. spawn --apply-update 子进程（DETACHED：不随服务退出被杀）。
+	// spawn --apply-update 子进程（DETACHED：不随服务退出被杀）。
 	cmd := exec.Command(agentPath, "--apply-update", stageDir, fmt.Sprint(os.Getpid()))
 	cmd.Dir = agentDir
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("spawn apply-update child: %w", err)
 	}
-	// 4. 主进程退出——SCM 视为服务停止，由子进程 StartService 拉起新版。
+	// 主进程退出——SCM 视为服务停止，由子进程 StartService 拉起新版。
 	u.Log.Info("update: apply-update child spawned, agent exiting for restart", "pid", cmd.Process.Pid)
 	go func() { os.Exit(0) }()
 	return nil

@@ -1,4 +1,4 @@
-// build-bundle.go — 打包自更新 bundle（manifest + agent + helper → tar.gz）。
+// build-bundle.go — 打包自更新 bundle（manifest + agent + core/desktop/shell → tar.gz）。
 // 用法: go run scripts/build-bundle.go <binDir> <version> <out.tar.gz>
 //
 // 版本单一来源：manifest 版本必须与 agent 自报版本一致（agent 构建时经
@@ -52,7 +52,6 @@ func main() {
 		"xnc-core.exe",          // prod bootstrap: XNCCore service binary
 		"xnc-desktop.exe",       // capture host (spawned by core)
 		"xnc-shell.exe",         // ConPTY/oneshot host (spawned by core)
-		"xnc-screen-helper.exe", // updater manifest still requires it
 	}
 	var mf manifest
 	mf.Version = version

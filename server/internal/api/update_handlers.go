@@ -3,7 +3,7 @@
 //
 // 上传方是部署流水线（构建机 curl，admin JWT）——CLI 面向使用者不提供
 // 上传命令。制品经 multipart/form-data：version、notes、bundle（tar.gz，
-// 含 xnc-agent.exe + xnc-screen-helper.exe + manifest.json）、cli（可选
+// 含 xnc-agent.exe + xnc-core/desktop/shell.exe + manifest.json）、cli（可选
 // xnc-windows-amd64.exe）。服务端校验 bundle 内容与 manifest 哈希一致
 // 后入库（bytea，随 pgdata 备份走）。
 package api
@@ -38,7 +38,7 @@ type bundleManifest struct {
 	} `json:"files"`
 }
 
-// verifyBundle 解包校验：tar.gz 内 manifest.json 与两个 exe 齐全，逐文件
+// verifyBundle 解包校验：tar.gz 内 manifest.json 与必需 exe 齐全，逐文件
 // 哈希与 manifest 一致，manifest 版本与声称版本一致。返回规范化后的
 // 文件名集合（防路径穿越：仅接受扁平文件名）。
 func verifyBundle(r io.Reader, version string) error {
@@ -79,9 +79,7 @@ func verifyBundle(r io.Reader, version string) error {
 	if _, ok := files["xnc-agent.exe"]; !ok {
 		return proto.Err(0, proto.CodeInternal, "bundle missing xnc-agent.exe")
 	}
-	if _, ok := files["xnc-screen-helper.exe"]; !ok {
-		return proto.Err(0, proto.CodeInternal, "bundle missing xnc-screen-helper.exe")
-	}
+	// 多余文件容忍（旧 bundle 含已退役的 xnc-screen-helper.exe 仍可通过）。
 	for _, f := range mf.Files {
 		b, ok := files[f.Name]
 		if !ok {

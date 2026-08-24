@@ -1,6 +1,5 @@
 // Package updater — agent 自更新：OFFER 去重 → 下载校验 → staging →
-// apply（Windows：杀 helper、删 DLL 缓存、spawn --apply-update 子进程、
-// 退出由子进程重启服务）。
+// apply（Windows：spawn --apply-update 子进程、退出由子进程重启服务）。
 //
 // 三入口（HELLO_ACK 回执 / 心跳 ACK 搭车 / UPDATE_OFFER）全部收敛到
 // Handle；同版本幂等跳过，进行中版本重入忽略。
@@ -40,15 +39,15 @@ type Updater struct {
 const (
 	manifestName = "manifest.json"
 	agentExe     = "xnc-agent.exe"
-	helperExe    = "xnc-screen-helper.exe"
 	coreExe      = "xnc-core.exe"
 	desktopExe   = "xnc-desktop.exe"
 	shellExe     = "xnc-shell.exe"
 )
 
-// requiredFiles 必需文件(prod bootstrap 起:agent + core 三件套 + helper;
-// 旧 bundle 无后四者但旧 agent 不会拉新语义 bundle——向前保证完整性)。
-var requiredFiles = []string{agentExe, coreExe, desktopExe, shellExe, helperExe}
+// requiredFiles 必需文件（agent + core 三件套）。旧 bundle（含已退役的
+// xnc-screen-helper.exe）兼容：stage 只校验必需文件存在、容忍多余文件；
+// apply 只搬 requiredFiles——旧 helper 文件留在节点，已退役无害。
+var requiredFiles = []string{agentExe, coreExe, desktopExe, shellExe}
 
 type manifest struct {
 	Version string `json:"version"`
@@ -204,7 +203,7 @@ func removeOld(path string) error {
 	old := path + ".old"
 	_ = os.Remove(old)
 	if _, err := os.Stat(path); err != nil {
-		return nil // 不存在（如 helper 首装）视为成功
+		return nil // 不存在视为成功（旧部署无 core 三件套）
 	}
 	return os.Rename(path, old)
 }

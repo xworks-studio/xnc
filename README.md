@@ -93,7 +93,6 @@ Agent (Windows 服务)
 cd deploy && docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 (cd cli && go build -o ../bin/xnc.exe .)
 (cd agent && go build -o ../bin/xnc-agent.exe ./cmd/xnc-agent)
-(cd agent/screen-helper && go build -o ../../bin/xnc-screen-helper.exe .)
 ```
 
 ## 构建带版本的 bundle（版本单一来源）
@@ -105,6 +104,9 @@ cd deploy && docker compose -f docker-compose.yml -f docker-compose.dev.yml up -
 cd agent && go build -ldflags "-X xnc/agent/machineinfo.Version=<v>" -o ../bin/xnc-agent.exe ./cmd/xnc-agent
 cd .. && go run scripts/build-bundle.go bin <v> bin/bundle-<v>.tar.gz   # 校验 agent 自报 == <v>
 ```
+
+bundle 含 4 个 exe（xnc-agent + xnc-core/desktop/shell 三件套；screen-helper
+已退役，0.4.6 起不再分发）。
 
 server 构建版本同理（`/api/health` 上报）：`deploy/.env` 设 `XNC_VERSION=<v>`
 后 `py deploy/deploy_srv.py env && py deploy/deploy_srv.py up`，compose 经

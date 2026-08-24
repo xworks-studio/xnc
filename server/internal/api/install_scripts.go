@@ -111,7 +111,9 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Failed to extract bundle" }
 
     Copy-Item (Join-Path $staging "xnc-agent.exe") $InstallDir -Force
-    Copy-Item (Join-Path $staging "xnc-screen-helper.exe") $InstallDir -Force
+    Copy-Item (Join-Path $staging "xnc-core.exe") $InstallDir -Force
+    Copy-Item (Join-Path $staging "xnc-desktop.exe") $InstallDir -Force
+    Copy-Item (Join-Path $staging "xnc-shell.exe") $InstallDir -Force
     Write-OK
 
     # [4/5] Register service

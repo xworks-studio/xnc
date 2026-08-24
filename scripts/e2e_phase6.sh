@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Phase 6 E2E: screen session — REST endpoint + viewer RBAC + cleanup.
-# Full streaming needs real agent + helper on TB16G7 (manual acceptance).
+# Full streaming needs real agent on TB16G7 (manual acceptance).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -13,7 +13,6 @@ export XNC_SERVER=$SERVER
 echo "== build =="
 (cd cli && go build -o "../$XNC" .)
 (cd mockagent && go build -o "../$MOCK" .)
-(cd agent/screen-helper && go build -o "../../bin/xnc-screen-helper$EXE" .)
 
 echo "== dev stack =="
 COMPOSE="docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.dev.yml"
@@ -65,13 +64,13 @@ else
 fi
 
 echo "== CLI screen --snapshot (expects graceful handling) =="
-# mockagent has no helper deployed — CLI should not crash
+# mockagent has no capture host — CLI should not crash
 DD=$(mktemp -d)
 set +e
 "$XNC" screen "$NODE_ID" --snapshot "$DD/snap.jpg" --json > "$DD/result.json" 2>&1
 SCREEN_EXIT=$?
 set -e
-echo "screen --snapshot exit: $SCREEN_EXIT (0=ok, non-zero=expected without helper)"
+echo "screen --snapshot exit: $SCREEN_EXIT (0=ok, non-zero=expected without capture host)"
 cat "$DD/result.json" | head -2
 rm -rf "$DD"
 

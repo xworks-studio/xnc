@@ -1818,7 +1818,7 @@ sql-01    offline
 
 # 45. Agent 更新（自更新系统）
 
-服务端驱动的全自动更新。Agent 收到 UPDATE_OFFER 后完成：下载 → sha256 校验 → staging（解包逐文件验哈希）→ apply（杀 helper、删 DLL 缓存、spawn --apply-update 子进程）→ 服务重启 → 新版本 HELLO 上报。
+服务端驱动的全自动更新。Agent 收到 UPDATE_OFFER 后完成：下载 → sha256 校验 → staging（解包逐文件验哈希）→ apply（spawn --apply-update 子进程）→ 服务重启 → 新版本 HELLO 上报。
 
 ## 快速版本检查（三通道，零轮询）
 
@@ -2966,8 +2966,8 @@ RDP 连接本身会改变会话状态。预览解决"先无扰动看一眼"。Ph
 screen 会话引擎 internal/session/screen (service, session 0)
    │ WTSQueryUserToken + CreateProcessAsUser
    ▼
-xnc-screen-helper.exe (user console session)
-   │ xnc-dda.dll (C ABI, 嵌入 helper exe)
+xnc-screen-helper.exe (user console session)   ← 已退役（0.4.6 起不再分发；bundle 4 exe，由 §65 desktop 引擎承接）
+   │ xnc-dda.dll (C ABI, 嵌入 helper exe)      ← 随 helper 退役
    │   ├─ DXGI Desktop Duplication → GPU BGRA → CPU 读回
    │   ├─ 备援: WGC (Win10 1903+)
    │   └─ 光标合成 (GDI 指针形状 → BGRA 叠加)

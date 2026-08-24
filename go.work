@@ -2,7 +2,6 @@ go 1.26.3
 
 use (
 	./agent
-	./agent/screen-helper
 	./cli
 	./mockagent
 	./proto
