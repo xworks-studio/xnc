@@ -608,6 +608,10 @@ CaptureSpawnResult RealCaptureSpawn(uint32_t session, const wchar_t* pipe_name,
   // nothing sensitive either way.
   std::vector<std::wstring> args = {L"--console-rt", L"--pipe", pipe_name,
                                     L"--secret-stdin"};
+  // --log-file: desktop opens its own log (service spawns have no console;
+  // inherited-stdio redirection proved unreliable — 2026-08-24 incident).
+  args.push_back(L"--log-file");
+  args.push_back(JoinSiblingPath(OwnModuleDir(), L"xnc-desktop.log"));
   if (degraded) {
     // Crash-loop lock (spec 15.2): GDI capture + software encoder only.
     args.push_back(L"--backend");

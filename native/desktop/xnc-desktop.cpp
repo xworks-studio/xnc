@@ -335,6 +335,10 @@ bool ParseDiagArgs(int argc, wchar_t** argv, DiagOptions* opt, std::wstring* err
       if (!v) return false;
       if (!ParseU32(v, &opt->fps) || opt->fps == 0)
         return fail(L"--fps must be a positive integer");
+    } else if (std::wcscmp(a, L"--log-file") == 0) {
+      const wchar_t* v = value_of(L"--log-file");
+      if (!v) return false;
+      opt->log_file = v;
     } else if (std::wcscmp(a, L"--out") == 0) {
       const wchar_t* v = value_of(L"--out");
       if (!v) return false;
@@ -798,6 +802,13 @@ int wmain(int argc, wchar_t** argv) {
   if (opt.help) {
     Usage(stdout);
     return 0;
+  }
+  // --log-file: production service spawns have no console and inherited
+  // stdio proved unreliable — log to a file the child owns (2026-08-24
+  // observability incident; UAC/backend diagnostics depend on this).
+  if (!opt.log_file.empty()) {
+    std::string narrow(opt.log_file.begin(), opt.log_file.end());
+    xnc::SetLogFile(narrow.c_str());
   }
   if (opt.selftest) return SelftestMain();
   if (opt.secret_stdin) {

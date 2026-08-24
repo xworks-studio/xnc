@@ -54,6 +54,7 @@ struct DiagOptions {
                                 // encode JPEG (WIC, quality 0.85), write file,
                                 // exit 0; errors exit 1
   std::wstring jpeg_path;       // --jpeg-single output path (required)
+  std::wstring log_file;        // --log-file <path>: XNC_LOG also appends here
   uint32_t max_width = 0;       // --max-w <n>: box-filter downscale clamp for
                                 // --jpeg-single (0 = no clamp)
 };
