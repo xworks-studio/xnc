@@ -56,6 +56,9 @@ services:
       - --lt-cred-mech
       - --user=${XNC_TURN_USERNAME:-xncdev}:${XNC_TURN_PASSWORD:-xncdev-secret}
       - --listening-port=3478
+      - --listening-ip=0.0.0.0
+      - --relay-ip=0.0.0.0
+      - --external-ip=${XNC_TURN_EXTERNAL_IP:-47.243.209.52}
       - --min-port=49160
       - --max-port=49200
       - --no-cli
