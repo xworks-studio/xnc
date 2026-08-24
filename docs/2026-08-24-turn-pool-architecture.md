@@ -66,5 +66,5 @@ Node agent ──WSS──▶ control.xnc.app(信令,不变)
 - 下发形态(本分支确认):池命中时下发**单台 TURN、两个 URL**——`turn:<ip>:<port>?transport=udp` 优先 + `?transport=tcp` 兜底,浏览器/节点取第一个可达的;凭据与 `XNC_TURN_USERNAME`/`XNC_TURN_CREDENTIAL` 共用(池内 coturn 统一 realm/凭据,任一台可服务任意会话)。IPv6 地址 URL 加方括号(`turn:[::1]:5349?...`)。
 - 分配:每会话(每次 `turnConfig()` 调用)round-robin 选 healthy 台;探测未开始前全部按 healthy(先试跑,≤30s 内校正)。全池不健康/池空 → 回落 `XNC_TURN_URLS` 全列表(现状)。
 - 健康探测:manager 生命周期内后台 goroutine(Start/Stop),启动立即跑一轮、之后每 30s 一轮;对每台发 20B STUN binding request(UDP,3s 超时),应答校验 binding success(0x0101)+ 魔数 + 同 transaction id + ≥28B(coturn 典型应答 = 20B 头 + XOR-MAPPED-ADDRESS 8B = 28B,或附 SOFTWARE 更长)——**不要求固定 40B**,按 RFC 5389 形态校验。连续 2 次失败 → unhealthy;1 次成功恢复。探测在锁外发网络请求,状态更新短持锁,分配只读快照,互不阻塞。
-- 并发:mutex 保护池状态与 round-robin 游标;探测 goroutine 随 router 生命周期(生产:main.go 优雅停机经 `handlers.Close()` 停;测试:manager.Start/Stop 直接治理)。
+- 并发:mutex 保护池状态与 round-robin 游标;探测 goroutine 随 router 生命周期(生产:main.go 优雅停机经 `NewApp().Close()` 先停探测、再排空 HTTP;测试:manager.Start/Stop 直接治理)。
 - 部署:compose xnc-server 与 deploy_srv.py `cmd_env` 均带 `XNC_TURN_POOL`(默认空,兼容既有环境);新增池机器只需在 `.env` 追加 IP。

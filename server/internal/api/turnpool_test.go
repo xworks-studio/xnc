@@ -6,6 +6,7 @@ package api
 import (
 	"encoding/binary"
 	"net"
+	"net/http"
 	"strconv"
 	"sync"
 	"testing"
@@ -267,4 +268,28 @@ func TestTurnConfigPoolPriority(t *testing.T) {
 
 func newTurnCfg(urls []string) config.Config {
 	return config.Config{TurnURLs: urls, TurnUsername: "testuser", TurnCredential: "testcred"}
+}
+
+// TestAppCloseStopsProbe：App 包装的 Close 必须真实停止探测 goroutine——
+// 假探测进入后阻塞（模拟 in-flight 探测），放行后 Close 返回即 goroutine 已
+// 退出（Stop 内 wg.Wait 等齐）；Close 幂等。
+func TestAppCloseStopsProbe(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	probe := func(string) bool {
+		once.Do(func() { close(entered) })
+		<-release
+		return true
+	}
+	m := NewTurnPoolManager([]string{"10.0.0.1"}, "u", "p")
+	m.probe = probe
+	m.interval = time.Hour // 只跑 Start 的首轮；停止与否由 goroutine 退出判定
+	m.Start()
+	<-entered // 探测 goroutine 已进入阻塞的探测调用
+
+	app := &App{Handler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), close: m.Stop}
+	close(release) // 放行 in-flight 探测
+	require.NoError(t, app.Close())
+	require.NoError(t, app.Close()) // 幂等
 }

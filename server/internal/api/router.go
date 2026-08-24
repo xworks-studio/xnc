@@ -23,13 +23,36 @@ type handlers struct {
 	turnPool *TurnPoolManager // XNC_TURN_POOL 配置时非 nil（后台健康探测随 router 生命周期 Start/Stop）
 }
 
-// Close 停止 handler 的后台 worker（TURN 池健康探测）。生产在
-// cmd/xnc-server/main.go 优雅停机时调用；测试直接经 manager.Stop() 治理。
+// Close 停止 handler 的后台 worker（TURN 池健康探测）。生产经 NewApp().Close()
+// 在 cmd/xnc-server/main.go 优雅停机时调用；测试直接经 manager.Stop() 治理。
 func (h *handlers) Close() error {
 	if h.turnPool != nil {
 		h.turnPool.Stop()
 	}
 	return nil
+}
+
+// App 生产入口的应用句柄：内嵌 http.Handler（router），并携带停止后台 worker
+// （TURN 池健康探测）的 Close。main.go 停机时先调用 Close（停探测 goroutine）
+// 再排空 HTTP 连接。
+type App struct {
+	http.Handler
+	close func()
+}
+
+// Close 停止后台 worker（幂等；未启动 worker 时 no-op）。
+func (a *App) Close() error {
+	if a.close != nil {
+		a.close()
+	}
+	return nil
+}
+
+// NewApp 生产入口：与 NewRouter（sess=nil 自建）等价，但返回 *App 携带 Close，
+// 优雅停机时先停 TURN 池探测 goroutine 再等 HTTP 排空。
+func NewApp(st *db.Store, cfg config.Config, reg *registry.Registry) *App {
+	r, closeFn := newRouterWithSession(st, cfg, reg, nil)
+	return &App{Handler: r, close: closeFn}
 }
 
 func NewRouter(st *db.Store, cfg config.Config, reg *registry.Registry) http.Handler {
@@ -38,8 +61,15 @@ func NewRouter(st *db.Store, cfg config.Config, reg *registry.Registry) http.Han
 
 // NewRouterWithSession 允许注入共享的 session manager（测试经 TestEnv.Sess 直接
 // 驱动会话生命周期）；sess 为 nil 时自建并按 config 覆写 shell 治理参数
-// （NewRouter 即此生产路径；Manager.New 的默认值仅零值兜底）。
+// （NewRouter/NewApp 即此生产路径；Manager.New 的默认值仅零值兜底）。
 func NewRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registry, sess *session.Manager) http.Handler {
+	r, _ := newRouterWithSession(st, cfg, reg, sess)
+	return r
+}
+
+// newRouterWithSession 共享构造：返回 router 与停止后台 worker 的闭包（生产经
+// NewApp().Close() 调用；测试直接经 manager.Stop() 治理）。
+func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registry, sess *session.Manager) (http.Handler, func()) {
 	if sess == nil {
 		sess = session.New(reg, slog.Default())
 		sess.ShellPerNode = cfg.ShellPerNode
@@ -163,5 +193,5 @@ func NewRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 	// index.html（react-router 客户端路由）；/api/* 前缀在 handler 内
 	// 保持 404，不被 SPA 吞掉。
 	r.Mount("/", server.SPAHandler())
-	return r
+	return r, func() { _ = h.Close() }
 }

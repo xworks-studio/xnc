@@ -51,15 +51,14 @@ func main() {
 	}
 
 	reg := registry.New()
-	h := api.NewRouter(st, cfg, reg)
-	// 优雅停机：先停 TURN 池健康探测等后台 worker，再等 HTTP 连接排空。
-	if closer, ok := h.(interface{ Close() error }); ok {
-		defer closer.Close()
-	}
-	srv := &http.Server{Addr: cfg.ListenAddr, Handler: h, ReadHeaderTimeout: 10 * time.Second}
+	app := api.NewApp(st, cfg, reg)
+	srv := &http.Server{Addr: cfg.ListenAddr, Handler: app, ReadHeaderTimeout: 10 * time.Second}
 
+	// 优雅停机（信号触发）：先停 TURN 池健康探测等后台 worker，再排空 HTTP
+	// 连接——顺序显式：探测 goroutine 不拖慢排空，也不在排空期间空转。
 	go func() {
 		<-ctx.Done()
+		_ = app.Close()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutCtx)

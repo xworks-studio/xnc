@@ -40,7 +40,6 @@ type turnServer struct {
 	IP         string
 	Port       int
 	Healthy    bool
-	lastProbe  time.Time
 	failStreak int
 }
 
@@ -204,7 +203,6 @@ func (m *TurnPoolManager) probeCycle() {
 	for _, s := range list {
 		ok := m.probe(s.addr())
 		m.mu.Lock()
-		s.lastProbe = time.Now()
 		prev := s.Healthy
 		if ok {
 			s.failStreak = 0
