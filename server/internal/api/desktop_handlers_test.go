@@ -281,9 +281,12 @@ func TestDesktopLeaseAndCapabilities(t *testing.T) {
 	assert.Equal(t, 403, code)
 
 	// 持有者关闭 → 约 → 新会话授予（server 仲裁移交闭环）。
-	sess := f.env.Sess.SessionsOf(mustUUID(f.nodeID), proto.KindDesktop)
-	require.NotEmpty(t, sess)
-	f.env.Sess.NotifyClose(sess[0].ID, "test")
+	// SessionsOf 是 map 序遍历（随机序），sess[0] 不保证是持有者——并发上限内
+	// 还有 operator 的 view-only 会话，误关它会留下未释放的约导致断言抖动。
+	// 全部关闭使「持有者关闭释放约」断言与遍历顺序无关。
+	for _, s := range f.env.Sess.SessionsOf(mustUUID(f.nodeID), proto.KindDesktop) {
+		f.env.Sess.NotifyClose(s.ID, "test")
+	}
 	body3, code := postDesk(f.tokens["owner"])
 	require.Equal(t, 202, code)
 	require.NotNil(t, body3.Lease)
