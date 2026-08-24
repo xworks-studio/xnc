@@ -4,17 +4,15 @@
 // coreclient(core XNIP pipe)CreateShell(0x0120,wts=活动控制台哨兵,
 // 令牌 kind 由 System 决定)→ shellpipe.Dial(xnc-shell pipe, secret)。
 // 连接模型镜像 desktop/core_windows.go:进程内共享一条 core 连接
-// (Ping 探活,死则重拨);dev 拓扑凭据经环境变量
-// XNC_CORE_PIPE + XNC_CORE_SECRET_HEX(回退 desktop 的
-// XNC_DESKTOP_CORE_* 同源变量),缺失 = CORE_UNAVAILABLE(dev 构建
-// 文档化行为:exec/shell 依赖运行中的 xnc-core)。
+// (Ping 探活,死则重拨);凭据解析统一委托 desktop.ResolveCoreEndpoint
+// (单一事实:env 链 XNC_CORE_* → XNC_DESKTOP_CORE_*,全缺回落 state-dir
+// 服务约定),缺失 = CORE_UNAVAILABLE(dev 构建文档化行为:exec/shell
+// 依赖运行中的 xnc-core)。
 package session
 
 import (
-	"encoding/hex"
 	"errors"
 	"log/slog"
-	"os"
 	"sync"
 
 	"xnc/agent/coreclient"
@@ -30,20 +28,13 @@ var profileEnum = map[string]uint8{
 	"BASH":       coreclient.ProfileBash,
 }
 
-// DefaultShellHost 按环境变量构造共享 core 连接的 ShellHost;凭据
-// 缺失/损坏返回 nil(调用方以 CORE_UNAVAILABLE 拒绝每次创建)。
+// DefaultShellHost 按环境变量构造共享 core 连接的 ShellHost;凭据解析
+// 委托 desktop.ResolveCoreEndpoint(stateDir="",不读盘)——env 链
+// XNC_CORE_* 优先、回落 XNC_DESKTOP_CORE_*。缺失/损坏返回 nil(调用方
+// 以 CORE_UNAVAILABLE 拒绝每次创建)。
 func DefaultShellHost(log *slog.Logger) ShellHost {
-	pipe := os.Getenv("XNC_CORE_PIPE")
-	secHex := os.Getenv("XNC_CORE_SECRET_HEX")
-	if pipe == "" || secHex == "" {
-		pipe = os.Getenv("XNC_DESKTOP_CORE_PIPE")
-		secHex = os.Getenv("XNC_DESKTOP_CORE_SECRET_HEX")
-	}
-	if pipe == "" || secHex == "" {
-		return nil
-	}
-	secret, err := hex.DecodeString(secHex)
-	if err != nil {
+	pipe, secret, err := desktop.ResolveCoreEndpoint("")
+	if err != nil || len(secret) == 0 {
 		return nil
 	}
 	return &coreShellHost{pipe: pipe, secret: secret, log: log}
@@ -54,9 +45,6 @@ func DefaultShellHost(log *slog.Logger) ShellHost {
 // 与 desktop handler 同一凭据源)。失败返回 nil(CORE_UNAVAILABLE)。
 // 2026-08-24 生产事故修复:此前缺 stateDir 回落,生产 exec/shell 全废。
 func ShellHostFromStateDir(stateDir string, log *slog.Logger) ShellHost {
-	if h := DefaultShellHost(log); h != nil {
-		return h
-	}
 	pipe, secret, err := desktop.ResolveCoreEndpoint(stateDir)
 	if err != nil || len(secret) == 0 {
 		if log != nil {

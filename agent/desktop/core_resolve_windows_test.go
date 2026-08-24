@@ -12,8 +12,7 @@ import (
 )
 
 func TestResolveCoreEndpointDefaultFallback(t *testing.T) {
-	t.Setenv("XNC_DESKTOP_CORE_PIPE", "")
-	t.Setenv("XNC_DESKTOP_CORE_SECRET_HEX", "")
+	clearCoreEnv(t)
 
 	dir := t.TempDir()
 	if _, _, err := resolveCoreEndpoint(dir); err == nil {
@@ -38,6 +37,7 @@ func TestResolveCoreEndpointDefaultFallback(t *testing.T) {
 }
 
 func TestResolveCoreEndpointEnvPrecedence(t *testing.T) {
+	clearCoreEnv(t)
 	t.Setenv("XNC_DESKTOP_CORE_PIPE", `\\.\pipe\dev-core`)
 	t.Setenv("XNC_DESKTOP_CORE_SECRET_HEX", "aabbccdd")
 	// state dir 无文件也不该被读——env 优先。
@@ -50,7 +50,58 @@ func TestResolveCoreEndpointEnvPrecedence(t *testing.T) {
 	}
 }
 
+// legacy shellhost 链(XNC_CORE_*)优先于 canonical 链(XNC_DESKTOP_CORE_*),
+// 与旧 DefaultShellHost 语义一致(2026-08-24 follow-up Task 7c 合并)。
+func TestResolveCoreEndpointLegacyChainPriority(t *testing.T) {
+	clearCoreEnv(t)
+	t.Setenv("XNC_CORE_PIPE", `\\.\pipe\legacy-core`)
+	t.Setenv("XNC_CORE_SECRET_HEX", "11223344")
+	t.Setenv("XNC_DESKTOP_CORE_PIPE", `\\.\pipe\dev-core`)
+	t.Setenv("XNC_DESKTOP_CORE_SECRET_HEX", "aabbccdd")
+	pipe, secret, err := resolveCoreEndpoint(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pipe != `\\.\pipe\legacy-core` || len(secret) != 4 {
+		t.Fatalf("legacy chain must win: pipe=%q len=%d", pipe, len(secret))
+	}
+}
+
+// legacy 链半缺 → 回落 canonical 链(保持旧 DefaultShellHost 的回落行为)。
+func TestResolveCoreEndpointLegacyPartialFallsThrough(t *testing.T) {
+	clearCoreEnv(t)
+	t.Setenv("XNC_CORE_PIPE", `\\.\pipe\legacy-core`) // secret 缺失 = 半缺
+	t.Setenv("XNC_DESKTOP_CORE_PIPE", `\\.\pipe\dev-core`)
+	t.Setenv("XNC_DESKTOP_CORE_SECRET_HEX", "aabbccdd")
+	pipe, secret, err := resolveCoreEndpoint(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pipe != `\\.\pipe\dev-core` || len(secret) != 4 {
+		t.Fatalf("partial legacy chain must fall through: pipe=%q len=%d", pipe, len(secret))
+	}
+}
+
+// DefaultShellHost 形态(stateDir 为空)不读 cwd 下的 secret 文件。
+func TestResolveCoreEndpointEmptyStateDirNoFileFallback(t *testing.T) {
+	clearCoreEnv(t)
+	if _, _, err := resolveCoreEndpoint(""); err == nil {
+		t.Fatal("empty stateDir must error, not read the cwd for a secret file")
+	}
+}
+
+// clearCoreEnv 清空两条凭据 env 链(防宿主环境残留干扰)。
+func clearCoreEnv(t *testing.T) {
+	for _, k := range []string{
+		"XNC_CORE_PIPE", "XNC_CORE_SECRET_HEX",
+		"XNC_DESKTOP_CORE_PIPE", "XNC_DESKTOP_CORE_SECRET_HEX",
+	} {
+		t.Setenv(k, "")
+	}
+}
+
 func TestResolveCoreEndpointPartialEnvIsError(t *testing.T) {
+	clearCoreEnv(t)
 	t.Setenv("XNC_DESKTOP_CORE_PIPE", `\\.\pipe\dev-core`)
 	t.Setenv("XNC_DESKTOP_CORE_SECRET_HEX", "")
 	dir := t.TempDir()
@@ -64,8 +115,7 @@ func TestResolveCoreEndpointPartialEnvIsError(t *testing.T) {
 }
 
 func TestNewHandlerDefaultBuildsStarter(t *testing.T) {
-	t.Setenv("XNC_DESKTOP_CORE_PIPE", "")
-	t.Setenv("XNC_DESKTOP_CORE_SECRET_HEX", "")
+	clearCoreEnv(t)
 	dir := t.TempDir()
 	if h := NewHandler(dir, nil); h != nil {
 		t.Fatal("expected nil handler when secret file missing")

@@ -72,41 +72,54 @@ func CoreSecretPath(stateDir string) string {
 }
 
 // ResolveCoreEndpoint 导出 resolveCoreEndpoint,供 exec/shell 的
-// ShellHost 生产回落复用(同一凭据源,单一事实)。
+// ShellHost 复用(同一凭据源,单一事实;含 legacy shellhost env 链)。
 func ResolveCoreEndpoint(stateDir string) (string, []byte, error) {
 	return resolveCoreEndpoint(stateDir)
 }
 
 // resolveCoreEndpoint 凭据解析(纯函数,便于单测):
 //
-//	env 双全(PIPE+SECRET_HEX) → env 值(dev-console/装时 flag 等价物);
-//	env 全缺                  → 生产缺省(DefaultCorePipe +
-//	                           CoreSecretPath(stateDir) 读盘,trim 换行);
-//	env 半缺 / secret 文件缺失或坏 hex → error(不回退弱配置)。
+//	env 链(逐条双全才可用,按优先级):
+//	  XNC_CORE_PIPE + XNC_CORE_SECRET_HEX          (legacy shellhost 链,优先)
+//	  XNC_DESKTOP_CORE_PIPE + XNC_DESKTOP_CORE_SECRET_HEX (canonical 链)
+//	legacy 链半缺 → 回落 canonical 链(保持旧 DefaultShellHost 语义);
+//	canonical 链半缺 / 任一链坏 hex → error(不回退弱配置);
+//	env 全缺 → 生产缺省(DefaultCorePipe + CoreSecretPath(stateDir) 读盘,
+//	trim 换行);stateDir 为空(DefaultShellHost 的 dev 形态)不读盘,直接 error。
 func resolveCoreEndpoint(stateDir string) (pipe string, secret []byte, err error) {
-	envPipe := os.Getenv("XNC_DESKTOP_CORE_PIPE")
-	envHex := os.Getenv("XNC_DESKTOP_CORE_SECRET_HEX")
-	switch {
-	case envPipe != "" && envHex != "":
-		secret, err := hex.DecodeString(envHex)
-		if err != nil {
-			return "", nil, fmt.Errorf("desktop: bad XNC_DESKTOP_CORE_SECRET_HEX: %w", err)
+	for i, chain := range [][2]string{
+		{"XNC_CORE_PIPE", "XNC_CORE_SECRET_HEX"},
+		{"XNC_DESKTOP_CORE_PIPE", "XNC_DESKTOP_CORE_SECRET_HEX"},
+	} {
+		envPipe := os.Getenv(chain[0])
+		envHex := os.Getenv(chain[1])
+		switch {
+		case envPipe != "" && envHex != "":
+			secret, err := hex.DecodeString(envHex)
+			if err != nil {
+				return "", nil, fmt.Errorf("desktop: bad %s: %w", chain[1], err)
+			}
+			return envPipe, secret, nil
+		case envPipe != "" || envHex != "":
+			if i == 0 {
+				continue // legacy 链半缺:试 canonical 链
+			}
+			return "", nil, errors.New("desktop: XNC_DESKTOP_CORE_* partially set (need both or neither)")
 		}
-		return envPipe, secret, nil
-	case envPipe != "" || envHex != "":
-		return "", nil, errors.New("desktop: XNC_DESKTOP_CORE_* partially set (need both or neither)")
-	default:
-		b, err := os.ReadFile(CoreSecretPath(stateDir))
-		if err != nil {
-			return "", nil, fmt.Errorf("desktop: no core credentials (env unset, %s unreadable): %w",
-				CoreSecretPath(stateDir), err)
-		}
-		secret, err := hex.DecodeString(strings.TrimSpace(string(b)))
-		if err != nil {
-			return "", nil, fmt.Errorf("desktop: bad %s: %w", DefaultCoreSecretName, err)
-		}
-		return DefaultCorePipe, secret, nil
 	}
+	if stateDir == "" {
+		return "", nil, errors.New("desktop: no core credentials in env (state-dir fallback needs a state dir)")
+	}
+	b, err := os.ReadFile(CoreSecretPath(stateDir))
+	if err != nil {
+		return "", nil, fmt.Errorf("desktop: no core credentials (env unset, %s unreadable): %w",
+			CoreSecretPath(stateDir), err)
+	}
+	secret, err = hex.DecodeString(strings.TrimSpace(string(b)))
+	if err != nil {
+		return "", nil, fmt.Errorf("desktop: bad %s: %w", DefaultCoreSecretName, err)
+	}
+	return DefaultCorePipe, secret, nil
 }
 
 // NewHandler 生产入口:凭据 = env(优先,dev-console 保持既有语义)
