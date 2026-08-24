@@ -49,10 +49,13 @@ type ScreenHandler struct {
 }
 
 // NewScreenHandler 构造使用默认 core 快照通路的处理器(Windows 经
-// coreclient 0x0111;非 Windows / dev 凭据缺失 → CORE_UNAVAILABLE)。
-func NewScreenHandler() *ScreenHandler {
+// coreclient 0x0111;非 Windows / 凭据缺失 → CORE_UNAVAILABLE)。
+// stateDir 传入以支持生产回落(XNCCore 服务约定;2026-08-24 修复:
+// 此前走 env-only 的 DefaultShellHost,生产无 env 时快照恒 CORE_UNAVAILABLE,
+// 而 exec/shell 已统一 ShellHostFromStateDir)。
+func NewScreenHandler(stateDir string) *ScreenHandler {
 	log := slog.Default()
-	return &ScreenHandler{Snap: defaultSnapshotProvider(log), Log: log}
+	return &ScreenHandler{Snap: defaultSnapshotProvider(stateDir, log), Log: log}
 }
 
 // Handle:快照模式 → SCREEN_BEGIN + 0x03 JPEG binary + 收线;流式 →

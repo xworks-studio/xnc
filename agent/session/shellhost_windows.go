@@ -221,10 +221,11 @@ func (h *coreShellHost) Snapshot(maxWidth uint32) ([]byte, error) {
 	return jpeg, nil
 }
 
-// defaultSnapshotProvider 构造默认快照通路(与 shellhost 同源的共享 core
-// 连接模型);dev 凭据缺失返回 CORE_UNAVAILABLE 拒绝器。
-func defaultSnapshotProvider(log *slog.Logger) SnapshotProvider {
-	if h := DefaultShellHost(log); h != nil {
+// defaultSnapshotProvider 构造默认快照通路(与 exec/shell 同源的共享 core
+// 连接模型);凭据缺失返回 CORE_UNAVAILABLE 拒绝器。stateDir 参与生产
+// 回落(XNCCore 服务约定;2026-08-24 修复:此前 env-only,生产快照恒败)。
+func defaultSnapshotProvider(stateDir string, log *slog.Logger) SnapshotProvider {
+	if h := ShellHostFromStateDir(stateDir, log); h != nil {
 		if csh, ok := h.(*coreShellHost); ok {
 			return csh
 		}

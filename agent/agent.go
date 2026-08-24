@@ -88,7 +88,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		engine.Register(proto.KindShell, &session.Shell{Log: slog.Default(), Host: shellHost})
 		engine.Register(proto.KindFile, session.NewFile(slog.Default()))
 		engine.Register(proto.KindTunnel, session.NewTunnel(slog.Default()))
-		engine.Register(proto.KindScreen, session.NewScreenHandler())
+		engine.Register(proto.KindScreen, session.NewScreenHandler(a.StateDir))
 		// desktop:凭据 = env(dev)→ 生产缺省(XNCCore 服务的
 		// \\.\pipe\xnc-core + <StateDir>\core-secret.hex)。缺省零行为
 		// 变化(refused 路径不变)。
