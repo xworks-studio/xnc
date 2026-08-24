@@ -26,6 +26,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	"golang.org/x/sys/windows"
@@ -46,6 +48,71 @@ func NewHandlerFromEnv(log *slog.Logger) *Handler {
 	secret, err := hex.DecodeString(secHex)
 	if err != nil {
 		log.Warn("desktop: bad XNC_DESKTOP_CORE_SECRET_HEX, kind not registered")
+		return nil
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Handler{Log: log, Starter: NewCoreStarter(pipe, secret, 0, log)}
+}
+
+// 生产缺省凭据(prod bootstrap):XNCCore 服务用 --secret-file 持久化
+// secret,binPath 固定管道名;agent 无 env/flag 时按同约定回退。
+const (
+	// DefaultCorePipe XNCCore 服务的固定 XNIP 管道名。
+	DefaultCorePipe = `\\.\pipe\xnc-core`
+	// DefaultCoreSecretName agent state dir 下的 secret 文件名
+	// (hex + 换行,与 xnc-core --secret-file 写盘格式一致)。
+	DefaultCoreSecretName = "core-secret.hex"
+)
+
+// CoreSecretPath 返回 <stateDir>\core-secret.hex。
+func CoreSecretPath(stateDir string) string {
+	return filepath.Join(stateDir, DefaultCoreSecretName)
+}
+
+// resolveCoreEndpoint 凭据解析(纯函数,便于单测):
+//
+//	env 双全(PIPE+SECRET_HEX) → env 值(dev-console/装时 flag 等价物);
+//	env 全缺                  → 生产缺省(DefaultCorePipe +
+//	                           CoreSecretPath(stateDir) 读盘,trim 换行);
+//	env 半缺 / secret 文件缺失或坏 hex → error(不回退弱配置)。
+func resolveCoreEndpoint(stateDir string) (pipe string, secret []byte, err error) {
+	envPipe := os.Getenv("XNC_DESKTOP_CORE_PIPE")
+	envHex := os.Getenv("XNC_DESKTOP_CORE_SECRET_HEX")
+	switch {
+	case envPipe != "" && envHex != "":
+		secret, err := hex.DecodeString(envHex)
+		if err != nil {
+			return "", nil, fmt.Errorf("desktop: bad XNC_DESKTOP_CORE_SECRET_HEX: %w", err)
+		}
+		return envPipe, secret, nil
+	case envPipe != "" || envHex != "":
+		return "", nil, errors.New("desktop: XNC_DESKTOP_CORE_* partially set (need both or neither)")
+	default:
+		b, err := os.ReadFile(CoreSecretPath(stateDir))
+		if err != nil {
+			return "", nil, fmt.Errorf("desktop: no core credentials (env unset, %s unreadable): %w",
+				CoreSecretPath(stateDir), err)
+		}
+		secret, err := hex.DecodeString(strings.TrimSpace(string(b)))
+		if err != nil {
+			return "", nil, fmt.Errorf("desktop: bad %s: %w", DefaultCoreSecretName, err)
+		}
+		return DefaultCorePipe, secret, nil
+	}
+}
+
+// NewHandler 生产入口:凭据 = env(优先,dev-console 保持既有语义)
+// → 生产缺省(XNCCore 服务约定)。拿不到凭据返回 nil(desktop kind
+// 不注册,零行为变化)。
+func NewHandler(stateDir string, log *slog.Logger) *Handler {
+	pipe, secret, err := resolveCoreEndpoint(stateDir)
+	if err != nil {
+		if log == nil {
+			log = slog.Default()
+		}
+		log.Info("desktop: core credentials unavailable, kind not registered", "err", err)
 		return nil
 	}
 	if log == nil {

@@ -23,7 +23,13 @@ type manifest struct {
 
 func main() {
 	dir, version, out := os.Args[1], os.Args[2], os.Args[3]
-	names := []string{"xnc-agent.exe", "xnc-screen-helper.exe"}
+	names := []string{
+		"xnc-agent.exe",
+		"xnc-core.exe",        // prod bootstrap: XNCCore service binary
+		"xnc-desktop.exe",     // capture host (spawned by core)
+		"xnc-shell.exe",       // ConPTY/oneshot host (spawned by core)
+		"xnc-screen-helper.exe", // updater manifest still requires it
+	}
 	var mf manifest
 	mf.Version = version
 	for _, n := range names {

@@ -87,10 +87,10 @@ func (a *Agent) Run(ctx context.Context) error {
 		engine.Register(proto.KindFile, session.NewFile(slog.Default()))
 		engine.Register(proto.KindTunnel, session.NewTunnel(slog.Default()))
 		engine.Register(proto.KindScreen, session.NewScreenHandler())
-		// desktop(M1-Slice2):仅当 core pipe 凭据已配置(dev:环境变量
-		// XNC_DESKTOP_CORE_PIPE/XNC_DESKTOP_CORE_SECRET_HEX;生产 = M2
-		// SCM 通道)才注册——缺省零行为变化(refused 路径不变)。
-		if dh := desktop.NewHandlerFromEnv(slog.Default()); dh != nil {
+		// desktop:凭据 = env(dev)→ 生产缺省(XNCCore 服务的
+		// \\.\pipe\xnc-core + <StateDir>\core-secret.hex)。缺省零行为
+		// 变化(refused 路径不变)。
+		if dh := desktop.NewHandler(a.StateDir, slog.Default()); dh != nil {
 			engine.Register(proto.KindDesktop, dh)
 		}
 		c.Handler = engine

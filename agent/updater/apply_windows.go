@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 )
 
@@ -70,57 +71,92 @@ func RunApply(stageDir, parentPID string, log func(format string, args ...any)) 
 	log("apply-update: waiting for parent %s to exit", parentPID)
 	waitProcessExit(parentPID, 30*time.Second)
 
-	// 换文件（.old 备份只保留一代）。
-	oldAgent := filepath.Join(agentDir, agentExe)
-	oldHelper := filepath.Join(agentDir, helperExe)
-	if err := removeOld(oldAgent); err != nil {
-		return fmt.Errorf("backup agent: %w", err)
+	// 换文件（.old 备份只保留一代）。prod bootstrap 起 bundle 含
+	// core/desktop/shell 三件套（requiredFiles），一并就位；XNCCore 服务
+	// 在换文件前停、agent 验证后拉起（withCoreRestart）。
+	old := make(map[string]string)
+	for _, name := range requiredFiles {
+		dst := filepath.Join(agentDir, name)
+		if err := removeOld(dst); err != nil {
+			return fmt.Errorf("backup %s: %w", name, err)
+		}
+		old[name] = dst
 	}
-	if err := removeOld(oldHelper); err != nil {
-		return fmt.Errorf("backup helper: %w", err)
+	swap := func() error {
+		for name, dst := range old {
+			if err := os.Rename(filepath.Join(stageDir, name), dst); err != nil {
+				return err
+			}
+		}
+		// 起 agent 服务 + 等连接标记（逻辑不变，只是挪进 swap 闭包）。
+		if err := startService(); err != nil {
+			return err
+		}
+		if err := waitConnectedMarker(stateDir, log); err != nil {
+			return err
+		}
+		// 成功：清扫备份与 staging（既有语义）。
+		for _, dst := range old {
+			_ = os.Remove(dst + ".old")
+		}
+		_ = os.RemoveAll(stageDir)
+		log("apply-update: verified, cleaned up")
+		return nil
 	}
-	newAgent := filepath.Join(stageDir, agentExe)
-	newHelper := filepath.Join(stageDir, helperExe)
-	if err := os.Rename(newAgent, oldAgent); err != nil {
-		return rollback(oldAgent, oldHelper, err)
+	rollback := func() error {
+		// swap 失败：恢复 .old、重启 agent 服务（既有回滚语义）。
+		for name, dst := range old {
+			_ = os.Remove(dst)
+			_ = os.Rename(dst+".old", dst)
+			_ = os.Remove(filepath.Join(stageDir, name)) // 残留清扫
+		}
+		_ = os.RemoveAll(stageDir)
+		_ = startService()
+		return nil
 	}
-	if err := os.Rename(newHelper, oldHelper); err != nil {
-		return rollback(oldAgent, oldHelper, err)
-	}
+	return withCoreRestart(coreSvc, swap, rollback)
+}
 
-	// 起服务。
-	if err := startService(); err != nil {
-		return rollback(oldAgent, oldHelper, err)
-	}
-
-	// 验证：新 agent 控制连接成功后写标记；超时回滚。
+// waitConnectedMarker 等新 agent 写 update-connected.ok（3 分钟超时）。
+func waitConnectedMarker(stateDir string, log func(string, ...any)) error {
 	marker := ConnectedMarkerPath(stateDir)
 	_ = os.Remove(marker)
 	log("apply-update: service started, waiting for connect marker")
 	deadline := time.Now().Add(3 * time.Minute)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(marker); err == nil {
-			// 成功：清扫备份与 staging。
-			_ = os.Remove(oldAgent + ".old")
-			_ = os.Remove(oldHelper + ".old")
-			_ = os.RemoveAll(stageDir)
-			log("apply-update: verified, cleaned up")
 			return nil
 		}
 		time.Sleep(2 * time.Second)
 	}
-	log("apply-update: connect marker timeout, rolling back")
-	return rollback(oldAgent, oldHelper, fmt.Errorf("new agent did not connect in time"))
+	return fmt.Errorf("new agent did not connect in time")
 }
 
-// rollback 恢复 .old 并重启服务（尽力而为；失败留给 SCM/人工）。
-func rollback(agentPath, helperPath string, cause error) error {
-	_ = os.Remove(agentPath)
-	_ = os.Remove(helperPath)
-	_ = os.Rename(agentPath+".old", agentPath)
-	_ = os.Rename(helperPath+".old", helperPath)
-	_ = startService()
-	return cause
+// coreServiceProd apply 之舞的 XNCCore 服务决策缝（可注入便于单测）。
+type coreService interface {
+	EnsureStopped() error // 服务不存在/未运行 = 成功（容错）
+	EnsureStarted() error // 同上（存在即尽力拉起）
+}
+
+// coreSvc 默认实现：真 SCM。RunApply 经它停/起 XNCCore。
+var coreSvc coreService = scmCoreService{coreServiceName}
+
+const coreServiceName = "XNCCore"
+
+// withCoreRestart：停 XNCCore → swap() → 拉 XNCCore（swap 失败先回滚再
+// 拉，与恢复后的旧文件配套）。XNCCore 不存在时停/起均为容错无操作。
+func withCoreRestart(c coreService, swap, rollback func() error) error {
+	if err := c.EnsureStopped(); err != nil {
+		return err
+	}
+	swapErr := swap()
+	if swapErr != nil {
+		_ = rollback()
+	}
+	if err := c.EnsureStarted(); err != nil {
+		return err
+	}
+	return swapErr
 }
 
 // waitProcessExit 轮询等待进程消失（OpenProcess 探测）。
@@ -165,4 +201,55 @@ func startService() error {
 	}
 	defer s.Close()
 	return s.Start()
+}
+
+// scmCoreService 停/起 XNCCore（服务缺失/未运行一律 nil——容错，apply
+// 之舞不得因无 XNCCore 的部署而失败）。
+type scmCoreService struct{ name string }
+
+func (s scmCoreService) EnsureStopped() error {
+	m, err := mgr.Connect()
+	if err != nil {
+		return nil // SCM 不可达：无从停（换文件仍可行；运行中的 core
+		// 句柄会让 rename 失败——那是部署问题，走既有错误路径）
+	}
+	defer m.Disconnect()
+	asvc, err := m.OpenService(s.name)
+	if err != nil {
+		return nil // 服务不存在
+	}
+	defer asvc.Close()
+	st, err := asvc.Query()
+	if err != nil || st.State != svc.StartPending && st.State != svc.Running {
+		return nil
+	}
+	_, _ = asvc.Control(svc.Stop)
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		st, err := asvc.Query()
+		if err != nil || st.State != svc.StopPending && st.State != svc.StartPending {
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return nil
+}
+
+func (s scmCoreService) EnsureStarted() error {
+	m, err := mgr.Connect()
+	if err != nil {
+		return nil // 容错：尽力而为
+	}
+	defer m.Disconnect()
+	asvc, err := m.OpenService(s.name)
+	if err != nil {
+		return nil // 服务不存在（旧部署无 XNCCore）
+	}
+	defer asvc.Close()
+	st, err := asvc.Query()
+	if err == nil && (st.State == svc.Running || st.State == svc.StartPending) {
+		return nil
+	}
+	_ = asvc.Start() // 容错：失败留给 XNCCore 自身的恢复启动（start= auto）
+	return nil
 }

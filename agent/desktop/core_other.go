@@ -9,3 +9,6 @@ import "log/slog"
 
 // NewHandlerFromEnv 恒返回 nil:非 Windows 无 core 采集,desktop kind 不注册。
 func NewHandlerFromEnv(*slog.Logger) *Handler { return nil }
+
+// NewHandler 恒返回 nil(同上;生产凭据回退是 Windows XNCCore 服务约定)。
+func NewHandler(stateDir string, log *slog.Logger) *Handler { return nil }

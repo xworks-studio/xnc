@@ -41,7 +41,14 @@ const (
 	manifestName = "manifest.json"
 	agentExe     = "xnc-agent.exe"
 	helperExe    = "xnc-screen-helper.exe"
+	coreExe      = "xnc-core.exe"
+	desktopExe   = "xnc-desktop.exe"
+	shellExe     = "xnc-shell.exe"
 )
+
+// requiredFiles 必需文件(prod bootstrap 起:agent + core 三件套 + helper;
+// 旧 bundle 无后四者但旧 agent 不会拉新语义 bundle——向前保证完整性)。
+var requiredFiles = []string{agentExe, coreExe, desktopExe, shellExe, helperExe}
 
 type manifest struct {
 	Version string `json:"version"`
@@ -176,7 +183,7 @@ func (u *Updater) stage(bundle []byte, version string) (string, error) {
 		}
 	}
 	// 必需文件齐全。
-	for _, need := range []string{agentExe, helperExe} {
+	for _, need := range requiredFiles {
 		if _, err := os.Stat(filepath.Join(dir, need)); err != nil {
 			return "", fmt.Errorf("bundle missing %s", need)
 		}
