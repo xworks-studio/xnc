@@ -192,6 +192,14 @@ export default function DesktopLive() {
   const [nodeName, setNodeName] = useState<string | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
   const [agentState, setAgentState] = useState<string | null>(null);
+  /**
+   * 控制权被占(lease denied:held)时的自动重试:旧会话的 lease 在 server 侧
+   * 60s TTL 内不会释放,用户手动刷新只会再撞窗口。denied 后按 8s 退避
+   * 重建会话(重新 POST /desktop → 新 session 有机会拿到 lease),最多 8 次。
+   * 2026-08-24 生产事故:用户反复刷新被"一直被占用"卡死。
+   */
+  const [sessionEpoch, setSessionEpoch] = useState(0);
+  const leaseRetry = useRef({ n: 0, timer: undefined as number | undefined });
   /** M2-S3 Task 5: displays from the ready frame + selected index. */
   const [displays, setDisplays] = useState<DisplayEntry[]>([]);
   const [displaySel, setDisplaySel] = useState(0);
@@ -609,6 +617,12 @@ export default function DesktopLive() {
       setLease({ status: "none" });
       setCursorDot(null);
       setSas({ pending: false, denied: false });
+      // teardown: cancel any pending lease-retry timer (the effect re-run
+      // owns a fresh one); epoch bump is what re-arms it.
+      if (leaseRetry.current.timer !== undefined) {
+        window.clearTimeout(leaseRetry.current.timer);
+        leaseRetry.current.timer = undefined;
+      }
     };
 
     api<DesktopStartResponse>(`/api/nodes/${nodeId}/desktop`, {
@@ -726,6 +740,8 @@ export default function DesktopLive() {
               break;
             case "lease_granted":
               ioRef.current.lease = true;
+              leaseRetry.current.n = 0;
+              if (leaseRetry.current.timer !== undefined) window.clearTimeout(leaseRetry.current.timer);
               setLease({ status: "granted", id: f.leaseId });
               // Sync remote lock state to the local toggles now (native
               // injects the toggle key only on mismatch).
@@ -740,6 +756,17 @@ export default function DesktopLive() {
               ioRef.current.lease = false;
               setLease({ status: "denied", reason: f.reason });
               setNotice(LEASE_NOTICES[f.reason ?? ""] ?? `input lease denied: ${f.reason ?? "unknown"}`);
+              // held = 控制权被其他会话持有(旧页面/刚关闭的会话,server 60s TTL
+              // 内不释放)。自动重建会话重试,别让用户手动刷新撞同一个窗口。
+              if (f.reason === "held" && leaseRetry.current.n < 8 && leaseRetry.current.timer === undefined) {
+                leaseRetry.current.n++;
+                const delay = 8000 * leaseRetry.current.n; // 8s/16s/24s…上限 64s
+                setNotice(`控制权被其他窗口占用,${Math.round(delay / 1000)} 秒后自动重试 (${leaseRetry.current.n}/8)…`);
+                leaseRetry.current.timer = window.setTimeout(() => {
+                  leaseRetry.current.timer = undefined;
+                  setSessionEpoch((e) => e + 1);
+                }, delay);
+              }
               break;
             case "lease_revoked":
               ioRef.current.lease = false;
@@ -791,7 +818,7 @@ export default function DesktopLive() {
 
     return teardown;
     // sendLock is a stable ref-only callback; node changes re-run the session
-  }, [nodeId, sendLock]);
+  }, [nodeId, sendLock, sessionEpoch]);
 
   const sendPli = () => {
     // Browsers cannot emit RTCP PLI from JS — this signaling frame asks
