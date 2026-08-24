@@ -17,6 +17,8 @@ import argparse
 import io
 import re
 import secrets
+import shutil
+import subprocess
 import sys
 import tarfile
 from pathlib import Path
@@ -153,11 +155,14 @@ sys.exit(0 if probe("udp", socket.SOCK_DGRAM) + probe("tcp", socket.SOCK_STREAM)
 # up 前清同名孤儿:名字命中本 compose 项目(deploy-<svc>-1)但项目 label
 # 不是 deploy 的残留容器(2026-08-24 retro P2#10:d00097cd9d8c_* 旧世代
 # 容器曾导致 rebuild 报名字冲突)。
+# 渲染注意:模板含 ${svc} 等 shell 变量,不能用 str.format(root=...)——
+# .format 会把 ${svc} 当字段并抛 KeyError(2026-08-24 retro 复现),故
+# 用 _orphan_prune_script 的 {root} 纯文本替换渲染。
 _ORPHAN_PRUNE = r'''
 cd {root} && for svc in $(docker compose -f deploy/docker-compose.yml config --services); do
   name="deploy-${svc}-1"
-  if docker inspect -f '{{{{.State.Status}}}}' "$name" >/dev/null 2>&1; then
-    proj=$(docker inspect -f '{{{{index .Config.Labels "com.docker.compose.project"}}}}' "$name" 2>/dev/null)
+  if docker inspect -f '{{.State.Status}}' "$name" >/dev/null 2>&1; then
+    proj=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$name" 2>/dev/null)
     if [ "$proj" != "deploy" ]; then
       echo "prune orphan container: $name (project='$proj')"
       docker rm -f "$name" && echo "  removed"
@@ -165,6 +170,50 @@ cd {root} && for svc in $(docker compose -f deploy/docker-compose.yml config --s
   fi
 done
 '''
+
+
+def _orphan_prune_script(root: str) -> str:
+    """渲染孤儿清理脚本并做健全性检查:只做 {root} 文本替换(绝不做
+    str.format),渲染后断言 root 已展开、${svc} shell 插值保留、无模板
+    大括号残留;bash 可用时再 bash -n 语法检查。任一失败即退出,不带病
+    上远端。"""
+    script = _ORPHAN_PRUNE.replace("{root}", root)
+    problems = []
+    if "{root}" in script:
+        problems.append("unexpanded {root} marker remains")
+    if "${svc}" not in script:
+        problems.append("shell interpolation ${svc} lost")
+    # 合法大括号:${...} shell 变量、{{...}} docker inspect Go 模板。
+    # 要抓的是残留的 str.format 占位符单大括号({root}/{svc}/...)。
+    if re.search(r"(?<![\${])\{(?!\{)", script):
+        problems.append("leftover single brace (unexpanded format placeholder)")
+    if problems:
+        sys.exit(f"orphan-prune script render failed: {'; '.join(problems)}")
+    _bash_syntax_check(script)
+    return script
+
+
+def _bash_syntax_check(script: str, bash: str | None = None):
+    """bash 可用时对渲染脚本做 bash -n 语法检查(健全性防线)。
+    先探活:Windows 上 PATH 里的 bash 可能是 WSL relay(System32\\bash.exe),
+    subprocess 起不来——探活失败就跳过,不硬失败;只有真 bash 报了语法
+    错误才退出。"""
+    if bash is None:
+        bash = shutil.which("bash")
+    if not bash:
+        return
+    try:
+        probe = subprocess.run([bash, "--version"], capture_output=True, timeout=15)
+        runnable = probe.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        runnable = False
+    if not runnable:
+        return
+    p = subprocess.run([bash, "-n"], input=script, text=True,
+                       capture_output=True, timeout=15)
+    if p.returncode != 0:
+        sys.exit("orphan-prune script failed bash -n syntax check:\n"
+                 + (p.stderr or p.stdout or "unknown error"))
 
 
 def connect(env: dict) -> paramiko.SSHClient:
@@ -318,7 +367,7 @@ def _compose_up(cmd: str, timeout: int = 900):
 
 def cmd_up():
     _write_remote_turn_conf()
-    sh(f"cd {REMOTE_ROOT} && " + _ORPHAN_PRUNE.format(root=REMOTE_ROOT), timeout=120)
+    sh(f"cd {REMOTE_ROOT} && " + _orphan_prune_script(REMOTE_ROOT), timeout=120)
     _compose_up(f"cd {REMOTE_ROOT} && docker compose -f deploy/docker-compose.yml up -d --build")
     sh(f"cd {REMOTE_ROOT} && docker compose -f deploy/docker-compose.yml ps --format 'table {{{{.Name}}}}\\t{{{{.Status}}}}'")
 
@@ -328,6 +377,16 @@ def cmd_logs(service: str):
 
 
 def cmd_verify():
+    # 渲染残留检查:远端 turnserver.conf 非注释行不应再有未展开的 ${...
+    # (模板变量缺 env/默认值或拼写错误会残留;模板头部注释里的 ${VAR}
+    # 说明不参与插值,故跳过 # 行,避免误报)。
+    code, resid = run(client,
+                      "awk '!/^[[:space:]]*#/ && /\\$\\{/ {print NR \": \" $0}' "
+                      f"{REMOTE_ROOT}/deploy/turnserver.conf")
+    if resid.strip():
+        sys.exit("rendered turnserver.conf still contains unexpanded template "
+                 "markers (${...) — missing .env value or bad ${VAR} syntax?:\n"
+                 + resid.strip())
     sh(f"cd {REMOTE_ROOT} && docker compose -f deploy/docker-compose.yml ps")
     sh("docker exec $(docker ps -qf name=xnc-server) /xnc-server -healthcheck && echo HEALTHCHECK-OK")
     env = load_env()
