@@ -1,5 +1,9 @@
 # Deploy xnc-agent to NODE_MAIN (LABS-TB16G7) and start it in background.
 # Usage: powershell -NoProfile -File deploy/agent_tb16g7.ps1 -Server https://control.xnc.app -Token <enrollment-token>
+# DEPRECATED: historical install script for NODE_MAIN (dev machine itself).
+# Current install path: agent `install` service + updater bundles (see
+# scripts/diag-deploy.sh / README); xnc-screen-helper.exe no longer ships
+# (retired 0.4.6, 4-file bundle since 0.4.7).
 param(
     [Parameter(Mandatory = $true)] [string] $Server,
     [Parameter(Mandatory = $true)] [string] $Token,
@@ -32,9 +36,6 @@ try {
     } -ArgumentList $RemoteDir
 
     Copy-Item -Path $LocalExe -Destination "$RemoteDir\xnc-agent.exe" -ToSession $session -Force
-    # Screen helper lives next to the agent exe (agent/session/screen.go
-    # derives the path from its own executable directory).
-    Copy-Item -Path "$PSScriptRoot\..\bin\xnc-screen-helper.exe" -Destination "$RemoteDir\xnc-screen-helper.exe" -ToSession $session -Force
 
     Invoke-Command -Session $session -ScriptBlock {
         param($dir, $server, $token)
