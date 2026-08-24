@@ -1,10 +1,10 @@
-"""SRV 连接测试：密码认证 + 部署前置能力探测。凭据从 deploy/machines.env 读取，不回显。"""
+"""SRV 连接测试：密码认证 + 部署前置能力探测。凭据从 deploy/.env 读取，不回显。"""
 import sys
 
 import paramiko
 
 ENV = {}
-for line in open("deploy/machines.env", encoding="utf-8-sig"):
+for line in open("deploy/.env", encoding="utf-8-sig"):
     line = line.strip()
     if not line or line.startswith("#") or "=" not in line:
         continue
@@ -16,7 +16,7 @@ port = int(ENV.get("SRV_SSH_PORT") or 22)
 user = ENV["SRV_SSH_USER"]
 password = ENV.get("SRV_SSH_PASSWORD", "")
 if not host or not user or not password:
-    sys.exit("machines.env: SRV host/user/password 不完整")
+    sys.exit("deploy/.env: SRV host/user/password 不完整")
 
 client = paramiko.SSHClient()
 client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
