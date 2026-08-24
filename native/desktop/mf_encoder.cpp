@@ -1,15 +1,27 @@
-// mf_encoder.cpp - CMSH264EncoderMFT pipeline (see mf_encoder.h). Clean-room
-// C++ rewrite of the reference flow (agent/screen-helper/encode_windows.go -
-// same SDK calls and parameter alignment, adapted not copied):
-//   CoInitializeEx(MTA) -> CoCreateInstance(CMSH264EncoderMFT) ->
-//   SetOutputType(H264: frame size, frame rate = caller fps, bitrate) ->
-//   SetInputType(NV12: tight stride = width) ->
-//   ICodecAPI best-effort shaping (GOP / B-frames=0 / low-delay RC /
-//   low-latency) -> GetOutputStreamInfo -> Begin/StartOfStream ->
-//   per frame: BGRA->NV12 -> IMFSample (wall-clock 100ns PTS) ->
-//   one-shot force-key at submission -> ProcessInput -> ProcessOutput loop
-//   (NEED_MORE_INPUT ends the loop, STREAM_CHANGE retries) -> one AU per
-//   output sample, IDR detection + first-IDR SPS/PPS cache.
+// mf_encoder.cpp - Media Foundation H.264 encoder pipeline (see mf_encoder.h).
+// Clean-room C++ rewrite of the reference flow (agent/screen-helper/
+// encode_windows.go - same SDK calls and parameter alignment, adapted not
+// copied), extended with the hardware-first ladder (hw-encode task):
+//   CoInitializeEx(MTA) ->
+//   hardware ladder: MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
+//     MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER, NV12-in, H264-out)
+//     -> per candidate: ActivateObject -> SetOutputType(H264: frame size,
+//     frame rate = caller fps, bitrate) -> SetInputType(NV12: tight stride
+//     = width; enumerated-type fallback + negotiated-stride padding for
+//     hardware MFTs) -> ICodecAPI best-effort shaping (GOP / B-frames=0 /
+//     low-delay RC / low-latency) -> GetOutputStreamInfo -> Begin/StartOfStream
+//     -> SELF-CHECK: 1..8 synthetic frames through the real submit path,
+//     first candidate whose output is non-empty wins; a pristine second
+//     instance of the winner is re-activated for the real stream (the
+//     self-check frames never leak into the caller's AU sequence)
+//   -> all candidates rejected / none present / SetForceSoftware ->
+//     CoCreateInstance(CMSH264EncoderMFT) software fallback (the old path).
+//   Per frame: BGRA->NV12 (stride-expanded when the MFT negotiated a wider
+//   stride) -> IMFSample (wall-clock 100ns PTS) -> one-shot force-key at
+//   submission -> ProcessInput -> ProcessOutput loop (NEED_MORE_INPUT ends
+//   the loop, STREAM_CHANGE retries) -> one AU per output sample, IDR
+//   detection + first-IDR SPS/PPS cache. Backend/FriendlyName/self-check
+//   outcome are logged (encoder_backend=hardware|software).
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -41,6 +53,14 @@ using Microsoft::WRL::ComPtr;
 // DEcoder, do not "fix" this GUID).
 const CLSID kClsidCMSH264EncoderMFT = {0x6ca50344, 0x051a, 0x4ded,
                                        {0x97, 0x79, 0xa4, 0x33, 0x05, 0x16, 0x5e, 0x35}};
+// Software rung's display name for logs (the CLSID has no friendly name).
+const wchar_t kSoftwareFriendlyName[] = L"CMSH264EncoderMFT (Microsoft H.264 Software Encoder)";
+
+// Hardware ladder self-check bound: feed at most this many synthetic frames
+// before declaring a candidate dead. Hardware encoders in low-latency mode
+// emit within the first 1-2 submissions; the bound guards drivers with a
+// deeper pipeline without stalling Init.
+constexpr uint32_t kSelfCheckMaxFrames = 8;
 
 std::string HrStep(const char* step, HRESULT hr) {
   char buf[160];
@@ -62,17 +82,156 @@ bool CodecApiSetUi4(ICodecAPI* api, const GUID* prop, uint32_t value, const char
   return true;
 }
 
+// The caller's H.264 output type (frame size, caller fps, bitrate).
+HRESULT MakeH264OutputType(uint32_t w, uint32_t h, uint32_t fps, uint32_t bitrate,
+                           IMFMediaType** out) {
+  const uint64_t frame_size = (static_cast<uint64_t>(w) << 32) | h;
+  const uint64_t frame_rate = (static_cast<uint64_t>(fps) << 32) | 1;
+  ComPtr<IMFMediaType> mt;
+  HRESULT hr = MFCreateMediaType(mt.GetAddressOf());
+  if (SUCCEEDED(hr)) hr = mt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+  if (SUCCEEDED(hr)) hr = mt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+  if (SUCCEEDED(hr)) hr = mt->SetUINT64(MF_MT_FRAME_SIZE, frame_size);
+  if (SUCCEEDED(hr)) hr = mt->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+  if (SUCCEEDED(hr)) hr = mt->SetUINT64(MF_MT_FRAME_RATE, frame_rate);
+  if (SUCCEEDED(hr)) hr = mt->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
+  if (SUCCEEDED(hr)) *out = mt.Detach();
+  return hr;
+}
+
+// The caller's NV12 input type (tight stride = width; the software MFT and
+// most hardware MFTs honor it, hardware MFTs that cannot are re-negotiated
+// through their enumerated types in InitWithMft).
+HRESULT MakeNv12InputType(uint32_t w, uint32_t h, uint32_t fps, IMFMediaType** out) {
+  const uint64_t frame_size = (static_cast<uint64_t>(w) << 32) | h;
+  const uint64_t frame_rate = (static_cast<uint64_t>(fps) << 32) | 1;
+  ComPtr<IMFMediaType> mt;
+  HRESULT hr = MFCreateMediaType(mt.GetAddressOf());
+  if (SUCCEEDED(hr)) hr = mt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+  if (SUCCEEDED(hr)) hr = mt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+  if (SUCCEEDED(hr)) hr = mt->SetUINT32(MF_MT_DEFAULT_STRIDE, w);
+  if (SUCCEEDED(hr)) hr = mt->SetUINT64(MF_MT_FRAME_SIZE, frame_size);
+  if (SUCCEEDED(hr)) hr = mt->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+  if (SUCCEEDED(hr)) hr = mt->SetUINT64(MF_MT_FRAME_RATE, frame_rate);
+  if (SUCCEEDED(hr)) *out = mt.Detach();
+  return hr;
+}
+
+// NV12 input-type negotiation ladder (hw-encode task 2 Part A). Hardware
+// MFTs differ in what they accept for CPU (system-memory) NV12; the probe
+// evidence on Arc 140T/130T: the tight type is rejected (0xC00D6D77) and
+// GetInputAvailableType yields nothing, so the ladder tries, in the mission
+// order, (1) no MF_MT_DEFAULT_STRIDE (MFT picks), (2) a 32-aligned stride,
+// (3) tight stride + MF_MT_SAMPLE_SIZE + MF_MT_AVG_BITRATE, then the MFT's
+// own enumerated NV12 types (verbatim, then with our frame size). Every
+// attempt logs encoder_input_attempt so the ladder stays diagnosable.
+enum class Nv12Variant : uint8_t {
+  kNoStride = 0,
+  kStride32Aligned,
+  kStrideWPlusSampleSize,
+  kTight,  // tight stride = width (the original caller type; kept last)
+};
+
+const char* Nv12VariantName(Nv12Variant v) {
+  switch (v) {
+    case Nv12Variant::kNoStride: return "no_stride";
+    case Nv12Variant::kStride32Aligned: return "stride_32aligned";
+    case Nv12Variant::kStrideWPlusSampleSize: return "stride_w+sample_size+bitrate";
+    case Nv12Variant::kTight: return "tight_stride_w";
+    default: return "?";
+  }
+}
+
+HRESULT MakeNv12InputTypeVariant(uint32_t w, uint32_t h, uint32_t fps,
+                                 uint32_t bitrate, Nv12Variant v,
+                                 IMFMediaType** out) {
+  const uint64_t frame_size = (static_cast<uint64_t>(w) << 32) | h;
+  const uint64_t frame_rate = (static_cast<uint64_t>(fps) << 32) | 1;
+  ComPtr<IMFMediaType> mt;
+  HRESULT hr = MFCreateMediaType(mt.GetAddressOf());
+  if (SUCCEEDED(hr)) hr = mt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+  if (SUCCEEDED(hr)) hr = mt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+  if (SUCCEEDED(hr)) hr = mt->SetUINT64(MF_MT_FRAME_SIZE, frame_size);
+  if (SUCCEEDED(hr)) hr = mt->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+  if (SUCCEEDED(hr)) hr = mt->SetUINT64(MF_MT_FRAME_RATE, frame_rate);
+  switch (v) {
+    case Nv12Variant::kNoStride:
+      break;  // omit MF_MT_DEFAULT_STRIDE entirely: MFT picks
+    case Nv12Variant::kStride32Aligned:
+      if (SUCCEEDED(hr)) hr = mt->SetUINT32(MF_MT_DEFAULT_STRIDE, (w + 31u) & ~31u);
+      break;
+    case Nv12Variant::kStrideWPlusSampleSize:
+      if (SUCCEEDED(hr)) hr = mt->SetUINT32(MF_MT_DEFAULT_STRIDE, w);
+      if (SUCCEEDED(hr)) hr = mt->SetUINT32(MF_MT_SAMPLE_SIZE, w * h * 3u / 2u);
+      if (SUCCEEDED(hr)) hr = mt->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
+      break;
+    case Nv12Variant::kTight:
+      if (SUCCEEDED(hr)) hr = mt->SetUINT32(MF_MT_DEFAULT_STRIDE, w);
+      break;
+    default:
+      return E_INVALIDARG;
+  }
+  if (SUCCEEDED(hr)) *out = mt.Detach();
+  return hr;
+}
+
+// Expands a tight-stride NV12 frame (w-byte rows) into a padded one
+// (stride-byte rows, zero padding) - needed when a hardware MFT negotiated
+// an aligned stride wider than the frame width.
+void ExpandToStride(const uint8_t* tight, uint8_t* padded, uint32_t w, uint32_t h,
+                    uint32_t stride) {
+  const size_t row = w;
+  for (uint32_t y = 0; y < h; ++y) {
+    uint8_t* dst = padded + static_cast<size_t>(y) * stride;
+    std::memcpy(dst, tight + static_cast<size_t>(y) * row, row);
+    std::memset(dst + row, 0, stride - w);
+  }
+  const size_t uv_off = static_cast<size_t>(stride) * h;
+  const size_t uv_src = static_cast<size_t>(w) * h;
+  for (uint32_t y = 0; y < h / 2; ++y) {
+    uint8_t* dst = padded + uv_off + static_cast<size_t>(y) * stride;
+    std::memcpy(dst, tight + uv_src + static_cast<size_t>(y) * row, row);
+    std::memset(dst + row, 0, stride - w);
+  }
+}
+
+// Fetches an IMFActivate's MFT_FRIENDLY_NAME_Attribute ("" on failure).
+std::wstring ActivateFriendlyName(IMFActivate* act) {
+  wchar_t* name = nullptr;
+  UINT32 nlen = 0;
+  std::wstring out;
+  if (SUCCEEDED(act->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &name, &nlen)) &&
+      name != nullptr) {
+    out.assign(name, nlen);
+  }
+  CoTaskMemFree(name);
+  return out;
+}
+
+std::string WideToNarrow(const std::wstring& w) {
+  std::string out;
+  for (wchar_t c : w) {
+    if (c < 0x80) out.push_back(static_cast<char>(c));
+    else out.push_back('?');
+  }
+  return out;
+}
+
 }  // namespace
 
 struct MfSoftEncoder::Impl {
   ComPtr<IMFTransform> mft;
   ComPtr<ICodecAPI> codec_api;
+  ComPtr<IMFActivate> activate;  // hardware ladder: factory of the live MFT
   bool mft_provides_samples = false;  // MFT_OUTPUT_STREAM_PROVIDES_SAMPLES
   size_t out_buf_size = 0;            // client-allocated output buffer size
   LARGE_INTEGER qpc0{};               // wall-clock PTS base
   LARGE_INTEGER qpc_freq{};
   int64_t rt_last = 0;                // last sample time, 100ns units
   bool co_init_owner = false;
+  uint32_t in_stride = 0;             // negotiated input stride (0 = tight)
+  std::vector<uint8_t> in_padded_;    // stride-expanded input (in_stride>w)
+  std::string friendly_narrow;        // FriendlyName for logs (narrow)
 
   // Wall-clock 100ns ticks since Init (monotonic, QPC-based).
   int64_t Now100ns() const {
@@ -87,13 +246,30 @@ MfSoftEncoder::MfSoftEncoder() = default;
 
 MfSoftEncoder::~MfSoftEncoder() { Shutdown(); }
 
+void MfSoftEncoder::ReleaseMft() {
+  if (!impl_) return;
+  if (impl_->activate.Get() != nullptr) {
+    impl_->activate->ShutdownObject();  // release the hardware session first
+    impl_->activate.Reset();
+  }
+  if (impl_->mft.Get() != nullptr) {
+    impl_->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+  }
+  impl_->codec_api.Reset();
+  impl_->mft.Reset();
+  impl_->mft_provides_samples = false;
+  impl_->out_buf_size = 0;
+  impl_->rt_last = 0;
+  impl_->in_stride = 0;
+  impl_->in_padded_.clear();
+  sps_pps_.clear();
+  last_was_key_ = false;
+  force_pending_ = false;
+}
+
 void MfSoftEncoder::Shutdown() {
   if (impl_) {
-    if (impl_->mft.Get() != nullptr) {
-      impl_->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
-    }
-    impl_->codec_api.Reset();
-    impl_->mft.Reset();
+    ReleaseMft();
     if (impl_->co_init_owner) {
       CoUninitialize();
       impl_->co_init_owner = false;
@@ -102,10 +278,208 @@ void MfSoftEncoder::Shutdown() {
     impl_ = nullptr;
   }
   w_ = h_ = fps_ = bitrate_ = 0;
-  last_was_key_ = false;
-  force_pending_ = false;
   nv12_.clear();
-  sps_pps_.clear();
+  backend_ = EncoderBackend::kSoftware;
+  friendly_name_.clear();
+}
+
+// Full negotiation + streaming start on a given MFT instance. Owns no
+// pointers; impl_ must exist. For hardware MFTs the caller's media types are
+// tried first and the MFT's own enumerated types (dims/rate/bitrate
+// overridden) act as fallback, and the negotiated input stride is read back
+// (padding buffer allocated when wider than w) - the "以枚举返回的输入类型
+// 为准" adaptation for MFTs that demand aligned strides/formats.
+bool MfSoftEncoder::InitWithMft(IMFTransform* mft, const std::wstring& friendly,
+                                bool hardware, std::string* err) {
+  if (mft == nullptr) {
+    if (err) *err = "InitWithMft: null mft";
+    return false;
+  }
+  const uint64_t frame_size = (static_cast<uint64_t>(w_) << 32) | h_;
+  const uint64_t frame_rate = (static_cast<uint64_t>(fps_) << 32) | 1;
+
+  // Output type: caller's H.264 type, then enumerated fallback for hardware.
+  ComPtr<IMFMediaType> out_mt;
+  HRESULT hr = MakeH264OutputType(w_, h_, fps_, bitrate_, out_mt.GetAddressOf());
+  if (SUCCEEDED(hr)) hr = mft->SetOutputType(0, out_mt.Get(), 0);
+  if (FAILED(hr) && hardware) {
+    for (DWORD i = 0;; ++i) {
+      ComPtr<IMFMediaType> t;
+      hr = mft->GetOutputAvailableType(0, i, t.GetAddressOf());
+      if (FAILED(hr)) break;
+      GUID sub{};
+      if (FAILED(t->GetGUID(MF_MT_SUBTYPE, &sub)) || sub != MFVideoFormat_H264) continue;
+      hr = t->SetUINT64(MF_MT_FRAME_SIZE, frame_size);
+      if (SUCCEEDED(hr)) hr = t->SetUINT64(MF_MT_FRAME_RATE, frame_rate);
+      if (SUCCEEDED(hr)) hr = t->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+      if (SUCCEEDED(hr)) hr = t->SetUINT32(MF_MT_AVG_BITRATE, bitrate_);
+      if (SUCCEEDED(hr)) hr = mft->SetOutputType(0, t.Get(), 0);
+      if (SUCCEEDED(hr)) {
+        out_mt = t;
+        break;
+      }
+    }
+  }
+  if (FAILED(hr)) {
+    if (err) *err = HrStep(hardware ? "SetOutputType(hw)" : "SetOutputType", hr);
+    return false;
+  }
+
+  // Input type. Software MFT: the caller's tight NV12 (works, and the
+  // historical path). Hardware MFTs: the attribute ladder first (hw-encode
+  // task 2 Part A - QSV rejects the tight type with MF_E_INVALID_MEDIA_TYPE
+  // 0xC00D6D77 on Arc; each attempt is logged), then the MFT's own
+  // enumerated NV12 types.
+  ComPtr<IMFMediaType> in_mt;
+  if (hardware) {
+    const Nv12Variant variants[] = {Nv12Variant::kNoStride,
+                                    Nv12Variant::kStride32Aligned,
+                                    Nv12Variant::kStrideWPlusSampleSize,
+                                    Nv12Variant::kTight};
+    for (Nv12Variant v : variants) {
+      ComPtr<IMFMediaType> t;
+      hr = MakeNv12InputTypeVariant(w_, h_, fps_, bitrate_, v, t.GetAddressOf());
+      if (SUCCEEDED(hr)) hr = mft->SetInputType(0, t.Get(), 0);
+      XNC_LOG_INFO("encoder_input_attempt backend=hardware attempt=%s hr=0x%08x",
+                   Nv12VariantName(v), static_cast<unsigned int>(hr));
+      if (SUCCEEDED(hr)) {
+        in_mt = t;
+        break;
+      }
+    }
+  } else {
+    hr = MakeNv12InputType(w_, h_, fps_, in_mt.GetAddressOf());
+    if (SUCCEEDED(hr)) hr = mft->SetInputType(0, in_mt.Get(), 0);
+    if (FAILED(hr)) {
+      if (err) *err = HrStep("SetInputType", hr);
+      return false;
+    }
+  }
+  if (FAILED(hr) && hardware) {
+    for (DWORD i = 0;; ++i) {
+      ComPtr<IMFMediaType> t;
+      hr = mft->GetInputAvailableType(0, i, t.GetAddressOf());
+      if (FAILED(hr)) break;
+      GUID sub{};
+      if (FAILED(t->GetGUID(MF_MT_SUBTYPE, &sub)) || sub != MFVideoFormat_NV12) continue;
+      // Verbatim first (the MFT's own attribute set - stride, color info,
+      // interlace etc. as offered), then with our frame size/rate stamped
+      // on top for capture sizes that differ from the MFT's default.
+      HRESULT hr_v = mft->SetInputType(0, t.Get(), 0);
+      XNC_LOG_INFO("encoder_input_attempt backend=hardware attempt=enumerated_verbatim idx=%lu hr=0x%08x",
+                   static_cast<unsigned long>(i), static_cast<unsigned int>(hr_v));
+      if (SUCCEEDED(hr_v)) {
+        in_mt = t;
+        hr = S_OK;
+        break;
+      }
+      hr = t->SetUINT64(MF_MT_FRAME_SIZE, frame_size);
+      if (SUCCEEDED(hr)) hr = t->SetUINT64(MF_MT_FRAME_RATE, frame_rate);
+      if (SUCCEEDED(hr)) hr = mft->SetInputType(0, t.Get(), 0);
+      XNC_LOG_INFO("encoder_input_attempt backend=hardware attempt=enumerated_framesize_ours idx=%lu hr=0x%08x",
+                   static_cast<unsigned long>(i), static_cast<unsigned int>(hr));
+      if (SUCCEEDED(hr)) {
+        in_mt = t;
+        break;
+      }
+    }
+  }
+  if (FAILED(hr)) {
+    if (err) *err = HrStep(hardware ? "SetInputType(hw)" : "SetInputType", hr);
+    return false;
+  }
+
+  // Negotiated input stride: honor a wider aligned stride (pad input rows);
+  // 0/absent/odd/<w means tight is in effect. Log the readback so the
+  // MFT's chosen stride is diagnosable after every successful negotiation.
+  impl_->in_stride = 0;
+  {
+    ComPtr<IMFMediaType> cur;
+    UINT32 s = 0;
+    if (SUCCEEDED(mft->GetInputCurrentType(0, cur.GetAddressOf()))) {
+      if (SUCCEEDED(cur->GetUINT32(MF_MT_DEFAULT_STRIDE, &s))) impl_->in_stride = s;
+    }
+    XNC_LOG_INFO("encoder_input_negotiated_stride backend=%s stride=%u w=%u",
+                 hardware ? "hardware" : "software", s, w_);
+    if (impl_->in_stride < w_ || (impl_->in_stride % 2) != 0) impl_->in_stride = 0;
+  }
+  if (impl_->in_stride != 0 && impl_->in_stride != w_) {
+    const size_t n = static_cast<size_t>(impl_->in_stride) * h_ * 3u / 2u;
+    impl_->in_padded_.assign(n, 0);
+    XNC_LOG_INFO("encoder_input_stride_padded stride=%u w=%u", impl_->in_stride, w_);
+  }
+
+  // Best-effort shaping via ICodecAPI. GOP long (IDRs are forced on demand,
+  // spec §7.5 recovery cadence lives above this class); B-frames 0 and
+  // low-delay/low-latency per spec §7.10 V1 全档. Hardware MFTs may reject
+  // any of these (or omit ICodecAPI) - best-effort log-and-continue.
+  impl_->codec_api.Reset();
+  hr = mft->QueryInterface(IID_PPV_ARGS(impl_->codec_api.GetAddressOf()));
+  if (SUCCEEDED(hr)) {
+    CodecApiSetUi4(impl_->codec_api.Get(), &CODECAPI_AVEncMPVGOPSize, fps_ * 10, "gop_size");
+    CodecApiSetUi4(impl_->codec_api.Get(), &CODECAPI_AVEncMPVDefaultBPictureCount, 0,
+                   "b_picture_count");
+    CodecApiSetUi4(impl_->codec_api.Get(), &CODECAPI_AVEncCommonRateControlMode,
+                   eAVEncCommonRateControlMode_LowDelayVBR, "rate_control_low_delay");
+    VARIANT v{};  // AVLowLatencyMode is VT_BOOL
+    v.vt = VT_BOOL;
+    v.boolVal = VARIANT_TRUE;
+    if (FAILED(impl_->codec_api->SetValue(&CODECAPI_AVLowLatencyMode, &v)))
+      XNC_LOG_INFO("codec_api_set_skip name=low_latency hr=rejected");
+  } else {
+    XNC_LOG_INFO("codec_api_unavailable hr=0x%08x", static_cast<unsigned int>(hr));
+  }
+
+  // Output allocation contract. CMSH264EncoderMFT does NOT set
+  // MFT_OUTPUT_STREAM_PROVIDES_SAMPLES - passing a null sample to
+  // ProcessOutput yields E_INVALIDARG - so the client-provided path below
+  // is the one that runs, but both are implemented (hardware MFTs vary).
+  MFT_OUTPUT_STREAM_INFO osi{};
+  hr = mft->GetOutputStreamInfo(0, &osi);
+  if (SUCCEEDED(hr)) {
+    impl_->mft_provides_samples = (osi.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) != 0;
+    if (osi.cbSize > impl_->out_buf_size) impl_->out_buf_size = osi.cbSize;
+  }
+  if (impl_->out_buf_size == 0) impl_->out_buf_size = static_cast<size_t>(w_) * h_ * 4 + 65536;
+
+  impl_->mft = mft;
+  impl_->friendly_narrow = WideToNarrow(friendly);
+  hr = impl_->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+  if (SUCCEEDED(hr)) hr = impl_->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+  if (FAILED(hr)) {
+    if (err) *err = HrStep("ProcessMessage(start streaming)", hr);
+    return false;
+  }
+  return true;
+}
+
+// Hardware ladder self-check: synthetic gradient frames (moving stripe so
+// consecutive frames differ and P frames flow) through the real submit path.
+// Success = at least one output AU before the feed bound.
+bool MfSoftEncoder::SelfCheckEncode(std::string* err) {
+  const size_t need = static_cast<size_t>(w_) * h_ * 4;
+  std::vector<uint8_t> bgra(need);
+  std::string e2;
+  for (uint32_t i = 0; i < kSelfCheckMaxFrames; ++i) {
+    for (uint32_t y = 0; y < h_; ++y) {
+      for (uint32_t x = 0; x < w_; ++x) {
+        uint8_t* px = bgra.data() + (static_cast<size_t>(y) * w_ + x) * 4;
+        px[0] = static_cast<uint8_t>(x & 0xFF);        // B gradient
+        px[1] = static_cast<uint8_t>(y & 0xFF);        // G gradient
+        px[2] = static_cast<uint8_t>((x * 3 + i * 41) & 0xFF);  // moving R
+        px[3] = 0xFF;
+      }
+    }
+    std::vector<std::vector<uint8_t>> aus;
+    if (!Encode(bgra.data(), bgra.size(), aus, &e2)) {
+      if (err) *err = e2;
+      return false;
+    }
+    if (!aus.empty()) return true;  // MFT produced output: candidate is alive
+  }
+  if (err) *err = "self-check: no output AU in " + std::to_string(kSelfCheckMaxFrames) +
+                  " feeds (encoder buffering or broken session)";
+  return false;
 }
 
 bool MfSoftEncoder::Init(uint32_t w, uint32_t h, uint32_t fps, uint32_t bitrate_bps,
@@ -139,143 +513,135 @@ bool MfSoftEncoder::Init(uint32_t w, uint32_t h, uint32_t fps, uint32_t bitrate_
     impl_->co_init_owner = true;  // S_OK or S_FALSE: both refcount a release
   }
 
-  hr = CoCreateInstance(kClsidCMSH264EncoderMFT, nullptr, CLSCTX_INPROC_SERVER,
-                        IID_PPV_ARGS(impl_->mft.GetAddressOf()));
-  if (FAILED(hr)) {
-    const std::string msg = HrStep("CoCreateInstance(CMSH264EncoderMFT)", hr);
-    Shutdown();
-    return fail(msg);
-  }
-
   w_ = w;
   h_ = h;
   fps_ = fps;
   bitrate_ = bitrate_bps;
-  const uint64_t frame_size = (static_cast<uint64_t>(w) << 32) | h;
-  const uint64_t frame_rate = (static_cast<uint64_t>(fps) << 32) | 1;  // = caller fps
 
-  // Output type: H.264 with caller dimensions/rate/bitrate.
-  ComPtr<IMFMediaType> out_mt;
-  hr = MFCreateMediaType(out_mt.GetAddressOf());
-  if (SUCCEEDED(hr)) hr = out_mt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-  if (SUCCEEDED(hr)) hr = out_mt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
-  if (SUCCEEDED(hr)) hr = out_mt->SetUINT64(MF_MT_FRAME_SIZE, frame_size);
-  if (SUCCEEDED(hr)) hr = out_mt->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-  if (SUCCEEDED(hr)) hr = out_mt->SetUINT64(MF_MT_FRAME_RATE, frame_rate);
-  if (SUCCEEDED(hr)) hr = out_mt->SetUINT32(MF_MT_AVG_BITRATE, bitrate_);
-  if (FAILED(hr)) {
-    const std::string msg = HrStep("output media type", hr);
-    Shutdown();
-    return fail(msg);
-  }
-  hr = impl_->mft->SetOutputType(0, out_mt.Get(), 0);
-  if (FAILED(hr)) {
-    const std::string msg = HrStep("SetOutputType", hr);
-    Shutdown();
-    return fail(msg);
-  }
-
-  // Input type: NV12 with tight stride (the MFT may otherwise assume an
-  // alignment-padded stride and our converted buffer is compact).
-  ComPtr<IMFMediaType> in_mt;
-  hr = MFCreateMediaType(in_mt.GetAddressOf());
-  if (SUCCEEDED(hr)) hr = in_mt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-  if (SUCCEEDED(hr)) hr = in_mt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-  if (SUCCEEDED(hr)) hr = in_mt->SetUINT32(MF_MT_DEFAULT_STRIDE, w);
-  if (SUCCEEDED(hr)) hr = in_mt->SetUINT64(MF_MT_FRAME_SIZE, frame_size);
-  if (SUCCEEDED(hr)) hr = in_mt->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-  if (SUCCEEDED(hr)) hr = in_mt->SetUINT64(MF_MT_FRAME_RATE, frame_rate);
-  if (FAILED(hr)) {
-    const std::string msg = HrStep("input media type", hr);
-    Shutdown();
-    return fail(msg);
-  }
-  hr = impl_->mft->SetInputType(0, in_mt.Get(), 0);
-  if (FAILED(hr)) {
-    const std::string msg = HrStep("SetInputType", hr);
-    Shutdown();
-    return fail(msg);
-  }
-
-  // Best-effort shaping via ICodecAPI. GOP long (IDRs are forced on demand,
-  // spec §7.5 recovery cadence lives above this class); B-frames 0 and
-  // low-delay/low-latency per spec §7.10 V1 全档.
-  hr = impl_->mft.As(&impl_->codec_api);
-  if (SUCCEEDED(hr)) {
-    CodecApiSetUi4(impl_->codec_api.Get(), &CODECAPI_AVEncMPVGOPSize, fps * 10, "gop_size");
-    CodecApiSetUi4(impl_->codec_api.Get(), &CODECAPI_AVEncMPVDefaultBPictureCount, 0,
-                   "b_picture_count");
-    CodecApiSetUi4(impl_->codec_api.Get(), &CODECAPI_AVEncCommonRateControlMode,
-                   eAVEncCommonRateControlMode_LowDelayVBR, "rate_control_low_delay");
-    VARIANT v{};  // AVLowLatencyMode is VT_BOOL
-    v.vt = VT_BOOL;
-    v.boolVal = VARIANT_TRUE;
-    if (FAILED(impl_->codec_api->SetValue(&CODECAPI_AVLowLatencyMode, &v)))
-      XNC_LOG_INFO("codec_api_set_skip name=low_latency hr=rejected");
-  } else {
-    XNC_LOG_INFO("codec_api_unavailable hr=0x%08x", static_cast<unsigned int>(hr));
+  // ---- Hardware-first ladder (hw-encode): MFT_ENUM_FLAG_HARDWARE H.264
+  // encoders in merit order; first one that negotiates AND self-checks wins.
+  if (!force_software_) {
+    MFT_REGISTER_TYPE_INFO in_ri{MFMediaType_Video, MFVideoFormat_NV12};
+    MFT_REGISTER_TYPE_INFO out_ri{MFMediaType_Video, MFVideoFormat_H264};
+    IMFActivate** acts = nullptr;
+    UINT32 nacts = 0;
+    hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
+                   MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                   &in_ri, &out_ri, &acts, &nacts);
+    if (FAILED(hr)) {
+      XNC_LOG_INFO("encoder_hw_enum_failed hr=0x%08x (falling back to software)",
+                   static_cast<unsigned int>(hr));
+    } else if (nacts == 0) {
+      XNC_LOG_INFO("encoder_hw_none_found (falling back to software)");
+    } else {
+      for (UINT32 i = 0; i < nacts; ++i) {
+        const std::wstring friendly = ActivateFriendlyName(acts[i]);
+        std::string ierr, perr, serr;
+        bool ok = false;
+        // Probe instance: full negotiation + self-check encode.
+        ComPtr<IMFTransform> probe;
+        hr = acts[i]->ActivateObject(IID_PPV_ARGS(probe.GetAddressOf()));
+        if (SUCCEEDED(hr)) ok = InitWithMft(probe.Get(), friendly, true, &perr);
+        if (ok) ok = SelfCheckEncode(&serr);
+        if (ok) {
+          // The self-check consumed probe frames; re-activate a PRISTINE
+          // instance for the real stream so no synthetic AU ever reaches the
+          // caller (selftest scenario (c) asserts exact AU-index mapping).
+          ReleaseMft();
+          ComPtr<IMFTransform> live;
+          hr = acts[i]->ActivateObject(IID_PPV_ARGS(live.GetAddressOf()));
+          if (SUCCEEDED(hr)) {
+            ok = InitWithMft(live.Get(), friendly, true, &ierr);
+            if (ok) impl_->activate.Attach(acts[i]);  // take the enum ref for
+                                                      // session teardown at Shutdown
+          } else {
+            ok = false;
+            ierr = HrStep("ActivateObject(second instance)", hr);
+          }
+        }
+        if (ok) {
+          XNC_LOG_INFO("encoder_backend=hardware friendly=\"%s\" selfcheck=ok",
+                       impl_->friendly_narrow.c_str());
+          break;  // ladder winner
+        }
+        XNC_LOG_INFO("encoder_backend=hardware candidate_rejected friendly=\"%ls\" "
+                     "init_err=\"%s\" selfcheck_err=\"%s\"",
+                     friendly.c_str(), perr.c_str(), serr.empty() ? ierr.c_str() : serr.c_str());
+        ReleaseMft();
+        acts[i]->ShutdownObject();
+        acts[i]->Release();  // rejected candidate: drop the enum's ref
+      }
+    }
+    if (acts != nullptr) CoTaskMemFree(acts);
+    if (impl_->mft.Get() != nullptr) backend_ = EncoderBackend::kHardware;
   }
 
-  // Output allocation contract. CMSH264EncoderMFT does NOT set
-  // MFT_OUTPUT_STREAM_PROVIDES_SAMPLES - passing a null sample to
-  // ProcessOutput yields E_INVALIDARG - so the client-provided path below
-  // is the one that runs, but both are implemented.
-  MFT_OUTPUT_STREAM_INFO osi{};
-  hr = impl_->mft->GetOutputStreamInfo(0, &osi);
-  if (SUCCEEDED(hr)) {
-    impl_->mft_provides_samples = (osi.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) != 0;
-    if (osi.cbSize > impl_->out_buf_size) impl_->out_buf_size = osi.cbSize;
+  // ---- Software fallback (the pre-hw-encode path; --encoder software or
+  // every hardware candidate failed) ----
+  if (impl_->mft.Get() == nullptr) {
+    ReleaseMft();
+    hr = CoCreateInstance(kClsidCMSH264EncoderMFT, nullptr, CLSCTX_INPROC_SERVER,
+                          IID_PPV_ARGS(impl_->mft.GetAddressOf()));
+    if (FAILED(hr)) {
+      const std::string msg = HrStep("CoCreateInstance(CMSH264EncoderMFT)", hr);
+      Shutdown();
+      return fail(msg);
+    }
+    std::string ierr;
+    if (!InitWithMft(impl_->mft.Get(), kSoftwareFriendlyName, false, &ierr)) {
+      const std::string msg = "software encoder init: " + ierr;
+      Shutdown();
+      return fail(msg);
+    }
+    backend_ = EncoderBackend::kSoftware;
+    XNC_LOG_INFO("encoder_backend=software friendly=\"%s\" selfcheck=skipped",
+                 impl_->friendly_narrow.c_str());
   }
-  if (impl_->out_buf_size == 0) impl_->out_buf_size = static_cast<size_t>(w) * h * 4 + 65536;
 
-  hr = impl_->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-  if (SUCCEEDED(hr)) hr = impl_->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
-  if (FAILED(hr)) {
-    const std::string msg = HrStep("ProcessMessage(start streaming)", hr);
-    Shutdown();
-    return fail(msg);
-  }
-
-  nv12_.resize(Nv12Bytes(w, h));
+  friendly_name_ = impl_->friendly_narrow;
+  nv12_.resize(Nv12Bytes(w_, h_));
   QueryPerformanceFrequency(&impl_->qpc_freq);
   QueryPerformanceCounter(&impl_->qpc0);
   impl_->rt_last = 0;
-  XNC_LOG_INFO("encoder_init w=%u h=%u fps=%u bitrate=%u provides_samples=%d out_buf=%zu",
-               w, h, fps, bitrate_, impl_->mft_provides_samples ? 1 : 0,
-               impl_->out_buf_size);
+  XNC_LOG_INFO("encoder_init w=%u h=%u fps=%u bitrate=%u provides_samples=%d out_buf=%zu "
+               "backend=%s friendly=\"%s\"",
+               w_, h_, fps_, bitrate_, impl_->mft_provides_samples ? 1 : 0,
+               impl_->out_buf_size, BackendName(), friendly_name_.c_str());
   return true;
 }
 
-bool MfSoftEncoder::Encode(const uint8_t* bgra, size_t len,
-                           std::vector<std::vector<uint8_t>>& aus, std::string* err) {
-  aus.clear();
-  if (!impl_ || impl_->mft.Get() == nullptr) {
-    if (err) *err = "encoder not initialized";
-    return false;
-  }
-  const size_t need = static_cast<size_t>(w_) * h_ * 4;
-  if (!bgra || len < need) {
-    if (err)
-      *err = "short frame: " + std::to_string(len) + " < " + std::to_string(need);
-    return false;
-  }
-  if (!BgraToNv12(bgra, len, nv12_.data(), nv12_.size(), w_, h_)) {
-    if (err) *err = "nv12 convert rejected arguments";
-    return false;
+bool MfSoftEncoder::SubmitNv12(const uint8_t* nv12, size_t len,
+                               std::vector<std::vector<uint8_t>>& aus, std::string* err) {
+  const uint8_t* src = nv12;
+  size_t src_len = len;
+  if (impl_->in_stride != 0 && impl_->in_stride != w_) {
+    // Hardware MFT negotiated an aligned stride: expand rows into the
+    // padded buffer (zero-filled tails) once per frame.
+    if (impl_->in_padded_.size() != static_cast<size_t>(impl_->in_stride) * h_ * 3u / 2u) {
+      if (err) *err = "input stride buffer size mismatch";
+      return false;
+    }
+    if (len < static_cast<size_t>(w_) * h_ * 3u / 2u) {
+      if (err) *err = "short nv12 frame";
+      return false;
+    }
+    ExpandToStride(nv12, impl_->in_padded_.data(), w_, h_, impl_->in_stride);
+    src = impl_->in_padded_.data();
+    src_len = impl_->in_padded_.size();
   }
 
   // Input IMFSample carrying the NV12 bytes.
   ComPtr<IMFSample> sample;
   ComPtr<IMFMediaBuffer> buffer;
   HRESULT hr = MFCreateSample(sample.GetAddressOf());
-  if (SUCCEEDED(hr)) hr = MFCreateMemoryBuffer(static_cast<DWORD>(nv12_.size()), buffer.GetAddressOf());
+  if (SUCCEEDED(hr)) hr = MFCreateMemoryBuffer(static_cast<DWORD>(src_len), buffer.GetAddressOf());
   if (SUCCEEDED(hr)) {
     BYTE* base = nullptr;
     hr = buffer->Lock(&base, nullptr, nullptr);
     if (SUCCEEDED(hr)) {
-      std::memcpy(base, nv12_.data(), nv12_.size());
+      std::memcpy(base, src, src_len);
       buffer->Unlock();
-      hr = buffer->SetCurrentLength(static_cast<DWORD>(nv12_.size()));
+      hr = buffer->SetCurrentLength(static_cast<DWORD>(src_len));
     }
   }
   if (SUCCEEDED(hr)) hr = sample->AddBuffer(buffer.Get());
@@ -317,6 +683,26 @@ bool MfSoftEncoder::Encode(const uint8_t* bgra, size_t len,
     return false;
   }
   return CollectOutputs(aus, err);
+}
+
+bool MfSoftEncoder::Encode(const uint8_t* bgra, size_t len,
+                           std::vector<std::vector<uint8_t>>& aus, std::string* err) {
+  aus.clear();
+  if (!impl_ || impl_->mft.Get() == nullptr) {
+    if (err) *err = "encoder not initialized";
+    return false;
+  }
+  const size_t need = static_cast<size_t>(w_) * h_ * 4;
+  if (!bgra || len < need) {
+    if (err)
+      *err = "short frame: " + std::to_string(len) + " < " + std::to_string(need);
+    return false;
+  }
+  if (!BgraToNv12(bgra, len, nv12_.data(), nv12_.size(), w_, h_)) {
+    if (err) *err = "nv12 convert rejected arguments";
+    return false;
+  }
+  return SubmitNv12(nv12_.data(), nv12_.size(), aus, err);
 }
 
 void MfSoftEncoder::ForceNextIdr(const char* reason) {

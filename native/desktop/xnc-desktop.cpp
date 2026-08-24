@@ -5,8 +5,10 @@
 //   --help          usage text, exit 0
 //   --console-diag [--duration <sec>] [--out <file.h264>] [--fps <n>]
 //       diagnostic capture loop in the console session: DXGI capture ->
-//       FrameCache state machine -> MF software H.264 encoder -> shaped
-//       Annex-B AUs into --out, plus a stats.json sidecar next to it
+//       FrameCache state machine -> MF H.264 encoder (hardware MFT first
+//       with software fallback; --encoder software pins the software rung)
+//       -> shaped Annex-B AUs into --out, plus a stats.json sidecar next to
+//       it
 //       (written even when capture/encoder init fails, with zeroed
 //       counters). If desktop duplication is refused (no interactive
 //       desktop, e.g. run as SYSTEM in session 0) the process logs
@@ -48,6 +50,7 @@
 #include "mf_encoder.h"    // MfSoftEncoder
 #include "pipeline.h"      // Pipeline::Run + stats.json sidecar
 #include "rt_pipe_server.h"  // RtServer (real-time fan-out)
+#include "scaled_capture.h"  // ScaledCapture (--max-w rt/diag downscale)
 
 int SelftestMain();  // desktop_selftest.cpp
 
@@ -165,6 +168,9 @@ void Usage(FILE* out) {
       L"                  < 60 switches to GDI mid-run, a 30 s DXGI probe switches\n"
       L"                  back; every swap forces one IDR and emits STATE\n"
       L"                  backend_changed\n"
+      L"  --encoder       encoder selector (default hardware): hardware = hardware\n"
+      L"                  MFT first (Intel QSV / NVENC / AMF) with software\n"
+      L"                  fallback; software = force the software MFT (diagnostics)\n"
       L"  --console-rt    real-time pipe server mode: subscribers ATTACH over\n"
       L"                  the M0 handshake and receive FRAME events (until Ctrl+C)\n"
       L"  --secret-stdin  read the pipe secret from stdin: exactly 64 hex chars\n"
@@ -180,8 +186,11 @@ void Usage(FILE* out) {
       L"                  full frame (DXGI only), box-filter downscale to\n"
       L"                  --max-w if given, encode JPEG via WIC (quality\n"
       L"                  0.85) to <out.jpg>, exit 0; errors exit 1\n"
-      L"  --max-w         snapshot max width in px (0 = no clamp); only valid\n"
-      L"                  with --jpeg-single\n"
+      L"  --max-w         max width in px (0 = no clamp): with --jpeg-single\n"
+      L"                  clamps the snapshot; with --console-rt/\n"
+      L"                  --console-diag downscales every captured frame\n"
+      L"                  before encode (rt fluency fix - encoder Init and\n"
+      L"                  HOST_HELLO carry the scaled dims)\n"
       L"  --selftest      arg parsing + FrameBlob/encoder/pipeline/rt selftest\n"
       L"  --help          this usage text\n"
       L"desktop watch: always on - the secure-desktop observer runs in every\n"
@@ -382,17 +391,19 @@ bool ParseDiagArgs(int argc, wchar_t** argv, DiagOptions* opt, std::wstring* err
         return fail(L"--max-w must be a positive integer (0 = no clamp)");
     } else if (std::wcscmp(a, L"--encoder") == 0) {
       // M2-Slice2 Task 3: crash-loop degraded-restart contract (spec 15.2)
-      // passes "--backend gdi --encoder software". The MF software encoder
-      // is the only rung today, so this parses + logs and changes nothing;
-      // anything but "software" fails (a future hardware rung slots in
-      // here without touching the spawn contract).
+      // passes "--backend gdi --encoder software". hw-encode task: the
+      // default "hardware" runs the hardware-first ladder with software
+      // fallback; "software" pins the software rung for diagnostics (a
+      // broken GPU must never block the stream).
       const wchar_t* v = value_of(L"--encoder");
       if (!v) return false;
-      if (std::wcscmp(v, L"software") == 0) {
+      if (std::wcscmp(v, L"hardware") == 0) {
+        opt->encoder = DiagEncoder::kHardware;
+      } else if (std::wcscmp(v, L"software") == 0) {
         opt->encoder = DiagEncoder::kSoftware;
-        XNC_LOG_INFO("encoder selector: software (only rung; no-op)");
+        XNC_LOG_INFO("encoder selector: software (forced; hardware ladder off)");
       } else {
-        return fail(L"--encoder must be software (only encoder rung)");
+        return fail(L"--encoder must be hardware or software");
       }
     } else {
       return fail(std::wstring(L"unknown argument: ") + a);
@@ -410,8 +421,10 @@ bool ParseDiagArgs(int argc, wchar_t** argv, DiagOptions* opt, std::wstring* err
   if (opt->jpeg_single && opt->jpeg_path.empty())
     return fail(L"--jpeg-single requires an output path: --jpeg-single "
                 L"<out.jpg>");
-  if (opt->max_width != 0 && !opt->jpeg_single)
-    return fail(L"--max-w only applies to --jpeg-single");
+  if (opt->max_width != 0 && !opt->jpeg_single && !opt->console_rt &&
+      !opt->console_diag)
+    return fail(L"--max-w only applies to --jpeg-single, --console-rt or "
+                L"--console-diag");
   if (opt->console_diag && opt->out_path.empty())
     return fail(L"--console-diag requires --out <file.h264>");
   // The secret arrives from exactly ONE channel: --secret-stdin (service
@@ -497,9 +510,9 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
   // probe upgrades back once DXGI works again (STATE backend_changed).
   xnc::LadderOpts lopt = LadderOptsFor(opt);
   lopt.reset = &capture_reset;
-  xnc::LadderCapture capture(lopt);
+  std::unique_ptr<xnc::LadderCapture> ladder(new xnc::LadderCapture(lopt));
   std::string cap_err;
-  if (!capture.Init(&cap_err)) {
+  if (!ladder->Init(&cap_err)) {
     if (xnc::DxgiErrIsDesktopAccessDenied(cap_err)) {
       XNC_LOG_ERROR("dxgi_access_denied_session0 err=\"%s\"", cap_err.c_str());
       write_stats(fail_result("dxgi_access_denied_session0"));
@@ -510,13 +523,30 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
     std::fclose(out);
     return 1;
   }
-  XNC_LOG_INFO("capture_init w=%u h=%u", capture.Width(), capture.Height());
+  // feat/rt-scale (hw-encode task 2 Part B): --max-w downscales every
+  // captured frame BEFORE encode; the encoder, HOST_HELLO and input/cursor
+  // mapping all see the scaled dims (ScaledCapture wrapper).
+  std::unique_ptr<xnc::ICapture> capture;
+  if (opt.max_width > 0) {
+    const uint32_t sw = ladder->Width(), sh = ladder->Height();
+    uint32_t dw = 0, dh = 0;
+    xnc::ScaledDims(sw, sh, opt.max_width, &dw, &dh);
+    capture = std::make_unique<xnc::ScaledCapture>(std::move(ladder), opt.max_width);
+    XNC_LOG_INFO("capture_scale enabled max_w=%u src=%ux%u -> %ux%u",
+                 opt.max_width, sw, sh, dw, dh);
+  } else {
+    capture = std::move(ladder);
+  }
+  XNC_LOG_INFO("capture_init w=%u h=%u", capture->Width(), capture->Height());
 
-  // Task 5: capture -> FrameCache -> MF software encode -> shaped Annex-B
-  // AUs into --out; encoder at the capture's dimensions, fps from args.
+  // Task 5: capture -> FrameCache -> MF encode (hardware-first ladder with
+  // software fallback) -> shaped Annex-B AUs into --out; encoder at the
+  // capture's dimensions, fps from args. --encoder software pins the
+  // software rung (diagnostic lever).
   xnc::MfSoftEncoder encoder;
+  encoder.SetForceSoftware(opt.encoder == xnc::DiagEncoder::kSoftware);
   std::string enc_err;
-  if (!encoder.Init(capture.Width(), capture.Height(), opt.fps, kDiagBitrateBps,
+  if (!encoder.Init(capture->Width(), capture->Height(), opt.fps, kDiagBitrateBps,
                     &enc_err)) {
     XNC_LOG_ERROR("encoder_init_failed err=\"%s\"", enc_err.c_str());
     write_stats(fail_result("encoder_init_failed"));
@@ -535,12 +565,12 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
   const bool rt_extra = !opt.secret.empty() && !opt.pipe_name.empty();
   if (rt_extra) {
     xnc::InputManager::Opts iopt;
-    iopt.hello_w = capture.Width();  // MOVE coords are HOST_HELLO-space
-    iopt.hello_h = capture.Height();
+    iopt.hello_w = capture->Width();  // MOVE coords are HOST_HELLO-space
+    iopt.hello_h = capture->Height();
     input = std::make_unique<xnc::InputManager>(iopt);
     xnc::CursorManager::Opts copt;
-    copt.hello_w = capture.Width();
-    copt.hello_h = capture.Height();
+    copt.hello_w = capture->Width();
+    copt.hello_h = capture->Height();
     cursor = std::make_unique<xnc::CursorManager>(copt);
     xnc::RtServer::Opts ro;
     ro.pipe_name = opt.pipe_name;
@@ -555,7 +585,7 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
     ro.displays_fn = [](void*) { return xnc::DxgiDisplaysSnapshot(); };
     ro.switch_display_fn = [](void*, uint32_t idx) { return xnc::DxgiSelectDisplay(idx); };
     input->StartJanitor();
-    if (!rt.Start(ro, capture.Width(), capture.Height())) {
+    if (!rt.Start(ro, capture->Width(), capture->Height())) {
       write_stats(fail_result("rt_server_start_failed"));
       std::fclose(out);
       return 1;
@@ -563,8 +593,8 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
   }
 
   const xnc::PipelineResult res = rt_extra
-      ? xnc::Pipeline::Run(capture, encoder, out, rt, popt)
-      : xnc::Pipeline::Run(capture, encoder, out, popt);
+      ? xnc::Pipeline::Run(*capture, encoder, out, rt, popt)
+      : xnc::Pipeline::Run(*capture, encoder, out, popt);
   if (rt_extra) {
     rt.Shutdown();  // drain: stops the cursor poller, ReleaseAll on inputs
     input->StopJanitor();
@@ -625,7 +655,9 @@ int RunConsoleRt(const xnc::DiagOptions& opt) {
 
   // Provisional HOST_HELLO/input geometry: real table when it enumerates,
   // else a safe 1920x1080 placeholder (logon-UI wait only; the real dims
-  // ride the post-wait display_changed + capture_rebuilt).
+  // ride the post-wait display_changed + capture_rebuilt). With --max-w the
+  // provisional geometry is the SCALED one so the first HOST_HELLO already
+  // matches the stream's (scaled) space.
   uint32_t pw = 1920, ph = 1080;
   {
     const std::vector<xnc::DisplayInfo> ds = xnc::DxgiDisplaysSnapshot();
@@ -636,15 +668,18 @@ int RunConsoleRt(const xnc::DiagOptions& opt) {
       }
     }
   }
+  uint32_t hpw = pw, hph = ph;
+  if (opt.max_width > 0 && !xnc::ScaledDims(pw, ph, opt.max_width, &hpw, &hph))
+    hpw = pw, hph = ph;
 
   xnc::InputManager::Opts iopt;
-  iopt.hello_w = pw;  // MOVE coords are HOST_HELLO-space px
-  iopt.hello_h = ph;
+  iopt.hello_w = hpw;  // MOVE coords are HOST_HELLO-space px
+  iopt.hello_h = hph;
   xnc::InputManager input(iopt);
   input.StartJanitor();
   xnc::CursorManager::Opts copt;
-  copt.hello_w = pw;  // HOST_HELLO stream space
-  copt.hello_h = ph;
+  copt.hello_w = hpw;  // HOST_HELLO stream space
+  copt.hello_h = hph;
   xnc::CursorManager cursor(copt);
 
   xnc::RtServer::Opts ro;
@@ -672,7 +707,7 @@ int RunConsoleRt(const xnc::DiagOptions& opt) {
   xnc::RtServer server;
   if (logon_wait) {
     XNC_LOG_INFO("console_rt_logon_wait (pipe up with provisional dims; probing for the Default desktop)");
-    if (!server.Start(ro, pw, ph)) { input.StopJanitor(); return 1; }
+    if (!server.Start(ro, hpw, hph)) { input.StopJanitor(); return 1; }
     const ULONGLONG deadline = GetTickCount64() + 110000;  // agent intent window 90s + margin
     for (;;) {
       Sleep(500);
@@ -697,34 +732,52 @@ int RunConsoleRt(const xnc::DiagOptions& opt) {
   }
 
   // The ladder is constructed and Init'd EXACTLY ONCE (single-shot Init).
-  xnc::LadderCapture capture(lopt);
-  capture.SetStateSink(&server);  // backend swaps -> STATE backend_changed
+  std::unique_ptr<xnc::LadderCapture> ladder(new xnc::LadderCapture(lopt));
+  ladder->SetStateSink(&server);  // backend swaps -> STATE backend_changed
   {
     std::string ierr;
-    if (!capture.Init(&ierr)) {
+    if (!ladder->Init(&ierr)) {
       XNC_LOG_ERROR("capture_init_failed err=\"%s\"", ierr.c_str());
       if (logon_wait) { server.Shutdown(); input.StopJanitor(); }
       return 1;
     }
-    XNC_LOG_INFO("capture_init w=%u h=%u", capture.Width(), capture.Height());
+    XNC_LOG_INFO("capture_init w=%u h=%u", ladder->Width(), ladder->Height());
+  }
+  // feat/rt-scale: --max-w downscales every frame before encode (the
+  // encoder, HOST_HELLO and input/cursor mapping all see the scaled dims).
+  std::unique_ptr<xnc::ICapture> capture;
+  if (opt.max_width > 0) {
+    const uint32_t sw = ladder->Width(), sh = ladder->Height();
+    uint32_t dw = 0, dh = 0;
+    xnc::ScaledDims(sw, sh, opt.max_width, &dw, &dh);
+    capture = std::make_unique<xnc::ScaledCapture>(std::move(ladder), opt.max_width);
+    XNC_LOG_INFO("capture_scale enabled max_w=%u src=%ux%u -> %ux%u",
+                 opt.max_width, sw, sh, dw, dh);
+  } else {
+    capture = std::move(ladder);
   }
   if (logon_wait) {
-    XNC_LOG_INFO("logon_wait recovered w=%u h=%u", capture.Width(), capture.Height());
+    XNC_LOG_INFO("logon_wait recovered w=%u h=%u", capture->Width(),
+                 capture->Height());
     // Notify subscribers exactly like a unified reset: geometry first (the
     // rebuilt hello re-emit then carries the NEW dims), then rebuilt.
-    server.OnDisplayChanged(capture.Width(), capture.Height(), "reattach");
+    server.OnDisplayChanged(capture->Width(), capture->Height(), "reattach");
     server.OnState("capture_rebuilt", true);
   }
 
+  // Encoder: hardware-first ladder with software fallback; --encoder
+  // software pins the software rung (diagnostic lever, spec 15.2 degraded
+  // restart also lands here).
   xnc::MfSoftEncoder encoder;
+  encoder.SetForceSoftware(opt.encoder == xnc::DiagEncoder::kSoftware);
   std::string enc_err;
-  if (!encoder.Init(capture.Width(), capture.Height(), opt.fps, kDiagBitrateBps,
+  if (!encoder.Init(capture->Width(), capture->Height(), opt.fps, kDiagBitrateBps,
                     &enc_err)) {
     XNC_LOG_ERROR("encoder_init_failed err=\"%s\"", enc_err.c_str());
     if (logon_wait) { server.Shutdown(); input.StopJanitor(); }
     return 1;
   }
-  const int rc = server.Serve(capture, encoder, ro);
+  const int rc = server.Serve(*capture, encoder, ro);
   watch.Stop();
   input.StopJanitor();  // ReleaseAll already ran in RtServer::Shutdown
   return rc;
