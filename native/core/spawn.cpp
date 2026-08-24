@@ -124,8 +124,11 @@ bool SpawnInSession(HANDLE token, const wchar_t* exe, const wchar_t* cmdline,
   // so its stderr (XNC_LOG) reaches the console/pipe that captured
   // xnc-core. The child keeps the SYSTEM retagged token, so inheriting
   // these handles passes nothing to a lesser principal. When our own stdio
-  // is unusable the child just gets a hidden console and its logs are
-  // lost - not fatal.
+  // is unusable (service context) there is no fallback file: the child
+  // opens its own log via --log-file (core passes it at spawn time), so
+  // the stderr channel and the file channel stay single-sourced and no
+  // 0-byte xnc-xnc-*.log placeholder is ever created (2026-08-24
+  // observability incident follow-up).
   HANDLE hout = GetStdHandle(STD_OUTPUT_HANDLE);
   HANDLE herr = GetStdHandle(STD_ERROR_HANDLE);
   HANDLE out_dup = nullptr, err_dup = nullptr;
@@ -140,31 +143,10 @@ bool SpawnInSession(HANDLE token, const wchar_t* exe, const wchar_t* cmdline,
   } else {
     if (out_dup) { CloseHandle(out_dup); out_dup = nullptr; }
     if (err_dup) { CloseHandle(err_dup); err_dup = nullptr; }
-    // 服务模式(无 console 句柄):把子进程 stdout/stderr 落到 exe 同目录的
-    // 日志文件,否则 desktop 的 XNC_LOG(backend/UAC reset/健康分等诊断
-    // 关键)全部丢失(2026-08-24 生产可观测性事故)。
-    wchar_t logpath[MAX_PATH];
-    if (GetModuleFileNameW(nullptr, logpath, MAX_PATH) > 0) {
-      wchar_t* slash = std::wcsrchr(logpath, L'\\');
-      if (slash != nullptr) {
-        swprintf_s(slash + 1, MAX_PATH - (slash + 1 - logpath),
-                   L"xnc-%s-%lu.log", name.c_str(), GetCurrentProcessId());
-        HANDLE logf = CreateFileW(logpath, FILE_APPEND_DATA,
-                                  FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                                  OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (logf != INVALID_HANDLE_VALUE) {
-          out_dup = err_dup = logf;  // 同一句柄作 stdout+stderr(append)
-          redirect = true;
-        } else {
-          XNC_LOG_INFO("child log file unavailable (%lu); child logs go nowhere",
-                       GetLastError());
-        }
-      }
-    }
-    if (!redirect) {
-      XNC_LOG_INFO("stdio redirect unavailable (err=%lu); child logs go nowhere",
-                   GetLastError());
-    }
+    // 服务模式(无 console 句柄):不再做文件回退——子进程经 --log-file 自开
+    // 日志(desktop/shell 的 XNC_LOG 双写 stderr+文件);此处 redirect=false
+    // 意味着子进程日志仅走其自持通道,不产生额外的空文件。
+    XNC_LOG_INFO("stdio redirect unavailable; child logs via its own --log-file");
   }
   // Caller-supplied stdin (the pipe-secret channel, spec 1.5): an already
   // INHERITABLE handle passed through as the child's hStdInput.
@@ -187,8 +169,6 @@ bool SpawnInSession(HANDLE token, const wchar_t* exe, const wchar_t* cmdline,
       redirect || stdin_redirect /*bInheritHandles*/, CREATE_NO_WINDOW,
       nullptr, nullptr, &si, &pi);
   const DWORD e = GetLastError();
-  // out_dup 与 err_dup 在文件日志回退时是同一句柄(双重 CloseHandle 是
-  // 未定义行为);统一经单次释放。
   if (err_dup != nullptr && err_dup != out_dup) CloseHandle(err_dup);
   if (out_dup) CloseHandle(out_dup);
   if (!ok) return fail("CreateProcessAsUserW", e);

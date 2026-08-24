@@ -870,6 +870,11 @@ ShellSpawnResult RealShellSpawn(const ShellCreateReq& req, uint32_t session,
   }
   args.push_back(L"--timeout");
   args.push_back(timeout);
+  // --log-file: shell opens its own log (service spawns have no console;
+  // inherited-stdio redirection proved unreliable — same single log channel
+  // as desktop; xnc-shell.log next to xnc-core.exe).
+  args.push_back(L"--log-file");
+  args.push_back(JoinSiblingPath(OwnModuleDir(), L"xnc-shell.log"));
 
   std::vector<wchar_t*> av;
   for (auto& a : args) av.push_back(&a[0]);

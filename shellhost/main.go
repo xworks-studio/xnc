@@ -11,7 +11,7 @@
 //	              --profile POWERSHELL|PWSH|CMD|BASH
 //	              --mode interactive|oneshot
 //	              [--cols N --rows N] [--cwd DIR] [--env K=V]...
-//	              [--command LINE] [--timeout SEC]
+//	              [--command LINE] [--timeout SEC] [--log-file PATH]
 //
 // 退出码:0 正常终态;1 使用/运行错误;2 profile 缺失(PWSH/BASH 探测失败)。
 package main
@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 )
@@ -39,9 +40,25 @@ func run() int {
 		cwd        = flag.String("cwd", "", "working directory for the child")
 		command    = flag.String("command", "", "oneshot command line (inline)")
 		timeout    = flag.Int("timeout", 0, "oneshot timeout seconds (0 = default 300)")
+		logFile    = flag.String("log-file", "", "also append log output to this file (service spawns have no console)")
 	)
 	flag.Var(&envFlag, "env", "environment variable K=V (repeatable)")
 	flag.Parse()
+
+	if *logFile != "" {
+		// 服务模式(无 console,继承 stdio 不可靠):xnc-core spawn 时传
+		// --log-file,日志双写 stderr(console 模式可见)+ 文件(与 desktop
+		// 同一单一日志通道,2026-08-24 可观测性事故跟进)。文件打不开不
+		// 致命——stderr 通道保持,console 模式日志不丢。
+		f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "xnc-shell: --log-file %s: %v (continuing on stderr only)\n", *logFile, err)
+		} else {
+			defer f.Close()
+			h := slog.NewTextHandler(io.MultiWriter(os.Stderr, f), nil)
+			slog.SetDefault(slog.New(h))
+		}
+	}
 
 	if *pipe == "" || !*secretIn || *profileArg == "" || (*mode != "interactive" && *mode != "oneshot") {
 		fmt.Fprintln(os.Stderr, "usage: xnc-shell.exe --pipe <name> --secret-stdin --profile <POWERSHELL|PWSH|CMD|BASH> --mode <interactive|oneshot> [...]")
