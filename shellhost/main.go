@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 )
 
 func main() {
@@ -48,16 +49,13 @@ func run() int {
 	if *logFile != "" {
 		// 服务模式(无 console,继承 stdio 不可靠):xnc-core spawn 时传
 		// --log-file,日志双写 stderr(console 模式可见)+ 文件(与 desktop
-		// 同一单一日志通道,2026-08-24 可观测性事故跟进)。文件打不开不
-		// 致命——stderr 通道保持,console 模式日志不丢。
-		f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "xnc-shell: --log-file %s: %v (continuing on stderr only)\n", *logFile, err)
-		} else {
-			defer f.Close()
-			h := slog.NewTextHandler(io.MultiWriter(os.Stderr, f), nil)
-			slog.SetDefault(slog.New(h))
-		}
+		// 同一单一日志通道,2026-08-24 可观测性事故跟进)。懒打开:首次写
+		// 日志才创建文件——健康会话不产生 0 字节 xnc-shell.log;文件打不
+		// 开不致命,回落 stderr 通道,console 模式日志不丢。
+		lw := &logFileWriter{path: *logFile}
+		defer lw.Close()
+		h := slog.NewTextHandler(io.MultiWriter(os.Stderr, lw), nil)
+		slog.SetDefault(slog.New(h))
 	}
 
 	if *pipe == "" || !*secretIn || *profileArg == "" || (*mode != "interactive" && *mode != "oneshot") {
@@ -179,4 +177,45 @@ func hexNibble(c byte) (byte, bool) {
 		return c - 'A' + 10, true
 	}
 	return 0, false
+}
+
+// logFileWriter 懒打开 --log-file:首次写日志时才创建文件
+// (健康会话不产生 0 字节 xnc-shell.log)。打开失败:一次性提示到
+// stderr,之后的记录照常经 MultiWriter 落到 stderr(与启动即开的
+// 既有降级语义一致)。
+type logFileWriter struct {
+	mu     sync.Mutex
+	path   string
+	f      *os.File
+	failed bool
+}
+
+func (w *logFileWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.f == nil && !w.failed {
+		f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			w.failed = true
+			fmt.Fprintf(os.Stderr, "xnc-shell: --log-file %s: %v (continuing on stderr only)\n", w.path, err)
+			return len(p), nil // 吞掉本记录:stderr 已被 MultiWriter 写入
+		}
+		w.f = f
+	}
+	if w.f != nil {
+		return w.f.Write(p)
+	}
+	return len(p), nil
+}
+
+// Close 关闭已打开的日志文件(未打开过则无操作)。
+func (w *logFileWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.f != nil {
+		err := w.f.Close()
+		w.f = nil
+		return err
+	}
+	return nil
 }

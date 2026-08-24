@@ -132,10 +132,21 @@ int RunDiagSpawn(const wchar_t* child_exe, int argc, wchar_t** argv, int from) {
     return 1;
   }
 
+  // --log-file: the child (xnc-desktop.exe) opens its own log - service
+  // diag spawns have no console (2026-08-24 observability incident
+  // follow-up). Appended after the verbatim child args; xnc-desktop's
+  // parser takes the last --log-file, overriding an explicit user one
+  // deterministically.
+  std::vector<std::wstring> extra = {
+      L"--log-file",
+      xnc::JoinSiblingPath(xnc::OwnModuleDir(), L"xnc-desktop.log")};
+  std::vector<wchar_t*> av;
+  for (int i = from; i < argc; i++) av.push_back(argv[i]);
+  for (auto& a : extra) av.push_back(&a[0]);
   std::wstring cmd;
   std::string cmd_err;
-  if (!xnc::BuildChildCommandLine(child_exe, argc, argv, from, &cmd,
-                                  &cmd_err)) {
+  if (!xnc::BuildChildCommandLine(child_exe, static_cast<int>(av.size()),
+                                  av.data(), 0, &cmd, &cmd_err)) {
     CloseHandle(token);
     std::fwprintf(stderr,
         L"xnc-core: --diag-spawn rejected a child argument (%hs)\n",

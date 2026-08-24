@@ -438,6 +438,11 @@ SnapshotSpawnResult RealSnapshotSpawn(uint32_t session, uint32_t max_w) {
     args.push_back(L"--max-w");
     args.push_back(maxw);
   }
+  // --log-file: same single log channel as the RT desktop spawn - service
+  // spawns have no console (2026-08-24 observability incident follow-up).
+  // Snapshot child shares xnc-desktop.log with the RT child (append mode).
+  args.push_back(L"--log-file");
+  args.push_back(JoinSiblingPath(OwnModuleDir(), L"xnc-desktop.log"));
   std::vector<wchar_t*> av;
   for (auto& a : args) av.push_back(&a[0]);
   std::wstring cmd;
