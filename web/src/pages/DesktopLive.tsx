@@ -698,6 +698,11 @@ export default function DesktopLive() {
                 if (e.candidate) send({ type: "ice", candidate: e.candidate.toJSON() });
               };
               pc.addTransceiver("video", { direction: "recvonly" });
+              // 占位 DataChannel:WebRTC 的 answer 只能回显 offer 的 m-line——
+              // 若 offer 不含 m=application,agent 预建的 input/mouse/cursor
+              // 通道永远不会被协商(无输入、无光标;e2eviewer 用同法)。
+              // 2026-08-24 生产事故根因。
+              pc.createDataChannel("viewer");
               pc.createOffer()
                 .then((offer) => pc!.setLocalDescription(offer))
                 .then(() => send({ type: "offer", sdp: pc!.localDescription!.sdp }))
