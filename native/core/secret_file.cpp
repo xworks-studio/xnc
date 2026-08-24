@@ -43,7 +43,9 @@ std::wstring TrimTrailing(const std::wstring& s) {
 
 bool ParseSecretHexW(const std::wstring& hex, std::string& out) {
   size_t n = hex.size();
-  if (n < 2 || n > 2 * kMaxPipeSecretBytes || n % 2 != 0) return false;
+  // Min 16 bytes: a short secret is a hard error, never a weak fallback.
+  // (Generation always writes 32 bytes.)
+  if (n < 2 * 16 || n > 2 * kMaxPipeSecretBytes || n % 2 != 0) return false;
   out.resize(n / 2, 0);
   for (size_t i = 0; i < n / 2; i++) {
     int hi = HexValW(hex[2 * i]), lo = HexValW(hex[2 * i + 1]);
@@ -128,7 +130,9 @@ bool LoadOrCreateSecretFile(const wchar_t* path, std::string& secret,
     return false;
   }
 
-  // Missing: generate 32 bytes, write hex + newline, lock the DACL.
+  // Missing: generate 32 bytes; create the file EMPTY and DACL-lock it
+  // BEFORE writing the secret (no inherit-ACL window where the hex content
+  // is readable), then write hex + newline.
   uint8_t raw[32];
   NTSTATUS rng = BCryptGenRandom(nullptr, raw, sizeof(raw),
                                  BCRYPT_USE_SYSTEM_PREFERRED_RNG);
@@ -155,6 +159,17 @@ bool LoadOrCreateSecretFile(const wchar_t* path, std::string& secret,
     err = "secret file create failed (err=" + std::to_string(gle) + ")";
     return false;
   }
+  // Lock the (still empty) file's DACL first: between CREATE_NEW and this
+  // SetFileSecurity the file exists but contains no secret material, so the
+  // inherited parent-dir ACL cannot leak anything.
+  if (!LockSecretFileDacl(path)) {
+    gle = GetLastError();
+    CloseHandle(f);
+    DeleteFileW(path);  // never leave a half-initialized secret file behind
+    SetLastError(gle);
+    err = "secret file DACL lock failed (err=" + std::to_string(gle) + ")";
+    return false;
+  }
   DWORD written = 0;
   BOOL ok = WriteFile(f, hex_text.data(),
                       static_cast<DWORD>(hex_text.size()), &written,
@@ -163,11 +178,6 @@ bool LoadOrCreateSecretFile(const wchar_t* path, std::string& secret,
   CloseHandle(f);
   if (!ok) {
     err = "secret file write failed";
-    return false;
-  }
-  if (!LockSecretFileDacl(path)) {
-    err = "secret file DACL lock failed (err=" +
-          std::to_string(GetLastError()) + ")";
     return false;
   }
   secret.assign(reinterpret_cast<const char*>(raw), sizeof(raw));

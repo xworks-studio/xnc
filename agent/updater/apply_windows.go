@@ -10,6 +10,9 @@
 // 子进程（RunApply）：等父进程退出 → 备份换文件 → StartService →
 // 等待 connected.ok 标记（新 agent 首次控制连接成功后写）→ 成功删 .old
 // 退出；超时回滚（.old 复位 + 再启动）。
+//
+// 注意：apply 期间 XNCCore 服务停机（无 pipe server），直到新 agent 写
+// 出 connected 标记——最长约为该标记窗口（~3 分钟）。
 package updater
 
 import (

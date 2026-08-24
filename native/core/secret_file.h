@@ -15,7 +15,8 @@
 namespace xnc {
 
 // Reads <path> (hex + optional trailing whitespace/newline; nominal 64 hex
-// chars = 32 bytes) into `secret`. If the file does not exist, generates 32
+// chars = 32 bytes; minimum 16 bytes when reading) into `secret`. If the
+// file does not exist, creates it empty, DACL-locks it, then generates 32
 // random bytes, writes hex + newline, locks the DACL, and returns the
 // secret with generated=true. Returns false + a human-readable `err` on any
 // I/O, parse, RNG or ACL failure (caller must refuse to serve rather than

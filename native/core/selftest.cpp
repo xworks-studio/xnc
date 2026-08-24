@@ -1115,6 +1115,21 @@ int SelftestMain() {
         CHECK("sf-garbage",
               !LoadOrCreateSecretFile(path.c_str(), s3, g3, e3));
       }
+      // A valid-hex but too-short secret (<16 bytes) must also be rejected.
+      {
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                               nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+          DWORD w3;
+          WriteFile(h, "0011223344556677\n", 17, &w3, nullptr);
+          CloseHandle(h);
+        }
+        std::string s4, e4;
+        bool g4 = false;
+        CHECK("sf-short",
+              !LoadOrCreateSecretFile(path.c_str(), s4, g4, e4));
+      }
       DeleteFileW(path.c_str());
     }
     if (fails==0) std::printf("selftest ok\n");
