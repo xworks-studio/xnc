@@ -112,7 +112,8 @@ const LEASE_NOTICES: Record<string, string> = {
 /** M2-Slice1 Task 2/3 desktop STATE codes worth a toast (uniform with the
  * display_changed notice; the code also stays in the status bar). */
 const STATE_NOTICES: Record<string, string> = {
-  recovering: "capture resetting — stream recovering",
+  recovering:
+    "安全桌面已激活(UAC/锁屏/系统弹窗)——画面暂停,输入仍可用:可盲按 Alt+Y 批准 UAC 或 Ctrl+Alt+Del;弹窗关闭后自动恢复",
   capture_rebuilt: "capture rebuilt — stream restored",
   backend_changed: "capture backend changed (DXGI/GDI ladder)",
 };
