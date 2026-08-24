@@ -71,6 +71,12 @@ func CoreSecretPath(stateDir string) string {
 	return filepath.Join(stateDir, DefaultCoreSecretName)
 }
 
+// ResolveCoreEndpoint 导出 resolveCoreEndpoint,供 exec/shell 的
+// ShellHost 生产回落复用(同一凭据源,单一事实)。
+func ResolveCoreEndpoint(stateDir string) (string, []byte, error) {
+	return resolveCoreEndpoint(stateDir)
+}
+
 // resolveCoreEndpoint 凭据解析(纯函数,便于单测):
 //
 //	env 双全(PIPE+SECRET_HEX) → env 值(dev-console/装时 flag 等价物);

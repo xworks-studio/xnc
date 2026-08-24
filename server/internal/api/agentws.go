@@ -143,9 +143,14 @@ func (h *handlers) agentConnect(w http.ResponseWriter, r *http.Request) {
 			conn.Beats++
 			// 快速版本检查 ②：PING/PONG 搭车——agent 报当前版本，ACK
 			// 回目标版本；版本落后即推 OFFER（灰度改 pin 后一个保活周
-			// 期内全网感知，零新增消息类型）。
+			// 期内全网感知，零新增消息类型）。targetVer 每拍重解析:
+			// 握手时缓存的值在 pin 变更后对长连接永远过期(2026-08-24
+			// 生产事故:改 pin 后 agent 死循环在旧 target)。
 			var hb proto.Heartbeat
 			_ = m.Decode(&hb)
+			if rel, ok := h.targetReleaseFor(ctx, node.ID); ok {
+				targetVer = rel.Version
+			}
 			if hb.Version != "" && targetVer != "" && hb.Version != targetVer {
 				h.maybeOfferUpdate(ctx, node.ID, hb.Version, sendControl)
 			}

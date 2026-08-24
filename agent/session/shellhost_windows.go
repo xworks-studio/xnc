@@ -18,6 +18,7 @@ import (
 	"sync"
 
 	"xnc/agent/coreclient"
+	"xnc/agent/desktop"
 	"xnc/agent/shellpipe"
 )
 
@@ -43,6 +44,24 @@ func DefaultShellHost(log *slog.Logger) ShellHost {
 	}
 	secret, err := hex.DecodeString(secHex)
 	if err != nil {
+		return nil
+	}
+	return &coreShellHost{pipe: pipe, secret: secret, log: log}
+}
+
+// ShellHostFromStateDir 生产入口:env 链(同 DefaultShellHost)优先,
+// 全缺则回落 XNCCore 服务约定(固定 pipe + <stateDir>/core-secret.hex,
+// 与 desktop handler 同一凭据源)。失败返回 nil(CORE_UNAVAILABLE)。
+// 2026-08-24 生产事故修复:此前缺 stateDir 回落,生产 exec/shell 全废。
+func ShellHostFromStateDir(stateDir string, log *slog.Logger) ShellHost {
+	if h := DefaultShellHost(log); h != nil {
+		return h
+	}
+	pipe, secret, err := desktop.ResolveCoreEndpoint(stateDir)
+	if err != nil || len(secret) == 0 {
+		if log != nil {
+			log.Warn("exec/shell: no core credentials (env unset, state-dir fallback failed)", "err", err)
+		}
 		return nil
 	}
 	return &coreShellHost{pipe: pipe, secret: secret, log: log}

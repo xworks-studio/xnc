@@ -82,8 +82,10 @@ func (a *Agent) Run(ctx context.Context) error {
 	// 其 active 会话已随断连作废，重建即正确语义。
 	c.OnReady = func(sendControl func(m proto.Message) error) {
 		engine := session.NewEngine(slog.Default(), sendControl)
-		engine.Register(proto.KindExec, session.NewExec(slog.Default()))
-		engine.Register(proto.KindShell, session.NewShell(slog.Default()))
+		// exec/shell:凭据与 desktop 同源(env → XNCCore 服务缺省)。
+		shellHost := session.ShellHostFromStateDir(a.StateDir, slog.Default())
+		engine.Register(proto.KindExec, &session.Exec{Log: slog.Default(), Host: shellHost})
+		engine.Register(proto.KindShell, &session.Shell{Log: slog.Default(), Host: shellHost})
 		engine.Register(proto.KindFile, session.NewFile(slog.Default()))
 		engine.Register(proto.KindTunnel, session.NewTunnel(slog.Default()))
 		engine.Register(proto.KindScreen, session.NewScreenHandler())
