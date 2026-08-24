@@ -1,10 +1,10 @@
 """XNC SRV 生产部署工具。
 
-凭据读 deploy/machines.env（gitignored）。子命令按需单独执行，`all` 全流程幂等：
+凭据读 deploy/.env（gitignored）。子命令按需单独执行，`all` 全流程幂等：
 
     py deploy/deploy_srv.py docker    # 安装 Docker（已装则跳过）
     py deploy/deploy_srv.py push      # 打包 proto/server/deploy 上传 /opt/xnc
-    py deploy/deploy_srv.py env       # 远端生成 deploy/.env（已存在则保留），回写管理员凭据到本地 machines.env
+    py deploy/deploy_srv.py env       # 远端生成 deploy/.env（已存在则保留），回写管理员凭据到本地 deploy/.env
     py deploy/deploy_srv.py up        # compose up -d --build
     py deploy/deploy_srv.py verify    # 容器状态 + 栈内健康检查 + 公网 HTTPS health
     py deploy/deploy_srv.py logs [svc]
@@ -25,7 +25,7 @@ REMOTE_ROOT = "/opt/xnc"
 
 def load_env() -> dict:
     env = {}
-    for line in (ROOT / "deploy" / "machines.env").read_text(encoding="utf-8-sig").splitlines():
+    for line in (ROOT / "deploy" / ".env").read_text(encoding="utf-8-sig").splitlines():
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
             k, v = line.split("=", 1)
@@ -82,11 +82,11 @@ def cmd_push():
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
         for name in ("proto", "server", "deploy"):
             tf.add(ROOT / name, arcname=name,
-                   filter=lambda ti: None if ti.name.endswith((".env", "machines.env")) else ti)
+                   filter=lambda ti: None if ti.name.endswith(".env") else ti)
         # Web UI source（Docker 内构建）；排除 node_modules 与 dist
         tf.add(ROOT / "web", arcname="web",
                filter=lambda ti: None if "node_modules" in ti.name or "/dist" in ti.name
-                   or ti.name.endswith((".env", "machines.env")) else ti)
+               or ti.name.endswith(".env") else ti)
     buf.seek(0)
     sh(f"mkdir -p {REMOTE_ROOT}")
     sftp = client.open_sftp()
@@ -101,11 +101,29 @@ def cmd_push():
 
 
 def cmd_env():
+    env = load_env()
+    # TURN vars: from local deploy/.env if set, else defaults (compose mirrors
+    # the same defaults, so older remote .env files keep working unchanged).
+    turn = {
+        "XNC_TURN_URLS": env.get("XNC_TURN_URLS", "turn:control.xnc.app:3478?transport=tcp"),
+        "XNC_TURN_USERNAME": env.get("XNC_TURN_USERNAME", "xncdev"),
+        "XNC_TURN_PASSWORD": env.get("XNC_TURN_PASSWORD", "xncdev-secret"),
+    }
     code, out = run(client, f"test -s {REMOTE_ROOT}/deploy/.env && echo EXISTS")
     if code == 0:
-        print("remote deploy/.env exists, keeping it")
+        # Append any missing TURN keys; never touch existing values.
+        sftp = client.open_sftp()
+        with sftp.open(f"{REMOTE_ROOT}/deploy/.env") as f:
+            cur = f.read().decode()
+        missing = {k: v for k, v in turn.items() if f"\n{k}=" not in cur and not cur.startswith(f"{k}=")}
+        if missing:
+            with sftp.open(f"{REMOTE_ROOT}/deploy/.env", "a") as f:
+                f.write("".join(f"{k}={v}\n" for k, v in missing.items()))
+            print(f"appended TURN vars to remote .env: {', '.join(missing)}")
+        else:
+            print("remote deploy/.env exists, keeping it")
+        sftp.close()
         return
-    env = load_env()
     admin_email = env.get("SRV_ADMIN_EMAIL") or "admin@xnc.app"
     values = {
         "XNC_DOMAIN": env["SRV_DOMAIN"],
@@ -113,6 +131,7 @@ def cmd_env():
         "XNC_JWT_SECRET": secrets.token_urlsafe(48),
         "XNC_ADMIN_EMAIL": admin_email,
         "XNC_ADMIN_PASSWORD": secrets.token_urlsafe(16),
+        **turn,
     }
     body = "\n".join(f"{k}={v}" for k, v in values.items()) + "\n"
     sftp = client.open_sftp()
@@ -121,11 +140,11 @@ def cmd_env():
     sftp.close()
     sh(f"chmod 600 {REMOTE_ROOT}/deploy/.env && wc -l {REMOTE_ROOT}/deploy/.env")
     _record_local_admin(values["XNC_ADMIN_EMAIL"], values["XNC_ADMIN_PASSWORD"])
-    print("remote .env written (600); admin credentials recorded to deploy/machines.env")
+    print("remote .env written (600); admin credentials recorded to deploy/.env")
 
 
 def _record_local_admin(email: str, password: str):
-    p = ROOT / "deploy" / "machines.env"
+    p = ROOT / "deploy" / ".env"
     lines = p.read_text(encoding="utf-8-sig").splitlines()
     out, seen = [], set()
     for ln in lines:
