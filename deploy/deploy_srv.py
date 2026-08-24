@@ -291,6 +291,9 @@ def cmd_env():
         "XNC_TURN_URLS": env.get("XNC_TURN_URLS", "turn:control.xnc.app:3478?transport=tcp"),
         "XNC_TURN_USERNAME": env.get("XNC_TURN_USERNAME", "xncdev"),
         "XNC_TURN_PASSWORD": env.get("XNC_TURN_PASSWORD", "xncdev-secret"),
+        # TURN 池（境内媒体中转）：逗号分隔 ip[:port]，空 = 未配置（沿用
+        # XNC_TURN_URLS）。缺失时追加空键，保证远程 .env 显式可见、后续可改。
+        "XNC_TURN_POOL": env.get("XNC_TURN_POOL", ""),
     }
     # XNC_VERSION: server 构建版本（版本单一来源，与 agent bundle 版本一致）。
     # 仅本地 .env 显式设置时同步——未设置即回落 0.0.0-dev，不强加默认值。

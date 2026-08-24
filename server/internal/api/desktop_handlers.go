@@ -30,9 +30,17 @@ type desktopReq struct {
 	WTSSession uint32 `json:"wtsSession"`
 }
 
-// turnConfig 从 server config 构造 desktop TURN 配置；不完整（URLs/username/
-// credential 任一缺失）→ nil = 未配置。
+// turnConfig 构造 desktop TURN 配置。池（XNC_TURN_POOL）配置且至少一台
+// healthy → 返回池内分配的单台 TURN（udp+tcp 两个 URL，凭据共用）；分配失败
+// （池空/全不健康/凭据缺失）→ 回落 XNC_TURN_URLS 全列表（现状）。两者皆不
+// 完整（URLs/username/credential 任一缺失）→ nil = 未配置。
 func (h *handlers) turnConfig() *proto.DesktopTurnConfig {
+	if h.turnPool != nil {
+		if t, ok := h.turnPool.Allocate(); ok && t.Configured() {
+			return &t
+		}
+		// 池分配失败（全不健康/空）→ 回落旧路径（保持现状语义）
+	}
 	t := &proto.DesktopTurnConfig{
 		URLs: h.cfg.TurnURLs, Username: h.cfg.TurnUsername, Credential: h.cfg.TurnCredential,
 	}

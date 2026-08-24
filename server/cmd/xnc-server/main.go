@@ -52,6 +52,10 @@ func main() {
 
 	reg := registry.New()
 	h := api.NewRouter(st, cfg, reg)
+	// 优雅停机：先停 TURN 池健康探测等后台 worker，再等 HTTP 连接排空。
+	if closer, ok := h.(interface{ Close() error }); ok {
+		defer closer.Close()
+	}
 	srv := &http.Server{Addr: cfg.ListenAddr, Handler: h, ReadHeaderTimeout: 10 * time.Second}
 
 	go func() {

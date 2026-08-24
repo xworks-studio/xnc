@@ -26,6 +26,11 @@ type Config struct {
 	TurnURLs           []string      // XNC_TURN_URLS，逗号分隔（turn:/turns: URL）
 	TurnUsername       string        // XNC_TURN_USERNAME（dev = lt-cred 静态用户）
 	TurnCredential     string        // XNC_TURN_CREDENTIAL（M2 换 REST 时效凭据）
+	// TurnPool 境内 TURN 中转池（XNC_TURN_POOL，逗号分隔 ip[:port]，缺省端口
+	// 3478）。空 = 未配置 → 沿用 TurnURLs 全列表（现状）。非空时 desktop 会话
+	// 从池中 round-robin 分配单台（udp 优先 + tcp 兜底两个 URL），凭据与
+	// TurnUsername/TurnCredential 共用。
+	TurnPool []string
 	DesktopPerNode     int           // XNC_DESKTOP_PER_NODE，默认 4（对齐 agent host max_subs=4，多 viewer），0 = 不限
 	DesktopIdleTimeout time.Duration // XNC_DESKTOP_IDLE，默认 5m（无信令活动即关），0 = 不限
 }
@@ -46,6 +51,7 @@ func Load() (Config, error) {
 		TurnURLs:           envList("XNC_TURN_URLS"),
 		TurnUsername:       os.Getenv("XNC_TURN_USERNAME"),
 		TurnCredential:     os.Getenv("XNC_TURN_CREDENTIAL"),
+		TurnPool:           envList("XNC_TURN_POOL"),
 		DesktopPerNode:     envInt("XNC_DESKTOP_PER_NODE", 4),
 		DesktopIdleTimeout: envDur("XNC_DESKTOP_IDLE", 5*time.Minute),
 	}

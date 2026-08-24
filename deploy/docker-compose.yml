@@ -32,6 +32,10 @@ services:
       XNC_TURN_USERNAME: ${XNC_TURN_USERNAME:-xncdev}
       XNC_TURN_PASSWORD: ${XNC_TURN_PASSWORD:-xncdev-secret}
       XNC_TURN_CREDENTIAL: ${XNC_TURN_CREDENTIAL:-xncdev-secret}
+      # TURN 池（境内媒体中转）：逗号分隔 ip[:port]（缺省端口 3478），空 =
+      # 未配置 → 沿用 XNC_TURN_URLS（现状）。池配置后 desktop 会话从池中
+      # round-robin 分配单台，凭据与上面 XNC_TURN_USERNAME/CREDENTIAL 共用。
+      XNC_TURN_POOL: ${XNC_TURN_POOL:-}
     depends_on:
       postgres:
         condition: service_healthy

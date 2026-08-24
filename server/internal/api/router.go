@@ -16,10 +16,20 @@ import (
 )
 
 type handlers struct {
-	st   *db.Store
-	cfg  config.Config
-	reg  *registry.Registry
-	sess *session.Manager
+	st       *db.Store
+	cfg      config.Config
+	reg      *registry.Registry
+	sess     *session.Manager
+	turnPool *TurnPoolManager // XNC_TURN_POOL 配置时非 nil（后台健康探测随 router 生命周期 Start/Stop）
+}
+
+// Close 停止 handler 的后台 worker（TURN 池健康探测）。生产在
+// cmd/xnc-server/main.go 优雅停机时调用；测试直接经 manager.Stop() 治理。
+func (h *handlers) Close() error {
+	if h.turnPool != nil {
+		h.turnPool.Stop()
+	}
+	return nil
 }
 
 func NewRouter(st *db.Store, cfg config.Config, reg *registry.Registry) http.Handler {
@@ -39,6 +49,12 @@ func NewRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		sess.DesktopIdleTimeout = cfg.DesktopIdleTimeout
 	}
 	h := &handlers{st: st, cfg: cfg, reg: reg, sess: sess}
+	// 池配置（XNC_TURN_POOL 非空）→ 启动后台健康探测；未配置 → nil，desktop
+	// turnConfig 走旧路径（XNC_TURN_URLS 全列表），行为与现状完全一致。
+	if len(cfg.TurnPool) > 0 {
+		h.turnPool = NewTurnPoolManager(cfg.TurnPool, cfg.TurnUsername, cfg.TurnCredential)
+		h.turnPool.Start()
+	}
 	r := chi.NewRouter()
 
 	r.Get("/api/health", func(w http.ResponseWriter, _ *http.Request) {
