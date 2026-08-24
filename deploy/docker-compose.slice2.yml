@@ -39,6 +39,10 @@ services:
 
   coturn:
     image: coturn/coturn:alpine
+    # Dev-only divergence from the base compose (production coturn runs the
+    # rendered deploy/turnserver.conf via `-c`; dev keeps inline flags because
+    # the checked-in template is prod-oriented and this overlay predates the
+    # config file — see docker-compose.yml coturn comment).
     # -n: no pid file. --no-tls/--no-dtls: dev TURN is plain turn: ...?transport=tcp.
     # Static lt-cred user (slice2 dev); M2 moves to REST-cred turnover.
     command:

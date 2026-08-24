@@ -135,3 +135,18 @@ Notes:
   and relays it in SESSION_OPEN params. Without it the endpoint answers
   503 `TURN_UNCONFIGURED`. One desktop session per node; idle (no signaling
   frames) for 5 min auto-closes (viewer may simply re-POST).
+
+## 生产端口清单(control.xnc.app / SRV,2026-08-24 retro P2#11 文档化)
+
+安全组需开以下全部,否则对应功能失效(本次事故:3478 未开 → STUN/TURN
+全盲;coturn 配置见 deploy/turnserver.conf,模板由 deploy_srv.py `up` 渲染):
+
+| 端口 | 协议 | 用途 |
+|---|---|---|
+| 443 | TCP | HTTPS/WSS — Caddy 反代 xnc-server(web + /api) |
+| 3478 | TCP+UDP | coturn STUN/TURN 监听(lt-cred 静态凭据,relay-only,无 TLS) |
+| 49160-49200 | UDP | coturn TURN relay 分配段(min-port/max-port;不开则 relay 候选不可达) |
+
+自检:`py deploy/deploy_srv.py verify` 含 STUN binding 探测(UDP+TCP
+127.0.0.1:3478,期望 0x0101 应答)——本机端口通不代表安全组通,公网侧用
+`curl https://<domain>/api/health`(verify 已含)。

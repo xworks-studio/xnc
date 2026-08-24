@@ -5,8 +5,8 @@
     py deploy/deploy_srv.py docker    # 安装 Docker（已装则跳过）
     py deploy/deploy_srv.py push      # 打包 proto/server/deploy 上传 /opt/xnc
     py deploy/deploy_srv.py env       # 远端生成 deploy/.env（已存在则保留），回写管理员凭据到本地 deploy/.env
-    py deploy/deploy_srv.py up        # compose up -d --build
-    py deploy/deploy_srv.py verify    # 容器状态 + 栈内健康检查 + 公网 HTTPS health
+    py deploy/deploy_srv.py up        # 渲染 turnserver.conf + 清同名孤儿,compose up -d --build(Conflict 时 rm 重试一次)
+    py deploy/deploy_srv.py verify    # 容器状态 + 栈内健康检查 + 公网 HTTPS health + 本机 STUN 自检(UDP/TCP)
     py deploy/deploy_srv.py logs [svc]
     py deploy/deploy_srv.py all
 
@@ -15,6 +15,7 @@
 """
 import argparse
 import io
+import re
 import secrets
 import sys
 import tarfile
@@ -34,6 +35,136 @@ def load_env() -> dict:
             k, v = line.split("=", 1)
             env[k.strip()] = v.strip().strip('"').strip("'")
     return env
+
+
+def _parse_env_text(raw: str) -> dict:
+    env = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            env[k.strip()] = v.strip().strip('"').strip("'")
+    return env
+
+
+# turnserver.conf 模板插值:coturn 配置文件本身不支持 ${VAR} 展开(2026-08-24
+# retro Task 6 调研),故由本工具在 `up` 前用 deploy/.env(compose 插值同源)
+# 渲染。支持 ${VAR} 与 ${VAR:-default};渲染后为空的键值行整行丢弃(如
+# relay-ip=),避免 coturn 拿到空值。
+_TURN_VAR_RE = re.compile(r"\$\{([A-Z][A-Z0-9_]*)(?::-([^}]*))?\}")
+
+
+def _render_turn_conf(tmpl: str, env: dict) -> str:
+    def sub(m: re.Match) -> str:
+        name, default = m.group(1), m.group(2)
+        v = env.get(name)
+        if v is not None and v != "":
+            return v
+        return default if default is not None else ""
+
+    out = []
+    for line in tmpl.splitlines():
+        if line.strip().startswith("#"):
+            out.append(line)  # 注释不参与插值(保留 ${...} 模板说明)
+            continue
+        rendered = _TURN_VAR_RE.sub(sub, line)
+        if not rendered.strip():
+            continue
+        if "=" in rendered:
+            k, _, v = rendered.partition("=")
+            if k.strip() and not v.strip():
+                continue  # 值渲染为空 → 整行丢弃
+        out.append(rendered)
+    return "\n".join(out) + "\n"
+
+
+def _write_remote_turn_conf():
+    """远端渲染 deploy/turnserver.conf(模板 + deploy/.env,单一事实;
+    幂等:已渲染的静态文件原样写出)。"""
+    sftp = client.open_sftp()
+    try:
+        try:
+            with sftp.open(f"{REMOTE_ROOT}/deploy/.env") as f:
+                env = _parse_env_text(f.read().decode(errors="replace"))
+        except OSError:
+            sys.exit(f"{REMOTE_ROOT}/deploy/.env missing — run `env` first")
+        try:
+            with sftp.open(f"{REMOTE_ROOT}/deploy/turnserver.conf") as f:
+                tmpl = f.read().decode(errors="replace")
+        except OSError:
+            sys.exit(f"{REMOTE_ROOT}/deploy/turnserver.conf missing — run `push` first")
+    finally:
+        sftp.close()
+    body = _render_turn_conf(tmpl, env)
+    sftp = client.open_sftp()
+    try:
+        with sftp.open(f"{REMOTE_ROOT}/deploy/turnserver.conf", "w") as f:
+            f.write(body)
+        sftp.chmod(f"{REMOTE_ROOT}/deploy/turnserver.conf", 0o600)
+    finally:
+        sftp.close()
+    print("rendered deploy/turnserver.conf from deploy/.env (template vars resolved)")
+
+
+def _remote_py(script: str) -> str:
+    """包装一段 python3 脚本供远端执行(远端 shell heredoc;需远端有
+    python3 —— Ubuntu Server 自带)。"""
+    return "python3 - <<'XNC_PY_EOF'\n" + script + "\nXNC_PY_EOF"
+
+
+# STUN binding 自检(UDP + TCP,127.0.0.1:3478,docker-proxy → coturn 容器):
+# 发 20B binding request,期望回包 type=0x0101(binding response)且携带
+# magic cookie;长度 ≥ 20B(实际按 coturn 应答打印,通常 ~40B)。
+_STUN_PROBE = r'''
+import socket, struct, sys
+
+TID = b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c"
+REQ = struct.pack(">HHI12s", 0x0001, 0, 0x2112A442, TID)
+
+
+def probe(kind, sock_type):
+    s = socket.socket(socket.AF_INET, sock_type)
+    s.settimeout(4)
+    try:
+        if sock_type == socket.SOCK_STREAM:
+            s.connect(("127.0.0.1", 3478))
+            s.sendall(REQ)
+        else:
+            s.sendto(REQ, ("127.0.0.1", 3478))
+        data = s.recv(512)
+        if len(data) < 20:
+            print(f"STUN {kind}: fail (short response {len(data)}B)")
+            return 1
+        mtype = struct.unpack(">H", data[:2])[0]
+        ok = mtype == 0x0101 and data[4:8] == b"\x21\x12\xa4\x42"
+        print(f"STUN {kind}: {'ok' if ok else 'fail'} ({len(data)}B, type=0x{mtype:04x})")
+        return 0 if ok else 1
+    except Exception as e:
+        print(f"STUN {kind}: fail ({e})")
+        return 1
+    finally:
+        s.close()
+
+
+sys.exit(0 if probe("udp", socket.SOCK_DGRAM) + probe("tcp", socket.SOCK_STREAM) == 0 else 1)
+'''
+
+
+# up 前清同名孤儿:名字命中本 compose 项目(deploy-<svc>-1)但项目 label
+# 不是 deploy 的残留容器(2026-08-24 retro P2#10:d00097cd9d8c_* 旧世代
+# 容器曾导致 rebuild 报名字冲突)。
+_ORPHAN_PRUNE = r'''
+cd {root} && for svc in $(docker compose -f deploy/docker-compose.yml config --services); do
+  name="deploy-${svc}-1"
+  if docker inspect -f '{{{{.State.Status}}}}' "$name" >/dev/null 2>&1; then
+    proj=$(docker inspect -f '{{{{index .Config.Labels "com.docker.compose.project"}}}}' "$name" 2>/dev/null)
+    if [ "$proj" != "deploy" ]; then
+      echo "prune orphan container: $name (project='$proj')"
+      docker rm -f "$name" && echo "  removed"
+    fi
+  fi
+done
+'''
 
 
 def connect(env: dict) -> paramiko.SSHClient:
@@ -167,8 +298,28 @@ def _record_local_admin(email: str, password: str):
     p.write_text("\n".join(out) + "\n", encoding="utf-8")
 
 
+def _compose_up(cmd: str, timeout: int = 900):
+    """docker compose up,带一次 Conflict 重试:旧世代孤儿容器
+    (2026-08-24 retro P2#10,d00097cd9d8c_* 残留)会让 up 报
+    "container name ... is already in use by container <id>" —— 按报错
+    精确 rm 该容器后重试一次(比盲删安全)。"""
+    code, out = run(client, cmd, timeout=timeout)
+    print(f"$ {cmd}\n{out}")
+    if code == 0:
+        return
+    m = re.search(r'is already in use by container "?([0-9a-f]{12,})"?', out)
+    if not m:
+        sys.exit(f"remote command failed ({code}): {cmd}")
+    cid = m.group(1)
+    print(f"compose Conflict on container {cid}: removing and retrying once")
+    sh(f"docker rm -f {cid}")
+    sh(cmd, timeout=timeout)
+
+
 def cmd_up():
-    sh(f"cd {REMOTE_ROOT} && docker compose -f deploy/docker-compose.yml up -d --build", timeout=900)
+    _write_remote_turn_conf()
+    sh(f"cd {REMOTE_ROOT} && " + _ORPHAN_PRUNE.format(root=REMOTE_ROOT), timeout=120)
+    _compose_up(f"cd {REMOTE_ROOT} && docker compose -f deploy/docker-compose.yml up -d --build")
     sh(f"cd {REMOTE_ROOT} && docker compose -f deploy/docker-compose.yml ps --format 'table {{{{.Name}}}}\\t{{{{.Status}}}}'")
 
 
@@ -181,6 +332,9 @@ def cmd_verify():
     sh("docker exec $(docker ps -qf name=xnc-server) /xnc-server -healthcheck && echo HEALTHCHECK-OK")
     env = load_env()
     sh(f"sleep 3; curl -sS -m 20 https://{env['SRV_DOMAIN']}/api/health && echo")
+    # STUN 自检(Task 6):coturn 监听端口在本机 3478(UDP+TCP)发 STUN
+    # binding,期望 0x0101 应答;失败即 verify 失败。
+    sh(_remote_py(_STUN_PROBE), timeout=60)
 
 
 COMMANDS = {"docker": cmd_docker, "push": cmd_push, "env": cmd_env, "up": cmd_up, "verify": cmd_verify}
