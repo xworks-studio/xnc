@@ -7,7 +7,7 @@ import (
 	"runtime"
 )
 
-const Version = "0.4.4" // bundle 版本（agent+helper 整体发布；自更新的比对单位）
+const Version = "0.4.5" // bundle 版本（agent+helper 整体发布；自更新的比对单位）
 
 type Info struct {
 	Hostname     string
