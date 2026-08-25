@@ -246,6 +246,30 @@ bool MfSoftEncoder::InitWithMft(IMFTransform* mft, const std::wstring& friendly,
   const uint64_t frame_size = (static_cast<uint64_t>(w_) << 32) | h_;
   const uint64_t frame_rate = (static_cast<uint64_t>(fps_) << 32) | 1;
 
+  // Rate control must be configured BEFORE media-type negotiation: the MS
+  // H.264 encoder rejects CODECAPI_AVEncCommonRateControlMode (0x80070057)
+  // once input/output types are locked — production observed
+  // `rate_control_low_delay set_skip` → default VBR → 17-frame lookahead
+  // → ~1 IDR/s scene-cut storms + per-IDR lookahead re-fill (feeds=16,
+  // ~533ms no output) → browser frame drops (跳帧). LowDelayVBR is the
+  // target; CBR is the fallback (B-frames 0 + CBR still removes the
+  // lookahead). GOP/B-pictures/low-latency below stay after types (the
+  // encoder accepts them there).
+  {
+    ComPtr<ICodecAPI> codec_api;
+    if (SUCCEEDED(mft->QueryInterface(IID_PPV_ARGS(codec_api.GetAddressOf())))) {
+      if (!CodecApiSetUi4(codec_api.Get(), &CODECAPI_AVEncCommonRateControlMode,
+                          eAVEncCommonRateControlMode_LowDelayVBR, "rate_control_low_delay")) {
+        CodecApiSetUi4(codec_api.Get(), &CODECAPI_AVEncCommonRateControlMode,
+                       eAVEncCommonRateControlMode_CBR, "rate_control_cbr_fallback");
+      }
+      // GOP-in-seconds 显式归零:文档语义 0 = 使用 GOPSize。生产实测
+      // GOPSize=300 被编码器无视(~1 IDR/s 风暴;探针实测有效 GOP=90 帧),
+      // 显式声明"按帧数"可能恢复 300 帧周期。
+      CodecApiSetUi4(codec_api.Get(), &CODECAPI_AVEncMPVGOPSInSec, 0, "gop_in_sec");
+    }
+  }
+
   // Output type: caller's H.264 type, then enumerated fallback for hardware.
   ComPtr<IMFMediaType> out_mt;
   HRESULT hr = MakeH264OutputType(w_, h_, fps_, bitrate_, out_mt.GetAddressOf());
@@ -311,15 +335,14 @@ bool MfSoftEncoder::InitWithMft(IMFTransform* mft, const std::wstring& friendly,
   // Best-effort shaping via ICodecAPI. GOP long (IDRs are forced on demand,
   // spec §7.5 recovery cadence lives above this class); B-frames 0 and
   // low-delay/low-latency per spec §7.10 V1 全档. Hardware MFTs may reject
-  // any of these (or omit ICodecAPI) - best-effort log-and-continue.
+  // any of these (or omit ICodecAPI) - best-effort log-and-continue. Rate
+  // control moved to pre-type negotiation above (rejected once locked).
   impl_->codec_api.Reset();
   hr = mft->QueryInterface(IID_PPV_ARGS(impl_->codec_api.GetAddressOf()));
   if (SUCCEEDED(hr)) {
     CodecApiSetUi4(impl_->codec_api.Get(), &CODECAPI_AVEncMPVGOPSize, fps_ * 10, "gop_size");
     CodecApiSetUi4(impl_->codec_api.Get(), &CODECAPI_AVEncMPVDefaultBPictureCount, 0,
                    "b_picture_count");
-    CodecApiSetUi4(impl_->codec_api.Get(), &CODECAPI_AVEncCommonRateControlMode,
-                   eAVEncCommonRateControlMode_LowDelayVBR, "rate_control_low_delay");
     VARIANT v{};  // AVLowLatencyMode is VT_BOOL
     v.vt = VT_BOOL;
     v.boolVal = VARIANT_TRUE;

@@ -642,11 +642,13 @@ export default function DesktopLive() {
                 const video = videoRef.current;
                 if (!video) return;
                 video.srcObject = e.streams[0] ?? new MediaStream([e.track]);
-                // 远控低延迟关键:最小化播放缓冲(默认 ~200ms+ 的 jitter
-                // buffer 会让操作反馈明显滞后)。Chrome/Edge 支持
-                // playoutDelayHint;0 = 最小延迟(丢帧换实时)。
+                // 远控延迟/平滑权衡:playoutDelayHint 是 Chrome 的缓冲目标。
+                // 中继路径上场景切换 IDR(~1/s,~120KB@1080p)在 4.9Mbps TURN
+                // 上要 ~200ms 才传完;hint=0 时迟到的帧被 Chrome 直接丢弃
+                // (不发 PLI)→ 每秒一次画面冻结跳变(跳帧)。0.2s 完全吸收
+                // IDR 突发,延迟代价 ~200ms(相对旧 10s 体感可忽略)。
                 try {
-                  (e.receiver as unknown as { playoutDelayHint?: number }).playoutDelayHint = 0;
+                  (e.receiver as unknown as { playoutDelayHint?: number }).playoutDelayHint = 0.2;
                 } catch {
                   /* 旧浏览器不支持,忽略 */
                 }

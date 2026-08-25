@@ -1412,6 +1412,33 @@ int SelftestMain() {
                   CountAusWithNal(aus, 5));
     }
   }
+  { // (g) GOP 行为探针:生产发现 ~1 IDR/s(编码器无视 GOP=300?)。纯合成
+    // 图案(fps=30, 350 帧 > GOP=300)隔离内容因素:若 GOP 生效,IDR 只应
+    // 出现在帧 1 与 ~301;若 ~1/s(≈30 帧一个),则编码器忽略/钳位 GOP。
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const uint32_t gop_w = 128, gop_h = 96, gop_fps = 30, gop_bitrate = 2000000;
+    const bool init_ok = enc.Init(gop_w, gop_h, gop_fps, gop_bitrate, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: mf-init-gop err=%s\n", err.c_str());
+    CHECK("mf-init-gop", init_ok);
+    if (init_ok) {
+      SyntheticBars bars(gop_w, gop_h);
+      std::vector<uint32_t> idr_positions;
+      std::string e2;
+      for (uint32_t i = 0; i < 350; ++i) {
+        std::vector<std::vector<uint8_t>> frame_aus;
+        if (!enc.Encode(bars.Frame(i), bars.Bytes(), frame_aus, &e2)) break;
+        for (const auto& au : frame_aus)
+          if (xnc::NalHasType(au.data(), au.size(), 5)) idr_positions.push_back(i);
+      }
+      std::printf("SELFTEST NOTE: mf-gop-probe fps=%u frames=350 idrs=%zu at=[",
+                  gop_fps, idr_positions.size());
+      for (size_t k = 0; k < idr_positions.size(); ++k)
+        std::printf("%s%u", k ? " " : "", idr_positions[k]);
+      std::printf("]\n");
+      CHECK("mf-gop-probe-ran", !idr_positions.empty());
+    }
+  }
   { // (b) force-key 契约(E2 关键帧风暴回归):冷启动缓冲期对连续 5 帧只
     // 调一次 ForceNextIdr + Drain 排空 → 输出中 IDR 恰 1 个。若契约破坏
     // (以「未见关键帧输出」为由每次 Encode 重复置位)→ 多个 IDR → FAIL。
