@@ -36,7 +36,7 @@ if errorlevel 1 (
 cd /d "%~dp0"
 
 if not exist ..\..\bin mkdir ..\..\bin
-cl /nologo /utf-8 /W3 /MT /std:c++17 /EHsc xnc-desktop.cpp desktop_watch.cpp dxgi_capture.cpp gdi_capture.cpp backend_ladder.cpp mf_encoder.cpp nv12.cpp pipeline.cpp rt_pipe_server.cpp input_manager.cpp cursor_manager.cpp jpeg_wic.cpp scaled_capture.cpp desktop_selftest.cpp ..\common\frame.cpp ..\common\handshake.cpp /Fe:..\..\bin\xnc-desktop.exe /Fo:..\..\bin\ /link d3d11.lib dxgi.lib mfplat.lib mfuuid.lib ole32.lib bcrypt.lib advapi32.lib user32.lib gdi32.lib windowscodecs.lib oleaut32.lib
+cl /nologo /utf-8 /W3 /MT /std:c++17 /EHsc xnc-desktop.cpp desktop_watch.cpp dxgi_capture.cpp gdi_capture.cpp backend_ladder.cpp mf_encoder.cpp nv12.cpp pipeline.cpp rt_pipe_server.cpp input_manager.cpp cursor_manager.cpp jpeg_wic.cpp scaled_capture.cpp desktop_selftest.cpp ..\common\frame.cpp ..\common\handshake.cpp /Fe:..\..\bin\xnc-desktop.exe /Fo:..\..\bin\ /link d3d11.lib dxgi.lib mfplat.lib mfuuid.lib ole32.lib bcrypt.lib advapi32.lib user32.lib gdi32.lib windowscodecs.lib oleaut32.lib winmm.lib
 if errorlevel 1 exit /b 1
 
 echo [desktop] built ..\..\bin\xnc-desktop.exe

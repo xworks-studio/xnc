@@ -167,6 +167,13 @@ class MfSoftEncoder {
   bool Encode(const uint8_t* bgra, size_t len, std::vector<std::vector<uint8_t>>& aus,
               std::string* err);
 
+  // gpu-readback task: encodes one compact NV12 frame directly (len >=
+  // w*h*3/2, tight stride = width) - NO BGRA->NV12 conversion (the DXGI GPU
+  // path already produced NV12 in the VideoProcessor). Same submit/output
+  // contract as Encode. Invalid dims/len are rejected like Encode.
+  bool EncodeNV12(const uint8_t* nv12, size_t len,
+                  std::vector<std::vector<uint8_t>>& aus, std::string* err);
+
   // Arms the one-shot IDR request (see header comment). Pure bookkeeping -
   // the ICodecAPI property is applied at the next Encode submission.
   void ForceNextIdr(const char* reason);

@@ -42,6 +42,38 @@ inline void CompactBgraRows(const uint8_t* src, size_t src_pitch, uint8_t* dst,
   }
 }
 
+// Copies a pitched NV12 staging Map() into tightly packed dst
+// (w*h + w*h/2 bytes). D3D11 quirk (verified 2026-08-25 on Intel): an NV12
+// staging texture is ONE subresource - Map(0) returns the Y plane rows then
+// the interleaved UV plane rows packed contiguously with the SAME RowPitch
+// (uv rows start at y_pitch*h; Map(subresource 1) fails E_INVALIDARG).
+// w/h must be even; mirrors CompactBgraRows' role.
+inline void CompactNv12Rows(const uint8_t* src, size_t pitch, uint8_t* dst,
+                            uint32_t w, uint32_t h) {
+  const size_t row = static_cast<size_t>(w);
+  for (uint32_t r = 0; r < h; ++r)
+    std::memcpy(dst + static_cast<size_t>(r) * row,
+                src + static_cast<size_t>(r) * pitch, row);
+  const uint8_t* uv = src + pitch * h;
+  uint8_t* uv_dst = dst + static_cast<size_t>(w) * h;
+  for (uint32_t r = 0; r < h / 2; ++r)
+    std::memcpy(uv_dst + static_cast<size_t>(r) * row,
+                uv + static_cast<size_t>(r) * pitch, row);
+}
+
+// NV12 Y-plane analogue of SamplePointsNotUniform: samples 256 evenly spread
+// Y values; true when they are not all identical (the "not black / not
+// garbage-uniform" first-frame diag for the GPU NV12 path).
+inline bool Nv12YNotUniform(const uint8_t* nv12, uint32_t w, uint32_t h) {
+  if (!nv12 || w == 0 || h == 0) return false;
+  for (uint32_t i = 1; i < 256; ++i) {
+    const uint32_t x = static_cast<uint32_t>((static_cast<uint64_t>(i) * w) / 256);
+    const uint32_t y = static_cast<uint32_t>((static_cast<uint64_t>(i) * h) / 256);
+    if (nv12[static_cast<size_t>(y) * w + x] != nv12[0]) return true;
+  }
+  return false;
+}
+
 // FNV-1a 64 over n bytes (diag: hash of the first 64 frame bytes).
 // Known vectors: "" -> 0xcbf29ce484222325, "a" -> 0xaf63dc4c8601ec8c,
 // "foobar" -> 0x85944171f73967e8.
@@ -182,6 +214,61 @@ bool DxgiSelectDisplay(uint32_t idx);
 // and the pipeline's encode thread (pipe_latency_ms measurement).
 uint64_t NowMonoUs();
 
+// ---- gpu-readback task: GPU downscale + NV12 path ----
+//
+// DxgiCapture gains a GPU-scale mode: when Init'ed with a max width > 0, the
+// acquired desktop texture is NOT read back as full-resolution BGRA. Instead
+// a D3D11 VideoProcessor scales it to max_w (aspect preserved) AND converts
+// to NV12 in one VideoProcessorBlt (rotation applied in the same pass via
+// ID3D11VideoContext1::VideoProcessorSetStreamRotation), then a small NV12
+// staging texture is read back (~4x less data than full BGRA). The FrameBlob
+// then carries Pixfmt::kNv12 at the SCALED dims - the pipeline feeds the
+// encoder's NV12 entry directly (no CPU downscale, no CPU BGRA->NV12).
+// max_w == 0 keeps the legacy full-BGRA CPU readback path.
+
+// Rotation of the duplicated output (maps 1:1 to DXGI_OUTDUPL_DESC.Rotation
+// and to D3D11_VIDEO_PROCESSOR_ROTATION for the in-pass VP rotation).
+enum class Rotate : uint8_t { kNone = 0, k90 = 1, k180 = 2, k270 = 3 };
+
+inline Rotate RotateFromDxgi(int dxgi_rotation) {
+  switch (dxgi_rotation) {
+    case 2: return Rotate::k90;   // DXGI_MODE_ROTATION_ROTATE90
+    case 3: return Rotate::k180;  // DXGI_MODE_ROTATION_ROTATE180
+    case 4: return Rotate::k270;  // DXGI_MODE_ROTATION_ROTATE270
+    default: return Rotate::kNone;  // IDENTITY(1) / UNSPECIFIED(0)
+  }
+}
+
+// VideoProcessor output dims for a source w*h under `rot` and a max width:
+// 90/270 rotations swap the dims first, then max_w scaling (aspect
+// preserved) with a %4 snap (D3D11 requires NV12 texture widths %4; the
+// encoder needs even - %4 covers both, ≤3px off the true aspect). Identity
+// when w <= max_w (or max_w == 0). Returns false on degenerate input
+// (zero dims after snap, or max_w would upscale - the VP path never
+// upscales). Pure - the selftest covers it without a GPU.
+inline bool GpuScaledDims(uint32_t w, uint32_t h, Rotate rot, uint32_t max_w,
+                          uint32_t* ow, uint32_t* oh) {
+  if (ow == nullptr || oh == nullptr) return false;
+  if (w == 0 || h == 0) return false;
+  uint32_t dw = w, dh = h;
+  if (rot == Rotate::k90 || rot == Rotate::k270) {
+    dw = h;
+    dh = w;
+  }
+  if (max_w > 0 && dw > max_w) {
+    uint32_t nh = static_cast<uint32_t>(((static_cast<uint64_t>(dh) * max_w + dw - 1) / dw));
+    dw = max_w;
+    dh = nh;
+  }
+  if (dw == 0 || dh == 0) return false;
+  dw -= dw % 4;  // NV12 %4 snap (covers the encoder's even requirement)
+  dh -= dh % 4;
+  if (dw == 0 || dh == 0) return false;
+  *ow = dw;
+  *oh = dh;
+  return true;
+}
+
 // DXGI Desktop Duplication with CPU readback. Single-threaded use only.
 class DxgiCapture final : public ICapture {
  public:
@@ -199,8 +286,11 @@ class DxgiCapture final : public ICapture {
   // wake at the target frame cadence.
   bool Acquire(FrameBlob& blob, std::string* err = nullptr,
                uint32_t timeout_ms = 0) override;
-  uint32_t Width() const override { return w_; }
-  uint32_t Height() const override { return h_; }
+  // GPU path: the VideoProcessor OUTPUT (scaled/rotated) dims - the stream,
+  // encoder Init and HOST_HELLO all live in that (scaled) space. BGRA path:
+  // the duplication's native dims.
+  uint32_t Width() const override { return gpu_max_w_ > 0 ? out_w_ : w_; }
+  uint32_t Height() const override { return gpu_max_w_ > 0 ? out_h_ : h_; }
   uint32_t RebuildCount() const override { return rebuilds_; }
 
   // Unified CaptureReset entry (M2-Slice1 Task 2): full re-creation
@@ -221,6 +311,14 @@ class DxgiCapture final : public ICapture {
   // rebuild path. On failure *err is "<step>: hr=0x%08X" (or a message).
   bool Init(std::string* err);
 
+  // gpu-readback task: same as Init, but with the GPU-scale+NV12 pipeline
+  // enabled (max_w > 0 = scale/convert to NV12 at max_w in the VideoProcessor
+  // and read the small NV12 frame back; max_w == 0 behaves exactly like
+  // Init). When the device/video processor cannot do the NV12 conversion the
+  // backend DEGRADES IN PLACE to the legacy full-BGRA path (logged, never a
+  // hard failure) - ScaledCapture then does the CPU downscale as before.
+  bool InitGpuScale(uint32_t max_w, std::string* err);
+
  private:
   // Cheap rebuild: re-DuplicateOutput on the existing device/output and
   // resize staging if the mode changed. Falls back to Init on hard errors.
@@ -232,6 +330,11 @@ class DxgiCapture final : public ICapture {
   bool HandleAccessLost(std::string* err, long hr);
   // (Re)creates the CPU-readable staging texture for current w_/h_.
   bool MakeStaging(std::string* err);
+  // gpu-readback: (re)creates the VideoProcessor (enumerator for the current
+  // source dims/format + NV12 output) and the NV12 output + double-buffered
+  // staging textures for out_w_ x out_h_. Must be called after w_/h_/rot_/
+  // out_w_/out_h_ are set. On failure the caller degrades to the BGRA path.
+  bool MakeGpuPipeline(std::string* err);
 
   struct Impl;  // COM pointers (d3d11.h stays out of this header)
   Impl* impl_;
@@ -239,7 +342,19 @@ class DxgiCapture final : public ICapture {
   uint32_t rebuilds_ = 0;
   uint32_t consecutive_rebuild_failures_ = 0;
   bool have_base_frame_ = false;  // first frame after create/rebuild is base
+  // gpu-readback state: gpu_max_w_ > 0 = GPU path active (dims below are the
+  // VideoProcessor OUTPUT dims); rot_ is the duplication rotation applied in
+  // the same VideoProcessorBlt pass.
+  uint32_t gpu_max_w_ = 0;
+  Rotate rot_ = Rotate::kNone;
+  uint32_t out_w_ = 0, out_h_ = 0;  // scaled/rotated NV12 dims (GPU path)
 };
+
+// gpu-readback task: TryCreateDxgiCapture with the GPU-scale+NV12 pipeline.
+// max_w > 0 enables it (see InitGpuScale; graceful BGRA degradation when the
+// driver cannot do the NV12 conversion); max_w == 0 is exactly
+// TryCreateDxgiCapture. Returns null + *err when no output can be duplicated.
+std::unique_ptr<ICapture> TryCreateDxgiCaptureGpu(uint32_t max_w, std::string* err);
 
 }  // namespace xnc
 

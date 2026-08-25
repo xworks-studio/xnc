@@ -8,6 +8,11 @@
 // pipeline aliases it (valid until the next Acquire, per the ICapture
 // contract). Dimensions are snapped to even (the encoder requires even
 // w/h); the aspect is preserved, only shrinking ever happens.
+//
+// gpu-readback task: when the wrapped capture already outputs scaled NV12
+// (DXGI GPU VideoProcessor path - blob.pixfmt == kNv12), Acquire is a pure
+// pass-through: no CPU downscale, no copy. The CPU downscale remains for
+// BGRA backends (GDI; degraded DXGI instances).
 #ifndef XNC_NATIVE_DESKTOP_SCALED_CAPTURE_H_
 #define XNC_NATIVE_DESKTOP_SCALED_CAPTURE_H_
 

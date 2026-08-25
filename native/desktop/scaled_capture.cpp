@@ -4,6 +4,13 @@
 // adds the pipeline integration: the blob dims become the scaled dims, the
 // destination buffer is persistent across frames, and odd target dims are
 // snapped to even (encoder contract) by dropping one edge row/column.
+//
+// gpu-readback task: when the inner capture already outputs scaled NV12 (the
+// DXGI VideoProcessor GPU path - blob.pixfmt == kNv12), Acquire passes the
+// frame through untouched - no CPU downscale, no copy (the GPU did both the
+// scaling and the BGRA->NV12 conversion). The CPU downscale stays for the
+// BGRA backends (GDI produces BGRA; a degraded DXGI instance falls back
+// here too).
 #include "scaled_capture.h"
 
 #include "../common/log.h"
@@ -40,6 +47,16 @@ bool ScaledCapture::Acquire(FrameBlob& blob, std::string* err, uint32_t timeout_
   }
   FrameBlob raw;
   if (!inner_->Acquire(raw, err, timeout_ms)) return false;  // err_timeout/rebuilt/... passthrough
+
+  // gpu-readback: inner (DXGI GPU path) already scaled to max_w and
+  // converted to NV12 in the VideoProcessor - pass through untouched (no
+  // CPU downscale, no copy; the blob's dims are the GPU-scaled ones).
+  if (raw.pixfmt == Pixfmt::kNv12) {
+    scaled_w_ = raw.w;
+    scaled_h_ = raw.h;
+    blob = std::move(raw);
+    return true;
+  }
 
   uint32_t nw = 0, nh = 0;
   if (!ScaledDims(raw.w, raw.h, max_w_, &nw, &nh)) {
@@ -90,6 +107,8 @@ bool ScaledCapture::Acquire(FrameBlob& blob, std::string* err, uint32_t timeout_
   }
   blob.w = dw;
   blob.h = dh;
+  blob.pixfmt = Pixfmt::kBgra;  // explicit: blobs are reused across acquires
+  blob.gpu_scale_us = 0;
   blob.mono_us = raw.mono_us;
   return true;
 }

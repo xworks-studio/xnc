@@ -12,14 +12,28 @@
 
 namespace xnc {
 
-// One captured frame: tightly packed 8-bit BGRA (bgra.size() == w * h * 4)
-// plus the capture timestamp in monotonic-clock microseconds. Fields are
-// default-initialized so a default-constructed blob is {empty, 0, 0, 0}
-// (value semantics matter: diag/pipeline code reuses FrameBlob locals).
+// Pixel layout of a FrameBlob buffer (gpu-readback task): the DXGI GPU path
+// produces NV12 directly (VideoProcessor scale+convert, no CPU BGRA), the
+// GDI/CPU paths stay BGRA. The pipeline routes on this field: NV12 -> the
+// encoder's NV12 entry (no BGRA->NV12 conversion), BGRA -> ScaledCapture CPU
+// downscale + encoder BGRA entry.
+enum class Pixfmt : uint8_t { kBgra = 0, kNv12 = 1 };
+
+// One captured frame: tightly packed 8-bit pixels (bgra.size() == w * h * 4
+// for BGRA, w * h * 3 / 2 for NV12) plus the capture timestamp in
+// monotonic-clock microseconds. pixfmt says which layout bgra holds. Fields
+// are default-initialized so a default-constructed blob is {empty, 0, 0, 0,
+// BGRA, 0} (value semantics matter: diag/pipeline code reuses FrameBlob
+// locals).
 struct FrameBlob {
   std::vector<uint8_t> bgra;
   uint32_t w = 0, h = 0;
+  Pixfmt pixfmt = Pixfmt::kBgra;
   uint64_t mono_us = 0;
+  // GPU-path diag: microseconds the DXGI backend spent in the GPU
+  // scale/NV12 + readback portion of this frame (0 = not measured / not the
+  // GPU path). Pipeline windows it into the gpu_scale_ms log line.
+  uint64_t gpu_scale_us = 0;
 };
 
 // Capture backend. Acquire semantics (pinned for Task 3/5, M2-S1 T2 adds

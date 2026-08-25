@@ -4,8 +4,10 @@
 // TWO threads joined by a bounded handoff queue (frame_queue.h):
 //
 //   CAPTURE thread (RunCore's thread): Acquire (timeout = spf) -> scale
-//   (ScaledCapture inside capture) -> push the scaled BGRA buffer into the
-//   encode queue (depth 2, drop-oldest on full -> keep the LATEST frame,
+//   (ScaledCapture inside capture; the DXGI GPU path scales+converts to NV12
+//   in the VideoProcessor instead) -> push the scaled frame (BGRA or NV12
+//   per blob.pixfmt - the encode thread routes the encoder entry on it) into
+//   the encode queue (depth 2, drop-oldest on full -> keep the LATEST frame,
 //   ADR-014), preserving the capture mono_us timestamp. err_timeout (static)
 //   produces no frame (the encode thread idles); err_rebuilt / unified
 //   CaptureReset rewind the state machine and synchronize with BOTH threads
@@ -33,6 +35,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>  // Sleep, GetTickCount64
+#include <mmsystem.h>  // timeBeginPeriod/timeEndPeriod (1 ms timer resolution)
 
 #include <atomic>
 #include <cerrno>
@@ -58,6 +61,19 @@ uint64_t NowMs() { return GetTickCount64(); }
 // backends block inside Acquire (spf or 100 ms), fakes return instantly -
 // this keeps the capture loop off the CPU in both cases.
 constexpr DWORD kIdleSleepMs = 15;
+
+// 1 ms timer resolution for the run's pacing Sleeps. Windows Sleep/
+// GetTickCount64 default to ~15.6 ms granularity: with the GPU readback the
+// capture-side spf pacing (33 ms @ 30 fps) becomes the cadence limiter and a
+// tick-quantized Sleep(30) actually sleeps 30-46 ms (measured ~22-24 fps at
+// spf=33). timeBeginPeriod(1) makes the pacing exact (~30 fps) - the standard
+// media-loop practice for a dedicated capture/encode process. RAII: restored
+// on every RunCore exit path.
+class TimePeriodGuard {
+ public:
+  TimePeriodGuard() { timeBeginPeriod(1); }
+  ~TimePeriodGuard() { timeEndPeriod(1); }
+};
 
 // Warm-up wall-clock bound (spec §7.4): 2 s. Also bounds the on-demand
 // IDR re-feed window (same rule, spec §7.5 carry-over).
@@ -129,6 +145,7 @@ struct PipelineShared {
   FrameCache cache;
   PipelineResult* res = nullptr;  // every write happens under mu
   std::vector<uint8_t> base;      // cached base frame (owned copy; re-feed source)
+  Pixfmt base_pixfmt = Pixfmt::kBgra;  // base's layout (NV12 on the GPU path)
   uint64_t base_mono_us = 0;      // base frame capture timestamp (re-feeds)
   uint64_t warmup_started_ms = 0; // base submission time (2 s wall bound)
   uint32_t warmup_gen_feeds = 0;  // re-feeds this generation (rebuild resets)
@@ -160,6 +177,27 @@ struct LatencyWindow {
     const uint64_t now = NowMonoUs();
     if (now <= mono_us || now - mono_us > kLatencyMaxUs) return;  // bad stamp
     sum_us += now - mono_us;
+    ++n;
+    if (n >= kLatencyWindowFrames) Flush();
+  }
+  void Flush() {
+    if (n == 0) return;
+    XNC_LOG_INFO("%s avg=%.2f n=%u", label,
+                 static_cast<double>(sum_us) / 1000.0 / static_cast<double>(n), n);
+    sum_us = 0;
+    n = 0;
+  }
+};
+
+// Duration window (gpu-readback diag): averages a measured duration in
+// microseconds (e.g. the DXGI backend's GPU scale+NV12+readback time, from
+// FrameBlob::gpu_scale_us), flushed like LatencyWindow.
+struct DurationWindow {
+  const char* label;
+  uint64_t sum_us = 0;
+  uint32_t n = 0;
+  void Add(uint64_t us) {
+    sum_us += us;
     ++n;
     if (n >= kLatencyWindowFrames) Flush();
   }
@@ -276,6 +314,7 @@ bool RunResetSequence(ResetSequence& s) {
     std::lock_guard<std::mutex> lk(s.sh->mu);
     s.sh->cache.OnRebuild();  // WAIT_BASE_FRAME + one-shot "rebuild" IDR
     s.sh->base.clear();
+    s.sh->base_pixfmt = Pixfmt::kBgra;
     s.sh->base_mono_us = 0;
     s.sh->warmup_started_ms = 0;
     s.sh->warmup_gen_feeds = 0;
@@ -379,7 +418,13 @@ void ProcessFrame(EncodeCtx& ctx, const FrameBlob& f, bool warmup) {
   // enc_mu held: the one-shot flag is encoder stream state (Init clears it).
   if (idr_reason != nullptr) ctx.enc.ForceNextIdr(idr_reason);
   std::string eerr;
-  if (!ctx.enc.Encode(f.bgra.data(), f.bgra.size(), ctx.aus, &eerr)) {
+  // gpu-readback: route on the blob's layout - NV12 (DXGI GPU path) skips
+  // the encoder's BGRA->NV12 conversion, BGRA (GDI / degraded DXGI) uses
+  // the classic entry.
+  const bool ok = f.pixfmt == Pixfmt::kNv12
+                      ? ctx.enc.EncodeNV12(f.bgra.data(), f.bgra.size(), ctx.aus, &eerr)
+                      : ctx.enc.Encode(f.bgra.data(), f.bgra.size(), ctx.aus, &eerr);
+  if (!ok) {
     const std::string msg = eerr.empty() ? "encode failed" : eerr;
     {
       std::lock_guard<std::mutex> lk(ctx.sh.mu);
@@ -514,6 +559,7 @@ bool IdleFeed(EncodeCtx& ctx) {
   }
   std::vector<uint8_t> base_copy;
   uint64_t base_mono_us = 0;
+  Pixfmt base_pixfmt = Pixfmt::kBgra;
   bool feed = false;
   {
     std::lock_guard<std::mutex> lk(ctx.sh.mu);
@@ -541,6 +587,7 @@ bool IdleFeed(EncodeCtx& ctx) {
       }
       base_copy = ctx.sh.base;
       base_mono_us = ctx.sh.base_mono_us;
+      base_pixfmt = ctx.sh.base_pixfmt;
       feed = true;
     } else {
       PhaseOutcomeLogs(ctx);
@@ -549,6 +596,7 @@ bool IdleFeed(EncodeCtx& ctx) {
   if (!feed) return false;
   FrameBlob feed_frame;
   feed_frame.bgra = std::move(base_copy);
+  feed_frame.pixfmt = base_pixfmt;  // NV12 on the GPU path (encoder routing)
   feed_frame.mono_us = base_mono_us;
   ProcessFrame(ctx, feed_frame, true);
   return true;
@@ -586,6 +634,7 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
     res.err = "fps must be > 0";
     return res;
   }
+  TimePeriodGuard tpg;  // 1 ms timer granularity for the pacing Sleeps
 
   const uint32_t spf_ms = 1000u / opt.fps;
   const uint32_t warmup_feed_bound = WarmupFeedBound(opt.fps);
@@ -619,6 +668,8 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
   cap_win.label = "cap_cycle_ms";
   LatencyWindow acq_win;  // capture-side acquire+downscale duration
   acq_win.label = "cap_acq_ms";
+  DurationWindow gpu_win;  // gpu-readback: GPU scale+NV12+readback duration
+  gpu_win.label = "gpu_scale_ms";
   ResetStormTracker storm;  // same-reason rebuild-storm backoff (M2-S2 T1)
 
   for (;;) {
@@ -668,6 +719,7 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
     const uint64_t t_acq0 = NowMonoUs();
     if (cap.Acquire(blob, &acq_err, spf_ms)) {
       acq_win.Add(t_acq0);  // acquire (incl. downscale) duration window
+      if (blob.gpu_scale_us != 0) gpu_win.Add(blob.gpu_scale_us);
       // Frame-size change (M2-S1 Task 2): the backend adopted a new mode
       // but the encoder is still at the old size - route to the unified
       // reset (resolution) instead of feeding a wrong-sized frame in.
@@ -689,6 +741,7 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
         const bool is_base = sh.cache.OnCapturedFrame();  // captured++ inside
         if (is_base) {
           sh.base = blob.bgra;  // full frame: warm-up re-feed source
+          sh.base_pixfmt = blob.pixfmt;
           sh.base_mono_us = blob.mono_us;
           res.width = blob.w;
           res.height = blob.h;
@@ -705,10 +758,16 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
         const size_t head = blob.bgra.size() < 64 ? blob.bgra.size() : 64;
         const unsigned long long hash =
             static_cast<unsigned long long>(Fnv1a64(blob.bgra.data(), head));
-        const bool non_black = SamplePointsNotUniform(blob.bgra.data(), blob.w, blob.h);
-        XNC_LOG_INFO("first_frame hash_head64=%016llx non_black=%d w=%u h=%u mono_us=%llu",
+        // gpu-readback: the non-black probe reads Y values for NV12 blobs
+        // (BGRA pixels otherwise - NV12 is not 4 bytes/pixel).
+        const bool non_black =
+            blob.pixfmt == Pixfmt::kNv12
+                ? Nv12YNotUniform(blob.bgra.data(), blob.w, blob.h)
+                : SamplePointsNotUniform(blob.bgra.data(), blob.w, blob.h);
+        XNC_LOG_INFO("first_frame hash_head64=%016llx non_black=%d w=%u h=%u mono_us=%llu pixfmt=%s",
                      hash, non_black ? 1 : 0, blob.w, blob.h,
-                     static_cast<unsigned long long>(blob.mono_us));
+                     static_cast<unsigned long long>(blob.mono_us),
+                     blob.pixfmt == Pixfmt::kNv12 ? "nv12" : "bgra");
         if (!non_black)
           XNC_LOG_ERROR("first_frame_uniform (all 256 sampled pixels equal - suspect black/garbage frame)");
       }
@@ -718,6 +777,7 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
       handoff.bgra = blob.bgra;
       handoff.w = blob.w;
       handoff.h = blob.h;
+      handoff.pixfmt = blob.pixfmt;
       handoff.mono_us = blob.mono_us;
       queue.Push(std::move(handoff));
       cap_win.Add(t_acq0);  // acquire start -> push done (XIAOXIN split diag)
@@ -747,6 +807,7 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
         std::lock_guard<std::mutex> lk(sh.mu);
         sh.cache.OnRebuild();
         sh.base.clear();
+        sh.base_pixfmt = Pixfmt::kBgra;
         sh.base_mono_us = 0;
         sh.warmup_started_ms = 0;
         sh.warmup_gen_feeds = 0;
@@ -825,6 +886,7 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
   encode_th.join();
   cap_win.Flush();  // partial capture-cycle window at run end
   acq_win.Flush();  // partial acquire window at run end
+  gpu_win.Flush();  // partial gpu-scale window at run end
 
   // End of run: flush the encoder tail (NOTIFY_DRAIN) so the lookahead
   // window's AUs are not dropped, through the same shaping path. The encode

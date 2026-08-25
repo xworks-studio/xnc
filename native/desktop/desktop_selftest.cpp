@@ -193,6 +193,46 @@ class ScriptedCapture final : public xnc::ICapture {
   uint64_t mono_ = 0;
 };
 
+// gpu-readback: fake of the DXGI GPU backend - emits NV12 frames (converted
+// from the same synthetic bars, tight stride = width) at pre-scaled dims
+// with blob.pixfmt == kNv12, like the VideoProcessor path. Used by the
+// ScaledCapture pass-through and the pipeline NV12-routing e2e.
+class Nv12ScriptedCapture final : public xnc::ICapture {
+ public:
+  Nv12ScriptedCapture(uint32_t w, uint32_t h, uint32_t total_frames)
+      : bars_(w, h), w_(w), h_(h), total_(total_frames),
+        nv12_(xnc::Nv12Bytes(w, h)) {}
+  bool Acquire(xnc::FrameBlob& blob, std::string* err = nullptr,
+               uint32_t timeout_ms = 0) override {
+    (void)timeout_ms;
+    if (err) err->clear();
+    if (next_ < total_) {
+      if (!xnc::BgraToNv12(bars_.Frame(next_), bars_.Bytes(), nv12_.data(),
+                           nv12_.size(), w_, h_)) {
+        if (err) *err = "nv12 convert failed";
+        return false;
+      }
+      blob.bgra = nv12_;
+      blob.w = w_;
+      blob.h = h_;
+      blob.pixfmt = xnc::Pixfmt::kNv12;
+      blob.gpu_scale_us = 2000 + next_ * 7;  // like the real DXGI GPU backend
+      blob.mono_us = xnc::NowMonoUs();
+      ++next_;
+      return true;
+    }
+    if (err) *err = "err_timeout";  // static screen from here on
+    return false;
+  }
+  uint32_t Width() const override { return w_; }
+  uint32_t Height() const override { return h_; }
+
+ private:
+  SyntheticBars bars_;
+  uint32_t w_, h_, total_, next_ = 0;
+  std::vector<uint8_t> nv12_;
+};
+
 // rt 场景 ③ 专用:确定性 LCG 噪声帧(320x240,逐帧全噪声 → 压缩后 AU
 // 数 KB 级)。合成的 64x48 彩条压缩后只有 ~160B/AU,永远填不满管道
 // 缓冲,队列溢出不可达;噪声帧让卡死订阅者的 64KB 管道缓冲 + 深度 3
@@ -964,7 +1004,8 @@ struct FakeDxgiFactory {
   int64_t fail_after = -1;  // <0 = never; else creations > fail_after fail
   std::atomic<uint32_t> created{0};
   std::string fail_err = "D3D11CreateDevice: hr=0x887A0007";
-  std::unique_ptr<xnc::ICapture> Make(std::string* err) {
+  std::unique_ptr<xnc::ICapture> Make(uint32_t max_w, std::string* err) {
+    (void)max_w;  // fake rungs are BGRA; the GPU pipeline is not fake-able
     const uint32_t n = ++created;
     if (fail_after >= 0 && static_cast<int64_t>(n) > fail_after) {
       if (err) *err = fail_err;
@@ -977,7 +1018,8 @@ struct FakeDxgiFactory {
 struct FakeGdiFactory {
   uint32_t w = 96, h = 64;
   std::atomic<uint32_t> created{0};
-  std::unique_ptr<xnc::ICapture> Make(std::string* err) {
+  std::unique_ptr<xnc::ICapture> Make(uint32_t max_w, std::string* err) {
+    (void)max_w;
     ++created;
     if (err) err->clear();
     return std::make_unique<FakeGdiRung>(w, h);
@@ -990,11 +1032,11 @@ struct FakeGdiFactory {
 // dangle while a ladder is alive).
 FakeDxgiFactory* g_ld_dxgi = nullptr;
 FakeGdiFactory* g_ld_gdi = nullptr;
-std::unique_ptr<xnc::ICapture> LdMakeDxgi(std::string* err) {
-  return g_ld_dxgi != nullptr ? g_ld_dxgi->Make(err) : nullptr;
+std::unique_ptr<xnc::ICapture> LdMakeDxgi(uint32_t max_w, std::string* err) {
+  return g_ld_dxgi != nullptr ? g_ld_dxgi->Make(max_w, err) : nullptr;
 }
-std::unique_ptr<xnc::ICapture> LdMakeGdi(std::string* err) {
-  return g_ld_gdi != nullptr ? g_ld_gdi->Make(err) : nullptr;
+std::unique_ptr<xnc::ICapture> LdMakeGdi(uint32_t max_w, std::string* err) {
+  return g_ld_gdi != nullptr ? g_ld_gdi->Make(max_w, err) : nullptr;
 }
 
 }  // namespace
@@ -1056,16 +1098,24 @@ int SelftestMain() {
     CHECK("args-unknown-flag", !Parse({L"--bogus"}).ok);
     CHECK("args-mode-exclusive", !Parse({L"--selftest", L"--console-diag", L"--out", L"t"}).ok);
   }
-  { // FrameBlob 布局(MSVC x64 ABI):bgra(vector 24B)+w(4)+h(4)+mono_us(8) 紧凑 40B
-    CHECK("frameblob-sizeof", sizeof(xnc::FrameBlob) == 40);
+  { // FrameBlob 布局(MSVC x64 ABI):bgra(vector 24B)+w(4)+h(4)+pixfmt(1)+
+    // 对齐填充(3)+mono_us(8)+gpu_scale_us(8) 紧凑 56B(gpu-readback 任务
+    // 新增 pixfmt 布局字段与 gpu_scale_us 计时段)
+    CHECK("frameblob-sizeof", sizeof(xnc::FrameBlob) == 56);
     CHECK("frameblob-off-bgra", offsetof(xnc::FrameBlob, bgra) == 0);
     CHECK("frameblob-off-w", offsetof(xnc::FrameBlob, w) == 24);
     CHECK("frameblob-off-h", offsetof(xnc::FrameBlob, h) == 28);
-    CHECK("frameblob-off-mono", offsetof(xnc::FrameBlob, mono_us) == 32);
+    CHECK("frameblob-off-pixfmt", offsetof(xnc::FrameBlob, pixfmt) == 32);
+    CHECK("frameblob-off-mono", offsetof(xnc::FrameBlob, mono_us) == 40);
+    CHECK("frameblob-off-gpu-scale", offsetof(xnc::FrameBlob, gpu_scale_us) == 48);
     CHECK("frameblob-field-sizes", sizeof(xnc::FrameBlob::w) == 4 && sizeof(xnc::FrameBlob::h) == 4 &&
-                                  sizeof(xnc::FrameBlob::mono_us) == 8);
+                                  sizeof(xnc::FrameBlob::mono_us) == 8 &&
+                                  sizeof(xnc::FrameBlob::gpu_scale_us) == 8 &&
+                                  sizeof(xnc::FrameBlob::pixfmt) == 1);
     xnc::FrameBlob fb;
-    CHECK("frameblob-default", fb.bgra.empty() && fb.w == 0 && fb.h == 0 && fb.mono_us == 0);
+    CHECK("frameblob-default", fb.bgra.empty() && fb.w == 0 && fb.h == 0 &&
+                               fb.mono_us == 0 && fb.gpu_scale_us == 0 &&
+                               fb.pixfmt == xnc::Pixfmt::kBgra);
   }
   { // ICapture 形状:抽象基类(Acquire/Width/Height 纯虚),虚析构可 delete
     static_assert(std::is_abstract<xnc::ICapture>::value, "ICapture must stay abstract");
@@ -1126,6 +1176,73 @@ int SelftestMain() {
     CHECK("fnv1a64-a", xnc::Fnv1a64(a, 1) == 0xaf63dc4c8601ec8cull);
     const uint8_t foobar[] = {'f', 'o', 'o', 'b', 'a', 'r'};
     CHECK("fnv1a64-foobar", xnc::Fnv1a64(foobar, 6) == 0x85944171f73967e8ull);
+  }
+  { // gpu-readback: VideoProcessor 输出尺寸(缩放+旋转+偶对齐,纯函数)。
+    // 与 ScaledDims 相同的 2880x1800 -> 1920x1200 缩放;90/270 先交换边长
+    uint32_t ow = 0, oh = 0;
+    CHECK("gpu-sd-2880x1800", xnc::GpuScaledDims(2880, 1800, xnc::Rotate::kNone, 1920, &ow, &oh) &&
+          ow == 1920 && oh == 1200);
+    CHECK("gpu-sd-identity", xnc::GpuScaledDims(1280, 720, xnc::Rotate::kNone, 1920, &ow, &oh) &&
+          ow == 1280 && oh == 720);
+    CHECK("gpu-sd-zero-clamp", xnc::GpuScaledDims(2880, 1800, xnc::Rotate::kNone, 0, &ow, &oh) &&
+          ow == 2880 && oh == 1800);
+    CHECK("gpu-sd-even-snap-w", xnc::GpuScaledDims(1365, 768, xnc::Rotate::kNone, 1920, &ow, &oh) &&
+          ow == 1364 && oh == 768);
+    CHECK("gpu-sd-even-snap-h", xnc::GpuScaledDims(1920, 1081, xnc::Rotate::kNone, 1920, &ow, &oh) &&
+          ow == 1920 && oh == 1080);
+    // 90 度:2880x1800 横屏旋转后 1800x2880(竖宽 1800 <= 1920 → 不缩放)
+    CHECK("gpu-sd-rot90-no-scale", xnc::GpuScaledDims(2880, 1800, xnc::Rotate::k90, 1920, &ow, &oh) &&
+          ow == 1800 && oh == 2880);
+    // 90 度 + 缩放:1440x3440 旋转后 3440x1440 → 1920 宽,高 = ceil(1440*1920/3440)=804
+    CHECK("gpu-sd-rot90-scaled", xnc::GpuScaledDims(1440, 3440, xnc::Rotate::k90, 1920, &ow, &oh) &&
+          ow == 1920 && oh == 804);
+    CHECK("gpu-sd-rot270-swap", xnc::GpuScaledDims(1800, 2880, xnc::Rotate::k270, 1920, &ow, &oh) &&
+          ow == 1920 && oh == 1200);
+    CHECK("gpu-sd-rot180-keeps-dims", xnc::GpuScaledDims(2880, 1800, xnc::Rotate::k180, 1920, &ow, &oh) &&
+          ow == 1920 && oh == 1200);
+    CHECK("gpu-sd-reject-zero", !xnc::GpuScaledDims(0, 100, xnc::Rotate::kNone, 1920, &ow, &oh));
+    CHECK("gpu-sd-rot-dxgi-mapping",
+          xnc::RotateFromDxgi(0) == xnc::Rotate::kNone &&  // UNSPECIFIED
+          xnc::RotateFromDxgi(1) == xnc::Rotate::kNone &&  // IDENTITY
+          xnc::RotateFromDxgi(2) == xnc::Rotate::k90 &&
+          xnc::RotateFromDxgi(3) == xnc::Rotate::k180 &&
+          xnc::RotateFromDxgi(4) == xnc::Rotate::k270);
+  }
+  { // gpu-readback: NV12 单子资源行距压缩(D3D11 quirk:Map(0) 返回 Y 行 +
+    // 紧接的 UV 行,共用同一 RowPitch;Map(1) 报 E_INVALIDARG - 2026-08-25
+    // 在 Intel 驱动实测)。与 BGRA 版 CompactBgraRows 对照。
+    const uint32_t w = 16, h = 10;
+    const size_t pitch = w + 8;  // 对齐加长行距(Y/UV 共用)
+    // 填充标记取 0xFE:Y/UV 合法值最大 0xAF/0xE4,不会误撞
+    std::vector<uint8_t> src((size_t)pitch * h + (size_t)pitch * (h / 2), 0xFE);
+    for (uint32_t r = 0; r < h; ++r)
+      for (size_t i = 0; i < w; ++i) src[(size_t)r * pitch + i] = static_cast<uint8_t>(0x10 + r * 16 + i);
+    uint8_t* uv = src.data() + (size_t)pitch * h;  // Y 平面之后
+    for (uint32_t r = 0; r < h / 2; ++r)
+      for (size_t i = 0; i < w; ++i) uv[(size_t)r * pitch + i] = static_cast<uint8_t>(0xE0 + r);
+    std::vector<uint8_t> dst(xnc::Nv12Bytes(w, h), 0);
+    xnc::CompactNv12Rows(src.data(), pitch, dst.data(), w, h);
+    bool planes_ok = true;
+    for (uint32_t r = 0; r < h && planes_ok; ++r)
+      for (size_t i = 0; i < w; ++i)
+        if (dst[(size_t)r * w + i] != static_cast<uint8_t>(0x10 + r * 16 + i)) { planes_ok = false; break; }
+    for (uint32_t r = 0; r < h / 2 && planes_ok; ++r)
+      for (size_t i = 0; i < w; ++i)
+        if (dst[(size_t)w * h + (size_t)r * w + i] != static_cast<uint8_t>(0xE0 + r)) { planes_ok = false; break; }
+    CHECK("nv12-planes-content", planes_ok);
+    CHECK("nv12-planes-size", dst.size() == (size_t)w * h * 3 / 2);
+    CHECK("nv12-planes-no-padding", std::find(dst.begin(), dst.end(), 0xFE) == dst.end());
+  }
+  { // gpu-readback: NV12 Y 平面 256 点非全等判定(NV12 版 first_frame 检查)
+    const uint32_t w = 64, h = 48;
+    std::vector<uint8_t> black((size_t)w * h * 3 / 2, 0);
+    CHECK("nv12-y-uniform-black", !xnc::Nv12YNotUniform(black.data(), w, h));
+    std::vector<uint8_t> same((size_t)w * h * 3 / 2, 0x66);
+    CHECK("nv12-y-uniform-nonblack", !xnc::Nv12YNotUniform(same.data(), w, h));
+    std::vector<uint8_t> grad((size_t)w * h * 3 / 2, 0);
+    for (uint32_t y2 = 0; y2 < h; ++y2)
+      for (uint32_t x = 0; x < w; ++x) grad[(size_t)y2 * w + x] = static_cast<uint8_t>(x);
+    CHECK("nv12-y-gradient-nonuniform", xnc::Nv12YNotUniform(grad.data(), w, h));
   }
   { // 256 点采样非全等判定(诊断非全黑检查)
     const uint32_t w = 64, h = 48;
@@ -1659,6 +1776,56 @@ int SelftestMain() {
       }
     }
   }
+  { // (e) gpu-readback: EncodeNV12 直接编码 NV12(合成 NV12 帧,跳过
+    // BGRA->NV12)——输出契约与 Encode 一致:首 AU 含 SPS+PPS+IDR、全 VCL;
+    // 短帧/未初始化拒绝;与 Encode 的 BGRA 路径产出等价(同源彩条)。
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(kEncW, kEncH, kEncFps, kEncBitrate, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: mf-init-e err=%s\n", err.c_str());
+    CHECK("mf-init-e", init_ok);
+    if (init_ok) {
+      // 未初始化拒绝(与 Encode 的 mf-encode-before-init 同一契约)
+      xnc::MfSoftEncoder uninit;
+      std::vector<std::vector<uint8_t>> guard_aus;
+      std::string guard_err;
+      CHECK("mf-e-nv12-before-init-guard",
+            !uninit.EncodeNV12(nullptr, 0, guard_aus, &guard_err) && !guard_err.empty());
+      SyntheticBars bars(kEncW, kEncH);
+      std::vector<uint8_t> nv12(xnc::Nv12Bytes(kEncW, kEncH));
+      std::vector<std::vector<uint8_t>> aus;
+      bool ok = true, all_vcl = true;
+      std::string e2;
+      for (uint32_t i = 0; i < 30; ++i) {
+        std::vector<std::vector<uint8_t>> frame_aus;
+        if (!xnc::BgraToNv12(bars.Frame(i), bars.Bytes(), nv12.data(), nv12.size(), kEncW, kEncH)) {
+          ok = false; break;
+        }
+        if (!enc.EncodeNV12(nv12.data(), nv12.size(), frame_aus, &e2)) { ok = false; break; }
+        for (const auto& au : frame_aus) {
+          aus.push_back(au);
+          all_vcl = all_vcl && (xnc::NalHasType(au.data(), au.size(), 5) ||
+                                xnc::NalHasType(au.data(), au.size(), 1));
+        }
+      }
+      CHECK("mf-e-encode-ok", ok);
+      CHECK("mf-e-has-output", aus.size() >= 1);
+      if (!aus.empty()) {
+        CHECK("mf-e-first-sps", xnc::NalHasType(aus[0].data(), aus[0].size(), 7));
+        CHECK("mf-e-first-pps", xnc::NalHasType(aus[0].data(), aus[0].size(), 8));
+        CHECK("mf-e-first-idr", xnc::NalHasType(aus[0].data(), aus[0].size(), 5));
+      }
+      CHECK("mf-e-every-au-vcl", all_vcl);
+      // NOTE 必须在短帧拒绝检查之前:EncodeNV12 会先清空目标 aus
+      std::printf("SELFTEST NOTE: mf-e aus=%zu idrs=%zu\n", aus.size(),
+                  CountAusWithNal(aus, 5));
+      // 短帧/越界拒绝(用独立 scratch,不污染已收集的 aus)
+      std::vector<std::vector<uint8_t>> scratch;
+      CHECK("mf-e-short-frame-rejected",
+            !enc.EncodeNV12(nv12.data(), nv12.size() - 1, scratch, &e2) && !e2.empty());
+      CHECK("mf-e-short-frame-rejected-empty", scratch.empty());
+    }
+  }
   // ---- Task 5:Pipeline 端到端(FAKE ICapture + 真 MfSoftEncoder,64x48@15) ----
   {
     // 场景 1 warm-up(§7.4 修订):3 帧后静止 → 无关键帧输出前重喂 base,
@@ -1735,6 +1902,45 @@ int SelftestMain() {
         CHECK("pipe-reb-stream-idr-count",
               CountNalTypeInStream(stream.data(), stream.size(), 5) == 2);
         CHECK("pipe-reb-first-au-keyframe", StreamStartsWithKeyframe(stream));
+      }
+    }
+  }
+  { // 场景 3 (gpu-readback): NV12 blob 全管线路由 - Nv12ScriptedCapture
+    // (pixfmt=kNv12, GPU 后端形态)直入 Pipeline:编码线程走 EncodeNV12,
+    // 暖启动重喂 base 保持 NV12,流契约不变(1 IDR + SPS/PPS 前置 + VCL)
+    const uint32_t w = 64, h = 48, fps = 15;
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(w, h, fps, 500000, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: mf-init-pipe-nv12 err=%s\n", err.c_str());
+    CHECK("pipe-nv12-init", init_ok);
+    if (init_ok) {
+      Nv12ScriptedCapture cap(w, h, 3);  // 3 帧后静止 -> 触发暖启动重喂
+      xnc::PipelineOpts o;
+      o.duration_s = 2;
+      o.fps = fps;
+      o.target_bitrate_bps = 500000;
+      TempBinFile tf;
+      CHECK("pipe-nv12-tmpfile", tf.Open(3));
+      if (tf.get() != nullptr) {
+        xnc::PipelineResult res = xnc::Pipeline::Run(cap, enc, tf.get(), o);
+        const xnc::FrameCacheCounters& c = res.counters;
+        std::printf("SELFTEST NOTE: pipe-nv12 ok=%d captured=%llu encoded=%llu feeds=%llu keyframes=%llu aus=%llu bytes=%llu\n",
+                    res.ok ? 1 : 0, (unsigned long long)c.captured,
+                    (unsigned long long)c.encoded, (unsigned long long)c.warmup_feeds,
+                    (unsigned long long)c.keyframes, (unsigned long long)res.aus_written,
+                    (unsigned long long)res.bytes_written);
+        CHECK("pipe-nv12-ok", res.ok);
+        CHECK("pipe-nv12-captured", c.captured == 3);
+        CHECK("pipe-nv12-feeds-happened", c.warmup_feeds >= 1);
+        CHECK("pipe-nv12-encoded-invariant", c.encoded == c.captured + c.warmup_feeds);
+        CHECK("pipe-nv12-exactly-one-idr", c.keyframes == 1);
+        CHECK("pipe-nv12-aus-written", res.aus_written >= 1);
+        const std::vector<uint8_t> stream = ReadAll(tf.get());
+        CHECK("pipe-nv12-bytes-match", stream.size() == (size_t)res.bytes_written);
+        CHECK("pipe-nv12-first-au-sps-pps-idr", StreamStartsWithKeyframe(stream));
+        CHECK("pipe-nv12-stream-idr-count",
+              CountNalTypeInStream(stream.data(), stream.size(), 5) == c.keyframes);
       }
     }
   }
@@ -4442,6 +4648,27 @@ int SelftestMain() {
       CHECK("sci-dims", sci.Width() == 800 && sci.Height() == 600);
       CHECK("sci-acquire", sci.Acquire(b, &serr) && b.w == 800 && b.h == 600 &&
             b.bgra.size() == (size_t)800 * 600 * 4);
+      // gpu-readback: NV12 inner (the DXGI GPU path) passes through ScaledCapture
+      // untouched - no CPU downscale, dims/pixfmt/gpu_scale preserved, and the
+      // wrapped capture's scaled dims are the wrapper's dims (identity scale).
+      {
+        xnc::ScaledCapture scn(std::make_unique<Nv12ScriptedCapture>(1920, 1200, 2), 1920);
+        CHECK("scn-dims", scn.Width() == 1920 && scn.Height() == 1200);
+        xnc::FrameBlob bn;
+        CHECK("scn-acquire1", scn.Acquire(bn, &serr));
+        CHECK("scn-nv12-pixfmt", bn.pixfmt == xnc::Pixfmt::kNv12);
+        CHECK("scn-nv12-dims", bn.w == 1920 && bn.h == 1200 &&
+              bn.bgra.size() == xnc::Nv12Bytes(1920, 1200));
+        CHECK("scn-gpu-scale-preserved", bn.gpu_scale_us == 2000);  // diag stamp survives
+        CHECK("scn-acquire2", scn.Acquire(bn, &serr));
+        CHECK("scn-nv12-again", bn.pixfmt == xnc::Pixfmt::kNv12 && bn.w == 1920 &&
+              bn.gpu_scale_us == 2007);
+        // 小屏 NV12(无需缩放)同样直通
+        xnc::ScaledCapture scni(std::make_unique<Nv12ScriptedCapture>(800, 600, 1), 1920);
+        CHECK("scni-acquire", scni.Acquire(bn, &serr) && bn.pixfmt == xnc::Pixfmt::kNv12 &&
+              bn.w == 800 && bn.h == 600 && bn.bgra.size() == xnc::Nv12Bytes(800, 600));
+        CHECK("scni-timeout-passthrough", !scni.Acquire(bn, &serr) && serr == "err_timeout");
+      }
     }
 
     // WIC round trip: synthetic 64x48 BGRA -> JPEG -> JFIF magic + SOF dims.

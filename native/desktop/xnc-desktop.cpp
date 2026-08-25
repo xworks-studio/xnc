@@ -506,6 +506,10 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
   // probe upgrades back once DXGI works again (STATE backend_changed).
   xnc::LadderOpts lopt = LadderOptsFor(opt);
   lopt.reset = &capture_reset;
+  // gpu-readback: --max-w > 0 asks the DXGI rung for the GPU downscale+NV12
+  // pipeline (scale+convert in the VideoProcessor, small NV12 readback);
+  // the ScaledCapture wrapper below then passes NV12 frames through.
+  lopt.gpu_max_w = opt.max_width;
   std::unique_ptr<xnc::LadderCapture> ladder(new xnc::LadderCapture(lopt));
   std::string cap_err;
   if (!ladder->Init(&cap_err)) {
@@ -528,8 +532,13 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
     uint32_t dw = 0, dh = 0;
     xnc::ScaledDims(sw, sh, opt.max_width, &dw, &dh);
     capture = std::make_unique<xnc::ScaledCapture>(std::move(ladder), opt.max_width);
-    XNC_LOG_INFO("capture_scale enabled max_w=%u src=%ux%u -> %ux%u",
-                 opt.max_width, sw, sh, dw, dh);
+    // gpu-readback: with the GPU pipeline the ladder's DXGI dims are ALREADY
+    // the scaled ones (GPU VideoProcessor) - the wrapper is a pass-through;
+    // with GDI/degraded DXGI it is the CPU downscale as before.
+    XNC_LOG_INFO("capture_scale enabled max_w=%u src=%ux%u -> %ux%u%s",
+                 opt.max_width, sw, sh, dw, dh,
+                 sw == dw && sh == dh ? " (gpu path: scale+NV12 in video processor)"
+                                      : "");
   } else {
     capture = std::move(ladder);
   }
@@ -636,6 +645,9 @@ int RunConsoleRt(const xnc::DiagOptions& opt) {
 
   xnc::LadderOpts lopt = LadderOptsFor(opt);
   lopt.reset = &capture_reset;
+  // gpu-readback: --max-w > 0 asks the DXGI rung for the GPU downscale+NV12
+  // pipeline (see RunConsoleDiag wiring).
+  lopt.gpu_max_w = opt.max_width;
   // M2-Slice3 Task 6 (logoff/logon self-heal gate): spawning into a session
   // whose input desktop is the logon UI (WTSConnected console, Winlogon
   // desktop) DENIES duplication 0x80070005 even as SYSTEM (M2-Slice1 T1
@@ -761,8 +773,10 @@ int RunConsoleRt(const xnc::DiagOptions& opt) {
     uint32_t dw = 0, dh = 0;
     xnc::ScaledDims(sw, sh, opt.max_width, &dw, &dh);
     capture = std::make_unique<xnc::ScaledCapture>(std::move(ladder), opt.max_width);
-    XNC_LOG_INFO("capture_scale enabled max_w=%u src=%ux%u -> %ux%u",
-                 opt.max_width, sw, sh, dw, dh);
+    XNC_LOG_INFO("capture_scale enabled max_w=%u src=%ux%u -> %ux%u%s",
+                 opt.max_width, sw, sh, dw, dh,
+                 sw == dw && sh == dh ? " (gpu path: scale+NV12 in video processor)"
+                                      : "");
   } else {
     capture = std::move(ladder);
   }

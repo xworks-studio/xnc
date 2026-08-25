@@ -47,11 +47,16 @@ namespace {
 
 uint64_t LadderDefaultClock() { return GetTickCount64(); }
 
-std::unique_ptr<ICapture> LadderMakeDxgiReal(std::string* err) {
-  return TryCreateDxgiCapture(err);
+// gpu-readback: the DXGI rung factory honors the ladder's gpu_max_w - the
+// GPU downscale+NV12 pipeline when scaling is wanted, the legacy full-BGRA
+// path otherwise.
+std::unique_ptr<ICapture> LadderMakeDxgiReal(uint32_t max_w, std::string* err) {
+  return max_w > 0 ? TryCreateDxgiCaptureGpu(max_w, err)
+                   : TryCreateDxgiCapture(err);
 }
 
-std::unique_ptr<ICapture> LadderMakeGdiReal(std::string* err) {
+std::unique_ptr<ICapture> LadderMakeGdiReal(uint32_t max_w, std::string* err) {
+  (void)max_w;  // GDI is always full-BGRA; the ScaledCapture CPU path scales
   return TryCreateGdiCapture(err);
 }
 
@@ -120,7 +125,7 @@ void LadderCapture::EmitBackendChanged(const char* backend, const char* reason) 
 
 bool LadderCapture::SwapToDxgi(const char* reason) {
   std::string derr;
-  auto c = o_.make_dxgi(&derr);
+  auto c = o_.make_dxgi(o_.gpu_max_w, &derr);
   if (c == nullptr) {
     XNC_LOG_ERROR("backend_swap dxgi create failed err=\"%s\"", derr.c_str());
     return false;
@@ -137,7 +142,7 @@ bool LadderCapture::SwapToDxgi(const char* reason) {
 
 bool LadderCapture::SwapToGdi(const char* reason) {
   std::string gerr;
-  auto c = o_.make_gdi(&gerr);
+  auto c = o_.make_gdi(o_.gpu_max_w, &gerr);
   if (c == nullptr) {
     XNC_LOG_ERROR("backend_swap gdi create failed err=\"%s\"", gerr.c_str());
     return false;
@@ -159,7 +164,7 @@ bool LadderCapture::Init(std::string* err) {
   }
   if (o_.force_gdi) {
     std::string gerr;
-    impl_->gdi = o_.make_gdi(&gerr);
+    impl_->gdi = o_.make_gdi(o_.gpu_max_w, &gerr);
     if (impl_->gdi == nullptr) {
       if (err) *err = gerr.empty() ? "gdi init failed (forced)" : gerr;
       XNC_LOG_ERROR("backend_ladder_init failed backend=gdi(forced) err=\"%s\"",
@@ -172,7 +177,7 @@ bool LadderCapture::Init(std::string* err) {
     return true;
   }
   std::string derr;
-  impl_->dxgi = o_.make_dxgi(&derr);
+  impl_->dxgi = o_.make_dxgi(o_.gpu_max_w, &derr);
   if (impl_->dxgi != nullptr) {
     active_.store(BackendKind::kDxgi, std::memory_order_relaxed);
     XNC_LOG_INFO("backend_ladder_init backend=dxgi health=%u force_health=%d probe_ms=%u",
@@ -191,7 +196,7 @@ bool LadderCapture::Init(std::string* err) {
   }
   // Genuine DXGI failure (driver/GPU): GDI is the designed rung below.
   std::string gerr;
-  impl_->gdi = o_.make_gdi(&gerr);
+  impl_->gdi = o_.make_gdi(o_.gpu_max_w, &gerr);
   if (impl_->gdi != nullptr) {
     active_.store(BackendKind::kGdi, std::memory_order_relaxed);
     switches_.store(0, std::memory_order_relaxed);  // start choice, not a swap
@@ -375,7 +380,7 @@ void LadderCapture::ProbeLoop() {
     if (active_.load(std::memory_order_relaxed) != BackendKind::kGdi) continue;
     if (probe_ok_.load(std::memory_order_relaxed)) continue;  // already armed
     std::string perr;
-    std::unique_ptr<ICapture> probe = o_.make_dxgi(&perr);
+    std::unique_ptr<ICapture> probe = o_.make_dxgi(o_.gpu_max_w, &perr);
     bool ok = false;
     if (probe != nullptr) {
       FrameBlob blob;

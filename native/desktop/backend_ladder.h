@@ -164,10 +164,18 @@ struct LadderOpts {
   uint32_t probe_interval_ms = 30000;  // 30s DXGI probe while on GDI (0=off)
   int32_t force_health = -1;       // XNC_FORCE_DXGI_HEALTH (>=0 = override)
   bool force_gdi = false;          // XNC_FORCE_BACKEND=gdi / --backend gdi
-  // Backend factories (null = the real TryCreateDxgiCapture /
-  // TryCreateGdiCapture, wired in backend_ladder.cpp).
-  std::unique_ptr<ICapture> (*make_dxgi)(std::string* err) = nullptr;
-  std::unique_ptr<ICapture> (*make_gdi)(std::string* err) = nullptr;
+  // gpu-readback task: >0 = the DXGI rung is created with the GPU
+  // downscale+NV12 pipeline at this max width (make_dxgi receives it; the
+  // ladder forwards it to the DXGI factory). 0 = legacy full-BGRA DXGI rung
+  // (the CPU ScaledCapture wrapper then does the downscale). GDI is always
+  // BGRA - the wrapper's CPU path covers it.
+  uint32_t gpu_max_w = 0;
+  // Backend factories (null = the real TryCreateDxgiCaptureGpu /
+  // TryCreateGdiCapture, wired in backend_ladder.cpp). max_w is the ladder's
+  // gpu_max_w (0 = no GPU scale) - the DXGI factory creates the GPU or the
+  // legacy path accordingly; GDI factories ignore it.
+  std::unique_ptr<ICapture> (*make_dxgi)(uint32_t max_w, std::string* err) = nullptr;
+  std::unique_ptr<ICapture> (*make_gdi)(uint32_t max_w, std::string* err) = nullptr;
   // "DXGI init error means no desktop access" predicate (null = the real
   // DxgiErrIsDesktopAccessDenied). When true the ladder does NOT silently
   // fall back to GDI - GetDC(NULL) would happily capture the WRONG desktop

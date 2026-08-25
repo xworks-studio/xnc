@@ -604,6 +604,23 @@ bool MfSoftEncoder::Encode(const uint8_t* bgra, size_t len,
   return SubmitNv12(nv12_.data(), nv12_.size(), aus, err);
 }
 
+bool MfSoftEncoder::EncodeNV12(const uint8_t* nv12, size_t len,
+                               std::vector<std::vector<uint8_t>>& aus,
+                               std::string* err) {
+  aus.clear();
+  if (!impl_ || impl_->mft.Get() == nullptr) {
+    if (err) *err = "encoder not initialized";
+    return false;
+  }
+  const size_t need = Nv12Bytes(w_, h_);
+  if (need == 0 || !nv12 || len < need) {
+    if (err)
+      *err = "short nv12 frame: " + std::to_string(len) + " < " + std::to_string(need);
+    return false;
+  }
+  return SubmitNv12(nv12, len, aus, err);
+}
+
 void MfSoftEncoder::ForceNextIdr(const char* reason) {
   force_pending_ = true;
   XNC_LOG_INFO("force_key_pending reason=%s", reason ? reason : "");
