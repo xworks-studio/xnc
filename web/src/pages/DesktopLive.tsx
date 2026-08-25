@@ -642,6 +642,14 @@ export default function DesktopLive() {
                 const video = videoRef.current;
                 if (!video) return;
                 video.srcObject = e.streams[0] ?? new MediaStream([e.track]);
+                // 远控低延迟关键:最小化播放缓冲(默认 ~200ms+ 的 jitter
+                // buffer 会让操作反馈明显滞后)。Chrome/Edge 支持
+                // playoutDelayHint;0 = 最小延迟(丢帧换实时)。
+                try {
+                  (e.receiver as unknown as { playoutDelayHint?: number }).playoutDelayHint = 0;
+                } catch {
+                  /* 旧浏览器不支持,忽略 */
+                }
                 startFrameLoop(video);
               };
               pc.onicecandidate = (e) => {
