@@ -97,14 +97,30 @@ func RunApply(stageDir, parentPID string, log func(format string, args ...any)) 
 	}
 	rollback := func() error {
 		// swap 失败：恢复 .old、重启 agent 服务（既有回滚语义）。
+		// 2026-08-25 生产事故修复：waitConnectedMarker 超时回滚时新 agent
+		// 可能仍在运行，运行中 exe 被锁导致 .old→exe 的 rename 失败（现场：
+		// 4 个 .old 残留、新 exe 缺失、服务停止）。必须先停服务再换文件。
+		if err := ensureAgentStopped(); err != nil {
+			log("apply-update: rollback stop service failed: %v", err)
+		}
+		var rollbackErr error
 		for name, dst := range old {
-			_ = os.Remove(dst)
-			_ = os.Rename(dst+".old", dst)
+			if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
+				rollbackErr = err
+			}
+			if err := os.Rename(dst+".old", dst); err != nil && !os.IsNotExist(err) {
+				rollbackErr = err
+			}
 			_ = os.Remove(filepath.Join(stageDir, name)) // 残留清扫
 		}
 		_ = os.RemoveAll(stageDir)
-		_ = startService()
-		return nil
+		if err := startService(); err != nil {
+			log("apply-update: rollback start service failed: %v", err)
+		}
+		if rollbackErr != nil {
+			log("apply-update: rollback incomplete: %v", rollbackErr)
+		}
+		return rollbackErr
 	}
 	return withCoreRestart(coreSvc, swap, rollback)
 }
@@ -193,6 +209,35 @@ func startService() error {
 	}
 	defer s.Close()
 	return s.Start()
+}
+
+// ensureAgentStopped 回滚前停 XNCAgent(运行中的 exe 会锁文件,致 .old
+// 恢复失败——2026-08-25 生产事故;容错:服务未运行/不存在 = 成功)。
+func ensureAgentStopped() error {
+	m, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer m.Disconnect()
+	s, err := m.OpenService("XNCAgent")
+	if err != nil {
+		return nil // 服务不存在
+	}
+	defer s.Close()
+	st, err := s.Query()
+	if err != nil || st.State != svc.StartPending && st.State != svc.Running {
+		return nil
+	}
+	_, _ = s.Control(svc.Stop)
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		st, err = s.Query()
+		if err != nil || st.State == svc.Stopped {
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("XNCAgent did not stop within 30s")
 }
 
 // scmCoreService 停/起 XNCCore（服务缺失/未运行一律 nil——容错，apply
