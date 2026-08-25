@@ -49,12 +49,15 @@ const (
 var sessionIDRe = regexp.MustCompile(`^[A-Za-z0-9-]+$`)
 
 // Exec 命令模式处理器。Host 为 nil 时用 DefaultShellHost(dev 环境变量);
-// 测试注入 fake。TmpDir 为空 = os.TempDir()（脚本模式临时文件目录，
-// 测试注入点）。
+// 测试注入 fake。TmpDir 为空且 StateDir 非空时脚本落 StateDir——服务以
+// SYSTEM 运行时 os.TempDir() 指向 SystemTemp,用户令牌侧 xnc-shell 无
+// 权限读取(exec --file 生产回归);state dir(如 C:\xnc)对 Users 可读。
 type Exec struct {
 	Log    *slog.Logger
 	Host   ShellHost
 	TmpDir string
+	// StateDir 非空时优先于 os.TempDir() 作为脚本临时目录。
+	StateDir string
 }
 
 func NewExec(log *slog.Logger) *Exec { return &Exec{Log: log, Host: DefaultShellHost(log)} }
@@ -275,6 +278,9 @@ func (ex *Exec) writeScript(sessionID, script string) (string, error) {
 
 func (ex *Exec) scriptPath(sessionID string) string {
 	dir := ex.TmpDir
+	if dir == "" {
+		dir = ex.StateDir
+	}
 	if dir == "" {
 		dir = os.TempDir()
 	}

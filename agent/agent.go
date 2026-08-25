@@ -84,7 +84,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		engine := session.NewEngine(slog.Default(), sendControl)
 		// exec/shell:凭据与 desktop 同源(env → XNCCore 服务缺省)。
 		shellHost := session.ShellHostFromStateDir(a.StateDir, slog.Default())
-		engine.Register(proto.KindExec, &session.Exec{Log: slog.Default(), Host: shellHost})
+		engine.Register(proto.KindExec, &session.Exec{Log: slog.Default(), Host: shellHost, StateDir: a.StateDir})
 		engine.Register(proto.KindShell, &session.Shell{Log: slog.Default(), Host: shellHost})
 		engine.Register(proto.KindFile, session.NewFile(slog.Default()))
 		engine.Register(proto.KindTunnel, session.NewTunnel(slog.Default()))
