@@ -237,21 +237,21 @@ func (p *Publisher) WriteFrame(f Frame) error {
 	return nil
 }
 
-// frameDuration 推导本帧时长:mono 差 ∈ (0, 2s] 视为有效,否则回退
-// DefaultDuration。2s 上限只防御 mono 时钟异常(Windows QPC 单调不回退,
-// 合法间隙仅来自编码器强制 IDR 后的 lookahead 回填,~0.55s@30fps)——该
-// 间隙是真实时间,必须原样计入 RTP 时间轴:此前 500ms 钳位让每次 IDR
-// 丢失 ~0.5s,播放时间轴持续落后真实时间(几分钟后体感延迟达秒级),
-// 且 IDR 帧"迟到"触发浏览器反复 PLI。
+// frameDuration 推导本帧时长:mono 差直接采用,回退 DefaultDuration 仅在
+// mono 不前进时(首帧/同帧 re-feed/时钟回跳)。无上限:Windows QPC 单调
+// 不回退,合法间隙包括编码器强制 IDR 后的 lookahead 回填(~0.55s@30fps)
+// 与长静止后恢复(用户离开桌面几十秒后操作,间隙 = 静止时长)——二者都
+// 是真实时间,必须原样计入 RTP 时间轴。此前 2s 钳位让恢复首帧的时间戳
+// 落后真实时间,Chrome 判其"迟到"丢弃,画面停在旧帧直到某帧被接受才
+// 跳变——"回退帧"观感。host 重启/pipe 重连不会误入此路径:会话重建
+// 时 Publisher 全新,lastMono 从 0 开始。
 func (p *Publisher) frameDuration(monoUs uint64) time.Duration {
 	p.stateMu.Lock()
 	defer p.stateMu.Unlock()
 	if p.lastMono != 0 && monoUs > p.lastMono {
 		d := time.Duration(monoUs-p.lastMono) * time.Microsecond
-		if d <= 2*time.Second {
-			p.lastMono = monoUs
-			return d
-		}
+		p.lastMono = monoUs
+		return d
 	}
 	p.lastMono = monoUs
 	return p.defDur
