@@ -32,10 +32,16 @@ struct FrameBlob {
 // SYSTEM - T1 evidence) or no duplication exists - the pipeline routes
 // this into the unified CaptureReset instead of treating it fatal; any
 // other *err = fatal (repeated hard failures etc.).
+//
+// timeout_ms bounds the block for one new frame (pipeline-decouple: the
+// capture thread passes spf so a static screen wakes at the target frame
+// cadence instead of the backend's default wait). 0 = backend default
+// (DxgiCapture: 100 ms; GDI/fakes: their own pacing). Fakes may ignore it.
 class ICapture {
  public:
   virtual ~ICapture() = default;
-  virtual bool Acquire(FrameBlob&, std::string* err = nullptr) = 0;
+  virtual bool Acquire(FrameBlob&, std::string* err = nullptr,
+                       uint32_t timeout_ms = 0) = 0;
   virtual uint32_t Width() const = 0;
   virtual uint32_t Height() const = 0;
   // Total in-place rebuilds so far (ACCESS_LOST/DEVICE_REMOVED) - diag

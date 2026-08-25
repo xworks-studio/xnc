@@ -187,8 +187,9 @@ struct LadderOpts {
 };
 
 // ICapture wrapper owning the DXGI/GDI ladder. Acquire/Rebuild run on the
-// pipeline thread; the DXGI probe runs on its own thread and touches only
-// atomics + its own probe capture (never the active backend).
+// pipeline CAPTURE thread (pipeline-decouple); the DXGI probe runs on its
+// own thread and touches only atomics + its own probe capture (never the
+// active backend).
 class LadderCapture final : public ICapture {
  public:
   explicit LadderCapture(const LadderOpts& o = LadderOpts{});
@@ -203,7 +204,8 @@ class LadderCapture final : public ICapture {
 
   // ICapture. Delegates to the active backend, scores the outcome, and
   // downgrades/converts per the header contract.
-  bool Acquire(FrameBlob& blob, std::string* err = nullptr) override;
+  bool Acquire(FrameBlob& blob, std::string* err = nullptr,
+               uint32_t timeout_ms = 0) override;
   uint32_t Width() const override;
   uint32_t Height() const override;
   uint32_t RebuildCount() const override;

@@ -8,7 +8,7 @@
 // server stop flag so Shutdown() never hangs.
 //
 // Thread map (max_subs <= 4):
-//   pipeline thread - Pipeline::Run -> RtServer::OnAu fan-out (this class
+//   ENCODE thread - Pipeline::Run -> RtServer::OnAu fan-out (this class
 //                     is the AuSink; enqueue only, never blocks on IO)
 //   accept thread   - one listening instance at a time; on connect hands
 //                     the handle to a fresh reader thread
@@ -681,7 +681,7 @@ void RtServer::SenderLoop(std::shared_ptr<SubConn> c) {
   }
 }
 
-// ---- AuSink (pipeline thread) ----
+// ---- AuSink (encode thread; OnState/OnDisplayChanged from the capture thread) ----
 
 const char* RtServer::OnAu(bool is_idr, uint64_t mono_us, const uint8_t* au,
                            size_t len) {

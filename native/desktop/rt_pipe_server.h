@@ -580,7 +580,7 @@ class RtServer : public AuSink {
 
   void RequestStop() { stop_.store(true); }
 
-  // ---- AuSink (called on the pipeline thread) ----
+  // ---- AuSink (OnAu on the encode thread; states from the capture thread) ----
   // Broadcasts one AU; never fatal (drops per subscriber instead).
   const char* OnAu(bool is_idr, uint64_t mono_us, const uint8_t* au,
                    size_t len) override;

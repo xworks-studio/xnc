@@ -30,6 +30,7 @@
 #include "diag.h"
 #include "dxgi_capture.h"
 #include "frame_cache.h"
+#include "frame_queue.h"
 #include "gdi_capture.h"
 #include "input_manager.h"
 #include "jpeg_wic.h"
@@ -82,7 +83,8 @@ ParseOutcome Parse(const std::vector<std::wstring>& args) {
 // Selftest-only fake backend: proves ICapture is implementable/abstract and
 // is reusable by Task 5's synthetic-capture pipeline tests.
 struct FakeCapture final : xnc::ICapture {
-  bool Acquire(xnc::FrameBlob&, std::string* = nullptr) override { return false; }
+  bool Acquire(xnc::FrameBlob&, std::string* = nullptr,
+               uint32_t = 0) override { return false; }
   uint32_t Width() const override { return 0; }
   uint32_t Height() const override { return 0; }
 };
@@ -156,7 +158,9 @@ class ScriptedCapture final : public xnc::ICapture {
   ScriptedCapture(uint32_t w, uint32_t h, uint32_t total_frames,
                   uint32_t rebuild_at = kNoScriptedRebuild)
       : bars_(w, h), w_(w), h_(h), total_(total_frames), rebuild_at_(rebuild_at) {}
-  bool Acquire(xnc::FrameBlob& blob, std::string* err = nullptr) override {
+  bool Acquire(xnc::FrameBlob& blob, std::string* err = nullptr,
+               uint32_t timeout_ms = 0) override {
+    (void)timeout_ms;  // fakes never block
     if (err) err->clear();
     if (next_ == rebuild_at_ && !rebuild_fired_) {
       rebuild_fired_ = true;
@@ -169,7 +173,7 @@ class ScriptedCapture final : public xnc::ICapture {
       blob.bgra.assign(p, p + bars_.Bytes());
       blob.w = w_;
       blob.h = h_;
-      blob.mono_us = ++mono_;
+      blob.mono_us = xnc::NowMonoUs();  // real clock: pipe_latency_ms needs genuine capture stamps
       ++next_;
       return true;
     }
@@ -197,7 +201,9 @@ class NoisyCapture final : public xnc::ICapture {
  public:
   NoisyCapture(uint32_t w, uint32_t h, uint32_t total)
       : bgra_((size_t)w * h * 4), w_(w), h_(h), total_(total) {}
-  bool Acquire(xnc::FrameBlob& blob, std::string* err = nullptr) override {
+  bool Acquire(xnc::FrameBlob& blob, std::string* err = nullptr,
+               uint32_t timeout_ms = 0) override {
+    (void)timeout_ms;  // fakes never block
     if (err) err->clear();
     if (next_ < total_) {
       uint32_t st = 0x1234567u + next_ * 7919u;
@@ -211,7 +217,7 @@ class NoisyCapture final : public xnc::ICapture {
       blob.bgra = bgra_;
       blob.w = w_;
       blob.h = h_;
-      blob.mono_us = ++mono_;
+      blob.mono_us = xnc::NowMonoUs();  // real clock: pipe_latency_ms needs genuine capture stamps
       ++next_;
       return true;
     }
@@ -734,7 +740,9 @@ class ResetCapture final : public xnc::ICapture {
  public:
   ResetCapture(uint32_t w, uint32_t h, uint32_t total)
       : buf_((size_t)w * h * 4), w_(w), h_(h), total_(total) {}
-  bool Acquire(xnc::FrameBlob& blob, std::string* err = nullptr) override {
+  bool Acquire(xnc::FrameBlob& blob, std::string* err = nullptr,
+               uint32_t timeout_ms = 0) override {
+    (void)timeout_ms;  // fakes never block
     if (err) err->clear();
     if (access_lost_) {
       if (err) *err = "err_access_lost";
@@ -745,7 +753,7 @@ class ResetCapture final : public xnc::ICapture {
       blob.bgra = buf_;
       blob.w = w_;
       blob.h = h_;
-      blob.mono_us = ++mono_;
+      blob.mono_us = xnc::NowMonoUs();  // real clock: pipe_latency_ms needs genuine capture stamps
       ++next_;
       return true;
     }
@@ -796,17 +804,22 @@ class ResetCapture final : public xnc::ICapture {
 
 // AuSink recorder for the pipeline reset scenarios: counts AUs, records
 // STATE codes (+recoverable flag) and DISPLAY_CHANGED events in order.
+// Thread-safe: with the capture/encode threads decoupled, OnAu runs on the
+// encode thread while OnState/OnDisplayChanged run on the capture thread.
 struct RecordingSink final : xnc::AuSink {
   const char* OnAu(bool is_idr, uint64_t, const uint8_t*, size_t) override {
+    std::lock_guard<std::mutex> lk(mu);
     aus++;
     if (is_idr) keys++;
     return nullptr;
   }
   void OnState(const char* code, bool recoverable) override {
+    std::lock_guard<std::mutex> lk(mu);
     states.emplace_back(code != nullptr ? code : "?");
     states_recoverable.push_back(recoverable);
   }
   void OnDisplayChanged(uint32_t w, uint32_t h, const char* reason) override {
+    std::lock_guard<std::mutex> lk(mu);
     Disp d;
     d.w = w;
     d.h = h;
@@ -814,13 +827,16 @@ struct RecordingSink final : xnc::AuSink {
     displays.push_back(d);
   }
   bool Saw(const char* code) const {
+    std::lock_guard<std::mutex> lk(mu);
     return std::find(states.begin(), states.end(), std::string(code)) != states.end();
   }
   bool SawRecoverable(const char* code) const {
+    std::lock_guard<std::mutex> lk(mu);
     for (size_t i = 0; i < states.size() && i < states_recoverable.size(); ++i)
       if (states[i] == code) return states_recoverable[i];
     return false;
   }
+  mutable std::mutex mu;
   uint64_t aus = 0, keys = 0;
   std::vector<std::string> states;
   std::vector<bool> states_recoverable;
@@ -863,7 +879,9 @@ class FakeDxgiRung final : public xnc::ICapture {
                uint32_t rebuild_fails = 0)
       : buf_((size_t)w * h * 4, 0x11), w_(w), h_(h),
         frames_(frames), hard_errors_(hard_errors), rebuild_fails_(rebuild_fails) {}
-  bool Acquire(xnc::FrameBlob& blob, std::string* err = nullptr) override {
+  bool Acquire(xnc::FrameBlob& blob, std::string* err = nullptr,
+               uint32_t timeout_ms = 0) override {
+    (void)timeout_ms;  // fakes never block
     ++acquire_calls_;
     if (err) err->clear();
     if (next_ < frames_) {
@@ -871,7 +889,7 @@ class FakeDxgiRung final : public xnc::ICapture {
       blob.bgra = buf_;
       blob.w = w_;
       blob.h = h_;
-      blob.mono_us = ++mono_;
+      blob.mono_us = xnc::NowMonoUs();  // real clock: pipe_latency_ms needs genuine capture stamps
       ++next_;
       return true;
     }
@@ -912,14 +930,16 @@ class FakeGdiRung final : public xnc::ICapture {
  public:
   explicit FakeGdiRung(uint32_t w = 96, uint32_t h = 64)
       : buf_((size_t)w * h * 4, 0x22), w_(w), h_(h) {}
-  bool Acquire(xnc::FrameBlob& blob, std::string* err = nullptr) override {
+  bool Acquire(xnc::FrameBlob& blob, std::string* err = nullptr,
+               uint32_t timeout_ms = 0) override {
+    (void)timeout_ms;  // fakes never block
     if (err) err->clear();
     buf_[next_ % buf_.size()] = 0x90 + (next_ & 0xF);
     ++next_;
     blob.bgra = buf_;
     blob.w = w_;
     blob.h = h_;
-    blob.mono_us = ++mono_;
+    blob.mono_us = xnc::NowMonoUs();  // real clock: pipe_latency_ms needs genuine capture stamps
     return true;
   }
   uint32_t Width() const override { return w_; }
@@ -1425,6 +1445,39 @@ int SelftestMain() {
     CHECK("fc-double-rebuild-one-reason", c3.TakePendingIdrReason() != nullptr &&
                                               c3.TakePendingIdrReason() == nullptr);
   }
+  { // pipeline-decouple:FrameQueue 交接队列(有界深度 2,满则丢最旧保最新,
+    // FIFO 顺序不重排;Shutdown 唤醒等待者且排空后才拒绝)
+    xnc::FrameQueue q(2);
+    auto mk = [](uint64_t mono) {
+      xnc::FrameBlob f;
+      f.mono_us = mono;
+      f.bgra.assign(4, static_cast<uint8_t>(mono));
+      return f;
+    };
+    CHECK("fq-empty-initially", q.Empty() && q.Size() == 0 && !q.Done());
+    xnc::FrameBlob out;
+    CHECK("fq-pop-empty-fails", !q.TryPop(&out));
+    q.Push(mk(1));
+    q.Push(mk(2));
+    q.Push(mk(3));  // depth 2: frame 1 is evicted - the LATEST is kept
+    CHECK("fq-bounded-depth", q.Size() == 2);
+    CHECK("fq-drop-oldest", q.TryPop(&out) && out.mono_us == 2);
+    CHECK("fq-second", q.TryPop(&out) && out.mono_us == 3);
+    CHECK("fq-drained", q.Empty());
+    // Drop 只发生在前端(最旧),保序:FIFO 弹序单调
+    q.Push(mk(4));
+    q.Push(mk(5));
+    q.Push(mk(6));
+    q.Push(mk(7));  // evicts 4 then 5
+    CHECK("fq-order-preserved", q.TryPop(&out) && out.mono_us == 6 &&
+                                    q.TryPop(&out) && out.mono_us == 7);
+    // Shutdown:唤醒等待者;已排队帧仍可弹出(排空语义),空后返回 false
+    q.Shutdown();
+    CHECK("fq-done-flag", q.Done());
+    q.Push(mk(8));  // 关闭后仍入队(编码线程排空阶段)
+    CHECK("fq-drain-after-shutdown", q.TryPop(&out) && out.mono_us == 8 &&
+                                         q.WaitPop(&out, 10) == false && q.Empty());
+  }
   { // Task 5:VclNalus/ShapeAu 码流整形(vclNALUs 语义移植:丢 7/8/9,
     // 4 字节起始码归一,尾零回退;IDR AU = 缓存 SpsPps + VCL)
     const uint8_t au[] = {0, 0, 0, 1, 0x09, 0xF0,                     // AUD(9) 4B
@@ -1525,7 +1578,8 @@ int SelftestMain() {
   }
   { // Task 5:致命 Acquire 错误 → Run 立即失败(未初始化编码器也安全)
     struct FatalCapture final : xnc::ICapture {
-      bool Acquire(xnc::FrameBlob&, std::string* err = nullptr) override {
+      bool Acquire(xnc::FrameBlob&, std::string* err = nullptr,
+                   uint32_t = 0) override {
         if (err) *err = "err_fatal_probe";
         return false;
       }

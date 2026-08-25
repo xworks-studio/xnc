@@ -177,6 +177,11 @@ std::vector<DisplayInfo> DxgiDisplaysSnapshot();
 // -range index or an empty table.
 bool DxgiSelectDisplay(uint32_t idx);
 
+// Monotonic-clock microseconds since boot (QueryPerformanceCounter), the
+// FrameBlob::mono_us clock. Shared by the capture backend (stamps frames)
+// and the pipeline's encode thread (pipe_latency_ms measurement).
+uint64_t NowMonoUs();
+
 // DXGI Desktop Duplication with CPU readback. Single-threaded use only.
 class DxgiCapture final : public ICapture {
  public:
@@ -189,8 +194,11 @@ class DxgiCapture final : public ICapture {
   // "err_rebuilt" / "err_access_lost" retryables, anything else fatal).
   // Task 3 CPU path: every content frame is a full CopyResource→staging→Map
   // readback; dirty-rect incremental frames are a Task 5/M4 concern and
-  // never applied before the base frame exists.
-  bool Acquire(FrameBlob& blob, std::string* err = nullptr) override;
+  // never applied before the base frame exists. timeout_ms == 0 uses the
+  // backend default (100 ms); the pipeline passes spf so static screens
+  // wake at the target frame cadence.
+  bool Acquire(FrameBlob& blob, std::string* err = nullptr,
+               uint32_t timeout_ms = 0) override;
   uint32_t Width() const override { return w_; }
   uint32_t Height() const override { return h_; }
   uint32_t RebuildCount() const override { return rebuilds_; }

@@ -27,12 +27,14 @@ bool ScaledDims(uint32_t w, uint32_t h, uint32_t max_w, uint32_t* ow,
                 uint32_t* oh);
 
 // ICapture decorator performing the downscale. Thread contract: used on the
-// pipeline thread only, like the backends it wraps.
+// pipeline CAPTURE thread only (pipeline-decouple), like the backends it
+// wraps.
 class ScaledCapture final : public ICapture {
  public:
   // Takes ownership of inner; max_w == 0 disables scaling (pure passthrough).
   ScaledCapture(std::unique_ptr<ICapture> inner, uint32_t max_w);
-  bool Acquire(FrameBlob& blob, std::string* err = nullptr) override;
+  bool Acquire(FrameBlob& blob, std::string* err = nullptr,
+               uint32_t timeout_ms = 0) override;
   uint32_t Width() const override;
   uint32_t Height() const override;
   uint32_t RebuildCount() const override;

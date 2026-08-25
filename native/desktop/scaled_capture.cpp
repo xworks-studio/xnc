@@ -33,13 +33,13 @@ bool ScaledDims(uint32_t w, uint32_t h, uint32_t max_w, uint32_t* ow,
 ScaledCapture::ScaledCapture(std::unique_ptr<ICapture> inner, uint32_t max_w)
     : inner_(std::move(inner)), max_w_(max_w) {}
 
-bool ScaledCapture::Acquire(FrameBlob& blob, std::string* err) {
+bool ScaledCapture::Acquire(FrameBlob& blob, std::string* err, uint32_t timeout_ms) {
   if (!inner_) {
     if (err) *err = "no inner capture";
     return false;
   }
   FrameBlob raw;
-  if (!inner_->Acquire(raw, err)) return false;  // err_timeout/rebuilt/... passthrough
+  if (!inner_->Acquire(raw, err, timeout_ms)) return false;  // err_timeout/rebuilt/... passthrough
 
   uint32_t nw = 0, nh = 0;
   if (!ScaledDims(raw.w, raw.h, max_w_, &nw, &nh)) {

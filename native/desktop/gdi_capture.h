@@ -101,8 +101,10 @@ class GdiCapture final : public ICapture {
   GdiCapture& operator=(const GdiCapture&) = delete;
 
   // ICapture - see the file header for the GDI err vocabulary ("err_timeout"
-  // / "err_rebuilt" / "err_access_lost"; never fatal).
-  bool Acquire(FrameBlob& blob, std::string* err = nullptr) override;
+  // / "err_rebuilt" / "err_access_lost"; never fatal). timeout_ms is ignored
+  // (GDI paces itself to the 15 fps cap).
+  bool Acquire(FrameBlob& blob, std::string* err = nullptr,
+               uint32_t timeout_ms = 0) override;
   uint32_t Width() const override { return w_; }
   uint32_t Height() const override { return h_; }
   uint32_t RebuildCount() const override { return rebuilds_; }

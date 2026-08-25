@@ -206,7 +206,7 @@ bool LadderCapture::Init(std::string* err) {
   return false;
 }
 
-bool LadderCapture::Acquire(FrameBlob& blob, std::string* err) {
+bool LadderCapture::Acquire(FrameBlob& blob, std::string* err, uint32_t timeout_ms) {
   // Inline upgrade (no coordinator to ride): swap now and surface the swap
   // as the retryable "err_rebuilt" (the pipeline rewinds + arms the IDR).
   if (active_.load(std::memory_order_relaxed) == BackendKind::kGdi &&
@@ -230,7 +230,7 @@ bool LadderCapture::Acquire(FrameBlob& blob, std::string* err) {
   std::string e;
   bool ok = false;
   if (cap != nullptr) {
-    ok = cap->Acquire(blob, &e);
+    ok = cap->Acquire(blob, &e, timeout_ms);
   } else {
     e = "err_access_lost";  // no backend (init edge): unified reset territory
   }

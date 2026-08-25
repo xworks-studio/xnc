@@ -23,6 +23,7 @@
 #include <cstdio>
 
 #include "../common/log.h"
+#include "dxgi_capture.h"  // NowMonoUs (shared mono-us clock)
 #include "gdi_capture.h"
 
 namespace xnc {
@@ -30,18 +31,6 @@ namespace xnc {
 namespace {
 
 uint64_t NowMs() { return GetTickCount64(); }
-
-uint64_t NowMonoUs() {
-  static LARGE_INTEGER freq = [] {
-    LARGE_INTEGER f{};
-    QueryPerformanceFrequency(&f);
-    return f;
-  }();
-  LARGE_INTEGER c{};
-  QueryPerformanceCounter(&c);
-  return static_cast<uint64_t>((static_cast<unsigned long long>(c.QuadPart) * 1000000ull) /
-                               static_cast<unsigned long long>(freq.QuadPart));
-}
 
 // Destroys every GDI object (SelectObject restore order matters for the
 // owned bitmap: it cannot be deleted while selected into mem_dc).
@@ -122,7 +111,8 @@ bool GdiCapture::Rebuild(std::string* err) {
   return ok;
 }
 
-bool GdiCapture::Acquire(FrameBlob& blob, std::string* err) {
+bool GdiCapture::Acquire(FrameBlob& blob, std::string* err, uint32_t timeout_ms) {
+  (void)timeout_ms;  // GDI paces itself to the 15 fps cap (spec §7.6)
   const auto set_err = [err](const char* e) {
     if (err) *err = e;
   };

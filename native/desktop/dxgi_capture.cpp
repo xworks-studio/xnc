@@ -55,6 +55,10 @@ void SetHrErr(std::string* err, const char* step, HRESULT hr) {
   if (err) *err = buf;
 }
 
+}  // namespace
+
+// Declared in dxgi_capture.h (shared with the pipeline's latency clock);
+// defined out of the anonymous namespace so the declaration links.
 uint64_t NowMonoUs() {
   static LARGE_INTEGER freq = [] {
     LARGE_INTEGER f{};
@@ -66,9 +70,6 @@ uint64_t NowMonoUs() {
   return static_cast<uint64_t>(((static_cast<unsigned long long>(c.QuadPart)) * 1000000ull) /
                                static_cast<unsigned long long>(freq.QuadPart));
 }
-
-}  // namespace
-
 struct DxgiCapture::Impl {
   ComPtr<ID3D11Device> dev;
   ComPtr<ID3D11DeviceContext> ctx;
@@ -414,7 +415,7 @@ bool DxgiCapture::HandleAccessLost(std::string* err, long hr_long) {
   return false;
 }
 
-bool DxgiCapture::Acquire(FrameBlob& blob, std::string* err) {
+bool DxgiCapture::Acquire(FrameBlob& blob, std::string* err, uint32_t timeout_ms) {
   if (!impl_->dupl) {
     // M2-S1 T2: no duplication = access lost. The old "err_not_initialized"
     // fatal artifact (the T1 probe's child-killer) is gone; re-creation is
@@ -424,7 +425,8 @@ bool DxgiCapture::Acquire(FrameBlob& blob, std::string* err) {
   }
   DXGI_OUTDUPL_FRAME_INFO info{};
   ComPtr<IDXGIResource> res;
-  HRESULT hr = impl_->dupl->AcquireNextFrame(kAcquireTimeoutMs, &info, &res);
+  const UINT wait_ms = timeout_ms != 0 ? timeout_ms : kAcquireTimeoutMs;
+  HRESULT hr = impl_->dupl->AcquireNextFrame(wait_ms, &info, &res);
   if (hr == DXGI_ERROR_WAIT_TIMEOUT) {  // static screen: no change, no blob
     if (err) *err = "err_timeout";
     return false;

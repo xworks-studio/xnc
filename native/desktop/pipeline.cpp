@@ -1,35 +1,52 @@
 // pipeline.cpp - Pipeline::Run + stats.json writers (see pipeline.h).
-// Loop shape (plan Task 5, spec §7.4/§7.5):
-//   Acquire -> frame (base/incremental via FrameCache) | err_timeout (no
-//   encode; warm-up re-feed while no keyframe AU yet) | err_rebuilt
-//   (FrameCache.OnRebuild + one-shot "rebuild" force) | fatal (stop)
-//   -> Encode -> shape every AU (SPS/PPS prefix on IDR, 4B start codes,
-//   AUD dropped) -> sink->OnAu; per-second counter beat; at end FlushTail
-//   recovers the lookahead window's AUs through the same shaping path.
+// Loop shape (plan Task 5, spec §7.4/§7.5; pipeline-decouple rework):
 //
-// M1-Slice2 Task 2: the loop emits through an AuSink. The diag FILE* dump
-// is FileAuSink below (identical behavior to the pre-slice code, including
-// error strings); RtServer is the fan-out sink. On-demand IDR (spec §7.5 +
-// Slice1 carry-over): while the screen is static a subscriber join
-// (PendingIdrReason, e.g. "sub_join") arms ONE ForceNextIdr - at most once
-// per kIdrMinIntervalMs, only after the stream's first keyframe, never
-// while a previous request is in flight - and the cached base frame is
-// re-fed on the timeout path (same bounds as warm-up: 2 x lookahead window
-// or 2 s; never re-forcing) until the IDR AU emerges (on-demand warm-up).
+// TWO threads joined by a bounded handoff queue (frame_queue.h):
+//
+//   CAPTURE thread (RunCore's thread): Acquire (timeout = spf) -> scale
+//   (ScaledCapture inside capture) -> push the scaled BGRA buffer into the
+//   encode queue (depth 2, drop-oldest on full -> keep the LATEST frame,
+//   ADR-014), preserving the capture mono_us timestamp. err_timeout (static)
+//   produces no frame (the encode thread idles); err_rebuilt / unified
+//   CaptureReset rewind the state machine and synchronize with BOTH threads
+//   (the reset drains the queue, then re-inits the encoder under the encode
+//   mutex). The capture thread paces pushes to spf - the old SubmitFrame
+//   pacing moved here so the encode thread can run at encode speed.
+//
+//   ENCODE thread: waits on the queue -> takes the latest frame -> encode
+//   (MFT) -> shape every AU (SPS/PPS prefix on IDR, 4B start codes, AUD
+//   dropped) -> sink->OnAu; no pacing beyond the queue (drop-oldest keeps
+//   the latest; under motion encode runs at encode speed, under static the
+//   queue is empty -> idle). While the queue is empty the warm-up / on-
+//   demand IDR re-feed of the cached base frame runs here (the old timeout-
+//   path semantics, gated on a recent capture timeout so re-feeds still only
+//   happen on a static screen), and the merged IDR request (PendingIdrReason)
+//   is polled here (it owns the encoder). At run end the encode thread
+//   drains the queue (nothing captured is dropped), then RunCore recovers
+//   the lookahead window's AUs via FlushTail through the same shaping path.
+//
+// The FrameCache state machine is shared: capture thread counts captured/
+// timeouts and caches the base frame; encode thread counts encoded/warmup
+// feeds and observes keyframes - all under one shared mutex (quick ops
+// only; the 17-20ms Encode call itself runs outside it).
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>  // Sleep, GetTickCount64
 
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../common/log.h"
-#include "dxgi_capture.h"  // Fnv1a64, SamplePointsNotUniform (first-frame diag)
+#include "dxgi_capture.h"  // Fnv1a64, SamplePointsNotUniform (first-frame diag), NowMonoUs
+#include "frame_queue.h"   // bounded capture->encode handoff (pipeline-decouple)
 #include "pipeline.h"
 
 namespace xnc {
@@ -38,8 +55,8 @@ namespace {
 uint64_t NowMs() { return GetTickCount64(); }
 
 // Idle nap between do-nothing timeouts (static screen after warm-up): real
-// backends block inside Acquire (~100 ms), fakes return instantly - this
-// keeps the loop off the CPU in both cases.
+// backends block inside Acquire (spf or 100 ms), fakes return instantly -
+// this keeps the capture loop off the CPU in both cases.
 constexpr DWORD kIdleSleepMs = 15;
 
 // Warm-up wall-clock bound (spec §7.4): 2 s. Also bounds the on-demand
@@ -82,7 +99,8 @@ struct OnDemandIdr {
 };
 
 // Diag FILE* sink: the exact pre-slice dump behavior (binary fwrite of
-// every shaped AU; fatal error string "fwrite out failed").
+// every shaped AU; fatal error string "fwrite out failed"). OnAu is called
+// from the ENCODE thread only.
 class FileAuSink final : public AuSink {
  public:
   explicit FileAuSink(FILE* f) : f_(f) {}
@@ -98,112 +116,143 @@ class FileAuSink final : public AuSink {
   FILE* f_;
 };
 
-// One submission (real captured frame, warm-up re-feed or on-demand IDR
-// re-feed): paces to the target fps, applies any pending one-shot IDR
-// request (armed by a capture rebuild - E2 contract: it rides the next
-// submission exactly once and is never re-armed), encodes, shapes and
-// delivers every output AU to the sink. mono_us is the capture timestamp
-// of the submitted frame (the base frame's for re-feeds) and stamps every
-// AU of this submission. Returns nullptr on success; a non-null fatal
-// message (res already flagged) aborts the run.
-const char* SubmitFrame(MfSoftEncoder& enc, AuSink& sink, const uint8_t* bgra,
-                        size_t len, uint64_t mono_us, FrameCache& cache,
-                        PipelineResult* res, bool warmup, uint32_t spf_ms,
-                        uint64_t* last_submit_ms, uint64_t* last_mono_us,
-                        std::vector<std::vector<uint8_t>>& aus,
-                        std::vector<uint8_t>& shaped, OnDemandIdr* ondemand) {
-  // Pace submissions to the target fps (the encoder timestamps with the
-  // wall clock, so submit cadence == frame cadence).
-  if (*last_submit_ms != 0) {
-    const uint64_t since = NowMs() - *last_submit_ms;
-    if (since < spf_ms) Sleep(static_cast<DWORD>(spf_ms - since));
-  }
-  *last_submit_ms = NowMs();
-  *last_mono_us = mono_us;
+// ---- shared state between the capture and encode threads ----
+// Everything the two threads must agree on lives here under ONE mutex:
+// the FrameCache state machine (capture thread: OnCapturedFrame/OnTimeout/
+// OnRebuild; encode thread: OnEncoded/OnWarmupFeed/OnKeyframeAu), the cached
+// base frame (capture writes on a new base, encode reads for re-feeds), the
+// warm-up / on-demand counters, the encoder dims and the PipelineResult
+// fields. All lock hold times are microseconds - the encoder's Encode/Init
+// calls NEVER run under this mutex.
+struct PipelineShared {
+  std::mutex mu;
+  FrameCache cache;
+  PipelineResult* res = nullptr;  // every write happens under mu
+  std::vector<uint8_t> base;      // cached base frame (owned copy; re-feed source)
+  uint64_t base_mono_us = 0;      // base frame capture timestamp (re-feeds)
+  uint64_t warmup_started_ms = 0; // base submission time (2 s wall bound)
+  uint32_t warmup_gen_feeds = 0;  // re-feeds this generation (rebuild resets)
+  bool warmup_phase_logged = false;  // one warmup_done/exhausted log per gen
+  OnDemandIdr ondemand;
+  uint64_t last_initiated_idr_ms = 0;  // kIdrMinIntervalMs throttle anchor
+  uint64_t last_mono_us = 0;       // last submission timestamp (FlushTail AUs)
+  uint32_t enc_w = 0, enc_h = 0;   // encoder's dims (reset re-init updates)
+  uint64_t last_timeout_ms = 0;    // last static-screen observation (capture
+                                   // thread) - gates re-feeds on the encode
+                                   // thread so they only happen on a static
+                                   // screen (old timeout-path semantics)
+};
 
-  const char* idr_reason = cache.TakePendingIdrReason();
-  if (idr_reason != nullptr) enc.ForceNextIdr(idr_reason);
+// Per-frame pipeline latency window (pipeline-decouple): capture mono_us ->
+// OnAu completion, windowed avg logged every kLatencyWindowFrames. Measures
+// the end-to-end delay the decoupling removes (was ~acquire-wait + encode
+// serialized; now encode + handoff). Samples whose stamp is older than
+// kLatencyMaxUs are dropped: a stamp that old means the capture clock is not
+// the QPC wall clock (unit/fake captures) or a re-feed of a long-static base
+// frame - neither is a pipeline latency.
+constexpr uint32_t kLatencyWindowFrames = 60;
+constexpr uint64_t kLatencyMaxUs = 60ull * 1000000ull;  // 60 s sanity bound
+struct LatencyWindow {
+  uint64_t sum_us = 0;
+  uint32_t n = 0;
+  void Add(uint64_t mono_us) {
+    const uint64_t now = NowMonoUs();
+    if (now <= mono_us || now - mono_us > kLatencyMaxUs) return;  // bad stamp
+    sum_us += now - mono_us;
+    ++n;
+    if (n >= kLatencyWindowFrames) Flush();
+  }
+  void Flush() {
+    if (n == 0) return;
+    XNC_LOG_INFO("pipe_latency_ms avg=%.2f n=%u",
+                 static_cast<double>(sum_us) / 1000.0 / static_cast<double>(n), n);
+    sum_us = 0;
+    n = 0;
+  }
+};
 
-  std::string eerr;
-  if (!enc.Encode(bgra, len, aus, &eerr)) {
-    res->ok = false;
-    res->err = eerr.empty() ? "encode failed" : eerr;
-    XNC_LOG_ERROR("encode_failed err=\"%s\"", res->err.c_str());
-    return "encode";
-  }
-  if (warmup) {
-    cache.OnWarmupFeed();
-  } else {
-    cache.OnEncoded();
-  }
-  for (const auto& au : aus) {
-    const bool is_idr = NalHasType(au.data(), au.size(), 5);
-    ShapeAu(au.data(), au.size(), is_idr, enc.SpsPps(), &shaped);
-    if (!shaped.empty()) {
-      res->aus_written++;
-      res->bytes_written += shaped.size();
-      if (const char* err = sink.OnAu(is_idr, mono_us, shaped.data(), shaped.size())) {
-        res->ok = false;
-        res->err = err;
-        return err;
-      }
-    }
-    if (is_idr) {
-      cache.OnKeyframeAu();  // ends warm-up (§7.4)
-      if (ondemand->armed) {
-        XNC_LOG_INFO("idr_delivered reason=%s feeds=%u", ondemand->reason,
-                     ondemand->feeds);
-        ondemand->armed = false;
-      }
-    }
-  }
-  return nullptr;
-}
+// ---- encode-thread context ----
+struct EncodeCtx {
+  MfSoftEncoder& enc;
+  AuSink& sink;
+  PipelineShared& sh;
+  FrameQueue& queue;
+  const PipelineOpts& opt;
+  std::mutex enc_mu;  // serializes Encode/FlushTail (encode thread) vs
+                      // Init (unified reset on the capture thread)
+  std::atomic<bool> fatal{false};  // encode-side fatal: run must end
+  std::vector<std::vector<uint8_t>> aus;  // per-submission encoder outputs
+  std::vector<uint8_t> shaped;            // shaped-AU scratch
+  LatencyWindow lat;
+  uint32_t spf_ms = 0;
+  uint32_t warmup_feed_bound = 0;
+  uint32_t static_grace_ms = 0;  // re-feed gate: a timeout within this
+                                 // window means "static screen"
+  uint64_t last_feed_ms = 0;     // re-feed pacing anchor (old SubmitFrame
+                                 // pacing, applied to synthetic re-feeds)
+
+  EncodeCtx(MfSoftEncoder& e, AuSink& s, PipelineShared& sh_, FrameQueue& q,
+            const PipelineOpts& o, uint32_t spf, uint32_t wf_bound)
+      : enc(e),
+        sink(s),
+        sh(sh_),
+        queue(q),
+        opt(o),
+        spf_ms(spf),
+        warmup_feed_bound(wf_bound),
+        static_grace_ms(spf * 2 + kIdleSleepMs + 50) {}
+};
 
 // ---- unified capture reset execution (M2-Slice1 Task 2, spec §7.5) ----
 //
-// One reset sequence, run entirely on the pipeline thread (the acquire loop
-// IS the suspension - nothing calls Acquire while this runs):
+// One reset sequence, run entirely on the CAPTURE thread (the acquire loop
+// IS the suspension - nothing calls Acquire while this runs); the encode
+// thread keeps draining the queue and idling:
+//   0. drain the handoff queue: frames already captured carry the PRE-reset
+//      generation/dims and must go through the OLD encoder - the re-init
+//      below invalidates them (the encode thread drains on its own; capture
+//      is suspended here, so no new frames arrive);
 //   1. STATE "recovering" (recoverable): the pipe stays alive and the
 //      cursor/input threads (RtServer-owned) keep serving;
-//   2. while the desktop gate is non-DEFAULT (secure desktop up - T1
+//   2. rewind the stream state (FrameCache::OnRebuild -> WAIT_BASE_FRAME +
+//      one-shot "rebuild" IDR, base cleared, warm-up reset) so the encode
+//      thread stops re-feeding the old generation while the reset is in
+//      flight;
+//   3. while the desktop gate is non-DEFAULT (secure desktop up - T1
 //      evidence: re-duplication/init are DENIED 0x80070005 even as SYSTEM)
-//      poll every kResetPollMs; aborts on stop/duration;
-//   3. single rebuild path: ICapture::Rebuild, then encoder re-Init when
-//      the dimensions changed. Retryable failures back off 500 ms; a
+//      poll every kResetPollMs; aborts on stop/duration/encode-fatal;
+//   4. single rebuild path: ICapture::Rebuild, then encoder re-Init (under
+//      the encode mutex - an in-flight Encode must finish first) when the
+//      dimensions changed. Retryable failures back off 500 ms; a
 //      kResetHardFailStreak streak emits STATE "capture_failed" once and
 //      slows the retry cadence to 1 s. If the desktop leaves again
 //      mid-retry, re-enter the wait;
-//   4. on success the stream rewinds exactly like an err_rebuilt
-//      (FrameCache::OnRebuild -> next frame is the new base frame + the
-//      one-shot "rebuild" ForceIDR), PipelineResult gains the new dims and
-//      reset accounting, STATE "capture_rebuilt" fires (RtServer:
-//      generation++), and a dimension change surfaces via OnDisplayChanged
-//      (0x010A broadcast).
+//   5. on success the stream rewinds exactly like an err_rebuilt (the next
+//      frame is the new base frame + the one-shot "rebuild" ForceIDR),
+//      PipelineResult gains the new dims and reset accounting, STATE
+//      "capture_rebuilt" fires (RtServer: generation++), and a dimension
+//      change surfaces via OnDisplayChanged (0x010A broadcast).
 struct ResetSequence {
   ICapture* cap;
   MfSoftEncoder* enc;
   AuSink* sink;
-  FrameCache* cache;
-  PipelineResult* res;
+  PipelineShared* sh;
   const PipelineOpts* opt;
-  uint32_t* enc_w;
-  uint32_t* enc_h;
-  std::vector<uint8_t>* base;
-  uint64_t* warmup_started_ms;
-  uint32_t* warmup_gen_feeds;
-  bool* warmup_phase_logged;
+  FrameQueue* queue;
+  std::mutex* enc_mu;
+  std::atomic<bool>* fatal;
   uint64_t run_t0;       // RunCore start (duration deadline anchor)
   uint64_t duration_ms;
   const char* reason;
 };
 
-// Returns true when the RUN must end (stop flag / duration), false when the
-// reset completed and the acquire loop should resume.
+// Returns true when the RUN must end (stop flag / duration / encode fatal),
+// false when the reset completed and the acquire loop should resume.
 bool RunResetSequence(ResetSequence& s) {
   const auto abort = [&s] {
     return (s.opt->stop != nullptr && s.opt->stop->load()) ||
-           NowMs() - s.run_t0 >= s.duration_ms;
+           NowMs() - s.run_t0 >= s.duration_ms ||
+           s.fatal->load(std::memory_order_relaxed);
   };
   const auto gate_away = [&s] {
     return s.opt->reset != nullptr &&
@@ -215,6 +264,23 @@ bool RunResetSequence(ResetSequence& s) {
                gate_away() ? 1 : 0);
   s.sink->OnState("recovering", true);
 
+  // Phase 0: drain the handoff queue (pre-reset frames through the old
+  // encoder; the encode thread keeps popping on its own).
+  while (!s.queue->Empty() && !abort()) Sleep(kResetPollMs);
+  if (abort()) return true;
+
+  // Phase 1: rewind the stream state NOW so the encode thread stops
+  // re-feeding the old base while the reset is in flight.
+  {
+    std::lock_guard<std::mutex> lk(s.sh->mu);
+    s.sh->cache.OnRebuild();  // WAIT_BASE_FRAME + one-shot "rebuild" IDR
+    s.sh->base.clear();
+    s.sh->base_mono_us = 0;
+    s.sh->warmup_started_ms = 0;
+    s.sh->warmup_gen_feeds = 0;
+    s.sh->warmup_phase_logged = false;
+  }
+
   // Phase 2: wait for the desktop to come back (immediate rebuilds are
   // provably futile while the secure desktop holds the output).
   while (gate_away()) {
@@ -223,6 +289,12 @@ bool RunResetSequence(ResetSequence& s) {
   }
 
   // Phase 3: single rebuild path with retry/backoff.
+  uint32_t old_w = 0, old_h = 0;
+  {
+    std::lock_guard<std::mutex> lk(s.sh->mu);
+    old_w = s.sh->enc_w;
+    old_h = s.sh->enc_h;
+  }
   uint32_t streak = 0;
   bool failed_state_sent = false;
   uint32_t new_w = 0, new_h = 0;
@@ -233,8 +305,12 @@ bool RunResetSequence(ResetSequence& s) {
     if (ok) {
       new_w = s.cap->Width();
       new_h = s.cap->Height();
-      if (new_w != *s.enc_w || new_h != *s.enc_h) {
-        ok = s.enc->Init(new_w, new_h, s.opt->fps, s.opt->target_bitrate_bps, &rerr);
+      if (new_w != old_w || new_h != old_h) {
+        // Serialize with the encode thread: an in-flight Encode/FlushTail
+        // must finish before the MFT is torn down and re-negotiated.
+        std::lock_guard<std::mutex> elk(*s.enc_mu);
+        ok = s.enc->Init(new_w, new_h, s.opt->fps, s.opt->target_bitrate_bps,
+                         &rerr);
         if (ok)
           XNC_LOG_INFO("capture_reset encoder re-init w=%u h=%u", new_w, new_h);
       }
@@ -259,18 +335,17 @@ bool RunResetSequence(ResetSequence& s) {
   }
 
   // Phase 4: rewind the stream state to the new generation.
-  const bool dims_changed = new_w != *s.enc_w || new_h != *s.enc_h;
-  *s.enc_w = new_w;
-  *s.enc_h = new_h;
-  s.res->width = new_w;
-  s.res->height = new_h;
-  s.res->resets++;
-  CopyReason(s.res->last_reset_reason, sizeof(s.res->last_reset_reason), s.reason);
-  s.cache->OnRebuild();  // WAIT_BASE_FRAME + one-shot "rebuild" IDR
-  s.base->clear();
-  *s.warmup_started_ms = 0;
-  *s.warmup_gen_feeds = 0;
-  *s.warmup_phase_logged = false;
+  const bool dims_changed = new_w != old_w || new_h != old_h;
+  {
+    std::lock_guard<std::mutex> lk(s.sh->mu);
+    s.sh->enc_w = new_w;
+    s.sh->enc_h = new_h;
+    s.sh->res->width = new_w;
+    s.sh->res->height = new_h;
+    s.sh->res->resets++;
+  }
+  CopyReason(s.sh->res->last_reset_reason,
+             sizeof(s.sh->res->last_reset_reason), s.reason);
   s.sink->OnState("capture_rebuilt", true);  // RtServer: generation++
   // M2-S3 Task 5: a display SWITCH always notifies (0x010A reason="switch")
   // even when the two monitors share a resolution - viewers must refresh the
@@ -281,6 +356,223 @@ bool RunResetSequence(ResetSequence& s) {
                s.reason, new_w, new_h, dims_changed ? 1 : 0,
                static_cast<unsigned long long>(NowMs() - t_start));
   return false;
+}
+
+// One submission (real captured frame, warm-up re-feed or on-demand IDR
+// re-feed): applies any pending one-shot IDR request (armed by a capture
+// rebuild - E2 contract: it rides the next submission exactly once and is
+// never re-armed), encodes, shapes and delivers every output AU to the
+// sink. mono_us is the capture timestamp of the submitted frame (the base
+// frame's for re-feeds) and stamps every AU of this submission. Runs on
+// the ENCODE thread; enc_mu is held by the caller for the whole call (the
+// encoder + its SpsPps cache must stay consistent with the AU shaping).
+void ProcessFrame(EncodeCtx& ctx, const FrameBlob& f, bool warmup) {
+  // One-shot rebuild IDR request (E2 contract: ride the next submission).
+  const char* idr_reason = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(ctx.sh.mu);
+    idr_reason = ctx.sh.cache.TakePendingIdrReason();
+    ctx.sh.last_mono_us = f.mono_us;
+  }
+  std::lock_guard<std::mutex> elk(ctx.enc_mu);
+  // enc_mu held: the one-shot flag is encoder stream state (Init clears it).
+  if (idr_reason != nullptr) ctx.enc.ForceNextIdr(idr_reason);
+  std::string eerr;
+  if (!ctx.enc.Encode(f.bgra.data(), f.bgra.size(), ctx.aus, &eerr)) {
+    const std::string msg = eerr.empty() ? "encode failed" : eerr;
+    {
+      std::lock_guard<std::mutex> lk(ctx.sh.mu);
+      ctx.sh.res->ok = false;
+      ctx.sh.res->err = msg;
+    }
+    XNC_LOG_ERROR("encode_failed err=\"%s\"", msg.c_str());
+    ctx.fatal.store(true, std::memory_order_relaxed);
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lk(ctx.sh.mu);
+    if (warmup)
+      ctx.sh.cache.OnWarmupFeed();
+    else
+      ctx.sh.cache.OnEncoded();
+  }
+  for (const auto& au : ctx.aus) {
+    const bool is_idr = NalHasType(au.data(), au.size(), 5);
+    ShapeAu(au.data(), au.size(), is_idr, ctx.enc.SpsPps(), &ctx.shaped);
+    if (!ctx.shaped.empty()) {
+      {
+        std::lock_guard<std::mutex> lk(ctx.sh.mu);
+        ctx.sh.res->aus_written++;
+        ctx.sh.res->bytes_written += ctx.shaped.size();
+      }
+      if (const char* err =
+              ctx.sink.OnAu(is_idr, f.mono_us, ctx.shaped.data(), ctx.shaped.size())) {
+        {
+          std::lock_guard<std::mutex> lk(ctx.sh.mu);
+          ctx.sh.res->ok = false;
+          ctx.sh.res->err = err;
+        }
+        XNC_LOG_ERROR("sink_onau_failed err=\"%s\"", err);
+        ctx.fatal.store(true, std::memory_order_relaxed);
+        return;
+      }
+    }
+    if (is_idr) {
+      std::lock_guard<std::mutex> lk(ctx.sh.mu);
+      ctx.sh.cache.OnKeyframeAu();  // ends warm-up (§7.4)
+      if (ctx.sh.ondemand.armed) {
+        XNC_LOG_INFO("idr_delivered reason=%s feeds=%u", ctx.sh.ondemand.reason,
+                     ctx.sh.ondemand.feeds);
+        ctx.sh.ondemand.armed = false;
+      }
+    }
+  }
+  ctx.lat.Add(f.mono_us);  // capture mono_us -> OnAu completion
+}
+
+// One-time warm-up outcome logs per generation (moved with the re-feed
+// logic from the old timeout path). Caller holds ctx.sh.mu.
+void PhaseOutcomeLogs(EncodeCtx& ctx) {
+  const bool have_base = !ctx.sh.cache.NeedsBaseFrame() && !ctx.sh.base.empty();
+  if (!ctx.sh.warmup_phase_logged && have_base) {
+    if (ctx.sh.cache.HaveKeyframe()) {
+      ctx.sh.warmup_phase_logged = true;
+      XNC_LOG_INFO("warmup_done feeds=%u keyframes=%llu", ctx.sh.warmup_gen_feeds,
+                   static_cast<unsigned long long>(ctx.sh.cache.counters().keyframes));
+    } else if (ctx.sh.warmup_gen_feeds >= ctx.warmup_feed_bound ||
+               (ctx.sh.warmup_started_ms != 0 &&
+                NowMs() - ctx.sh.warmup_started_ms >= kWarmupWallBoundMs)) {
+      ctx.sh.warmup_phase_logged = true;
+      XNC_LOG_INFO("warmup_exhausted feeds=%u bound=%u keyframes=%llu",
+                   ctx.sh.warmup_gen_feeds, ctx.warmup_feed_bound,
+                   static_cast<unsigned long long>(ctx.sh.cache.counters().keyframes));
+    }
+  }
+  // On-demand window exhausted without an IDR: log once; the armed force
+  // stays consumed and the IDR surfaces with the next real frame batch
+  // (still never re-forced).
+  if (ctx.sh.ondemand.armed && !ctx.sh.ondemand.exhaust_logged && have_base &&
+      !ctx.sh.ondemand.FeedAllowed(NowMs(), ctx.warmup_feed_bound)) {
+    ctx.sh.ondemand.exhaust_logged = true;
+    XNC_LOG_INFO("idr_feed_exhausted reason=%s feeds=%u bound=%u",
+                 ctx.sh.ondemand.reason, ctx.sh.ondemand.feeds,
+                 ctx.warmup_feed_bound);
+  }
+}
+
+// Encoder-side merged IDR request (spec §7.5): arm at most once per 500 ms,
+// only after the stream's first keyframe (an in-progress initial warm-up
+// will deliver that IDR anyway) and never while one is in flight. Polled
+// once per encode loop iteration (the encode thread owns the encoder).
+void PollIdrRequest(EncodeCtx& ctx) {
+  const char* pending_reason = ctx.sink.PendingIdrReason();
+  if (pending_reason == nullptr) return;
+  bool arm = false;
+  {
+    std::lock_guard<std::mutex> lk(ctx.sh.mu);
+    arm = ctx.sh.cache.HaveKeyframe() && !ctx.sh.ondemand.armed &&
+          NowMs() - ctx.sh.last_initiated_idr_ms >= kIdrMinIntervalMs;
+    if (arm) {
+      ctx.sh.last_initiated_idr_ms = NowMs();
+      ctx.sh.ondemand.Arm(pending_reason, NowMs());
+    }
+  }
+  if (!arm) return;
+  // enc_mu held: the one-shot flag is encoder stream state (Init clears it).
+  std::lock_guard<std::mutex> elk(ctx.enc_mu);
+  ctx.enc.ForceNextIdr(pending_reason);
+  ctx.sink.ConsumePendingIdr(pending_reason);
+  XNC_LOG_INFO("idr_request reason=%s min_interval_ms=%llu", pending_reason,
+               static_cast<unsigned long long>(kIdrMinIntervalMs));
+}
+
+// Encode thread's idle path (queue empty = static screen): the warm-up /
+// on-demand IDR re-feed of the cached base frame (old timeout-path
+// semantics, spec §7.4/§7.5). Gated on a recent capture timeout so
+// re-feeds only happen on a static screen - under motion real frames flow
+// and the lookahead fills naturally. Re-feeds are paced to spf (old
+// SubmitFrame pacing: the encoder timestamps with the wall clock, so
+// submit cadence == stream cadence even for synthetic submissions). The
+// pace slot comes FIRST: a frame arriving during the wait is handed to the
+// caller's pop path and the feed counters are only bumped when the feed
+// actually fires (encoded == captured + warmup_feeds stays exact).
+// Returns true when a submission happened.
+bool IdleFeed(EncodeCtx& ctx) {
+  // Pace the re-feed slot to the target cadence (old SubmitFrame pacing).
+  if (ctx.last_feed_ms != 0) {
+    const uint64_t since = NowMs() - ctx.last_feed_ms;
+    if (since < ctx.spf_ms) Sleep(static_cast<DWORD>(ctx.spf_ms - since));
+  }
+  ctx.last_feed_ms = NowMs();
+  if (ctx.queue.Done()) return false;  // shutdown landed mid-pace: stop
+  // A real frame arrived while we slept: it wins over the re-feed.
+  FrameBlob f;
+  if (ctx.queue.TryPop(&f)) {
+    ProcessFrame(ctx, f, false);
+    return true;
+  }
+  std::vector<uint8_t> base_copy;
+  uint64_t base_mono_us = 0;
+  bool feed = false;
+  {
+    std::lock_guard<std::mutex> lk(ctx.sh.mu);
+    const bool have_base = !ctx.sh.cache.NeedsBaseFrame() && !ctx.sh.base.empty();
+    // Old semantics: re-feeds only ever ran on the timeout path. Replicate
+    // via the last-timeout gate instead of the (now capture-side) loop.
+    const bool static_screen =
+        NowMs() - ctx.sh.last_timeout_ms <= ctx.static_grace_ms;
+    const uint64_t warmup_elapsed =
+        ctx.sh.warmup_started_ms != 0 ? NowMs() - ctx.sh.warmup_started_ms : 0;
+    const bool warmup_feed_ok =
+        static_screen && have_base && !ctx.sh.cache.HaveKeyframe() &&
+        ctx.sh.warmup_gen_feeds < ctx.warmup_feed_bound &&
+        warmup_elapsed < kWarmupWallBoundMs;
+    // On-demand IDR re-feed (static screen + armed subscriber request):
+    // same source frame, same bounds, never a second force (§7.5).
+    const bool ondemand_feed_ok =
+        static_screen && have_base && ctx.sh.cache.HaveKeyframe() &&
+        ctx.sh.ondemand.FeedAllowed(NowMs(), ctx.warmup_feed_bound);
+    if (warmup_feed_ok || ondemand_feed_ok) {
+      if (warmup_feed_ok) {
+        ++ctx.sh.warmup_gen_feeds;
+      } else {
+        ++ctx.sh.ondemand.feeds;
+      }
+      base_copy = ctx.sh.base;
+      base_mono_us = ctx.sh.base_mono_us;
+      feed = true;
+    } else {
+      PhaseOutcomeLogs(ctx);
+    }
+  }
+  if (!feed) return false;
+  FrameBlob feed_frame;
+  feed_frame.bgra = std::move(base_copy);
+  feed_frame.mono_us = base_mono_us;
+  ProcessFrame(ctx, feed_frame, true);
+  return true;
+}
+
+// The encode thread: drains the frame queue at encode speed (no pacing -
+// the capture thread paces pushes to spf). While the queue is empty (static
+// screen) it idles with periodic warm-up / on-demand re-feed checks and the
+// merged IDR poll; at run end it drains everything queued (nothing captured
+// is dropped), then exits.
+void EncodeLoop(EncodeCtx& ctx) {
+  FrameBlob f;
+  for (;;) {
+    if (ctx.fatal.load(std::memory_order_relaxed)) break;
+    PollIdrRequest(ctx);
+    if (ctx.queue.TryPop(&f)) {
+      ProcessFrame(ctx, f, false);
+      continue;
+    }
+    if (ctx.queue.Done()) break;
+    // Queue empty: warm-up / on-demand re-feed path (static screen).
+    if (IdleFeed(ctx)) continue;
+    if (ctx.queue.WaitPop(&f, kIdleSleepMs)) ProcessFrame(ctx, f, false);
+  }
+  ctx.lat.Flush();  // partial window at run end
 }
 
 PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
@@ -294,35 +586,40 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
     return res;
   }
 
-  FrameCache cache;
-  cache.Start();
   const uint32_t spf_ms = 1000u / opt.fps;
   const uint32_t warmup_feed_bound = WarmupFeedBound(opt.fps);
 
-  std::vector<uint8_t> base;              // cached base frame (re-feed source)
-  std::vector<std::vector<uint8_t>> aus;  // per-submission encoder outputs
-  std::vector<uint8_t> shaped;            // shaped-AU scratch
+  PipelineShared sh;
+  sh.res = &res;
+  sh.cache.Start();
+  {
+    std::lock_guard<std::mutex> lk(sh.mu);
+    sh.enc_w = cap.Width();
+    sh.enc_h = cap.Height();
+  }
+
+  // Bounded handoff: depth 2 = one frame in flight in the encoder + one
+  // pending; overflow drops the OLDEST so the encoder always sees the
+  // latest frame (ADR-014). Frames are owned copies - the capture's scaled
+  // buffer is valid only until the next Acquire.
+  FrameQueue queue(2);
+  EncodeCtx ctx(enc, sink, sh, queue, opt, spf_ms, warmup_feed_bound);
+  std::thread encode_th(EncodeLoop, std::ref(ctx));
+
   FrameBlob blob;
   std::string acq_err;
 
   const uint64_t t0 = NowMs();
   const uint64_t duration_ms = static_cast<uint64_t>(opt.duration_s) * 1000ull;
   uint32_t next_beat_s = 1;
-  uint64_t last_submit_ms = 0;
-  uint64_t last_mono_us = 0;       // stamps FlushTail AUs
-  uint64_t base_mono_us = 0;       // cached base frame timestamp (re-feeds)
-  uint64_t warmup_started_ms = 0;  // base submission time (2 s wall bound)
-  uint64_t last_initiated_idr_ms = 0;  // kIdrMinIntervalMs throttle anchor
-  uint32_t warmup_gen_feeds = 0;   // re-feeds this generation (rebuild resets)
-  bool warmup_phase_logged = false;  // one warmup_done/exhausted log per gen
+  uint64_t last_push_ms = 0;  // capture-side spf pacing anchor
   bool first_frame_logged = false;
-  uint32_t enc_w = cap.Width(), enc_h = cap.Height();  // encoder's dims
-  OnDemandIdr ondemand;
   ResetStormTracker storm;  // same-reason rebuild-storm backoff (M2-S2 T1)
 
   for (;;) {
     if (NowMs() - t0 >= duration_ms) break;
     if (opt.stop != nullptr && opt.stop->load()) break;
+    if (ctx.fatal.load(std::memory_order_relaxed)) break;  // encode died
 
     // Unified capture reset (M2-Slice1 Task 2): consume a merged/debounced
     // request and run suspend -> wait-desktop -> rebuild -> resume. A
@@ -339,7 +636,8 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
           bool storm_abort = false;
           while (NowMs() < storm_until) {
             if ((opt.stop != nullptr && opt.stop->load()) ||
-                NowMs() - t0 >= duration_ms) {
+                NowMs() - t0 >= duration_ms ||
+                ctx.fatal.load(std::memory_order_relaxed)) {
               storm_abort = true;
               break;
             }
@@ -348,53 +646,52 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
           if (storm_abort) break;
         }
         storm.RecordExecuted(reset_reason, NowMs());
-        ResetSequence seq{&cap,           &enc,
-                          &sink,          &cache,
-                          &res,           &opt,
-                          &enc_w,         &enc_h,
-                          &base,          &warmup_started_ms,
-                          &warmup_gen_feeds, &warmup_phase_logged,
-                          t0,             duration_ms,
+        ResetSequence seq{&cap,     &enc,    &sink,  &sh,      &opt,
+                          &queue,   &ctx.enc_mu, &ctx.fatal,
+                          t0,       duration_ms,
                           reset_reason};
         if (RunResetSequence(seq)) break;
         continue;  // re-poll stop/duration/pending resets before acquiring
       }
     }
 
-    // Merged IDR request (spec §7.5): arm at most once per 500 ms, only
-    // after the stream's first keyframe (an in-progress initial warm-up
-    // will deliver that IDR anyway) and never while one is in flight.
-    const char* pending_reason = sink.PendingIdrReason();
-    if (pending_reason != nullptr && cache.HaveKeyframe() && !ondemand.armed &&
-        NowMs() - last_initiated_idr_ms >= kIdrMinIntervalMs) {
-      enc.ForceNextIdr(pending_reason);
-      sink.ConsumePendingIdr(pending_reason);
-      last_initiated_idr_ms = NowMs();
-      ondemand.Arm(pending_reason, NowMs());
-      XNC_LOG_INFO("idr_request reason=%s min_interval_ms=%llu", pending_reason,
-                   static_cast<unsigned long long>(kIdrMinIntervalMs));
-    }
-
     acq_err.clear();
-    if (cap.Acquire(blob, &acq_err)) {
+    // Acquire with timeout = spf: under motion the backend returns as soon
+    // as a new frame presents; on a static screen it wakes every spf and
+    // reports err_timeout (the old 100 ms backend default would stall the
+    // paced capture loop).
+    if (cap.Acquire(blob, &acq_err, spf_ms)) {
       // Frame-size change (M2-S1 Task 2): the backend adopted a new mode
       // but the encoder is still at the old size - route to the unified
       // reset (resolution) instead of feeding a wrong-sized frame in.
-      if (opt.reset != nullptr && (blob.w != enc_w || blob.h != enc_h)) {
+      uint32_t ew = 0, eh = 0;
+      {
+        std::lock_guard<std::mutex> lk(sh.mu);
+        ew = sh.enc_w;
+        eh = sh.enc_h;
+      }
+      if (opt.reset != nullptr && (blob.w != ew || blob.h != eh)) {
         opt.reset->RequestReset(kResetReasonResolution);
         Sleep(kIdleSleepMs);  // ride the debounce window
         continue;
       }
-      const bool is_base = cache.OnCapturedFrame();  // captured++ inside
-      if (is_base) {
-        base = blob.bgra;  // full frame: warm-up re-feed source
-        base_mono_us = blob.mono_us;
-        res.width = blob.w;
-        res.height = blob.h;
-        warmup_started_ms = 0;  // re-anchored at this generation's first submit
-        warmup_gen_feeds = 0;
-        warmup_phase_logged = false;
-        XNC_LOG_INFO("base_frame w=%u h=%u state=%s", blob.w, blob.h, cache.StateName());
+      // Base-frame bookkeeping + cache under the shared lock: a new base
+      // frame refreshes the re-feed source and resets the warm-up counters.
+      {
+        std::lock_guard<std::mutex> lk(sh.mu);
+        const bool is_base = sh.cache.OnCapturedFrame();  // captured++ inside
+        if (is_base) {
+          sh.base = blob.bgra;  // full frame: warm-up re-feed source
+          sh.base_mono_us = blob.mono_us;
+          res.width = blob.w;
+          res.height = blob.h;
+          sh.warmup_started_ms = 0;  // re-anchored at this generation's first submit
+          sh.warmup_gen_feeds = 0;
+          sh.warmup_phase_logged = false;
+          XNC_LOG_INFO("base_frame w=%u h=%u state=%s", blob.w, blob.h,
+                       sh.cache.StateName());
+        }
+        if (sh.warmup_started_ms == 0) sh.warmup_started_ms = NowMs();
       }
       if (!first_frame_logged) {
         first_frame_logged = true;
@@ -408,72 +705,48 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
         if (!non_black)
           XNC_LOG_ERROR("first_frame_uniform (all 256 sampled pixels equal - suspect black/garbage frame)");
       }
-      if (warmup_started_ms == 0) warmup_started_ms = NowMs();
-      if (SubmitFrame(enc, sink, blob.bgra.data(), blob.bgra.size(), blob.mono_us, cache,
-                      &res, false, spf_ms, &last_submit_ms, &last_mono_us, aus, shaped,
-                      &ondemand) != nullptr)
-        break;
-    } else if (acq_err == "err_timeout") {
-      cache.OnTimeout();  // static screen: no encode, no packet (§7.4)
-      const bool have_base = !cache.NeedsBaseFrame() && !base.empty();
-      const uint64_t warmup_elapsed = warmup_started_ms != 0 ? NowMs() - warmup_started_ms : 0;
-      const bool warmup_feed_ok = have_base && !cache.HaveKeyframe() &&
-                                  warmup_gen_feeds < warmup_feed_bound &&
-                                  warmup_elapsed < kWarmupWallBoundMs;
-      // On-demand IDR re-feed (static screen + armed subscriber request):
-      // same source frame, same bounds, never a second force (§7.5).
-      const bool ondemand_feed_ok =
-          have_base && cache.HaveKeyframe() && ondemand.FeedAllowed(NowMs(), warmup_feed_bound);
-      if (warmup_feed_ok || ondemand_feed_ok) {
-        if (warmup_feed_ok) {
-          ++warmup_gen_feeds;
-        } else {
-          ++ondemand.feeds;
-        }
-        if (SubmitFrame(enc, sink, base.data(), base.size(), base_mono_us, cache, &res,
-                        true, spf_ms, &last_submit_ms, &last_mono_us, aus, shaped,
-                        &ondemand) != nullptr)
-          break;
-      } else {
-        // One warm-up outcome log per generation: done (first keyframe AU
-        // emerged) or exhausted (bound hit without one - spec §7.4 amended:
-        // then we simply wait for real frames; never re-force).
-        if (!warmup_phase_logged && have_base) {
-          if (cache.HaveKeyframe()) {
-            warmup_phase_logged = true;
-            XNC_LOG_INFO("warmup_done feeds=%u keyframes=%llu", warmup_gen_feeds,
-                         static_cast<unsigned long long>(cache.counters().keyframes));
-          } else if (warmup_gen_feeds >= warmup_feed_bound ||
-                     warmup_elapsed >= kWarmupWallBoundMs) {
-            warmup_phase_logged = true;
-            XNC_LOG_INFO("warmup_exhausted feeds=%u bound=%u keyframes=%llu",
-                         warmup_gen_feeds, warmup_feed_bound,
-                         static_cast<unsigned long long>(cache.counters().keyframes));
-          }
-        }
-        // On-demand window exhausted without an IDR: log once; the armed
-        // force stays consumed and the IDR surfaces with the next real
-        // frame batch (still never re-forced).
-        if (ondemand.armed && !ondemand.exhaust_logged && have_base &&
-            !ondemand.FeedAllowed(NowMs(), warmup_feed_bound)) {
-          ondemand.exhaust_logged = true;
-          XNC_LOG_INFO("idr_feed_exhausted reason=%s feeds=%u bound=%u",
-                       ondemand.reason, ondemand.feeds, warmup_feed_bound);
-        }
-        Sleep(kIdleSleepMs);
+      // Hand the scaled frame over: owned copy of the capture's persistent
+      // buffer (valid only until the next Acquire) + the capture timestamp.
+      FrameBlob handoff;
+      handoff.bgra = blob.bgra;
+      handoff.w = blob.w;
+      handoff.h = blob.h;
+      handoff.mono_us = blob.mono_us;
+      queue.Push(std::move(handoff));
+      // Capture-side pacing to the target fps (the old SubmitFrame pacing -
+      // the encoder timestamps with the wall clock, so submit cadence ==
+      // frame cadence; the ENCODE thread must run at encode speed instead).
+      if (last_push_ms != 0) {
+        const uint64_t since = NowMs() - last_push_ms;
+        if (since < spf_ms) Sleep(static_cast<DWORD>(spf_ms - since));
       }
+      last_push_ms = NowMs();
+    } else if (acq_err == "err_timeout") {
+      // Static screen: no frame, no handoff - the encode thread idles (and
+      // runs the warm-up / on-demand re-feed logic itself). Record the
+      // observation for the re-feed gate + counters.
+      {
+        std::lock_guard<std::mutex> lk(sh.mu);
+        sh.cache.OnTimeout();  // static screen: no encode, no packet (§7.4)
+        sh.last_timeout_ms = NowMs();
+      }
+      Sleep(kIdleSleepMs);  // keep the capture loop off the CPU (fakes)
     } else if (acq_err == "err_rebuilt") {
       // Backend rebuilt its duplication in place: rewind the state machine
       // (next frame is the new base, full readback) and arm the one-shot
       // "rebuild" IDR; the old cached base frame is invalid across rebuild.
-      cache.OnRebuild();
-      base.clear();
-      warmup_started_ms = 0;
-      warmup_gen_feeds = 0;
-      warmup_phase_logged = false;
+      {
+        std::lock_guard<std::mutex> lk(sh.mu);
+        sh.cache.OnRebuild();
+        sh.base.clear();
+        sh.base_mono_us = 0;
+        sh.warmup_started_ms = 0;
+        sh.warmup_gen_feeds = 0;
+        sh.warmup_phase_logged = false;
+      }
       sink.OnState("capture_rebuilt", true);
       XNC_LOG_INFO("capture_rebuild handled rebuilds=%u state=%s",
-                   cache.counters().rebuilds, cache.StateName());
+                   sh.cache.counters().rebuilds, sh.cache.StateName());
     } else if (acq_err == "err_access_lost") {
       // M2-Slice1 Task 2: the internal rebuild was refused (secure desktop
       // holds the output) or no duplication exists. Route into the unified
@@ -500,7 +773,17 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
 
     const uint32_t elapsed_s = static_cast<uint32_t>((NowMs() - t0) / 1000);
     if (elapsed_s >= next_beat_s) {
-      const FrameCacheCounters& c = cache.counters();
+      FrameCacheCounters c;
+      uint32_t w = 0, h = 0;
+      uint64_t aus = 0, bytes = 0;
+      {
+        std::lock_guard<std::mutex> lk(sh.mu);
+        c = sh.cache.counters();
+        w = res.width;
+        h = res.height;
+        aus = res.aus_written;
+        bytes = res.bytes_written;
+      }
       const char* desktop =
           opt.desktop_name_fn != nullptr
               ? opt.desktop_name_fn(opt.desktop_name_ctx)
@@ -511,27 +794,40 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
                      static_cast<unsigned long long>(c.encoded),
                      static_cast<unsigned long long>(c.keyframes),
                      static_cast<unsigned long long>(c.timeouts),
-                     static_cast<unsigned long long>(c.warmup_feeds), c.rebuilds, res.width,
-                     res.height, static_cast<unsigned long long>(res.aus_written),
-                     static_cast<unsigned long long>(res.bytes_written), desktop);
+                     static_cast<unsigned long long>(c.warmup_feeds), c.rebuilds, w,
+                     h, static_cast<unsigned long long>(aus),
+                     static_cast<unsigned long long>(bytes), desktop);
       } else {
         XNC_LOG_INFO("diag_pipeline elapsed=%us captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu rebuilds=%u w=%u h=%u aus=%llu bytes=%llu",
                      elapsed_s, static_cast<unsigned long long>(c.captured),
                      static_cast<unsigned long long>(c.encoded),
                      static_cast<unsigned long long>(c.keyframes),
                      static_cast<unsigned long long>(c.timeouts),
-                     static_cast<unsigned long long>(c.warmup_feeds), c.rebuilds, res.width,
-                     res.height, static_cast<unsigned long long>(res.aus_written),
-                     static_cast<unsigned long long>(res.bytes_written));
+                     static_cast<unsigned long long>(c.warmup_feeds), c.rebuilds, w,
+                     h, static_cast<unsigned long long>(aus),
+                     static_cast<unsigned long long>(bytes));
       }
       next_beat_s = elapsed_s + 1;
     }
   }
 
+  // Shutdown: wake the encode thread, let it drain everything queued (no
+  // captured frame is dropped at run end), then join.
+  queue.Shutdown();
+  encode_th.join();
+
   // End of run: flush the encoder tail (NOTIFY_DRAIN) so the lookahead
-  // window's AUs are not dropped, through the same shaping path.
+  // window's AUs are not dropped, through the same shaping path. The encode
+  // thread is gone; the encoder is quiescent (enc_mu is a formality).
   if (res.ok) {
-    aus.clear();
+    uint64_t last_mono_us = 0;
+    {
+      std::lock_guard<std::mutex> lk(sh.mu);
+      last_mono_us = sh.last_mono_us;
+    }
+    std::vector<std::vector<uint8_t>> aus;
+    std::vector<uint8_t> shaped;
+    std::lock_guard<std::mutex> elk(ctx.enc_mu);
     enc.FlushTail(aus);
     if (!aus.empty())
       XNC_LOG_INFO("encoder_flush_tail aus=%zu", aus.size());
@@ -550,12 +846,18 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
           break;
         }
       }
-      if (is_idr) cache.OnKeyframeAu();
+      if (is_idr) {
+        std::lock_guard<std::mutex> lk(sh.mu);
+        sh.cache.OnKeyframeAu();
+      }
     }
   }
   sink.OnState("stream_end", res.ok);
 
-  res.counters = cache.counters();
+  {
+    std::lock_guard<std::mutex> lk(sh.mu);
+    res.counters = sh.cache.counters();
+  }
   res.storm_resets = storm.storm_resets();
   const FrameCacheCounters& c = res.counters;
   XNC_LOG_INFO("pipeline_stop elapsed=%llums captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu rebuilds=%u resets=%u w=%u h=%u aus=%llu bytes=%llu ok=%d",

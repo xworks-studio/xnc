@@ -1,10 +1,15 @@
 // pipeline.h - capture -> FrameCache -> encode -> shaped Annex-B dump loop
-// (plan M1-Slice1 Task 5). Pipeline::Run drives one diagnostic capture
-// session end to end:
+// (plan M1-Slice1 Task 5; capture/encode decoupled by pipeline-decouple).
+// Pipeline::Run drives one diagnostic capture session end to end:
 //
-//   Acquire (ICapture contract) -> FrameCache state machine -> MfSoftEncoder
-//   -> per-AU stream shaping -> fwrite(h264) + per-second counter log,
-//   then MfSoftEncoder::FlushTail (lookahead window recovery) at end.
+//   CAPTURE thread (the Run caller's thread): Acquire (timeout = spf) ->
+//   FrameCache state machine -> push the scaled frame into a bounded
+//   handoff queue (depth 2, drop-oldest on full -> keep the LATEST frame,
+//   ADR-014). ENCODE thread: pop -> MfSoftEncoder -> per-AU stream shaping
+//   -> sink.OnAu, running at encode speed (under motion 30fps+; queue empty
+//   on a static screen -> idle), then MfSoftEncoder::FlushTail (lookahead
+//   window recovery) at end. The unified CaptureReset synchronizes with
+//   both threads (drain + encode-mutex re-init); see pipeline.cpp.
 //
 // Stream contract per AU (spec §7.10, port of vclNALUs semantics from
 // agent/screen-helper/capture_windows.go - same rules, C++ rewrite):
@@ -17,9 +22,10 @@
 //
 // Warm-up (spec §7.4 as amended 2026-08-22, commit 1a1dd41): CMSH264EncoderMFT
 // has ~17 frames of startup lookahead, so the first submitted frame does not
-// emerge as an AU until ~17 inputs later. On a static screen (acquire
-// timeouts) the pipeline re-feeds the cached base frame WITHOUT re-forcing
-// the IDR until the first keyframe AU emerges. Bounds: at most
+// emerge as an AU until ~17 inputs later. On a static screen (queue empty,
+// gated on a recent capture timeout) the ENCODE thread re-feeds the cached
+// base frame WITHOUT re-forcing the IDR until the first keyframe AU emerges
+// (old timeout-path semantics, moved with the pacing). Bounds: at most
 // min(2 x lookahead window frames, 2 s at target fps) re-feeds; warm-up feed
 // counts are logged. ForceNextIdr is never called during warm-up (E2).
 //
@@ -218,7 +224,10 @@ inline void ShapeAu(const uint8_t* au, size_t len, bool is_idr,
 
 // Receiver of the pipeline's shaped Annex-B AUs (M1-Slice2 Task 2): the
 // diag file dump and the real-time pipe fan-out are two implementations of
-// ONE pipeline loop. All methods are called on the pipeline thread.
+// ONE pipeline loop. Thread contract (pipeline-decouple): OnAu is called on
+// the ENCODE thread; OnState/OnDisplayChanged/OnDisplayChanged from the
+// CAPTURE thread (reset paths). Implementations must be thread-safe across
+// those calls (RtServer is; FileAuSink only ever sees OnAu).
 class AuSink {
  public:
   virtual ~AuSink() = default;
@@ -251,7 +260,7 @@ class AuSink {
   // Display topology change observed by a completed reset (M2-S1 Task 2):
   // the stream now carries w x h; reason is the reset reason string
   // ("resolution" / "desktop_switch" / ...). Sinks broadcast DISPLAY_CHANGED
-  // (0x010A) and update their HOST_HELLO geometry; called on the pipeline
+  // (0x010A) and update their HOST_HELLO geometry; called on the capture
   // thread right after the matching "capture_rebuilt" state event.
   virtual void OnDisplayChanged(uint32_t w, uint32_t h, const char* reason) {
     (void)w;
