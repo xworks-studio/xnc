@@ -76,6 +76,13 @@ export default function ScreenPreview() {
     let disposed = false;
     let ws: WebSocket | null = null;
     let decoder: VideoDecoder | null = null;
+    // 渲染单调性守卫(通用纪律):已渲染的最大时间戳。WebCodecs 输出回调
+    // 可能拿到乱序/迟到帧(网络重排、关键帧晚到)——时间戳 <= 已渲染的帧
+    // 一律丢弃,绝不把前一帧画在当前帧之后(VideoRenderFrames 同款规则)。
+    let lastRendered = -1;
+    // 流序时间戳:legacy screen 协议无采集时间戳,用单调递增计数代替
+    // performance.now()——后者是到达时刻,乱序到达会让解码器分不清新旧。
+    let chunkSeq = 0;
 
     // 关键帧首 SPS（含起始码）提取 codec string：avc1.<profile><compat><level>。
     // 关键帧契约：首 NALU 必为 SPS（helper 保证 IDR 前带 SPS/PPS）。
@@ -102,6 +109,14 @@ export default function ScreenPreview() {
       }
       decoder = new VideoDecoder({
         output: (frame) => {
+          // 迟到/乱序帧丢弃:时间戳不前进(<= 上一帧)说明是旧帧,直接
+          // 关闭不渲染——避免"前一帧渲染在当前帧之后"。
+          const ts = frame.timestamp ?? 0;
+          if (ts <= lastRendered) {
+            frame.close();
+            return;
+          }
+          lastRendered = ts;
           // 画布尺寸以解码帧为准（SPS 裁剪后可能与 SCREEN_BEGIN 声明差几像素）。
           if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
             canvas.width = frame.displayWidth;
@@ -196,7 +211,7 @@ export default function ScreenPreview() {
             dec.decode(
               new EncodedVideoChunk({
                 type: isKey ? "key" : "delta",
-                timestamp: performance.now(),
+                timestamp: ++chunkSeq,
                 data: au,
               }),
             );

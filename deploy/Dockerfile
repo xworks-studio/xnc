@@ -1,13 +1,12 @@
 # Phase 7: 单镜像 = 内嵌 Web UI 的控制面。
-# 1) node 阶段构建 web/dist（Vite 产物，Node 24 与本地/CI 一致）
+# 1) web/dist 由本地/CI 构建（Vite 产物，push 时打包上传）——服务器不跑
+#    npm（registry 网络在阿里云国际区不可靠：npm ci ECONNRESET 曾使构建
+#    全缓存的假象破裂，部署静默失败）
 # 2) go 阶段把产物拷入 server/web/dist → go:embed 进二进制
 # 3) distroless static 运行（CGO_ENABLED=0，纯静态）
-FROM node:24-alpine AS web
+FROM alpine:3.20 AS web
 WORKDIR /web
-COPY web/package.json web/package-lock.json ./
-RUN npm ci --no-fund --no-audit
-COPY web ./
-RUN npm run build
+COPY web/dist ./dist
 
 FROM golang:1.26-alpine AS build
 WORKDIR /src
