@@ -4345,6 +4345,65 @@ int SelftestMain() {
     // nh = ceil(2*2/4) = 1: one dst row covers both src rows; the first dst
     // pixel covers the 2x2 block x=0..2,y=0..2: B = (0+0x10+0x10+0x40)/4 = 0x18.
     CHECK("ds-box-avg", dst[0] == 0x18 && dst[1] == 0x20 && dst[2] == 0x30 && dst[3] == 0xFF);
+    // pipeline-decouple exactness regression: the optimized box filter must
+    // be byte-identical to the original naive per-pixel-division algorithm
+    // (the multiply-high + correction trick must not drift by even 1).
+    {
+      auto naive = [](const std::vector<uint8_t>& src, uint32_t w, uint32_t h,
+                      uint32_t max_w, std::vector<uint8_t>* out, uint32_t* ow,
+                      uint32_t* oh) {
+        const uint32_t nw = max_w;
+        const uint32_t nh = (uint32_t)(((uint64_t)h * nw + w - 1) / w);
+        out->assign((size_t)nw * nh * 4, 0);
+        for (uint32_t dy = 0; dy < nh; dy++) {
+          const uint32_t y0 = (uint32_t)(((uint64_t)h * dy) / nh);
+          const uint32_t y1 = (uint32_t)(((uint64_t)h * (dy + 1)) / nh);
+          for (uint32_t dx = 0; dx < nw; dx++) {
+            const uint32_t x0 = (uint32_t)(((uint64_t)w * dx) / nw);
+            const uint32_t x1 = (uint32_t)(((uint64_t)w * (dx + 1)) / nw);
+            uint64_t b = 0, g = 0, r = 0, a = 0;
+            uint32_t n = 0;
+            for (uint32_t y = y0; y < y1 && y < h; y++) {
+              const uint8_t* row = src.data() + (size_t)y * w * 4 + (size_t)x0 * 4;
+              for (uint32_t x = x0; x < x1 && x < w; x++, row += 4) {
+                b += row[0]; g += row[1]; r += row[2]; a += row[3]; n++;
+              }
+            }
+            uint8_t* d = out->data() + ((size_t)dy * nw + dx) * 4;
+            d[0] = (uint8_t)(b / n); d[1] = (uint8_t)(g / n);
+            d[2] = (uint8_t)(r / n); d[3] = (uint8_t)(a / n);
+          }
+        }
+        *ow = nw; *oh = nh;
+      };
+      // Deterministic content + awkward ratios (non-integer spans exercise
+      // the correction path), incl. a pathological tiny max_w (huge boxes).
+      const std::pair<uint32_t, uint32_t> sizes[] = {
+          {2880, 1800}, {1919, 1079}, {640, 480}, {4000, 3000}, {1024, 768}};
+      const uint32_t maxws[] = {1920, 1000, 333, 3, 1};
+      bool exact = true;
+      for (size_t s = 0; s < sizeof(sizes) / sizeof(sizes[0]) && exact; ++s) {
+        const uint32_t w = sizes[s].first, h = sizes[s].second;
+        std::vector<uint8_t> src((size_t)w * h * 4);
+        uint32_t st = 0x1234ABCDu;
+        for (size_t i = 0; i < src.size(); i += 4) {
+          st = st * 1664525u + 1013904223u;
+          src[i] = (uint8_t)(st >> 24);
+          src[i + 1] = (uint8_t)(st >> 16);
+          src[i + 2] = (uint8_t)(st >> 8);
+          src[i + 3] = 0xFF;
+        }
+        for (uint32_t mw : maxws) {
+          if (mw >= w) continue;
+          std::vector<uint8_t> fast, ref;
+          uint32_t fw = 0, fh = 0, rw = 0, rh = 0;
+          xnc::DownscaleBgra(src.data(), w, h, mw, &fast, &fw, &fh);
+          naive(src, w, h, mw, &ref, &rw, &rh);
+          if (fw != rw || fh != rh || fast != ref) exact = false;
+        }
+      }
+      CHECK("ds-exact-vs-naive", exact);
+    }
     // Identity pass-through when w <= max_w (and when max_w == 0).
     std::vector<uint8_t> id;
     CHECK("ds-identity", xnc::DownscaleBgra(src.data(), sw, sh, sw, &id, &ow, &oh) &&

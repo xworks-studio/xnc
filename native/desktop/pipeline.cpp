@@ -153,6 +153,7 @@ struct PipelineShared {
 constexpr uint32_t kLatencyWindowFrames = 60;
 constexpr uint64_t kLatencyMaxUs = 60ull * 1000000ull;  // 60 s sanity bound
 struct LatencyWindow {
+  const char* label = "pipe_latency_ms";
   uint64_t sum_us = 0;
   uint32_t n = 0;
   void Add(uint64_t mono_us) {
@@ -164,7 +165,7 @@ struct LatencyWindow {
   }
   void Flush() {
     if (n == 0) return;
-    XNC_LOG_INFO("pipe_latency_ms avg=%.2f n=%u",
+    XNC_LOG_INFO("%s avg=%.2f n=%u", label,
                  static_cast<double>(sum_us) / 1000.0 / static_cast<double>(n), n);
     sum_us = 0;
     n = 0;
@@ -614,6 +615,10 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
   uint32_t next_beat_s = 1;
   uint64_t last_push_ms = 0;  // capture-side spf pacing anchor
   bool first_frame_logged = false;
+  LatencyWindow cap_win;  // capture thread cycle (acquire start -> push done)
+  cap_win.label = "cap_cycle_ms";
+  LatencyWindow acq_win;  // capture-side acquire+downscale duration
+  acq_win.label = "cap_acq_ms";
   ResetStormTracker storm;  // same-reason rebuild-storm backoff (M2-S2 T1)
 
   for (;;) {
@@ -660,7 +665,9 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
     // as a new frame presents; on a static screen it wakes every spf and
     // reports err_timeout (the old 100 ms backend default would stall the
     // paced capture loop).
+    const uint64_t t_acq0 = NowMonoUs();
     if (cap.Acquire(blob, &acq_err, spf_ms)) {
+      acq_win.Add(t_acq0);  // acquire (incl. downscale) duration window
       // Frame-size change (M2-S1 Task 2): the backend adopted a new mode
       // but the encoder is still at the old size - route to the unified
       // reset (resolution) instead of feeding a wrong-sized frame in.
@@ -713,6 +720,7 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
       handoff.h = blob.h;
       handoff.mono_us = blob.mono_us;
       queue.Push(std::move(handoff));
+      cap_win.Add(t_acq0);  // acquire start -> push done (XIAOXIN split diag)
       // Capture-side pacing to the target fps (the old SubmitFrame pacing -
       // the encoder timestamps with the wall clock, so submit cadence ==
       // frame cadence; the ENCODE thread must run at encode speed instead).
@@ -815,6 +823,8 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
   // captured frame is dropped at run end), then join.
   queue.Shutdown();
   encode_th.join();
+  cap_win.Flush();  // partial capture-cycle window at run end
+  acq_win.Flush();  // partial acquire window at run end
 
   // End of run: flush the encoder tail (NOTIFY_DRAIN) so the lookahead
   // window's AUs are not dropped, through the same shaping path. The encode

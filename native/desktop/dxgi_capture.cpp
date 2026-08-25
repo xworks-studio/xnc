@@ -76,7 +76,14 @@ struct DxgiCapture::Impl {
   ComPtr<IDXGIOutput1> out1;   // fallback re-duplication handle
   ComPtr<IDXGIOutput5> out5;   // preferred DuplicateOutput1 handle
   ComPtr<IDXGIOutputDuplication> dupl;
-  ComPtr<ID3D11Texture2D> staging;  // persistent CPU-readable full-frame copy
+  // Persistent CPU-readable full-frame copies (pipeline-decouple perf pass:
+  // DOUBLE-BUFFERED so the CPU readback of frame N overlaps the GPU copy of
+  // frame N+1 - a single staging texture makes Map(D3D11_MAP_READ) block on
+  // the just-issued CopyResource, which was the live-pipeline capture limiter
+  // on XIAOXIN (~90ms/frame vs ~17ms standalone readback).
+  ComPtr<ID3D11Texture2D> staging_[2];
+  uint32_t staging_cur_ = 0;  // buffer the NEXT copy lands in
+  bool have_staged_ = false;  // false until the first frame is read back
 };
 
 // ---- M2-Slice3 Task 5: process-global displays table + selection ----
@@ -231,7 +238,10 @@ DxgiCapture::~DxgiCapture() { delete impl_; }
 
 // Creates the staging texture for the current w_/h_ (CPU read, BGRA).
 bool DxgiCapture::MakeStaging(std::string* err) {
-  impl_->staging.Reset();
+  impl_->staging_[0].Reset();
+  impl_->staging_[1].Reset();
+  impl_->staging_cur_ = 0;
+  impl_->have_staged_ = false;
   D3D11_TEXTURE2D_DESC td{};
   td.Width = w_;
   td.Height = h_;
@@ -241,10 +251,12 @@ bool DxgiCapture::MakeStaging(std::string* err) {
   td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
   td.Usage = D3D11_USAGE_STAGING;
   td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-  const HRESULT hr = impl_->dev->CreateTexture2D(&td, nullptr, &impl_->staging);
-  if (FAILED(hr)) {
-    SetHrErr(err, "CreateTexture2D(staging)", hr);
-    return false;
+  for (int i = 0; i < 2; i++) {
+    const HRESULT hr = impl_->dev->CreateTexture2D(&td, nullptr, &impl_->staging_[i]);
+    if (FAILED(hr)) {
+      SetHrErr(err, "CreateTexture2D(staging)", hr);
+      return false;
+    }
   }
   return true;
 }
@@ -282,7 +294,10 @@ bool DxgiCapture::Reduplicate(std::string* err) {
 
 bool DxgiCapture::Init(std::string* err) {
   impl_->dupl.Reset();
-  impl_->staging.Reset();
+  impl_->staging_[0].Reset();
+  impl_->staging_[1].Reset();
+  impl_->staging_cur_ = 0;
+  impl_->have_staged_ = false;
   impl_->out1.Reset();
   impl_->out5.Reset();
   impl_->ctx.Reset();
@@ -456,27 +471,35 @@ bool DxgiCapture::Acquire(FrameBlob& blob, std::string* err, uint32_t timeout_ms
   }
 
   // Full-frame copy into our persistent staging texture, then hand the
-  // desktop image straight back - never held across iterations.
-  impl_->ctx->CopyResource(impl_->staging.Get(), tex.Get());
+  // desktop image straight back - never held across iterations. The copy
+  // lands in staging_[staging_cur_]; the CPU reads the OTHER buffer, which
+  // the GPU finished copying during the previous iteration (double buffering
+  // keeps Map from blocking on the just-issued CopyResource).
+  const uint32_t read_buf =
+      impl_->have_staged_ ? (impl_->staging_cur_ ^ 1) : impl_->staging_cur_;
+  impl_->ctx->CopyResource(impl_->staging_[impl_->staging_cur_].Get(), tex.Get());
   tex.Reset();
   impl_->dupl->ReleaseFrame();
 
   D3D11_MAPPED_SUBRESOURCE mapped{};
-  hr = impl_->ctx->Map(impl_->staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+  hr = impl_->ctx->Map(impl_->staging_[read_buf].Get(), 0, D3D11_MAP_READ, 0,
+                       &mapped);
   if (FAILED(hr)) {
     SetHrErr(err, "Map(staging)", hr);
     return false;
   }
   const size_t need = BgraBytes(w_, h_);
   if (need == 0) {
-    impl_->ctx->Unmap(impl_->staging.Get(), 0);
+    impl_->ctx->Unmap(impl_->staging_[read_buf].Get(), 0);
     if (err) *err = "err_bad_dims";
     return false;
   }
   blob.bgra.resize(need);
   CompactBgraRows(static_cast<const uint8_t*>(mapped.pData), mapped.RowPitch,
                   blob.bgra.data(), w_, h_);
-  impl_->ctx->Unmap(impl_->staging.Get(), 0);
+  impl_->ctx->Unmap(impl_->staging_[read_buf].Get(), 0);
+  impl_->staging_cur_ = impl_->staging_cur_ ^ 1;
+  impl_->have_staged_ = true;
 
   blob.w = w_;
   blob.h = h_;
