@@ -97,7 +97,14 @@ class TimedIo {
                                 nullptr, &ov_)
                      : WriteFile(file_, buf + done, static_cast<DWORD>(len - done),
                                  nullptr, &ov_);
-      if (!ok && GetLastError() != ERROR_IO_PENDING) return false;
+      if (ok) {
+        // 同步完成(小帧 < pipe 缓冲):overlapped 事件不置位,若继续
+        // WaitForSingleObject 会空等 kIoSliceMs —— 2026-08-25 性能根因
+        // (rt 发送被压到 ~7fps)。同步完成直接计入,不等待。
+        done += len - done;
+        break;
+      }
+      if (GetLastError() != ERROR_IO_PENDING) return false;
       DWORD got = 0;
       if (!WaitAndGet(&got) || got == 0) return false;
       done += got;
