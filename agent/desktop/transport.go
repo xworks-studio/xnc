@@ -220,8 +220,12 @@ func (p *Publisher) WriteFrame(f Frame) error {
 		return nil
 	}
 	d := p.frameDuration(f.MonoUs)
+	ws := time.Now()
 	if err := p.track.WriteSample(media.Sample{Data: f.AU, Duration: d}); err != nil {
 		return fmt.Errorf("desktop: write sample: %w", err)
+	}
+	if ms := time.Since(ws).Milliseconds(); ms > 20 {
+		p.log.Info("desktop write_sample slow", "ms", ms, "auBytes", len(f.AU))
 	}
 	if !started {
 		p.stateMu.Lock()
