@@ -3167,11 +3167,29 @@ int SelftestMain() {
     // re-feed's re-stamp (now), not C's capture time (Task 2 approved
     // behavior), so no mono_us identity assertion - the binding assertion
     // is decoded-pixel identity.
+    //
+    // Backend pin (reviewer finding, fix round 1): the replay feeds
+    // back-to-back while the real pipeline paces submissions to spf with
+    // wall-clock sample times, and the kEncoderLookaheadFrames feed bound
+    // is measured for the software MFT. A hardware rung (QSV/NVENC/AMF)
+    // with a timestamp-sensitive rate controller or a longer lookahead
+    // could quantize the replay differently from the pipeline and fail the
+    // binding assertion spuriously. The instance is therefore pinned to
+    // the software rung - sticky across Init calls, so the references AND
+    // the live pipeline stream share one backend and stay comparable. This
+    // does not weaken the proof: the fix under test lives in the
+    // pipeline's capture/cache/ledger logic (idle re-encode of the LATEST
+    // captured frame), which is encoder-agnostic, and the other rt/mf
+    // scenarios keep exercising the hardware-first ladder with unpinned
+    // instances.
     xnc::MfSoftEncoder enc;
+    enc.SetForceSoftware(true);  // sticky; applies to refs and pipeline alike
     std::string err;
     const bool init_ok = enc.Init(kRtW, kRtH, kRtFps, kRtBitrate, &err);
     if (!init_ok) std::printf("SELFTEST NOTE: abc-init err=%s\n", err.c_str());
     CHECK("abc-init", init_ok);
+    CHECK("abc-backend-pinned-software",
+          enc.backend() == xnc::EncoderBackend::kSoftware);
     if (init_ok) {
       SyntheticBars bars(kRtW, kRtH);  // frame 0 = A, frame 2 = C (bars differ)
       std::vector<uint8_t> ref_a_au, ref_c_rec_au, ref_a_rec_au;
