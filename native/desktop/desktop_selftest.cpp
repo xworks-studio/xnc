@@ -1140,6 +1140,8 @@ int SelftestMain() {
     fb.bgra.resize(xnc::BgraBytes(fb.w, fb.h));
     CHECK("blob-size-matches-math", fb.bgra.size() == (size_t)fb.w * fb.h * 4);
   }
+  CHECK("staging-read-is-current-0", xnc::StagingReadIndex(0) == 0);
+  CHECK("staging-read-is-current-1", xnc::StagingReadIndex(1) == 1);
   { // 行距压缩(Map RowPitch > w*4 是常态):合成 pitched 数据逐行核对
     const uint32_t w = 8, h = 6;
     const size_t tight = (size_t)w * 4;      // 32

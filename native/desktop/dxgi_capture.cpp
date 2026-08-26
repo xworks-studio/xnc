@@ -89,21 +89,15 @@ struct DxgiCapture::Impl {
   ComPtr<IDXGIOutput1> out1;   // fallback re-duplication handle
   ComPtr<IDXGIOutput5> out5;   // preferred DuplicateOutput1 handle
   ComPtr<IDXGIOutputDuplication> dupl;
-  // Persistent CPU-readable full-frame copies (pipeline-decouple perf pass:
-  // DOUBLE-BUFFERED so the CPU readback of frame N overlaps the GPU copy of
-  // frame N+1 - a single staging texture makes Map(D3D11_MAP_READ) block on
-  // the just-issued CopyResource, which was the live-pipeline capture limiter
-  // on XIAOXIN (~90ms/frame vs ~17ms standalone readback).
+  // Persistent CPU-readable full-frame copies. staging_cur_ selects the
+  // texture written and read for the current acquire.
   ComPtr<ID3D11Texture2D> staging_[2];
-  uint32_t staging_cur_ = 0;  // buffer the NEXT copy lands in
-  bool have_staged_ = false;  // false until the first frame is read back
+  uint32_t staging_cur_ = 0;
 
   // gpu-readback task: VideoProcessor pipeline (scale+NV12+rotate in one
-  // blt). nv12_out_ is the DEFAULT-usage NV12 blt destination (double
-  // buffered like the BGRA staging: the blt of frame N+1 never races the
-  // copy of frame N); nv12_stage_ the CPU-readable copies. staging_cur_ /
-  // have_staged_ track the NV12 buffers in GPU mode (mutually exclusive
-  // with the BGRA path above - one mode per instance).
+  // blt). nv12_out_ is the DEFAULT-usage NV12 blt destination; nv12_stage_
+  // contains CPU-readable copies. staging_cur_ selects the buffers used for
+  // the current acquire in GPU mode (mutually exclusive with BGRA mode).
   ComPtr<ID3D11VideoDevice> vid_dev;
   ComPtr<ID3D11VideoContext> vid_ctx;
   ComPtr<ID3D11VideoProcessorEnumerator> vpe;
@@ -268,7 +262,6 @@ bool DxgiCapture::MakeStaging(std::string* err) {
   impl_->staging_[0].Reset();
   impl_->staging_[1].Reset();
   impl_->staging_cur_ = 0;
-  impl_->have_staged_ = false;
   D3D11_TEXTURE2D_DESC td{};
   td.Width = w_;
   td.Height = h_;
@@ -306,7 +299,6 @@ bool DxgiCapture::MakeGpuPipeline(std::string* err) {
   impl_->nv12_stage_[0].Reset();
   impl_->nv12_stage_[1].Reset();
   impl_->staging_cur_ = 0;
-  impl_->have_staged_ = false;
 
   if (!impl_->vid_dev) {
     const HRESULT hq = impl_->dev.As(&impl_->vid_dev);
@@ -522,7 +514,6 @@ bool DxgiCapture::Init(std::string* err) {
   impl_->staging_[0].Reset();
   impl_->staging_[1].Reset();
   impl_->staging_cur_ = 0;
-  impl_->have_staged_ = false;
   impl_->vid_dev.Reset();
   impl_->vid_ctx.Reset();
   impl_->vpe.Reset();
@@ -724,14 +715,11 @@ bool DxgiCapture::Acquire(FrameBlob& blob, std::string* err, uint32_t timeout_ms
 
   // gpu-readback GPU path: scale + NV12 convert (+ rotate) in ONE
   // VideoProcessorBlt into the persistent NV12 output, copy to the NV12
-  // staging buffer, then read back only the small NV12 frame. Double
-  // buffering: the blt/copy for frame N+1 overlaps the CPU readback of
-  // frame N (same pattern as the BGRA staging below - Map on the PREVIOUS
-  // buffer, which the GPU finished filling during this iteration).
+  // staging buffer, then read back only the small NV12 frame.
   if (gpu_max_w_ > 0) {
     const uint64_t gpu_t0 = NowMonoUs();
     const uint32_t cur = impl_->staging_cur_;
-    const uint32_t read_buf = impl_->have_staged_ ? (cur ^ 1) : cur;
+    const uint32_t read_buf = StagingReadIndex(cur);
     // Per-frame input view over the acquired desktop texture (the view is
     // tied to the texture, which changes every frame; the output view is
     // persistent, bound to the double-buffered NV12 output texture).
@@ -793,7 +781,6 @@ bool DxgiCapture::Acquire(FrameBlob& blob, std::string* err, uint32_t timeout_ms
                     blob.bgra.data(), out_w_, out_h_);
     impl_->ctx->Unmap(impl_->nv12_stage_[read_buf].Get(), 0);
     impl_->staging_cur_ = cur ^ 1;
-    impl_->have_staged_ = true;
 
     blob.w = out_w_;
     blob.h = out_h_;
@@ -808,14 +795,11 @@ bool DxgiCapture::Acquire(FrameBlob& blob, std::string* err, uint32_t timeout_ms
     return true;
   }
 
-  // Full-frame copy into our persistent staging texture, then hand the
-  // desktop image straight back - never held across iterations. The copy
-  // lands in staging_[staging_cur_]; the CPU reads the OTHER buffer, which
-  // the GPU finished copying during the previous iteration (double buffering
-  // keeps Map from blocking on the just-issued CopyResource).
-  const uint32_t read_buf =
-      impl_->have_staged_ ? (impl_->staging_cur_ ^ 1) : impl_->staging_cur_;
-  impl_->ctx->CopyResource(impl_->staging_[impl_->staging_cur_].Get(), tex.Get());
+  // Full-frame copy into the current persistent staging texture, then read
+  // that same acquired desktop image back before returning it.
+  const uint32_t cur = impl_->staging_cur_;
+  const uint32_t read_buf = StagingReadIndex(cur);
+  impl_->ctx->CopyResource(impl_->staging_[cur].Get(), tex.Get());
   tex.Reset();
   impl_->dupl->ReleaseFrame();
 
@@ -836,8 +820,7 @@ bool DxgiCapture::Acquire(FrameBlob& blob, std::string* err, uint32_t timeout_ms
   CompactBgraRows(static_cast<const uint8_t*>(mapped.pData), mapped.RowPitch,
                   blob.bgra.data(), w_, h_);
   impl_->ctx->Unmap(impl_->staging_[read_buf].Get(), 0);
-  impl_->staging_cur_ = impl_->staging_cur_ ^ 1;
-  impl_->have_staged_ = true;
+  impl_->staging_cur_ = cur ^ 1;
 
   blob.w = w_;
   blob.h = h_;

@@ -20,6 +20,11 @@
 
 namespace xnc {
 
+// The CPU must map the same staging texture that the current acquire copied.
+inline constexpr uint32_t StagingReadIndex(uint32_t write_index) {
+  return write_index;
+}
+
 // Byte size of a tightly packed w*h BGRA buffer (== FrameBlob::bgra.size()).
 // Returns 0 for absurd dimensions instead of overflowing/wrapping.
 inline size_t BgraBytes(uint32_t w, uint32_t h) {
