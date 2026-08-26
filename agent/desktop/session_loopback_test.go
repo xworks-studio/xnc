@@ -45,6 +45,10 @@ type fakeSource struct {
 	nextKey   bool // 下帧强制 IDR(镜像 host 的 needsKeyframe)
 	closed    bool
 	closeOnce sync.Once
+	// gapAfterConnect 仅供主 RTP 回环门使用：等待 connect IDR 请求后
+	// 输出 1s/31s 两帧。其他共用 fake 保持立即产帧语义。
+	gapAfterConnect bool
+	monoBase        uint64
 
 	frameCh   chan Frame
 	stateCh   chan StateEvent
@@ -52,12 +56,17 @@ type fakeSource struct {
 	done      chan struct{}
 }
 
+var fakeSourceMonoBase atomic.Uint64
+
 func newFakeSource() *fakeSource {
 	return &fakeSource{
 		frameCh:   make(chan Frame, 32),
 		stateCh:   make(chan StateEvent, 4),
 		displayCh: make(chan DisplayChangedEvent, 4),
 		done:      make(chan struct{}),
+		// Replacement capture sources share the host's process-wide monotonic
+		// clock; distinct bases keep reattach fixtures faithful to that contract.
+		monoBase: fakeSourceMonoBase.Add(1_000_000_000),
 	}
 }
 
@@ -161,25 +170,40 @@ func (s *fakeSource) Close() error {
 	return nil
 }
 
-// run 以 100fps(加速回环)合成帧直到 done;每 60 帧或 keyframe 请求后产出 IDR。
+// run 在连接请求首张 IDR 后以 100fps(加速回环)合成帧直到
+// done。首两帧的演示时间相差 30s，用于钉住 RTP 时钟必须把长静止
+// 间隔放在当前帧上；之后每 60 帧或 keyframe 请求后产出 IDR。
 func (s *fakeSource) run(t *testing.T) {
 	t.Helper()
 	go func() {
 		ticker := time.NewTicker(10 * time.Millisecond)
 		defer ticker.Stop()
-		mono := uint64(1_000_000)
+		mono := s.monoBase
 		var i int
+		started := !s.gapAfterConnect
 		for {
 			select {
 			case <-s.done:
 				return
 			case <-ticker.C:
-				mono += 10_000 // 10ms 帧距
-				i++
 				s.mu.Lock()
 				force := s.nextKey
-				s.nextKey = false
+				if force {
+					s.nextKey = false
+				}
 				s.mu.Unlock()
+				if !started && !force {
+					continue
+				}
+				if !started {
+					mono = 1_000_000
+					started = true
+				} else if s.gapAfterConnect && i == 1 {
+					mono = 31_000_000
+				} else {
+					mono += 10_000 // 10ms 帧距
+				}
+				i++
 				key := force || i%60 == 1
 				f := Frame{Key: key, MonoUs: mono, AU: synthAU(key, mono)}
 				select {
@@ -272,18 +296,20 @@ func (st *fakeStarter) sasCalls() []string {
 // ---- viewer 侧 ----
 
 type viewerStats struct {
-	rtpPkts      atomic.Uint64
-	frames       atomic.Uint64
-	keyframes    atomic.Uint64
-	firstFrameAt atomic.Int64
-	firstFrameCh chan struct{}
-	trackCh      chan *webrtc.TrackRemote
+	rtpPkts        atomic.Uint64
+	frames         atomic.Uint64
+	keyframes      atomic.Uint64
+	firstFrameAt   atomic.Int64
+	firstFrameCh   chan struct{}
+	trackCh        chan *webrtc.TrackRemote
+	rtpTimestampCh chan uint32
 }
 
 func newViewerStats() *viewerStats {
 	return &viewerStats{
-		firstFrameCh: make(chan struct{}),
-		trackCh:      make(chan *webrtc.TrackRemote, 1),
+		firstFrameCh:   make(chan struct{}),
+		trackCh:        make(chan *webrtc.TrackRemote, 1),
+		rtpTimestampCh: make(chan uint32, 128),
 	}
 }
 
@@ -320,6 +346,12 @@ func startViewerPC(t *testing.T) (*webrtc.PeerConnection, *viewerStats) {
 				return
 			}
 			st.rtpPkts.Add(1)
+			if pkt.Marker {
+				select {
+				case st.rtpTimestampCh <- pkt.Timestamp:
+				default:
+				}
+			}
 			sb.Push(pkt)
 			for {
 				smp := sb.Pop()
@@ -444,6 +476,7 @@ func waitStops(s *fakeStarter, n int32, d time.Duration) error {
 // TestSessionLoopbackVideoAndPLI 是 T4 的核心回环门(见文件头)。
 func TestSessionLoopbackVideoAndPLI(t *testing.T) {
 	src := newFakeSource()
+	src.gapAfterConnect = true
 	src.run(t)
 	st := &fakeStarter{src: src}
 	h := &Handler{Log: slog.Default(), Starter: st}
@@ -560,6 +593,20 @@ func TestSessionLoopbackVideoAndPLI(t *testing.T) {
 	case <-vstats.firstFrameCh:
 	case <-time.After(10 * time.Second):
 		t.Fatalf("no first frame; rtp=%d", vstats.rtpPkts.Load())
+	}
+	var firstRTP, secondRTP uint32
+	select {
+	case firstRTP = <-vstats.rtpTimestampCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("viewer: no first frame RTP timestamp")
+	}
+	select {
+	case secondRTP = <-vstats.rtpTimestampCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("viewer: no second frame RTP timestamp")
+	}
+	if delta := secondRTP - firstRTP; delta != 2_700_000 {
+		t.Fatalf("30s presentation gap RTP delta=%d, want 2700000", delta)
 	}
 	waitFrames(t, vstats, 20, 10*time.Second)
 	kf0 := vstats.keyframes.Load()

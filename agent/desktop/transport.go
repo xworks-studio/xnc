@@ -1,13 +1,8 @@
 // transport.go — Pion publisher(M1-Slice2 Task 4)。
 //
-// API 选择(与 plan「写 track」约定):TrackLocalStaticSample + WriteSample
-// (pion/webrtc v4.2.x 的惯用发送 API),不手写 RTP 打包——pion 内置
-// H264Payloader 消费 Annex-B AU:SPS/PPS 经 STAP-A 合并、大 NALU FU-A 分片
-// (packetization-mode=1),viewer 侧 pion H264 depacketizer 还原 4 字节起始码。
-// RTP 时戳 = WriteSample 按 sample.Duration 累计(duration*90kHz,带小数
-// 余量):我们用相邻帧 mono_us 差作为 Duration,故时戳序列 ≡ mono_us@90kHz
-// (模随机起始偏移与亚 tick 舍入)。mono 差非法(≤0 或 >500ms)时回退
-// DefaultDuration(由 HOST_HELLO fps 推得)。
+// API 选择:TrackLocalStaticRTP + Pion H264Payloader。Annex-B AU 由 Pion
+// 完成 STAP-A/FU-A 分包，每帧的所有 RTP 包都直接使用该 AU 的
+// MonoUs@90kHz 时戳；不再用 sample.Duration 隐式推进时间轴。
 package desktop
 
 import (
@@ -15,14 +10,16 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/pion/interceptor"
+	"github.com/pion/rtp"
+	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
-	"github.com/pion/webrtc/v4/pkg/media"
 )
 
 // h264FmtpLine 是本管线的 H264 协商参数:Mf 编码器输出不限于此声明档位,
@@ -36,27 +33,31 @@ type PublisherConfig struct {
 	// RelayOnly = iceTransportPolicy:relay(全局约束;回环单测传 false 走
 	// host 候选,因为 relay 需真 TURN)。
 	RelayOnly bool
-	// DefaultDuration 是 mono 差不可用时(首帧/时钟回退)的帧时长。
+	// DefaultDuration 仅为旧调用方的源码兼容字段；RTP 时间轴不使用它。
 	DefaultDuration time.Duration
 	Log             *slog.Logger
 }
 
 // Publisher 承载一个 viewer 会话的发送侧 PeerConnection + H264 视频轨。
 type Publisher struct {
-	log       *slog.Logger
-	pc        *webrtc.PeerConnection
-	sender    *webrtc.RTPSender
-	track     *webrtc.TrackLocalStaticSample
-	defDur    time.Duration
-	stats     pubStats
-	wg        sync.WaitGroup
-	closeO    sync.Once
-	connReady atomic.Bool // ICE+DTLS 已通(到达即向 host 请求 fresh IDR)
-	keyFn     func(reason string)
-	iceFn     func(webrtc.ICECandidateInit)
-	stateMu   sync.Mutex
-	lastMono  uint64
-	started   bool // 连接后首个 key 帧已写出(viewer 可解码起点)
+	log        *slog.Logger
+	pc         *webrtc.PeerConnection
+	sender     *webrtc.RTPSender
+	track      *webrtc.TrackLocalStaticRTP
+	packetizer rtp.Packetizer
+	rtpClock   *rtpClock
+	writeMu    sync.Mutex
+	// defDur/lastMono 只保留给旧 frameDuration 单测，不在发送热路径上。
+	defDur        time.Duration
+	stats         pubStats
+	wg            sync.WaitGroup
+	closeO        sync.Once
+	connReady     atomic.Bool // ICE+DTLS 已通(到达即向 host 请求 fresh IDR)
+	keyFn         func(reason string)
+	iceFn         func(webrtc.ICECandidateInit)
+	stateMu       sync.Mutex
+	lastMono      uint64
+	started       bool // 连接后首个 key 帧已写出(viewer 可解码起点)
 	intervalStats frameIntervalStats
 }
 
@@ -105,10 +106,6 @@ func NewPublisher(cfg PublisherConfig) (*Publisher, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	defDur := cfg.DefaultDuration
-	if defDur <= 0 {
-		defDur = 33 * time.Millisecond
-	}
 	policy := webrtc.ICETransportPolicyAll
 	if cfg.RelayOnly {
 		policy = webrtc.ICETransportPolicyRelay
@@ -127,7 +124,7 @@ func NewPublisher(cfg PublisherConfig) (*Publisher, error) {
 	if err != nil {
 		return nil, fmt.Errorf("desktop: peer connection: %w", err)
 	}
-	track, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{
+	track, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{
 		MimeType:    webrtc.MimeTypeH264,
 		ClockRate:   90000,
 		SDPFmtpLine: h264FmtpLine,
@@ -142,7 +139,12 @@ func NewPublisher(cfg PublisherConfig) (*Publisher, error) {
 		return nil, fmt.Errorf("desktop: add track: %w", err)
 	}
 	p := &Publisher{
-		log: log, pc: pc, sender: sender, track: track, defDur: defDur,
+		log:        log,
+		pc:         pc,
+		sender:     sender,
+		track:      track,
+		packetizer: rtp.NewPacketizer(1200, 102, 0, &codecs.H264Payloader{}, rtp.NewRandomSequencer(), 90000),
+		rtpClock:   newRTPClock(rand.Uint32()),
 	}
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		fn := p.iceFn
@@ -155,7 +157,7 @@ func NewPublisher(cfg PublisherConfig) (*Publisher, error) {
 		}
 		fn(c.ToJSON())
 	})
-	// 首帧语义(关键):ICE+DTLS 就绪前 RTPSender 尚未启动,WriteSample
+	// 首帧语义(关键):ICE+DTLS 就绪前 RTPSender 尚未启动,WriteRTP
 	// 会被静默丢弃——ATTACH 时的 IDR 恰好落在这个窗口。因此:到达
 	// Connected 即向 host 请求一次 fresh IDR(reason="connect",host 侧
 	// ≥500ms 间隔记账),它必然在 sender 启动后产出;WriteFrame 侧配合
@@ -199,8 +201,8 @@ func (p *Publisher) AddCandidate(c webrtc.ICECandidateInit) error {
 	return p.pc.AddICECandidate(c)
 }
 
-// WriteFrame 将一帧 Annex-B AU 写入视频轨:Duration 取 mono_us 差
-// (非法则回退默认),由 pion 计入 RTP 时戳(见文件头)。
+// WriteFrame 将一帧 Annex-B AU 分包后写入视频轨。同一 AU 的所有
+// 包使用同一个 MonoUs@90kHz 时戳，仅最后一包置 Marker。
 //
 // 首帧语义(双保险,见 NewPublisher 的 Connected 钩子):连接就绪前的帧
 // 一律丢弃(RTPSender 未启动,写了也静默蒸发);连接后丢弃 delta 直到
@@ -214,6 +216,8 @@ func (p *Publisher) WriteFrame(f Frame) error {
 		p.stats.preConnDropped.Add(1)
 		return nil
 	}
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
 	p.stateMu.Lock()
 	started := p.started
 	p.stateMu.Unlock()
@@ -221,16 +225,33 @@ func (p *Publisher) WriteFrame(f Frame) error {
 		p.stats.preKeyDropped.Add(1)
 		return nil
 	}
-	d := p.frameDuration(f.MonoUs)
-	if d > 0 && d <= time.Second {
-		p.intervalStats.add(d, p.log)
+	hadPreviousTimestamp := p.rtpClock.started
+	previousMonoUs := p.rtpClock.last
+	timestamp, err := p.rtpClock.Timestamp(f.MonoUs)
+	if err != nil {
+		return err
+	}
+	packets := p.packetizer.Packetize(f.AU, 0)
+	if len(packets) == 0 {
+		return errors.New("desktop: H264 payloader produced no RTP packets")
+	}
+	for i, packet := range packets {
+		packet.Timestamp = timestamp
+		packet.Marker = i == len(packets)-1
 	}
 	ws := time.Now()
-	if err := p.track.WriteSample(media.Sample{Data: f.AU, Duration: d}); err != nil {
-		return fmt.Errorf("desktop: write sample: %w", err)
+	for i, packet := range packets {
+		if err := p.track.WriteRTP(packet); err != nil {
+			return fmt.Errorf("desktop: write RTP packet %d/%d: %w", i+1, len(packets), err)
+		}
 	}
 	if ms := time.Since(ws).Milliseconds(); ms > 20 {
-		p.log.Info("desktop write_sample slow", "ms", ms, "auBytes", len(f.AU))
+		p.log.Info("desktop write_rtp slow", "ms", ms, "auBytes", len(f.AU), "rtpPackets", len(packets))
+	}
+	if hadPreviousTimestamp {
+		if deltaUs := f.MonoUs - previousMonoUs; deltaUs <= 1_000_000 {
+			p.intervalStats.add(time.Duration(deltaUs)*time.Microsecond, p.log)
+		}
 	}
 	if !started {
 		p.stateMu.Lock()
