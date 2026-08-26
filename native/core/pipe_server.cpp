@@ -616,8 +616,21 @@ CaptureSpawnResult RealCaptureSpawn(uint32_t session, const wchar_t* pipe_name,
   // feat/rt-scale (hw-encode task 2 Part B): downscale wide sources to
   // 1920 before encode - the software MFT ceiling at 3440x1440 is ~20 fps,
   // at 1920 it clears 30 fps; the hardware ladder stays in front either way.
-  args.push_back(L"--max-w");
-  args.push_back(L"1920");
+  // XNC_DESKTOP_MAXW / XNC_DESKTOP_FPS: node-level override (service env or
+  // registry) - e.g. 1280+60 for a 720p60 stream (smooth video content,
+  // jelly-effect mitigation). 0/unset = defaults.
+  uint32_t maxw = 1920, fps = 0;
+  if (const char* e = getenv("XNC_DESKTOP_MAXW")) maxw = static_cast<uint32_t>(atoi(e));
+  if (const char* e = getenv("XNC_DESKTOP_FPS")) fps = static_cast<uint32_t>(atoi(e));
+  if (maxw > 0) {
+    args.push_back(L"--max-w");
+    args.push_back(std::to_wstring(maxw));
+  }
+  if (fps > 0 && fps <= 120) {
+    args.push_back(L"--fps");
+    args.push_back(std::to_wstring(fps));
+  }
+  XNC_LOG_INFO("capture_spawn max_w=%u fps=%u", maxw, fps);
   // --log-file: desktop opens its own log (service spawns have no console;
   // inherited-stdio redirection proved unreliable — 2026-08-24 incident).
   args.push_back(L"--log-file");
