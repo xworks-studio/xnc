@@ -277,6 +277,10 @@ bool DecodeAnnexBToLumaHash(const std::vector<uint8_t>& annexb,
         why = ProbeHr("ProcessOutput", hr);
         break;
       }
+      // pEvents (if any) is caller-owned once ProcessOutput succeeds and
+      // nothing below consumes it, so release here: this covers the normal
+      // path and every early exit in the sample-handling code below.
+      if (odb.pEvents) odb.pEvents->Release();
       if (odb.pSample == nullptr) continue;
       ComPtr<IMFSample> sample;
       if (out_sample != nullptr) {

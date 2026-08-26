@@ -139,10 +139,13 @@ func NewPublisher(cfg PublisherConfig) (*Publisher, error) {
 		return nil, fmt.Errorf("desktop: add track: %w", err)
 	}
 	p := &Publisher{
-		log:        log,
-		pc:         pc,
-		sender:     sender,
-		track:      track,
+		log:    log,
+		pc:     pc,
+		sender: sender,
+		track:  track,
+		// The packetizer's payload type (102) and SSRC (0) literals are inert:
+		// both are per-binding values overwritten by TrackLocalStaticRTP.writeRTP
+		// for each binding before the packet hits the wire.
 		packetizer: rtp.NewPacketizer(1200, 102, 0, &codecs.H264Payloader{}, rtp.NewRandomSequencer(), 90000),
 		rtpClock:   newRTPClock(rand.Uint32()),
 	}
