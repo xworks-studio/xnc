@@ -57,20 +57,32 @@ namespace xnc {
 void LatestFrameStore::Update(const FrameBlob& f) {
   std::lock_guard<std::mutex> lk(mu_);
   frame_ = f;
+  ++generation_;
   valid_ = true;
 }
 
 bool LatestFrameStore::Snapshot(FrameBlob* out) const {
+  return Snapshot(out, nullptr);
+}
+
+bool LatestFrameStore::Snapshot(FrameBlob* out, uint64_t* generation) const {
   if (out == nullptr) return false;
   std::lock_guard<std::mutex> lk(mu_);
   if (!valid_) return false;
   *out = frame_;
+  if (generation != nullptr) *generation = generation_;
   return true;
+}
+
+bool LatestFrameStore::IsCurrent(uint64_t generation) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return valid_ && generation == generation_;
 }
 
 void LatestFrameStore::Invalidate() {
   std::lock_guard<std::mutex> lk(mu_);
   frame_ = FrameBlob{};
+  ++generation_;
   valid_ = false;
 }
 
@@ -330,6 +342,11 @@ bool RunResetSequence(ResetSequence& s) {
   // Phase 1: rewind the stream state NOW so the encode thread stops
   // re-feeding the old base while the reset is in flight.
   {
+    // Submission barrier: an idle feed that already passed validation owns
+    // enc_mu through ProcessFrameLocked and must finish before invalidation.
+    // Conversely, once reset owns enc_mu no idle feed can validate/submit
+    // until WAIT_BASE_FRAME and Invalidate are visible together.
+    std::lock_guard<std::mutex> elk(*s.enc_mu);
     std::lock_guard<std::mutex> lk(s.sh->mu);
     s.sh->cache.OnRebuild();  // WAIT_BASE_FRAME + one-shot "rebuild" IDR
     s.sh->latest.Invalidate();
@@ -423,7 +440,7 @@ bool RunResetSequence(ResetSequence& s) {
 // capture/push time and idle re-feeds use a fresh presentation time. Runs on
 // the ENCODE thread; enc_mu is held by the caller for the whole call (the
 // encoder + its SpsPps cache must stay consistent with the AU shaping).
-void ProcessFrame(EncodeCtx& ctx, const FrameBlob& f, bool warmup) {
+void ProcessFrameLocked(EncodeCtx& ctx, const FrameBlob& f, bool warmup) {
   // One-shot rebuild IDR request (E2 contract: ride the next submission).
   const char* idr_reason = nullptr;
   {
@@ -431,7 +448,6 @@ void ProcessFrame(EncodeCtx& ctx, const FrameBlob& f, bool warmup) {
     idr_reason = ctx.sh.cache.TakePendingIdrReason();
     ctx.sh.last_mono_us = f.mono_us;
   }
-  std::lock_guard<std::mutex> elk(ctx.enc_mu);
   // enc_mu held: the one-shot flag is encoder stream state (Init clears it).
   if (idr_reason != nullptr) ctx.enc.ForceNextIdr(idr_reason);
   std::string eerr;
@@ -491,6 +507,11 @@ void ProcessFrame(EncodeCtx& ctx, const FrameBlob& f, bool warmup) {
     }
   }
   ctx.lat.Add(f.mono_us);  // capture mono_us -> OnAu completion
+}
+
+void ProcessFrame(EncodeCtx& ctx, const FrameBlob& f, bool warmup) {
+  std::lock_guard<std::mutex> elk(ctx.enc_mu);
+  ProcessFrameLocked(ctx, f, warmup);
 }
 
 // One-time warm-up outcome logs per generation (moved with the re-feed
@@ -575,7 +596,8 @@ bool IdleFeed(EncodeCtx& ctx) {
     return true;
   }
   FrameBlob feed_frame;
-  bool feed = false;
+  uint64_t feed_generation = 0;
+  bool candidate = false;
   {
     std::lock_guard<std::mutex> lk(ctx.sh.mu);
     const bool have_base = !ctx.sh.cache.NeedsBaseFrame();
@@ -595,20 +617,33 @@ bool IdleFeed(EncodeCtx& ctx) {
         static_screen && have_base && ctx.sh.cache.HaveKeyframe() &&
         ctx.sh.ondemand.FeedAllowed(NowMs(), ctx.warmup_feed_bound);
     if ((warmup_feed_ok || ondemand_feed_ok) &&
-        ctx.sh.latest.Snapshot(&feed_frame)) {
-      if (warmup_feed_ok) {
-        ++ctx.sh.warmup_gen_feeds;
-      } else {
-        ++ctx.sh.ondemand.feeds;
-      }
-      feed = true;
+        ctx.sh.latest.Snapshot(&feed_frame, &feed_generation)) {
+      candidate = true;
     } else {
       PhaseOutcomeLogs(ctx);
     }
   }
-  if (!feed) return false;
+  if (!candidate) return false;
+
+  // Submission barrier + deterministic generation validation. Reset takes
+  // these locks in the same order before WAIT_BASE_FRAME/Invalidate. Thus a
+  // pre-reset snapshot either completes while holding enc_mu or is rejected
+  // here; it can never consume the rebuild IDR after invalidation.
+  std::lock_guard<std::mutex> elk(ctx.enc_mu);
+  {
+    std::lock_guard<std::mutex> lk(ctx.sh.mu);
+    if (ctx.sh.cache.NeedsBaseFrame() ||
+        !ctx.sh.latest.IsCurrent(feed_generation)) {
+      return false;
+    }
+    if (!ctx.sh.cache.HaveKeyframe()) {
+      ++ctx.sh.warmup_gen_feeds;
+    } else {
+      ++ctx.sh.ondemand.feeds;
+    }
+  }
   feed_frame.mono_us = NowMonoUs();
-  ProcessFrame(ctx, feed_frame, true);
+  ProcessFrameLocked(ctx, feed_frame, true);
   return true;
 }
 
@@ -831,6 +866,7 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
       // (next frame is the new base, full readback) and arm the one-shot
       // "rebuild" IDR; the old latest snapshot is invalid across rebuild.
       {
+        std::lock_guard<std::mutex> elk(ctx.enc_mu);
         std::lock_guard<std::mutex> lk(sh.mu);
         sh.cache.OnRebuild();
         sh.latest.Invalidate();

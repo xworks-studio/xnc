@@ -108,11 +108,14 @@ class LatestFrameStore {
  public:
   void Update(const FrameBlob& f);
   bool Snapshot(FrameBlob* out) const;
+  bool Snapshot(FrameBlob* out, uint64_t* generation) const;
+  bool IsCurrent(uint64_t generation) const;
   void Invalidate();
 
  private:
   mutable std::mutex mu_;
   FrameBlob frame_;
+  uint64_t generation_ = 0;
   bool valid_ = false;
 };
 

@@ -1610,6 +1610,14 @@ int SelftestMain() {
     xnc::FrameBlob got;
     CHECK("latest-frame-snapshot", latest.Snapshot(&got) &&
                                        got.mono_us == 3 && got.bgra[0] == 0x33);
+    uint64_t generation = 0;
+    CHECK("latest-frame-generation-snapshot",
+          latest.Snapshot(&got, &generation));
+    latest.Invalidate();
+    CHECK("latest-frame-reset-blocks-feed", !latest.Snapshot(&got));
+    latest.Update(MakeSolidFrame(4, 0x44));
+    CHECK("latest-frame-old-generation-rejected",
+          !latest.IsCurrent(generation));
   }
   { // pipeline-decouple:FrameQueue 交接队列(有界深度 2,满则丢最旧保最新,
     // FIFO 顺序不重排;Shutdown 唤醒等待者且排空后才拒绝)
