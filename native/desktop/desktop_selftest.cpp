@@ -52,7 +52,9 @@
 #include <cstdio>
 #include <algorithm>  // std::find
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -907,6 +909,12 @@ struct EncoderFaultPlan {
   struct CollectStep {
     bool ok = true;
     size_t aus = 0;
+    size_t emit_on_call = 0;  // zero = every call
+    const char* err = nullptr;
+    size_t calls = 0;
+  };
+  struct MessageStep {
+    bool ok = true;
     const char* err = nullptr;
     size_t calls = 0;
   };
@@ -916,13 +924,32 @@ struct EncoderFaultPlan {
   CollectStep submit;
   CollectStep drain;
   CollectStep flush_tail;
+  MessageStep end_of_stream;
+  MessageStep drain_message;
+  std::mutex input_mu;
+  std::condition_variable input_cv;
 
   static bool ProcessInput(void* opaque, std::string* err) {
     auto* p = static_cast<EncoderFaultPlan*>(opaque);
-    ++p->input_calls;
-    if (p->input_calls != p->reject_input_call) return true;
+    size_t call = 0;
+    {
+      std::lock_guard<std::mutex> lk(p->input_mu);
+      call = ++p->input_calls;
+    }
+    p->input_cv.notify_all();
+    if (call != p->reject_input_call) return true;
     if (err != nullptr) *err = "fault_pre_accept";
     return false;
+  }
+
+  size_t InputCalls() {
+    std::lock_guard<std::mutex> lk(input_mu);
+    return input_calls;
+  }
+
+  void WaitForInputCalls(size_t count) {
+    std::unique_lock<std::mutex> lk(input_mu);
+    input_cv.wait(lk, [&] { return input_calls >= count; });
   }
 
   static bool CollectOutputs(void* opaque, xnc::EncoderOutputStage stage,
@@ -936,11 +963,25 @@ struct EncoderFaultPlan {
                                    : &p->flush_tail);
     ++step->calls;
     static const uint8_t kCompletePFrame[] = {0, 0, 0, 1, 0x41, 0x80};
-    for (size_t i = 0; i < step->aus; ++i)
-      aus->emplace_back(kCompletePFrame,
-                        kCompletePFrame + sizeof(kCompletePFrame));
+    if (step->emit_on_call == 0 || step->emit_on_call == step->calls) {
+      for (size_t i = 0; i < step->aus; ++i)
+        aus->emplace_back(kCompletePFrame,
+                          kCompletePFrame + sizeof(kCompletePFrame));
+    }
     if (!step->ok && err != nullptr)
       *err = step->err != nullptr ? step->err : "fault_collect";
+    return step->ok;
+  }
+
+  static bool ProcessMessage(void* opaque, xnc::EncoderMessage message,
+                             std::string* err) {
+    auto* p = static_cast<EncoderFaultPlan*>(opaque);
+    MessageStep* step = message == xnc::EncoderMessage::kEndOfStream
+                            ? &p->end_of_stream
+                            : &p->drain_message;
+    ++step->calls;
+    if (!step->ok && err != nullptr)
+      *err = step->err != nullptr ? step->err : "fault_message";
     return step->ok;
   }
 
@@ -949,6 +990,7 @@ struct EncoderFaultPlan {
     seam.ctx = this;
     seam.process_input = &EncoderFaultPlan::ProcessInput;
     seam.collect_outputs = &EncoderFaultPlan::CollectOutputs;
+    seam.process_message = &EncoderFaultPlan::ProcessMessage;
     return seam;
   }
 };
@@ -957,8 +999,9 @@ struct EncoderFaultPlan {
 // last one. No test-side sleeps or wall-clock races are needed.
 class StopAfterCapture final : public xnc::ICapture {
  public:
-  StopAfterCapture(uint32_t total, std::atomic<bool>* stop)
-      : buf_(64u * 48u * 4u, 0x20), total_(total), stop_(stop) {}
+  StopAfterCapture(uint32_t total, std::atomic<bool>* stop,
+                   EncoderFaultPlan* plan)
+      : buf_(64u * 48u * 4u, 0x20), total_(total), stop_(stop), plan_(plan) {}
   bool Acquire(xnc::FrameBlob& blob, std::string* err = nullptr,
                uint32_t = 0) override {
     if (err != nullptr) err->clear();
@@ -966,6 +1009,9 @@ class StopAfterCapture final : public xnc::ICapture {
       if (err != nullptr) *err = "err_timeout";
       return false;
     }
+    // Keep at most one frame ahead of the encoder. This is a state-driven
+    // handoff, not a timing sleep, and makes the 64->65 overflow deterministic.
+    if (next_ != 0 && plan_ != nullptr) plan_->WaitForInputCalls(next_);
     buf_[next_ % buf_.size()] = static_cast<uint8_t>(0x40 + next_);
     blob.bgra = buf_;
     blob.w = Width();
@@ -983,6 +1029,66 @@ class StopAfterCapture final : public xnc::ICapture {
   std::vector<uint8_t> buf_;
   uint32_t total_ = 0, next_ = 0;
   std::atomic<bool>* stop_ = nullptr;
+  EncoderFaultPlan* plan_ = nullptr;
+};
+
+// Two encoder lifecycles in one Pipeline::Run: the first accepted input stays
+// delayed, ACCESS_LOST rebuilds at a new dimension (forcing encoder Init), and
+// the second lifecycle emits exactly one AU. Success proves the old pending
+// identity was cleared; without the lifecycle clear stream end sees one extra.
+class LedgerLifecycleCapture final : public xnc::ICapture {
+ public:
+  LedgerLifecycleCapture(EncoderFaultPlan* plan, std::atomic<bool>* stop)
+      : plan_(plan), stop_(stop), buf_(64u * 48u * 4u, 0x31) {}
+
+  bool Acquire(xnc::FrameBlob& blob, std::string* err = nullptr,
+               uint32_t = 0) override {
+    if (err != nullptr) err->clear();
+    if (event_ == 0) {
+      ++event_;
+      Fill(blob);
+      return true;
+    }
+    if (event_ == 1) {
+      plan_->WaitForInputCalls(1);
+      ++event_;
+      if (err != nullptr) *err = "err_access_lost";
+      return false;
+    }
+    if (event_ == 2 && rebuilt_) {
+      ++event_;
+      Fill(blob);
+      if (stop_ != nullptr) stop_->store(true);
+      return true;
+    }
+    if (err != nullptr) *err = "err_timeout";
+    return false;
+  }
+
+  uint32_t Width() const override { return w_; }
+  uint32_t Height() const override { return h_; }
+  bool Rebuild(std::string* err = nullptr) override {
+    if (err != nullptr) err->clear();
+    w_ = 66;
+    buf_.assign(static_cast<size_t>(w_) * h_ * 4u, 0x52);
+    rebuilt_ = true;
+    return true;
+  }
+
+ private:
+  void Fill(xnc::FrameBlob& blob) {
+    blob.bgra = buf_;
+    blob.w = w_;
+    blob.h = h_;
+    blob.pixfmt = xnc::Pixfmt::kBgra;
+    blob.mono_us = 100 + event_ * 100;
+  }
+
+  EncoderFaultPlan* plan_ = nullptr;
+  std::atomic<bool>* stop_ = nullptr;
+  std::vector<uint8_t> buf_;
+  uint32_t w_ = 64, h_ = 48, event_ = 0;
+  bool rebuilt_ = false;
 };
 
 xnc::PipelineResult RunEncoderFaultScenario(uint32_t frames,
@@ -1002,12 +1108,39 @@ xnc::PipelineResult RunEncoderFaultScenario(uint32_t frames,
     return r;
   }
   std::atomic<bool> stop{false};
-  StopAfterCapture cap(frames, &stop);
+  StopAfterCapture cap(frames, &stop, plan);
   xnc::PipelineOpts opt;
-  opt.duration_s = 2;
+  opt.duration_s = frames > 64 ? 10 : 2;
   opt.fps = 30;
   opt.target_bitrate_bps = 500000;
   opt.stop = &stop;
+  return xnc::Pipeline::Run(cap, enc, sink, opt);
+}
+
+xnc::PipelineResult RunLedgerLifecycleScenario(EncoderFaultPlan* plan,
+                                               xnc::AuSink& sink,
+                                               bool* init_ok) {
+  const xnc::MfEncoderFaultSeam seam = plan->Seam();
+  xnc::MfSoftEncoder enc(&seam);
+  enc.SetForceSoftware(true);
+  std::string err;
+  const bool initialized = enc.Init(64, 48, 30, 500000, &err);
+  if (init_ok != nullptr) *init_ok = initialized;
+  if (!initialized) {
+    xnc::PipelineResult r;
+    r.ok = false;
+    r.err = "fault-test init: " + err;
+    return r;
+  }
+  std::atomic<bool> stop{false};
+  LedgerLifecycleCapture cap(plan, &stop);
+  xnc::CaptureReset reset;
+  xnc::PipelineOpts opt;
+  opt.duration_s = 5;
+  opt.fps = 30;
+  opt.target_bitrate_bps = 500000;
+  opt.stop = &stop;
+  opt.reset = &reset;
   return xnc::Pipeline::Run(cap, enc, sink, opt);
 }
 
@@ -1222,7 +1355,7 @@ int SelftestMain() {
     CHECK("ledger-fault-preaccept-aborts",
           !res.ok && res.err == "fault_pre_accept");
     CHECK("ledger-fault-preaccept-branches",
-          plan.input_calls == 2 && plan.submit.calls == 1 &&
+          plan.InputCalls() == 2 && plan.submit.calls == 1 &&
               plan.drain.calls == 0 && plan.flush_tail.calls == 0);
     CHECK("ledger-fault-preaccept-no-au", sink.aus == 0);
   }
@@ -1244,6 +1377,34 @@ int SelftestMain() {
     CHECK("ledger-fault-postaccept-no-tail",
           plan.submit.calls == 1 && plan.drain.calls == 0 &&
               plan.flush_tail.calls == 0);
+  }
+  { // Sink failure is primary even when the same collection also failed.
+    EncoderFaultPlan plan;
+    plan.submit.ok = false;
+    plan.submit.aus = 1;
+    plan.submit.err = "fault_compound_collect";
+    FailingAuSink sink;
+    bool init_ok = false;
+    const xnc::PipelineResult res =
+        RunEncoderFaultScenario(1, &plan, sink, &init_ok);
+    CHECK("ledger-fault-compound-sink-init", init_ok);
+    CHECK("ledger-fault-compound-sink-primary",
+          !res.ok && res.err == "fault_sink_mid_vector" &&
+              sink.timestamps.size() == 1 && plan.submit.calls == 1);
+  }
+  { // Missing identity is primary even when collection returned failure.
+    EncoderFaultPlan plan;
+    plan.submit.ok = false;
+    plan.submit.aus = 2;
+    plan.submit.err = "fault_compound_collect";
+    RecordingSink sink;
+    bool init_ok = false;
+    const xnc::PipelineResult res =
+        RunEncoderFaultScenario(1, &plan, sink, &init_ok);
+    CHECK("ledger-fault-compound-mismatch-init", init_ok);
+    CHECK("ledger-fault-compound-mismatch-primary",
+          !res.ok && res.err == "encoder_identity_mismatch" &&
+              sink.aus == 1 && plan.submit.calls == 1);
   }
   { // Drain failure surfaces after its complete partial AUs are delivered.
     EncoderFaultPlan plan;
@@ -1289,6 +1450,32 @@ int SelftestMain() {
     CHECK("ledger-fault-pending-mismatch",
           !res.ok && res.err == "encoder_identity_mismatch" && sink.aus == 0);
   }
+  { // Real pipeline ledger reaches 64; submission 65 aborts before ProcessInput.
+    EncoderFaultPlan plan;
+    RecordingSink sink;
+    bool init_ok = false;
+    const xnc::PipelineResult res =
+        RunEncoderFaultScenario(65, &plan, sink, &init_ok);
+    CHECK("ledger-fault-pipeline-overflow-init", init_ok);
+    CHECK("ledger-fault-pipeline-overflow-error",
+          !res.ok && res.err == "encoder_submission_overflow");
+    CHECK("ledger-fault-pipeline-overflow-boundary",
+          plan.InputCalls() == 64 && plan.submit.calls == 64 && sink.aus == 0 &&
+              plan.drain.calls == 0 && plan.flush_tail.calls == 0);
+  }
+  { // Re-init clears lifecycle 1's pending identity before lifecycle 2 output.
+    EncoderFaultPlan plan;
+    plan.submit.aus = 1;
+    plan.submit.emit_on_call = 2;
+    RecordingSink sink;
+    bool init_ok = false;
+    const xnc::PipelineResult res =
+        RunLedgerLifecycleScenario(&plan, sink, &init_ok);
+    CHECK("ledger-fault-lifecycle-init", init_ok);
+    CHECK("ledger-fault-lifecycle-reuse-clean",
+          res.ok && res.err.empty() && res.resets == 1 && res.width == 66 &&
+              sink.aus == 1 && plan.InputCalls() == 2);
+  }
   { // Sink failure mid-vector remains the primary abort error during cleanup.
     EncoderFaultPlan plan;
     plan.drain.aus = 2;
@@ -1313,6 +1500,40 @@ int SelftestMain() {
     CHECK("ledger-fault-mismatch-preserved",
           !res.ok && res.err == "encoder_identity_mismatch" && sink.aus == 1);
     CHECK("ledger-fault-mismatch-skips-flush", plan.flush_tail.calls == 0);
+  }
+  { // EOS ProcessMessage failure surfaces after partial tail AU delivery.
+    EncoderFaultPlan plan;
+    plan.end_of_stream.ok = false;
+    plan.end_of_stream.err = "fault_flush_eos_message";
+    plan.flush_tail.aus = 1;
+    RecordingSink sink;
+    bool init_ok = false;
+    const xnc::PipelineResult res =
+        RunEncoderFaultScenario(1, &plan, sink, &init_ok);
+    CHECK("ledger-fault-eos-message-init", init_ok);
+    CHECK("ledger-fault-eos-message-surfaced",
+          !res.ok && res.err.find("encoder_flush_tail_failed") == 0 &&
+              res.err.find("fault_flush_eos_message") != std::string::npos);
+    CHECK("ledger-fault-eos-message-partial-delivered",
+          sink.aus == 1 && plan.end_of_stream.calls == 1 &&
+              plan.drain_message.calls == 1 && plan.flush_tail.calls == 1);
+  }
+  { // Drain ProcessMessage failure also surfaces after partial tail output.
+    EncoderFaultPlan plan;
+    plan.drain_message.ok = false;
+    plan.drain_message.err = "fault_flush_drain_message";
+    plan.flush_tail.aus = 1;
+    RecordingSink sink;
+    bool init_ok = false;
+    const xnc::PipelineResult res =
+        RunEncoderFaultScenario(1, &plan, sink, &init_ok);
+    CHECK("ledger-fault-drain-message-init", init_ok);
+    CHECK("ledger-fault-drain-message-surfaced",
+          !res.ok && res.err.find("encoder_flush_tail_failed") == 0 &&
+              res.err.find("fault_flush_drain_message") != std::string::npos);
+    CHECK("ledger-fault-drain-message-partial-delivered",
+          sink.aus == 1 && plan.end_of_stream.calls == 1 &&
+              plan.drain_message.calls == 1 && plan.flush_tail.calls == 1);
   }
   { // 默认值(plan Task 2 接口):--console-diag 只给 --out → fps=30 duration=10
     auto p = Parse({L"--console-diag", L"--out", L"t.h264"});

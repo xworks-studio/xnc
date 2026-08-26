@@ -135,6 +135,11 @@ enum class EncoderOutputStage : uint8_t {
   kFlushTail = 2,
 };
 
+enum class EncoderMessage : uint8_t {
+  kEndOfStream = 0,
+  kDrain = 1,
+};
+
 // Optional deterministic seam at the external MFT boundary. Production
 // constructs MfSoftEncoder with nullptr; native selftests inject precise
 // ProcessInput/ProcessOutput outcomes while exercising the real pipeline.
@@ -143,6 +148,8 @@ struct MfEncoderFaultSeam {
   bool (*process_input)(void* ctx, std::string* err) = nullptr;
   bool (*collect_outputs)(void* ctx, EncoderOutputStage stage,
                           std::vector<std::vector<uint8_t>>* aus,
+                          std::string* err) = nullptr;
+  bool (*process_message)(void* ctx, EncoderMessage message,
                           std::string* err) = nullptr;
 };
 

@@ -669,19 +669,30 @@ bool MfSoftEncoder::FlushTail(std::vector<std::vector<uint8_t>>& aus,
   // collection is still attempted so complete partial AUs are not lost.
   bool messages_ok = true;
   std::string message_err;
-  HRESULT hr = impl_->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-  if (FAILED(hr)) {
-    XNC_LOG_INFO("flush_tail end_of_stream hr=0x%08x (continuing)",
-                 static_cast<unsigned int>(hr));
-    messages_ok = false;
-    message_err = HrStep("flush_tail end_of_stream", hr);
-  }
-  hr = impl_->mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
-  if (FAILED(hr)) {
-    XNC_LOG_INFO("flush_tail drain hr=0x%08x (continuing)", static_cast<unsigned int>(hr));
-    if (messages_ok) message_err = HrStep("flush_tail drain", hr);
-    messages_ok = false;
-  }
+  const auto process_message = [&](EncoderMessage message,
+                                   MFT_MESSAGE_TYPE mft_message,
+                                   const char* step) {
+    bool ok = false;
+    std::string step_err;
+    if (fault_seam_ != nullptr && fault_seam_->process_message != nullptr) {
+      ok = fault_seam_->process_message(fault_seam_->ctx, message, &step_err);
+      if (!ok && step_err.empty()) step_err = std::string(step) + " failed";
+    } else {
+      const HRESULT hr = impl_->mft->ProcessMessage(mft_message, 0);
+      ok = SUCCEEDED(hr);
+      if (!ok) step_err = HrStep(step, hr);
+    }
+    if (!ok) {
+      XNC_LOG_INFO("%s err=\"%s\" (continuing)", step, step_err.c_str());
+      if (messages_ok) message_err = step_err;
+      messages_ok = false;
+    }
+  };
+  process_message(EncoderMessage::kEndOfStream,
+                  MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+                  "flush_tail end_of_stream");
+  process_message(EncoderMessage::kDrain, MFT_MESSAGE_COMMAND_DRAIN,
+                  "flush_tail drain");
   std::string collect_err;
   const bool outputs_ok =
       CollectOutputs(aus, &collect_err, EncoderOutputStage::kFlushTail);
