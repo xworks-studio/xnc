@@ -162,6 +162,17 @@ export default function DesktopLive() {
     plis: 0,
   });
 
+  // 逐帧诊断模式(?framediag=1):rVFC 每呈现一帧记录 {帧号, mediaTime,
+  // 呈现间隔},getStats 全量指标每 2s 快照——验证播放顺序单调(无回退帧)、
+  // 间隔稳定、无解码丢弃。默认关闭,诊断时开启,数据渲染到 DOM 供抓取。
+  const framediag = new URLSearchParams(window.location.search).has("framediag");
+  const [diag, setDiag] = useState<{ frames: string[]; stats: string[] } | null>(null);
+  const diagRef = useRef<{ frames: string[]; stats: string[]; lastPresent: number }>({
+    frames: [],
+    stats: [],
+    lastPresent: 0,
+  });
+
   // Slice3: lease / cursor dot / stream dims / text injection.
   const [lease, setLease] = useState<LeaseState>({ status: "none" });
   const [notice, setNotice] = useState<string | null>(null);
@@ -484,6 +495,7 @@ export default function DesktopLive() {
       if (!pc) return 0;
       let decoded = 0;
       let keys = 0;
+      const di = diagRef.current;
       try {
         const report = await pc.getStats();
         report.forEach((s) => {
@@ -491,14 +503,35 @@ export default function DesktopLive() {
             const r = s as RTCInboundRtpStreamStats & {
               framesDecoded?: number;
               keyFramesDecoded?: number;
+              framesReceived?: number;
+              framesDropped?: number;
+              framesPerSecond?: number;
+              jitter?: number;
+              packetsLost?: number;
+              nackCount?: number;
+              pliCount?: number;
             };
             decoded = r.framesDecoded ?? 0;
             keys = r.keyFramesDecoded ?? 0;
+            if (framediag && di) {
+              di.stats = [
+                `rx=${r.framesReceived ?? "?"}`,
+                `dec=${r.framesDecoded ?? "?"}`,
+                `drop=${r.framesDropped ?? "?"}`,
+                `fps=${r.framesPerSecond ?? "?"}`,
+                `jit=${((r.jitter ?? 0) * 1000).toFixed(1)}ms`,
+                `lost=${r.packetsLost ?? "?"}`,
+                `nack=${r.nackCount ?? "?"}`,
+                `pli=${r.pliCount ?? "?"}`,
+                `key=${r.keyFramesDecoded ?? "?"}`,
+              ];
+            }
           }
         });
       } catch {
         /* pc closing */
       }
+      if (framediag && di && di.stats.length > 0 && !diag) setDiag({ frames: di.frames, stats: di.stats });
       if (decoded > 0) {
         const now = performance.now();
         const elapsed = now - windowStart;
@@ -524,6 +557,18 @@ export default function DesktopLive() {
         frameCount++;
         const first = frameCount === 1;
         const now = performance.now();
+        // 逐帧诊断:每呈现一帧记录 帧号:mediaTime(秒,3位):呈现间隔(ms)。
+        // mediaTime 倒退 = 回退帧;间隔 0/巨大 = 重复/卡顿。
+        const di = diagRef.current;
+        if (framediag && di) {
+          const mt = typeof meta.mediaTime === "number" ? meta.mediaTime : NaN;
+          const dt = di.lastPresent ? Math.round((_now - di.lastPresent) * 1000) / 1000 : 0;
+          di.lastPresent = _now;
+          di.frames.push(`${frameCount}:${mt.toFixed(3)}:${dt.toFixed(1)}`);
+          if (di.frames.length > 240) di.frames.splice(0, di.frames.length - 240);
+          // 每 ~1s 快照一次 DOM(避免每帧 setState 拖累渲染)。
+          if (frameCount % 30 === 0) setDiag({ frames: di.frames.slice(-120), stats: di.stats });
+        }
         if (first || now - windowStart >= 900) {
           const elapsed = now - windowStart;
           const fps =
@@ -945,6 +990,14 @@ export default function DesktopLive() {
           <div>key {stats.keyframesDecoded}</div>
           <div>pli sent {stats.plis}</div>
         </div>
+        {framediag && diag && (
+          <div className="desktop-framediag mono">
+            <div>stats {diag.stats.join(" ")}</div>
+            {diag.frames.map((l, i) => (
+              <div key={i}>{l}</div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
