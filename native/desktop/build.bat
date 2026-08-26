@@ -23,7 +23,10 @@ rem GetUserObjectInformationW/CloseDesktop); gdi_capture.cpp (M2-Slice1 T3)
 rem needs gdi32.lib (BitBlt/GetDIBits/CreateCompatibleDC/
 rem CreateCompatibleBitmap) plus user32 (GetDC/ReleaseDC/
 rem GetSystemMetrics); backend_ladder.cpp (M2-Slice1 T3) needs no extra
-rem libs; artifacts go to ..\..\bin (gitignored).
+rem libs; mf_decoder_probe.cpp (2026-08-26 desktop-media-m0 correctness
+rem Task 5) is the TEST-ONLY H264->NV12 decode-to-luma-hash probe for the
+rem decoded A/B/C stale-pixel regression - only desktop_selftest.cpp calls
+rem it, so no production path links it; artifacts go to ..\..\bin (gitignored).
 rem Targets:
 rem   build.bat            build ..\..\bin\xnc-desktop.exe
 rem   build.bat selftest   build + run bin\xnc-desktop.exe --selftest
@@ -36,7 +39,7 @@ if errorlevel 1 (
 cd /d "%~dp0"
 
 if not exist ..\..\bin mkdir ..\..\bin
-cl /nologo /utf-8 /W3 /MT /std:c++17 /EHsc xnc-desktop.cpp desktop_watch.cpp dxgi_capture.cpp gdi_capture.cpp backend_ladder.cpp mf_encoder.cpp nv12.cpp pipeline.cpp rt_pipe_server.cpp input_manager.cpp cursor_manager.cpp jpeg_wic.cpp scaled_capture.cpp desktop_selftest.cpp ..\common\frame.cpp ..\common\handshake.cpp /Fe:..\..\bin\xnc-desktop.exe /Fo:..\..\bin\ /link d3d11.lib dxgi.lib mfplat.lib mfuuid.lib ole32.lib bcrypt.lib advapi32.lib user32.lib gdi32.lib windowscodecs.lib oleaut32.lib winmm.lib
+cl /nologo /utf-8 /W3 /MT /std:c++17 /EHsc xnc-desktop.cpp desktop_watch.cpp dxgi_capture.cpp gdi_capture.cpp backend_ladder.cpp mf_encoder.cpp mf_decoder_probe.cpp nv12.cpp pipeline.cpp rt_pipe_server.cpp input_manager.cpp cursor_manager.cpp jpeg_wic.cpp scaled_capture.cpp desktop_selftest.cpp ..\common\frame.cpp ..\common\handshake.cpp /Fe:..\..\bin\xnc-desktop.exe /Fo:..\..\bin\ /link d3d11.lib dxgi.lib mfplat.lib mfuuid.lib ole32.lib bcrypt.lib advapi32.lib user32.lib gdi32.lib windowscodecs.lib oleaut32.lib winmm.lib
 if errorlevel 1 exit /b 1
 
 echo [desktop] built ..\..\bin\xnc-desktop.exe

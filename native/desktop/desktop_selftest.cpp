@@ -13,7 +13,11 @@
 // carry-forward regression) ③ stuck subscriber -> queue overflow -> delta
 // drop + merged IDR ④ detach cleanup). Task 3 fix wave adds the
 // --secret-stdin service-path secret (stdin line codec + arg matrix; spec
-// 1.5: the secret never rides argv). Pure-logic cases need no desktop;
+// 1.5: the secret never rides argv). 2026-08-26 desktop-media-m0
+// correctness Task 5 adds the decoded A/B/C end-to-end regression: A/B/C
+// then timeouts then sub_join + pli - the recovery IDR must DECODE to C's
+// luma hash (mf_decoder_probe.h), not A's (stale-pixel acceptance test).
+// Pure-logic cases need no desktop;
 // the encoder/pipeline scenarios feed synthetic color bars straight into the
 // MF software H.264 MFT, so no capture is involved and they run on any
 // Windows box that ships CMSH264EncoderMFT (client SKUs). The rt loopback
@@ -34,6 +38,7 @@
 #include "gdi_capture.h"
 #include "input_manager.h"
 #include "jpeg_wic.h"
+#include "mf_decoder_probe.h"  // Task 5 m0: test-only decode-to-luma-hash probe
 #include "mf_encoder.h"
 #include "nv12.h"
 #include "pipeline.h"
@@ -155,6 +160,147 @@ size_t CountAusWithNal(const std::vector<std::vector<uint8_t>>& aus, uint8_t typ
     if (xnc::NalHasType(au.data(), au.size(), type)) ++n;
   return n;
 };
+
+// Task 5 (2026-08-26 desktop-media-m0 correctness): encodes ONE cold-start
+// reference IDR for `bgra` through a freshly-Init'ed encoder (same
+// dimensions/fps/bitrate as the scenario stream, so the backend ladder lands
+// on the same rung) and shapes it to the wire contract (SPS/PPS prefix +
+// 4-byte start codes). The scenario decodes the returned AU with
+// DecodeAnnexBToLumaHash and compares the pipeline's warm-up IDR (the first
+// submission = frame A) against it - never against a precomputed raw-color
+// constant (H.264 output varies by driver). For the POST-IDLE recovery IDR
+// use EncodeRecoveryReferenceIdr: a mid-session forced IDR quantizes
+// differently from a cold-start IDR of the same content.
+bool EncodeReferenceIdr(xnc::MfSoftEncoder& enc, uint32_t w, uint32_t h,
+                        uint32_t fps, uint32_t bitrate, const uint8_t* bgra,
+                        size_t bgra_len, std::vector<uint8_t>* shaped_au,
+                        std::string* err) {
+  std::string ierr;
+  if (!enc.Init(w, h, fps, bitrate, &ierr)) {
+    if (err != nullptr) *err = "ref init: " + ierr;
+    return false;
+  }
+  enc.ForceNextIdr("selftest-ref");  // one-shot; rides the first submission
+  std::string eerr;
+  std::vector<std::vector<uint8_t>> frame_aus;
+  std::vector<uint8_t> idr_au;
+  // Cold start: the MFT buffers ~kEncoderLookaheadFrames inputs before the
+  // first AU emerges (the first AU = the first submitted frame, an IDR).
+  for (uint32_t i = 0; i < xnc::kEncoderLookaheadFrames * 2 + 4; ++i) {
+    frame_aus.clear();
+    if (!enc.Encode(bgra, bgra_len, frame_aus, &eerr)) {
+      if (err != nullptr) *err = "ref encode: " + eerr;
+      return false;
+    }
+    for (const auto& au : frame_aus) {
+      if (xnc::NalHasType(au.data(), au.size(), 5)) {
+        idr_au = au;
+        break;
+      }
+    }
+    if (!idr_au.empty()) break;
+  }
+  if (idr_au.empty()) {
+    if (err != nullptr) *err = "no reference IDR AU within the feed bound";
+    return false;
+  }
+  xnc::ShapeAu(idr_au.data(), idr_au.size(), true, enc.SpsPps(), shaped_au);
+  if (shaped_au->empty()) {
+    if (err != nullptr) *err = "shaped reference AU is empty";
+    return false;
+  }
+  return true;
+}
+
+// Task 5 (2026-08-26 desktop-media-m0 correctness): encodes the RECOVERY
+// reference IDR for the A/B/C stale-pixel regression. The pipeline's
+// post-idle recovery IDR is a FORCED IDR produced mid-session after
+// A/B/C + warm-up re-feeds of the idle frame, and the encoder's rate
+// control quantizes it differently from a cold-start IDR of the same
+// content (measured on the MS software encoder: cold-start C and
+// mid-session forced C decode to different luma hashes). The reference
+// therefore replays the pipeline's exact submission history: A, B, C,
+// then re-feeds of frame `refeed_idx` until the cold-start IDR emerges
+// (the warm-up phase), then ForceNextIdr, then more re-feeds until the
+// forced recovery IDR emerges. Returns that forced IDR shaped to the wire
+// contract. refeed_idx == 2 reproduces the fixed pipeline (idle re-feed
+// of the latest frame C); refeed_idx == 0 reproduces the stale bug (idle
+// re-feed of A) for the discrimination check. A PRIVATE SyntheticBars is
+// built here: Frame(0) returns the ctor-drawn pristine pattern, so each
+// call starts from a clean buffer (Frame(i>0) redraws in place).
+bool EncodeRecoveryReferenceIdr(xnc::MfSoftEncoder& enc, uint32_t w, uint32_t h,
+                                uint32_t fps, uint32_t bitrate,
+                                uint32_t refeed_idx,
+                                std::vector<uint8_t>* shaped_au,
+                                std::string* err) {
+  std::string ierr;
+  if (!enc.Init(w, h, fps, bitrate, &ierr)) {
+    if (err != nullptr) *err = "ref init: " + ierr;
+    return false;
+  }
+  SyntheticBars bars(w, h);  // frame 0 = A, frame 1 = B, frame 2 = C
+  // Frame(0) skips the redraw (returns whatever Frame(i>0) drew last), so
+  // snapshot the pristine A pattern now for the stale re-feed case.
+  std::vector<uint8_t> pristine_a(bars.Bytes());
+  std::memcpy(pristine_a.data(), bars.Frame(0), bars.Bytes());
+  std::string eerr;
+  std::vector<std::vector<uint8_t>> frame_aus;
+  // bars.Frame(i) redraws the shared buffer, so feed by index each time.
+  auto feed = [&](uint32_t idx) {
+    frame_aus.clear();
+    const uint8_t* src = (idx == 0) ? pristine_a.data() : bars.Frame(idx);
+    return enc.Encode(src, bars.Bytes(), frame_aus, &eerr) ? true : false;
+  };
+  if (!feed(0) || !feed(1) || !feed(2)) {
+    if (err != nullptr) *err = "ref encode: " + eerr;
+    return false;
+  }
+  // Warm-up phase: re-feed the idle frame until the cold-start IDR emerges
+  // (mirrors the pipeline's warm-up loop, which stops on the first key).
+  bool saw_first = false;
+  for (uint32_t i = 0; i < xnc::kEncoderLookaheadFrames * 2 + 4; ++i) {
+    if (!feed(refeed_idx)) {
+      if (err != nullptr) *err = "ref encode: " + eerr;
+      return false;
+    }
+    for (const auto& au : frame_aus)
+      if (xnc::NalHasType(au.data(), au.size(), 5)) {
+        saw_first = true;
+        break;
+      }
+    if (saw_first) break;
+  }
+  if (!saw_first) {
+    if (err != nullptr) *err = "no warm-up IDR within the feed bound";
+    return false;
+  }
+  // On-demand IDR: the force rides the next re-feed (mirrors the pipeline's
+  // PollIdrRequest + IdleFeed recovery path).
+  enc.ForceNextIdr("selftest-ref");
+  std::vector<uint8_t> rec_au;
+  for (uint32_t i = 0; i < xnc::kEncoderLookaheadFrames * 2 + 4; ++i) {
+    if (!feed(refeed_idx)) {
+      if (err != nullptr) *err = "ref encode: " + eerr;
+      return false;
+    }
+    for (const auto& au : frame_aus)
+      if (xnc::NalHasType(au.data(), au.size(), 5)) {
+        rec_au = au;
+        break;
+      }
+    if (!rec_au.empty()) break;
+  }
+  if (rec_au.empty()) {
+    if (err != nullptr) *err = "no recovery reference IDR within the feed bound";
+    return false;
+  }
+  xnc::ShapeAu(rec_au.data(), rec_au.size(), true, enc.SpsPps(), shaped_au);
+  if (shaped_au->empty()) {
+    if (err != nullptr) *err = "shaped reference AU is empty";
+    return false;
+  }
+  return true;
+}
 
 // ---- Task 5 pipeline fixtures ----
 
@@ -3006,6 +3152,141 @@ int SelftestMain() {
                   (unsigned long long)res.counters.keyframes,
                   (unsigned long long)res.counters.warmup_feeds,
                   (unsigned long long)st.idr_sub_join);
+    }
+  }
+  { // Task 5 (2026-08-26 desktop-media-m0 correctness): A/B/C then timeouts
+    // then sub_join + pli -> the recovery IDR must DECODE to C's luma
+    // signature, not A's (stale-pixel acceptance test). All references are
+    // encoded + decoded in THIS run by the same encoder instance and the
+    // same config (w/h/fps/bitrate), never against precomputed raw-color
+    // constants. The recovery reference replays the pipeline's submission
+    // history (A/B/C + idle re-feeds + forced IDR) because the encoder's
+    // rate control quantizes a mid-session forced IDR differently from a
+    // cold-start IDR of the same content (measured; see
+    // EncodeRecoveryReferenceIdr). The recovery AU's mono_us is the idle
+    // re-feed's re-stamp (now), not C's capture time (Task 2 approved
+    // behavior), so no mono_us identity assertion - the binding assertion
+    // is decoded-pixel identity.
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(kRtW, kRtH, kRtFps, kRtBitrate, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: abc-init err=%s\n", err.c_str());
+    CHECK("abc-init", init_ok);
+    if (init_ok) {
+      SyntheticBars bars(kRtW, kRtH);  // frame 0 = A, frame 2 = C (bars differ)
+      std::vector<uint8_t> ref_a_au, ref_c_rec_au, ref_a_rec_au;
+      uint64_t hash_a = 0, hash_c_rec = 0, hash_a_rec = 0;
+      std::string perr;
+      // Cold-start IDR of A: what the pipeline's warm-up IDR must be.
+      const bool ref_a_ok =
+          EncodeReferenceIdr(enc, kRtW, kRtH, kRtFps, kRtBitrate, bars.Frame(0),
+                             bars.Bytes(), &ref_a_au, &err);
+      if (!ref_a_ok) std::printf("SELFTEST NOTE: abc-ref-a err=%s\n", err.c_str());
+      CHECK("abc-ref-a-encoded", ref_a_ok);
+      if (ref_a_ok) {
+        const bool dec = xnc::DecodeAnnexBToLumaHash(ref_a_au, &hash_a, &perr);
+        if (!dec) std::printf("SELFTEST NOTE: abc-ref-a-decode err=%s\n", perr.c_str());
+        CHECK("abc-ref-a-decoded", dec);
+      }
+      // Recovery-regime reference C: replay the pipeline's history with C
+      // as the idle re-feed, then force the on-demand IDR (fixed pipeline).
+      const bool ref_c_ok =
+          EncodeRecoveryReferenceIdr(enc, kRtW, kRtH, kRtFps, kRtBitrate, 2,
+                                     &ref_c_rec_au, &err);
+      if (!ref_c_ok) std::printf("SELFTEST NOTE: abc-ref-c-recovery err=%s\n", err.c_str());
+      CHECK("abc-ref-c-recovery-encoded", ref_c_ok);
+      if (ref_c_ok) {
+        const bool dec = xnc::DecodeAnnexBToLumaHash(ref_c_rec_au, &hash_c_rec, &perr);
+        if (!dec) std::printf("SELFTEST NOTE: abc-ref-c-recovery-decode err=%s\n", perr.c_str());
+        CHECK("abc-ref-c-recovery-decoded", dec);
+      }
+      // Recovery-regime reference A: the SAME history with A as the idle
+      // re-feed (the stale-pixel bug). Must decode differently from C.
+      const bool ref_a_rec_ok =
+          EncodeRecoveryReferenceIdr(enc, kRtW, kRtH, kRtFps, kRtBitrate, 0,
+                                     &ref_a_rec_au, &err);
+      if (!ref_a_rec_ok) std::printf("SELFTEST NOTE: abc-ref-a-recovery err=%s\n", err.c_str());
+      CHECK("abc-ref-a-recovery-encoded", ref_a_rec_ok);
+      if (ref_a_rec_ok) {
+        const bool dec = xnc::DecodeAnnexBToLumaHash(ref_a_rec_au, &hash_a_rec, &perr);
+        if (!dec) std::printf("SELFTEST NOTE: abc-ref-a-recovery-decode err=%s\n", perr.c_str());
+        CHECK("abc-ref-a-recovery-decoded", dec);
+      }
+      // Probe discriminative power (binding preflight 5): in the SAME
+      // recovery regime, A and C must have different luma signatures, or
+      // "recovery == C and not A" is unprovable.
+      CHECK("abc-probe-discriminates",
+            ref_c_ok && ref_a_rec_ok && hash_c_rec != hash_a_rec);
+      // Scenario stream: re-Init the same encoder instance (the reference
+      // sessions consumed their first IDRs and left lookahead buffered;
+      // without a re-Init the scenario stream would chain onto the
+      // reference stream's P frames - no keyframe all round).
+      const bool scen_ok = enc.Init(kRtW, kRtH, kRtFps, kRtBitrate, &err);
+      if (!scen_ok) std::printf("SELFTEST NOTE: abc-scenario-init err=%s\n", err.c_str());
+      CHECK("abc-scenario-init", scen_ok);
+      if (scen_ok) {
+        xnc::RtServer rt;
+        const xnc::RtServer::Opts ro = rt_opts(7);
+        CHECK("abc-start", rt.Start(ro, kRtW, kRtH));
+        ScriptedCapture cap(kRtW, kRtH, 3);  // A/B/C, then err_timeout forever
+        xnc::PipelineOpts po;
+        po.duration_s = 6;
+        po.fps = kRtFps;
+        po.target_bitrate_bps = kRtBitrate;
+        xnc::PipelineResult res;
+        std::thread pipe_th([&] { res = xnc::Pipeline::Run(cap, enc, rt, po); });
+        RtTestClient a;
+        CHECK("abc-connect", a.Connect(ro.pipe_name.c_str(), kRtSecret, sizeof(kRtSecret)));
+        CHECK("abc-attach", a.Attach(7));
+        a.Pump(4500, [&a] { return a.keys_ >= 1; });  // warm-up IDR (frame A)
+        CHECK("abc-first-key", a.keys_ >= 1);
+        const std::vector<uint8_t> first_key_au = a.last_key_payload_;
+        // Static-screen second subscriber (sub_join) + explicit pli:
+        // merged into one on-demand IDR.
+        RtTestClient b;
+        CHECK("abc-b-connect", b.Connect(ro.pipe_name.c_str(), kRtSecret, sizeof(kRtSecret)));
+        CHECK("abc-b-attach", b.Attach(9));
+        CHECK("abc-pli-sent",
+              a.SendRaw(xnc::kMsgKeyframeReq, xnc::EncodeKeyframeReq(7, "pli")));
+        const ULONGLONG t_end = GetTickCount64() + 4500;
+        while (GetTickCount64() < t_end && a.keys_ < 2) {
+          a.Pump(80);
+          b.Pump(80);
+        }
+        pipe_th.join();
+        a.Pump(500);
+        b.Pump(500);
+        rt.Shutdown();
+        CHECK("abc-b-got-idr", b.keys_ >= 1);  // carry-forward (sub_join path)
+        CHECK("abc-recovery-idr", a.keys_ >= 2);
+        // The warm-up IDR must be A (first submission = first frame): this
+        // also proves the probe decodes the pipeline's broadcast shaped AU
+        // format on the same decode path as the recovery assertion.
+        uint64_t hash_first = 0, hash_recovery = 0;
+        const bool first_dec = !first_key_au.empty() &&
+                               xnc::DecodeAnnexBToLumaHash(first_key_au, &hash_first, &perr);
+        if (!first_dec) std::printf("SELFTEST NOTE: abc-first-key-decode err=%s\n", perr.c_str());
+        CHECK("abc-first-key-decoded", first_dec);
+        CHECK("abc-first-key-is-a", first_dec && hash_first == hash_a);
+        const bool rec_dec = !a.last_key_payload_.empty() &&
+                             xnc::DecodeAnnexBToLumaHash(a.last_key_payload_,
+                                                         &hash_recovery, &perr);
+        if (!rec_dec) std::printf("SELFTEST NOTE: abc-recovery-decode err=%s\n", perr.c_str());
+        CHECK("abc-recovery-decoded", rec_dec);
+        CHECK("abc-recovery-is-c", rec_dec && hash_recovery == hash_c_rec);  // THE binding assertion
+        CHECK("abc-recovery-not-stale-a", rec_dec && hash_recovery != hash_a_rec);
+        const xnc::RtServer::Stats st = rt.stats();
+        CHECK("abc-demand-idr-reason", st.idr_sub_join + st.idr_explicit >= 1);
+        CHECK("abc-pipeline-ok", res.ok);
+        std::printf("SELFTEST NOTE: abc hash_a=%016llx hash_c_rec=%016llx "
+                    "hash_a_rec=%016llx first=%016llx recovery=%016llx keys=%llu "
+                    "sub_join=%llu explicit=%llu\n",
+                    (unsigned long long)hash_a, (unsigned long long)hash_c_rec,
+                    (unsigned long long)hash_a_rec,
+                    (unsigned long long)hash_first, (unsigned long long)hash_recovery,
+                    (unsigned long long)a.keys_, (unsigned long long)st.idr_sub_join,
+                    (unsigned long long)st.idr_explicit);
+      }
     }
   }
   { // 场景 ③:队列溢出 —— 卡死订阅者(attach 后从不读)→ 管道缓冲 +
