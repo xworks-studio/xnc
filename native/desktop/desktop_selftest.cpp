@@ -900,6 +900,126 @@ struct RecordingSink final : xnc::AuSink {
   std::vector<Disp> displays;
 };
 
+// Deterministic MFT-boundary fault plan for submission-ledger failure tests.
+// The pipeline, ledger, shaping, sink delivery, and cleanup remain real; only
+// external ProcessInput/ProcessOutput outcomes are supplied by this seam.
+struct EncoderFaultPlan {
+  struct CollectStep {
+    bool ok = true;
+    size_t aus = 0;
+    const char* err = nullptr;
+    size_t calls = 0;
+  };
+
+  size_t reject_input_call = static_cast<size_t>(-1);  // one-based
+  size_t input_calls = 0;
+  CollectStep submit;
+  CollectStep drain;
+  CollectStep flush_tail;
+
+  static bool ProcessInput(void* opaque, std::string* err) {
+    auto* p = static_cast<EncoderFaultPlan*>(opaque);
+    ++p->input_calls;
+    if (p->input_calls != p->reject_input_call) return true;
+    if (err != nullptr) *err = "fault_pre_accept";
+    return false;
+  }
+
+  static bool CollectOutputs(void* opaque, xnc::EncoderOutputStage stage,
+                             std::vector<std::vector<uint8_t>>* aus,
+                             std::string* err) {
+    auto* p = static_cast<EncoderFaultPlan*>(opaque);
+    CollectStep* step = stage == xnc::EncoderOutputStage::kSubmit
+                            ? &p->submit
+                            : (stage == xnc::EncoderOutputStage::kDrain
+                                   ? &p->drain
+                                   : &p->flush_tail);
+    ++step->calls;
+    static const uint8_t kCompletePFrame[] = {0, 0, 0, 1, 0x41, 0x80};
+    for (size_t i = 0; i < step->aus; ++i)
+      aus->emplace_back(kCompletePFrame,
+                        kCompletePFrame + sizeof(kCompletePFrame));
+    if (!step->ok && err != nullptr)
+      *err = step->err != nullptr ? step->err : "fault_collect";
+    return step->ok;
+  }
+
+  xnc::MfEncoderFaultSeam Seam() {
+    xnc::MfEncoderFaultSeam seam;
+    seam.ctx = this;
+    seam.process_input = &EncoderFaultPlan::ProcessInput;
+    seam.collect_outputs = &EncoderFaultPlan::CollectOutputs;
+    return seam;
+  }
+};
+
+// Produces exactly N frames and requests pipeline stop while returning the
+// last one. No test-side sleeps or wall-clock races are needed.
+class StopAfterCapture final : public xnc::ICapture {
+ public:
+  StopAfterCapture(uint32_t total, std::atomic<bool>* stop)
+      : buf_(64u * 48u * 4u, 0x20), total_(total), stop_(stop) {}
+  bool Acquire(xnc::FrameBlob& blob, std::string* err = nullptr,
+               uint32_t = 0) override {
+    if (err != nullptr) err->clear();
+    if (next_ >= total_) {
+      if (err != nullptr) *err = "err_timeout";
+      return false;
+    }
+    buf_[next_ % buf_.size()] = static_cast<uint8_t>(0x40 + next_);
+    blob.bgra = buf_;
+    blob.w = Width();
+    blob.h = Height();
+    blob.pixfmt = xnc::Pixfmt::kBgra;
+    blob.mono_us = 100 + static_cast<uint64_t>(next_) * 100;
+    ++next_;
+    if (next_ == total_ && stop_ != nullptr) stop_->store(true);
+    return true;
+  }
+  uint32_t Width() const override { return 64; }
+  uint32_t Height() const override { return 48; }
+
+ private:
+  std::vector<uint8_t> buf_;
+  uint32_t total_ = 0, next_ = 0;
+  std::atomic<bool>* stop_ = nullptr;
+};
+
+xnc::PipelineResult RunEncoderFaultScenario(uint32_t frames,
+                                            EncoderFaultPlan* plan,
+                                            xnc::AuSink& sink,
+                                            bool* init_ok) {
+  const xnc::MfEncoderFaultSeam seam = plan->Seam();
+  xnc::MfSoftEncoder enc(&seam);
+  enc.SetForceSoftware(true);
+  std::string err;
+  const bool initialized = enc.Init(64, 48, 30, 500000, &err);
+  if (init_ok != nullptr) *init_ok = initialized;
+  if (!initialized) {
+    xnc::PipelineResult r;
+    r.ok = false;
+    r.err = "fault-test init: " + err;
+    return r;
+  }
+  std::atomic<bool> stop{false};
+  StopAfterCapture cap(frames, &stop);
+  xnc::PipelineOpts opt;
+  opt.duration_s = 2;
+  opt.fps = 30;
+  opt.target_bitrate_bps = 500000;
+  opt.stop = &stop;
+  return xnc::Pipeline::Run(cap, enc, sink, opt);
+}
+
+struct FailingAuSink final : xnc::AuSink {
+  const char* OnAu(bool, uint64_t mono_us, const uint8_t*, size_t) override {
+    timestamps.push_back(mono_us);
+    return timestamps.size() == fail_on ? "fault_sink_mid_vector" : nullptr;
+  }
+  size_t fail_on = 1;
+  std::vector<uint64_t> timestamps;
+};
+
 // ---- M2-Slice1 Task 3 fixtures: fake ladder backends + state log ----
 
 // Records EmitBackendChanged callbacks ("backend/reason" pairs, in order).
@@ -1077,6 +1197,9 @@ int SelftestMain() {
     CHECK("ledger-space-reopens", ledger.Submit(64) && ledger.Pending() == 64);
     ledger.Clear();
     CHECK("ledger-clear", ledger.Pending() == 0 && !ledger.Take(&out));
+    CHECK("ledger-clear-new-lifecycle-submit", ledger.Submit(888));
+    CHECK("ledger-clear-new-lifecycle-take",
+          ledger.Take(&out) && out == 888 && ledger.Pending() == 0);
   }
   { // Failed input registration rollback removes only the newest item.
     xnc::SubmissionLedger ledger;
@@ -1087,6 +1210,109 @@ int SelftestMain() {
     CHECK("ledger-rollback-preserves-old", ledger.Pending() == 1 &&
                                                 ledger.Take(&out) && out == 10);
     CHECK("ledger-rollback-empty", !ledger.RollbackNewest(10));
+  }
+  { // Pre-accept rejection rolls back only the newest registration.
+    EncoderFaultPlan plan;
+    plan.reject_input_call = 2;  // input 1 stays accepted and pending
+    RecordingSink sink;
+    bool init_ok = false;
+    const xnc::PipelineResult res =
+        RunEncoderFaultScenario(2, &plan, sink, &init_ok);
+    CHECK("ledger-fault-preaccept-init", init_ok);
+    CHECK("ledger-fault-preaccept-aborts",
+          !res.ok && res.err == "fault_pre_accept");
+    CHECK("ledger-fault-preaccept-branches",
+          plan.input_calls == 2 && plan.submit.calls == 1 &&
+              plan.drain.calls == 0 && plan.flush_tail.calls == 0);
+    CHECK("ledger-fault-preaccept-no-au", sink.aus == 0);
+  }
+  { // Accepted input + partial collection failure keeps and consumes identity.
+    EncoderFaultPlan plan;
+    plan.submit.ok = false;
+    plan.submit.aus = 1;
+    plan.submit.err = "fault_submit_collect";
+    RecordingSink sink;
+    bool init_ok = false;
+    const xnc::PipelineResult res =
+        RunEncoderFaultScenario(1, &plan, sink, &init_ok);
+    CHECK("ledger-fault-postaccept-init", init_ok);
+    CHECK("ledger-fault-postaccept-aborts",
+          !res.ok && res.err.find("encoder_output_collection_failed") == 0 &&
+              res.err.find("fault_submit_collect") != std::string::npos);
+    CHECK("ledger-fault-postaccept-partial-delivered",
+          sink.aus == 1 && sink.timestamps.size() == 1);
+    CHECK("ledger-fault-postaccept-no-tail",
+          plan.submit.calls == 1 && plan.drain.calls == 0 &&
+              plan.flush_tail.calls == 0);
+  }
+  { // Drain failure surfaces after its complete partial AUs are delivered.
+    EncoderFaultPlan plan;
+    plan.drain.ok = false;
+    plan.drain.aus = 1;
+    plan.drain.err = "fault_drain_collect";
+    RecordingSink sink;
+    bool init_ok = false;
+    const xnc::PipelineResult res =
+        RunEncoderFaultScenario(1, &plan, sink, &init_ok);
+    CHECK("ledger-fault-drain-init", init_ok);
+    CHECK("ledger-fault-drain-aborts",
+          !res.ok && res.err.find("encoder_drain_failed") == 0 &&
+              res.err.find("fault_drain_collect") != std::string::npos);
+    CHECK("ledger-fault-drain-partial-delivered", sink.aus == 1);
+    CHECK("ledger-fault-drain-skips-flush",
+          plan.drain.calls == 1 && plan.flush_tail.calls == 0);
+  }
+  { // FlushTail failure surfaces; one complete AU consumes one of two inputs.
+    EncoderFaultPlan plan;
+    plan.flush_tail.ok = false;
+    plan.flush_tail.aus = 1;
+    plan.flush_tail.err = "fault_flush_collect";
+    RecordingSink sink;
+    bool init_ok = false;
+    const xnc::PipelineResult res =
+        RunEncoderFaultScenario(2, &plan, sink, &init_ok);
+    CHECK("ledger-fault-flush-init", init_ok);
+    CHECK("ledger-fault-flush-aborts",
+          !res.ok && res.err.find("encoder_flush_tail_failed") == 0 &&
+              res.err.find("fault_flush_collect") != std::string::npos);
+    CHECK("ledger-fault-flush-partial-delivered", sink.aus == 1);
+    CHECK("ledger-fault-flush-branches",
+          plan.drain.calls == 1 && plan.flush_tail.calls == 1);
+  }
+  { // Successful drain/tail with an unresolved input is identity mismatch.
+    EncoderFaultPlan plan;
+    RecordingSink sink;
+    bool init_ok = false;
+    const xnc::PipelineResult res =
+        RunEncoderFaultScenario(1, &plan, sink, &init_ok);
+    CHECK("ledger-fault-pending-init", init_ok);
+    CHECK("ledger-fault-pending-mismatch",
+          !res.ok && res.err == "encoder_identity_mismatch" && sink.aus == 0);
+  }
+  { // Sink failure mid-vector remains the primary abort error during cleanup.
+    EncoderFaultPlan plan;
+    plan.drain.aus = 2;
+    FailingAuSink sink;
+    bool init_ok = false;
+    const xnc::PipelineResult res =
+        RunEncoderFaultScenario(2, &plan, sink, &init_ok);
+    CHECK("ledger-fault-sink-init", init_ok);
+    CHECK("ledger-fault-sink-preserved",
+          !res.ok && res.err == "fault_sink_mid_vector" &&
+              sink.timestamps.size() == 1);
+    CHECK("ledger-fault-sink-skips-flush", plan.flush_tail.calls == 0);
+  }
+  { // An overproducing output vector aborts on the first missing identity.
+    EncoderFaultPlan plan;
+    plan.drain.aus = 2;
+    RecordingSink sink;
+    bool init_ok = false;
+    const xnc::PipelineResult res =
+        RunEncoderFaultScenario(1, &plan, sink, &init_ok);
+    CHECK("ledger-fault-mismatch-init", init_ok);
+    CHECK("ledger-fault-mismatch-preserved",
+          !res.ok && res.err == "encoder_identity_mismatch" && sink.aus == 1);
+    CHECK("ledger-fault-mismatch-skips-flush", plan.flush_tail.calls == 0);
   }
   { // 默认值(plan Task 2 接口):--console-diag 只给 --out → fps=30 duration=10
     auto p = Parse({L"--console-diag", L"--out", L"t.h264"});
@@ -1398,7 +1624,7 @@ int SelftestMain() {
     std::vector<std::vector<uint8_t>> aus;
     std::string err;
     CHECK("mf-encode-before-init", !enc.Encode(nullptr, 0, aus, &err) && !err.empty());
-    CHECK("mf-drain-before-init-noop", (enc.Drain(aus), aus.empty()));
+    CHECK("mf-drain-before-init-noop", enc.Drain(aus) && aus.empty());
     xnc::MfSoftEncoder enc2;
     std::string ierr;
     CHECK("mf-init-odd-dims-rejected", !enc2.Init(127, 96, kEncFps, kEncBitrate, &ierr) && !ierr.empty());
@@ -1517,7 +1743,8 @@ int SelftestMain() {
       }
       CHECK("mf-b-encode-ok", ok);
       if (ok) {
-        enc.Drain(aus);  // 冷启动缓冲排空:重复 ProcessOutput 至 NEED_MORE_INPUT
+        ok = enc.Drain(aus, &e2);  // 重复 ProcessOutput 至 NEED_MORE_INPUT
+        CHECK("mf-b-drain-ok", ok);
         // 首输出后再喂 5 帧(仍零额外 force):正确实现只应追 P 帧
         for (uint32_t i = 45; ok && i < 50; ++i) {
           std::vector<std::vector<uint8_t>> frame_aus;
@@ -1814,8 +2041,8 @@ int SelftestMain() {
   {
     xnc::MfSoftEncoder uninit;
     std::vector<std::vector<uint8_t>> noop;
-    uninit.FlushTail(noop);
-    CHECK("mf-flush-before-init-noop", noop.empty());  // 与 Drain 同样的防御
+    CHECK("mf-flush-before-init-noop",
+          uninit.FlushTail(noop) && noop.empty());  // 与 Drain 同样的防御
   }
   {
     // 直接喂 20 帧(无 force、无 Drain):冷启动 ~17 帧前瞻 → 期间至多 3 AU
@@ -1839,7 +2066,8 @@ int SelftestMain() {
       CHECK("mf-flush-feed-ok", ok);
       if (ok) {
         const size_t during = aus.size();
-        enc.FlushTail(aus);  // 追加
+        const bool flush_ok = enc.FlushTail(aus, &e2);  // 追加
+        CHECK("mf-flush-tail-ok", flush_ok);
         const size_t flushed = aus.size() - during;
         std::printf("SELFTEST NOTE: mf-flush during=%zu flushed=%zu total=%zu\n",
                     during, flushed, aus.size());

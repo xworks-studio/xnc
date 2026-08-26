@@ -120,9 +120,35 @@ inline void NalExtractTypes(const uint8_t* data, size_t len, const uint8_t* type
 // the encoder's outward contract is identical for both.
 enum class EncoderBackend : uint8_t { kHardware = 0, kSoftware = 1 };
 
+// One Encode/EncodeNV12 operation has two independently meaningful results:
+// ProcessInput may reject the input, or it may accept it and a later
+// ProcessOutput collection may fail after appending complete AUs.
+struct EncoderSubmitResult {
+  bool input_accepted = false;
+  bool outputs_ok = false;
+  explicit operator bool() const { return input_accepted && outputs_ok; }
+};
+
+enum class EncoderOutputStage : uint8_t {
+  kSubmit = 0,
+  kDrain = 1,
+  kFlushTail = 2,
+};
+
+// Optional deterministic seam at the external MFT boundary. Production
+// constructs MfSoftEncoder with nullptr; native selftests inject precise
+// ProcessInput/ProcessOutput outcomes while exercising the real pipeline.
+struct MfEncoderFaultSeam {
+  void* ctx = nullptr;
+  bool (*process_input)(void* ctx, std::string* err) = nullptr;
+  bool (*collect_outputs)(void* ctx, EncoderOutputStage stage,
+                          std::vector<std::vector<uint8_t>>* aus,
+                          std::string* err) = nullptr;
+};
+
 class MfSoftEncoder {
  public:
-  MfSoftEncoder();
+  explicit MfSoftEncoder(const MfEncoderFaultSeam* fault_seam = nullptr);
   ~MfSoftEncoder();
   MfSoftEncoder(const MfSoftEncoder&) = delete;
   MfSoftEncoder& operator=(const MfSoftEncoder&) = delete;
@@ -163,16 +189,20 @@ class MfSoftEncoder {
   // Encodes one compact BGRA frame (len >= w*h*4): converts to NV12,
   // submits, then collects whatever the MFT produced. aus is cleared, then
   // filled with 0..N raw Annex-B AUs (one per output sample; cold-start
-  // buffering yields 0). false + *err on submit/hardware failure.
-  bool Encode(const uint8_t* bgra, size_t len, std::vector<std::vector<uint8_t>>& aus,
-              std::string* err);
+  // buffering yields 0). The result distinguishes pre-accept rejection from
+  // accepted input followed by output-collection failure; complete partial
+  // AUs remain in aus in the latter case.
+  EncoderSubmitResult Encode(const uint8_t* bgra, size_t len,
+                             std::vector<std::vector<uint8_t>>& aus,
+                             std::string* err);
 
   // gpu-readback task: encodes one compact NV12 frame directly (len >=
   // w*h*3/2, tight stride = width) - NO BGRA->NV12 conversion (the DXGI GPU
   // path already produced NV12 in the VideoProcessor). Same submit/output
   // contract as Encode. Invalid dims/len are rejected like Encode.
-  bool EncodeNV12(const uint8_t* nv12, size_t len,
-                  std::vector<std::vector<uint8_t>>& aus, std::string* err);
+  EncoderSubmitResult EncodeNV12(const uint8_t* nv12, size_t len,
+                                 std::vector<std::vector<uint8_t>>& aus,
+                                 std::string* err);
 
   // Arms the one-shot IDR request (see header comment). Pure bookkeeping -
   // the ICodecAPI property is applied at the next Encode submission.
@@ -189,7 +219,8 @@ class MfSoftEncoder {
   // Cold-start buffer flush: repeatedly ProcessOutput until
   // MF_E_TRANSFORM_NEED_MORE_INPUT, appending any AUs to aus (NOT cleared).
   // Never applies or re-arms a force-key request - that is the E2 contract.
-  void Drain(std::vector<std::vector<uint8_t>>& aus);
+  // false surfaces collection failure; complete AUs appended first remain.
+  bool Drain(std::vector<std::vector<uint8_t>>& aus, std::string* err = nullptr);
 
   // End-of-stream flush (Task 5; the Task 4 review's deferred minor):
   // sends MFT_MESSAGE_NOTIFY_END_OF_STREAM + MFT_MESSAGE_COMMAND_DRAIN,
@@ -199,7 +230,9 @@ class MfSoftEncoder {
   // MFT will not emit a buffered frame while more input is still expected.
   // Never touches the force-key state. After FlushTail the encoder is
   // drained - do not feed it again; call Init to reuse the object.
-  void FlushTail(std::vector<std::vector<uint8_t>>& aus);
+  // false surfaces message/collection failure; complete partial AUs remain.
+  bool FlushTail(std::vector<std::vector<uint8_t>>& aus,
+                 std::string* err = nullptr);
 
  private:
   // Full media-type negotiation + streaming start on an existing MFT (no
@@ -214,14 +247,16 @@ class MfSoftEncoder {
   // Encode()'s submit half over a ready NV12 frame (stride-expands when the
   // negotiated input stride differs from w). Applies the one-shot force-key
   // at submission (E2 contract).
-  bool SubmitNv12(const uint8_t* nv12, size_t len, std::vector<std::vector<uint8_t>>& aus,
-                  std::string* err);
+  EncoderSubmitResult SubmitNv12(const uint8_t* nv12, size_t len,
+                                 std::vector<std::vector<uint8_t>>& aus,
+                                 std::string* err);
   // Drops the current MFT/session (END_STREAMING + release + activate
   // ShutdownObject) WITHOUT tearing down impl_/w_/h_ - used to discard
   // hardware ladder candidates and to reset between probe/live instances.
   // Clears stream-derived state (sps_pps_, last_was_key_, force_pending_).
   void ReleaseMft();
-  bool CollectOutputs(std::vector<std::vector<uint8_t>>& aus, std::string* err);
+  bool CollectOutputs(std::vector<std::vector<uint8_t>>& aus, std::string* err,
+                      EncoderOutputStage stage);
   void Shutdown();
 
   struct Impl;  // COM pointers + streaming state (mf_encoder.cpp)
@@ -230,6 +265,7 @@ class MfSoftEncoder {
   bool last_was_key_ = false;
   bool force_pending_ = false;  // one-shot, consumed at input SUBMISSION
   bool force_software_ = false; // --encoder software diagnostic pin
+  const MfEncoderFaultSeam* fault_seam_ = nullptr;  // non-owning; null in production
   EncoderBackend backend_ = EncoderBackend::kSoftware;
   std::string friendly_name_;
   std::vector<uint8_t> nv12_;   // reused conversion buffer (w*h*3/2)

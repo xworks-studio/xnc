@@ -495,10 +495,11 @@ void ProcessFrameLocked(EncodeCtx& ctx, const FrameBlob& f, bool warmup) {
   // gpu-readback: route on the blob's layout - NV12 (DXGI GPU path) skips
   // the encoder's BGRA->NV12 conversion, BGRA (GDI / degraded DXGI) uses
   // the classic entry.
-  const bool ok = f.pixfmt == Pixfmt::kNv12
-                      ? ctx.enc.EncodeNV12(f.bgra.data(), f.bgra.size(), ctx.aus, &eerr)
-                      : ctx.enc.Encode(f.bgra.data(), f.bgra.size(), ctx.aus, &eerr);
-  if (!ok) {
+  const EncoderSubmitResult submit =
+      f.pixfmt == Pixfmt::kNv12
+          ? ctx.enc.EncodeNV12(f.bgra.data(), f.bgra.size(), ctx.aus, &eerr)
+          : ctx.enc.Encode(f.bgra.data(), f.bgra.size(), ctx.aus, &eerr);
+  if (!submit.input_accepted) {
     const std::string msg = eerr.empty() ? "encode failed" : eerr;
     {
       std::lock_guard<std::mutex> lk(ctx.sh.mu);
@@ -516,6 +517,9 @@ void ProcessFrameLocked(EncodeCtx& ctx, const FrameBlob& f, bool warmup) {
     ctx.fatal.store(true, std::memory_order_relaxed);
     return;
   }
+  // ProcessInput accepted this registration even when output collection
+  // failed later. Count the input and retain its identity while delivering
+  // every complete AU CollectOutputs appended before that failure.
   {
     std::lock_guard<std::mutex> lk(ctx.sh.mu);
     if (warmup)
@@ -565,6 +569,18 @@ void ProcessFrameLocked(EncodeCtx& ctx, const FrameBlob& f, bool warmup) {
         ctx.sh.ondemand.armed = false;
       }
     }
+  }
+  if (!submit.outputs_ok) {
+    const std::string msg = eerr.empty()
+                                ? "encoder_output_collection_failed"
+                                : "encoder_output_collection_failed: " + eerr;
+    {
+      std::lock_guard<std::mutex> lk(ctx.sh.mu);
+      ctx.sh.res->ok = false;
+      ctx.sh.res->err = msg;
+    }
+    XNC_LOG_ERROR("encode_output_collection_failed err=\"%s\"", eerr.c_str());
+    ctx.fatal.store(true, std::memory_order_relaxed);
   }
 }
 
@@ -1053,25 +1069,46 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
     };
 
     if (res.ok) {
-      enc.Drain(aus);
+      std::string drain_err;
+      const bool drain_ok = enc.Drain(aus, &drain_err);
       if (!aus.empty())
         XNC_LOG_INFO("encoder_drain aus=%zu", aus.size());
       deliver("drain", false);
+      if (res.ok && !drain_ok) {
+        res.ok = false;
+        res.err = drain_err.empty() ? "encoder_drain_failed"
+                                    : "encoder_drain_failed: " + drain_err;
+        XNC_LOG_ERROR("encoder_drain_failed err=\"%s\"", drain_err.c_str());
+      }
     }
     if (res.ok) {
       aus.clear();
-      enc.FlushTail(aus);
+      std::string flush_err;
+      const bool flush_ok = enc.FlushTail(aus, &flush_err);
       if (!aus.empty())
         XNC_LOG_INFO("encoder_flush_tail aus=%zu", aus.size());
       deliver("flush_tail", true);
+      if (res.ok && !flush_ok) {
+        res.ok = false;
+        res.err = flush_err.empty() ? "encoder_flush_tail_failed"
+                                    : "encoder_flush_tail_failed: " + flush_err;
+        XNC_LOG_ERROR("encoder_flush_tail_failed err=\"%s\"", flush_err.c_str());
+      }
     }
 
     // No delayed output can survive stream end or a fatal encoder/sink
-    // path. Clear any registrations not consumed by the final drain.
+    // path. A nominally successful drain must account for every accepted
+    // input; unresolved identities are a fatal mismatch, never success.
     size_t discarded = 0;
     {
       std::lock_guard<std::mutex> lk(sh.mu);
       discarded = sh.submissions.Pending();
+      if (res.ok && discarded != 0) {
+        res.ok = false;
+        res.err = "encoder_identity_mismatch";
+        XNC_LOG_ERROR("encoder_identity_mismatch source=stream_end pending=%zu",
+                      discarded);
+      }
       sh.submissions.Clear();
     }
     if (discarded != 0) {

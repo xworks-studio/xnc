@@ -188,7 +188,8 @@ struct MfSoftEncoder::Impl {
   }
 };
 
-MfSoftEncoder::MfSoftEncoder() = default;
+MfSoftEncoder::MfSoftEncoder(const MfEncoderFaultSeam* fault_seam)
+    : fault_seam_(fault_seam) {}
 
 MfSoftEncoder::~MfSoftEncoder() { Shutdown(); }
 
@@ -528,8 +529,9 @@ bool MfSoftEncoder::Init(uint32_t w, uint32_t h, uint32_t fps, uint32_t bitrate_
   return true;
 }
 
-bool MfSoftEncoder::SubmitNv12(const uint8_t* nv12, size_t len,
-                               std::vector<std::vector<uint8_t>>& aus, std::string* err) {
+EncoderSubmitResult MfSoftEncoder::SubmitNv12(
+    const uint8_t* nv12, size_t len, std::vector<std::vector<uint8_t>>& aus,
+    std::string* err) {
   const uint8_t* src = nv12;
   size_t src_len = len;
   if (impl_->in_stride != 0 && impl_->in_stride != w_) {
@@ -537,11 +539,11 @@ bool MfSoftEncoder::SubmitNv12(const uint8_t* nv12, size_t len,
     // padded buffer (zero-filled tails) once per frame.
     if (impl_->in_padded_.size() != static_cast<size_t>(impl_->in_stride) * h_ * 3u / 2u) {
       if (err) *err = "input stride buffer size mismatch";
-      return false;
+      return {};
     }
     if (len < static_cast<size_t>(w_) * h_ * 3u / 2u) {
       if (err) *err = "short nv12 frame";
-      return false;
+      return {};
     }
     ExpandToStride(nv12, impl_->in_padded_.data(), w_, h_, impl_->in_stride);
     src = impl_->in_padded_.data();
@@ -565,7 +567,7 @@ bool MfSoftEncoder::SubmitNv12(const uint8_t* nv12, size_t len,
   if (SUCCEEDED(hr)) hr = sample->AddBuffer(buffer.Get());
   if (FAILED(hr)) {
     if (err) *err = HrStep("input sample", hr);
-    return false;
+    return {};
   }
 
   // PTS = wall clock since Init in 100ns units (the media-type frame rate is
@@ -595,47 +597,53 @@ bool MfSoftEncoder::SubmitNv12(const uint8_t* nv12, size_t len,
     }
   }
 
-  hr = impl_->mft->ProcessInput(0, sample.Get(), 0);
-  if (FAILED(hr)) {
-    if (err) *err = HrStep("ProcessInput", hr);
-    return false;
+  bool accepted = false;
+  if (fault_seam_ != nullptr && fault_seam_->process_input != nullptr) {
+    accepted = fault_seam_->process_input(fault_seam_->ctx, err);
+  } else {
+    hr = impl_->mft->ProcessInput(0, sample.Get(), 0);
+    accepted = SUCCEEDED(hr);
+    if (!accepted && err != nullptr) *err = HrStep("ProcessInput", hr);
   }
-  return CollectOutputs(aus, err);
+  if (!accepted) return {};
+  const bool outputs_ok = CollectOutputs(aus, err, EncoderOutputStage::kSubmit);
+  return {true, outputs_ok};
 }
 
-bool MfSoftEncoder::Encode(const uint8_t* bgra, size_t len,
-                           std::vector<std::vector<uint8_t>>& aus, std::string* err) {
+EncoderSubmitResult MfSoftEncoder::Encode(
+    const uint8_t* bgra, size_t len, std::vector<std::vector<uint8_t>>& aus,
+    std::string* err) {
   aus.clear();
   if (!impl_ || impl_->mft.Get() == nullptr) {
     if (err) *err = "encoder not initialized";
-    return false;
+    return {};
   }
   const size_t need = static_cast<size_t>(w_) * h_ * 4;
   if (!bgra || len < need) {
     if (err)
       *err = "short frame: " + std::to_string(len) + " < " + std::to_string(need);
-    return false;
+    return {};
   }
   if (!BgraToNv12(bgra, len, nv12_.data(), nv12_.size(), w_, h_)) {
     if (err) *err = "nv12 convert rejected arguments";
-    return false;
+    return {};
   }
   return SubmitNv12(nv12_.data(), nv12_.size(), aus, err);
 }
 
-bool MfSoftEncoder::EncodeNV12(const uint8_t* nv12, size_t len,
-                               std::vector<std::vector<uint8_t>>& aus,
-                               std::string* err) {
+EncoderSubmitResult MfSoftEncoder::EncodeNV12(
+    const uint8_t* nv12, size_t len, std::vector<std::vector<uint8_t>>& aus,
+    std::string* err) {
   aus.clear();
   if (!impl_ || impl_->mft.Get() == nullptr) {
     if (err) *err = "encoder not initialized";
-    return false;
+    return {};
   }
   const size_t need = Nv12Bytes(w_, h_);
   if (need == 0 || !nv12 || len < need) {
     if (err)
       *err = "short nv12 frame: " + std::to_string(len) + " < " + std::to_string(need);
-    return false;
+    return {};
   }
   return SubmitNv12(nv12, len, aus, err);
 }
@@ -645,32 +653,51 @@ void MfSoftEncoder::ForceNextIdr(const char* reason) {
   XNC_LOG_INFO("force_key_pending reason=%s", reason ? reason : "");
 }
 
-void MfSoftEncoder::Drain(std::vector<std::vector<uint8_t>>& aus) {
-  if (!impl_ || impl_->mft.Get() == nullptr) return;
-  std::string ignored;
-  CollectOutputs(aus, &ignored);  // appends; never touches force_pending_
+bool MfSoftEncoder::Drain(std::vector<std::vector<uint8_t>>& aus,
+                          std::string* err) {
+  if (!impl_ || impl_->mft.Get() == nullptr) return true;
+  return CollectOutputs(aus, err, EncoderOutputStage::kDrain);
 }
 
-void MfSoftEncoder::FlushTail(std::vector<std::vector<uint8_t>>& aus) {
-  if (!impl_ || impl_->mft.Get() == nullptr) return;
+bool MfSoftEncoder::FlushTail(std::vector<std::vector<uint8_t>>& aus,
+                              std::string* err) {
+  if (!impl_ || impl_->mft.Get() == nullptr) return true;
   // Canonical MFT flush: no more input (END_OF_STREAM), then COMMAND_DRAIN =
   // produce all pending output; CollectOutputs stops at
   // MF_E_TRANSFORM_NEED_MORE_INPUT, which drained encoders return once the
-  // window is empty. Message failures are logged and tolerated - collecting
-  // is still attempted.
+  // window is empty. Message failures are logged and surfaced, but output
+  // collection is still attempted so complete partial AUs are not lost.
+  bool messages_ok = true;
+  std::string message_err;
   HRESULT hr = impl_->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-  if (FAILED(hr))
+  if (FAILED(hr)) {
     XNC_LOG_INFO("flush_tail end_of_stream hr=0x%08x (continuing)",
                  static_cast<unsigned int>(hr));
+    messages_ok = false;
+    message_err = HrStep("flush_tail end_of_stream", hr);
+  }
   hr = impl_->mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
-  if (FAILED(hr))
+  if (FAILED(hr)) {
     XNC_LOG_INFO("flush_tail drain hr=0x%08x (continuing)", static_cast<unsigned int>(hr));
-  std::string ignored;
-  if (!CollectOutputs(aus, &ignored))
-    XNC_LOG_INFO("flush_tail collect stopped early (see previous error line)");
+    if (messages_ok) message_err = HrStep("flush_tail drain", hr);
+    messages_ok = false;
+  }
+  std::string collect_err;
+  const bool outputs_ok =
+      CollectOutputs(aus, &collect_err, EncoderOutputStage::kFlushTail);
+  if (!outputs_ok) {
+    if (err != nullptr) *err = collect_err;
+    return false;
+  }
+  if (!messages_ok && err != nullptr) *err = message_err;
+  return messages_ok;
 }
 
-bool MfSoftEncoder::CollectOutputs(std::vector<std::vector<uint8_t>>& aus, std::string* err) {
+bool MfSoftEncoder::CollectOutputs(std::vector<std::vector<uint8_t>>& aus,
+                                   std::string* err,
+                                   EncoderOutputStage stage) {
+  if (fault_seam_ != nullptr && fault_seam_->collect_outputs != nullptr)
+    return fault_seam_->collect_outputs(fault_seam_->ctx, stage, &aus, err);
   bool any_au = false;
   bool has_idr = false;
   for (;;) {
