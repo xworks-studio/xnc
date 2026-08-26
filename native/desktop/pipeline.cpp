@@ -54,6 +54,29 @@
 
 namespace xnc {
 
+bool SubmissionLedger::Submit(uint64_t mono_us) {
+  if (pending_.size() >= kMaxPending) return false;
+  pending_.push_back(mono_us);
+  return true;
+}
+
+bool SubmissionLedger::Take(uint64_t* mono_us) {
+  if (mono_us == nullptr || pending_.empty()) return false;
+  *mono_us = pending_.front();
+  pending_.pop_front();
+  return true;
+}
+
+size_t SubmissionLedger::Pending() const { return pending_.size(); }
+
+void SubmissionLedger::Clear() { pending_.clear(); }
+
+bool SubmissionLedger::RollbackNewest(uint64_t mono_us) {
+  if (pending_.empty() || pending_.back() != mono_us) return false;
+  pending_.pop_back();
+  return true;
+}
+
 void LatestFrameStore::Update(const FrameBlob& f) {
   std::lock_guard<std::mutex> lk(mu_);
   frame_ = f;
@@ -184,7 +207,7 @@ struct PipelineShared {
   bool warmup_phase_logged = false;  // one warmup_done/exhausted log per gen
   OnDemandIdr ondemand;
   uint64_t last_initiated_idr_ms = 0;  // kIdrMinIntervalMs throttle anchor
-  uint64_t last_mono_us = 0;       // last submission timestamp (FlushTail AUs)
+  SubmissionLedger submissions;    // successful MFT inputs awaiting output
   uint32_t enc_w = 0, enc_h = 0;   // encoder's dims (reset re-init updates)
   uint64_t last_timeout_ms = 0;    // last static-screen observation (capture
                                    // thread) - gates re-feeds on the encode
@@ -385,6 +408,10 @@ bool RunResetSequence(ResetSequence& s) {
         std::lock_guard<std::mutex> elk(*s.enc_mu);
         ok = s.enc->Init(new_w, new_h, s.opt->fps, s.opt->target_bitrate_bps,
                          &rerr);
+        // Init starts a new MFT lifecycle even when negotiation fails: its
+        // Shutdown first discards every delayed output from the old MFT.
+        std::lock_guard<std::mutex> lk(s.sh->mu);
+        s.sh->submissions.Clear();
         if (ok)
           XNC_LOG_INFO("capture_reset encoder re-init w=%u h=%u", new_w, new_h);
       }
@@ -436,20 +463,34 @@ bool RunResetSequence(ResetSequence& s) {
 // re-feed): applies any pending one-shot IDR request (armed by a capture
 // rebuild - E2 contract: it rides the next submission exactly once and is
 // never re-armed), encodes, shapes and delivers every output AU to the
-// sink. mono_us stamps every AU of this submission: real frames retain their
-// capture/push time and idle re-feeds use a fresh presentation time. Runs on
-// the ENCODE thread; enc_mu is held by the caller for the whole call (the
-// encoder + its SpsPps cache must stay consistent with the AU shaping).
+// sink. Each successful input is registered immediately before submission;
+// output AUs consume the oldest registration because MFT lookahead means an
+// AU generally belongs to an earlier Encode call. Runs on the ENCODE thread;
+// enc_mu is held by the caller for the whole call (the encoder + its SpsPps
+// cache must stay consistent with the AU shaping).
 void ProcessFrameLocked(EncodeCtx& ctx, const FrameBlob& f, bool warmup) {
   // One-shot rebuild IDR request (E2 contract: ride the next submission).
   const char* idr_reason = nullptr;
   {
     std::lock_guard<std::mutex> lk(ctx.sh.mu);
     idr_reason = ctx.sh.cache.TakePendingIdrReason();
-    ctx.sh.last_mono_us = f.mono_us;
   }
   // enc_mu held: the one-shot flag is encoder stream state (Init clears it).
   if (idr_reason != nullptr) ctx.enc.ForceNextIdr(idr_reason);
+
+  // Register at the input boundary, not at capture time: dropped handoff
+  // frames never enter the MFT and therefore never enter this ledger.
+  {
+    std::lock_guard<std::mutex> lk(ctx.sh.mu);
+    if (!ctx.sh.submissions.Submit(f.mono_us)) {
+      ctx.sh.res->ok = false;
+      ctx.sh.res->err = "encoder_submission_overflow";
+      XNC_LOG_ERROR("encoder_submission_overflow pending=%zu",
+                    ctx.sh.submissions.Pending());
+      ctx.fatal.store(true, std::memory_order_relaxed);
+      return;
+    }
+  }
   std::string eerr;
   // gpu-readback: route on the blob's layout - NV12 (DXGI GPU path) skips
   // the encoder's BGRA->NV12 conversion, BGRA (GDI / degraded DXGI) uses
@@ -461,8 +502,15 @@ void ProcessFrameLocked(EncodeCtx& ctx, const FrameBlob& f, bool warmup) {
     const std::string msg = eerr.empty() ? "encode failed" : eerr;
     {
       std::lock_guard<std::mutex> lk(ctx.sh.mu);
-      ctx.sh.res->ok = false;
-      ctx.sh.res->err = msg;
+      // Encode/EncodeNV12 rejected this input. Only its just-added tail
+      // registration is removed; older delayed submissions remain intact.
+      if (!ctx.sh.submissions.RollbackNewest(f.mono_us)) {
+        ctx.sh.res->ok = false;
+        ctx.sh.res->err = "encoder_identity_mismatch";
+      } else {
+        ctx.sh.res->ok = false;
+        ctx.sh.res->err = msg;
+      }
     }
     XNC_LOG_ERROR("encode_failed err=\"%s\"", msg.c_str());
     ctx.fatal.store(true, std::memory_order_relaxed);
@@ -476,6 +524,17 @@ void ProcessFrameLocked(EncodeCtx& ctx, const FrameBlob& f, bool warmup) {
       ctx.sh.cache.OnEncoded();
   }
   for (const auto& au : ctx.aus) {
+    uint64_t au_mono_us = 0;
+    {
+      std::lock_guard<std::mutex> lk(ctx.sh.mu);
+      if (!ctx.sh.submissions.Take(&au_mono_us)) {
+        ctx.sh.res->ok = false;
+        ctx.sh.res->err = "encoder_identity_mismatch";
+        XNC_LOG_ERROR("encoder_identity_mismatch source=encode");
+        ctx.fatal.store(true, std::memory_order_relaxed);
+        return;
+      }
+    }
     const bool is_idr = NalHasType(au.data(), au.size(), 5);
     ShapeAu(au.data(), au.size(), is_idr, ctx.enc.SpsPps(), &ctx.shaped);
     if (!ctx.shaped.empty()) {
@@ -485,7 +544,7 @@ void ProcessFrameLocked(EncodeCtx& ctx, const FrameBlob& f, bool warmup) {
         ctx.sh.res->bytes_written += ctx.shaped.size();
       }
       if (const char* err =
-              ctx.sink.OnAu(is_idr, f.mono_us, ctx.shaped.data(), ctx.shaped.size())) {
+              ctx.sink.OnAu(is_idr, au_mono_us, ctx.shaped.data(), ctx.shaped.size())) {
         {
           std::lock_guard<std::mutex> lk(ctx.sh.mu);
           ctx.sh.res->ok = false;
@@ -495,6 +554,7 @@ void ProcessFrameLocked(EncodeCtx& ctx, const FrameBlob& f, bool warmup) {
         ctx.fatal.store(true, std::memory_order_relaxed);
         return;
       }
+      ctx.lat.Add(au_mono_us);  // actual submitted input -> OnAu completion
     }
     if (is_idr) {
       std::lock_guard<std::mutex> lk(ctx.sh.mu);
@@ -506,7 +566,6 @@ void ProcessFrameLocked(EncodeCtx& ctx, const FrameBlob& f, bool warmup) {
       }
     }
   }
-  ctx.lat.Add(f.mono_us);  // capture mono_us -> OnAu completion
 }
 
 void ProcessFrame(EncodeCtx& ctx, const FrameBlob& f, bool warmup) {
@@ -949,42 +1008,78 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
   acq_win.Flush();  // partial acquire window at run end
   gpu_win.Flush();  // partial gpu-scale window at run end
 
-  // End of run: flush the encoder tail (NOTIFY_DRAIN) so the lookahead
-  // window's AUs are not dropped, through the same shaping path. The encode
-  // thread is gone; the encoder is quiescent (enc_mu is a formality).
-  if (res.ok) {
-    uint64_t last_mono_us = 0;
-    {
-      std::lock_guard<std::mutex> lk(sh.mu);
-      last_mono_us = sh.last_mono_us;
-    }
+  // End of run: collect any newly available output, then flush the encoder
+  // tail (NOTIFY_DRAIN) so the lookahead window's AUs are not dropped. Both
+  // paths consume one submission identity per raw AU. The encode thread is
+  // gone; enc_mu also preserves the reset lock-order contract here.
+  {
     std::vector<std::vector<uint8_t>> aus;
     std::vector<uint8_t> shaped;
     std::lock_guard<std::mutex> elk(ctx.enc_mu);
-    enc.FlushTail(aus);
-    if (!aus.empty())
-      XNC_LOG_INFO("encoder_flush_tail aus=%zu", aus.size());
-    for (const auto& au : aus) {
-      const bool is_idr = NalHasType(au.data(), au.size(), 5);
-      ShapeAu(au.data(), au.size(), is_idr, enc.SpsPps(), &shaped);
-      if (!shaped.empty()) {
-        res.aus_written++;
-        res.bytes_written += shaped.size();
-        const char* err = sink.OnAu(is_idr, last_mono_us, shaped.data(), shaped.size());
-        if (err != nullptr) {
-          res.ok = false;
-          res.err = std::strcmp(err, "fwrite out failed") == 0
-                        ? "fwrite out failed (flush)"
-                        : err;
-          break;
+    const auto deliver = [&](const char* source, bool flushing) {
+      for (const auto& au : aus) {
+        uint64_t au_mono_us = 0;
+        {
+          std::lock_guard<std::mutex> lk(sh.mu);
+          if (!sh.submissions.Take(&au_mono_us)) {
+            res.ok = false;
+            res.err = "encoder_identity_mismatch";
+            XNC_LOG_ERROR("encoder_identity_mismatch source=%s", source);
+            return false;
+          }
+        }
+        const bool is_idr = NalHasType(au.data(), au.size(), 5);
+        ShapeAu(au.data(), au.size(), is_idr, enc.SpsPps(), &shaped);
+        if (!shaped.empty()) {
+          res.aus_written++;
+          res.bytes_written += shaped.size();
+          const char* err =
+              sink.OnAu(is_idr, au_mono_us, shaped.data(), shaped.size());
+          if (err != nullptr) {
+            res.ok = false;
+            res.err = flushing && std::strcmp(err, "fwrite out failed") == 0
+                          ? "fwrite out failed (flush)"
+                          : err;
+            return false;
+          }
+          ctx.lat.Add(au_mono_us);
+        }
+        if (is_idr) {
+          std::lock_guard<std::mutex> lk(sh.mu);
+          sh.cache.OnKeyframeAu();
         }
       }
-      if (is_idr) {
-        std::lock_guard<std::mutex> lk(sh.mu);
-        sh.cache.OnKeyframeAu();
-      }
+      return true;
+    };
+
+    if (res.ok) {
+      enc.Drain(aus);
+      if (!aus.empty())
+        XNC_LOG_INFO("encoder_drain aus=%zu", aus.size());
+      deliver("drain", false);
+    }
+    if (res.ok) {
+      aus.clear();
+      enc.FlushTail(aus);
+      if (!aus.empty())
+        XNC_LOG_INFO("encoder_flush_tail aus=%zu", aus.size());
+      deliver("flush_tail", true);
+    }
+
+    // No delayed output can survive stream end or a fatal encoder/sink
+    // path. Clear any registrations not consumed by the final drain.
+    size_t discarded = 0;
+    {
+      std::lock_guard<std::mutex> lk(sh.mu);
+      discarded = sh.submissions.Pending();
+      sh.submissions.Clear();
+    }
+    if (discarded != 0) {
+      XNC_LOG_INFO("encoder_submission_clear pending=%zu reason=%s", discarded,
+                   res.ok ? "stream_end" : "stream_abort");
     }
   }
+  ctx.lat.Flush();  // drain/FlushTail may have completed the final window
   sink.OnState("stream_end", res.ok);
 
   {

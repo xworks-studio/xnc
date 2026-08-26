@@ -858,10 +858,11 @@ class ResetCapture final : public xnc::ICapture {
 // Thread-safe: with the capture/encode threads decoupled, OnAu runs on the
 // encode thread while OnState/OnDisplayChanged run on the capture thread.
 struct RecordingSink final : xnc::AuSink {
-  const char* OnAu(bool is_idr, uint64_t, const uint8_t*, size_t) override {
+  const char* OnAu(bool is_idr, uint64_t mono_us, const uint8_t*, size_t) override {
     std::lock_guard<std::mutex> lk(mu);
     aus++;
     if (is_idr) keys++;
+    timestamps.push_back(mono_us);
     return nullptr;
   }
   void OnState(const char* code, bool recoverable) override {
@@ -889,6 +890,7 @@ struct RecordingSink final : xnc::AuSink {
   }
   mutable std::mutex mu;
   uint64_t aus = 0, keys = 0;
+  std::vector<uint64_t> timestamps;
   std::vector<std::string> states;
   std::vector<bool> states_recoverable;
   struct Disp {
@@ -1053,6 +1055,39 @@ std::unique_ptr<xnc::ICapture> LdMakeGdi(uint32_t max_w, std::string* err) {
 }  // namespace
 
 int SelftestMain() {
+  { // Delayed encoder output must retain submission order, not call order.
+    xnc::SubmissionLedger ledger;
+    for (uint64_t t : {100, 200, 300})
+      CHECK("ledger-submit", ledger.Submit(t));
+    uint64_t out = 0;
+    CHECK("ledger-first", ledger.Take(&out) && out == 100);
+    CHECK("ledger-second", ledger.Take(&out) && out == 200);
+    CHECK("ledger-third", ledger.Take(&out) && out == 300);
+    CHECK("ledger-empty", !ledger.Take(&out));
+    CHECK("ledger-empty-null", !ledger.Take(nullptr));
+  }
+  { // The measured MFT window is bounded; overflow must fail explicitly.
+    xnc::SubmissionLedger ledger;
+    bool first_64 = true;
+    for (uint64_t t = 0; t < 64; ++t) first_64 &= ledger.Submit(t);
+    CHECK("ledger-cap-64", first_64 && ledger.Pending() == 64);
+    CHECK("ledger-overflow-rejected", !ledger.Submit(64) && ledger.Pending() == 64);
+    uint64_t out = 99;
+    CHECK("ledger-overflow-preserves-oldest", ledger.Take(&out) && out == 0);
+    CHECK("ledger-space-reopens", ledger.Submit(64) && ledger.Pending() == 64);
+    ledger.Clear();
+    CHECK("ledger-clear", ledger.Pending() == 0 && !ledger.Take(&out));
+  }
+  { // Failed input registration rollback removes only the newest item.
+    xnc::SubmissionLedger ledger;
+    CHECK("ledger-rollback-submit-old", ledger.Submit(10));
+    CHECK("ledger-rollback-submit-new", ledger.Submit(20));
+    CHECK("ledger-rollback-newest", ledger.RollbackNewest(20));
+    uint64_t out = 0;
+    CHECK("ledger-rollback-preserves-old", ledger.Pending() == 1 &&
+                                                ledger.Take(&out) && out == 10);
+    CHECK("ledger-rollback-empty", !ledger.RollbackNewest(10));
+  }
   { // 默认值(plan Task 2 接口):--console-diag 只给 --out → fps=30 duration=10
     auto p = Parse({L"--console-diag", L"--out", L"t.h264"});
     CHECK("args-ok-defaults", p.ok);
@@ -1902,7 +1937,8 @@ int SelftestMain() {
       TempBinFile tf;
       CHECK("pipe-warm-tmpfile", tf.Open(1));
       if (tf.get() != nullptr) {
-        xnc::PipelineResult res = xnc::Pipeline::Run(cap, enc, tf.get(), o);
+        RecordingSink sink;
+        xnc::PipelineResult res = xnc::Pipeline::Run(cap, enc, tf.get(), sink, o);
         const xnc::FrameCacheCounters& c = res.counters;
         std::printf("SELFTEST NOTE: pipe-warm ok=%d captured=%llu encoded=%llu feeds=%llu timeouts=%llu keyframes=%llu aus=%llu bytes=%llu\n",
                     res.ok ? 1 : 0, (unsigned long long)c.captured,
@@ -1916,6 +1952,10 @@ int SelftestMain() {
         CHECK("pipe-warm-encoded-invariant", c.encoded == c.captured + c.warmup_feeds);
         CHECK("pipe-warm-exactly-one-idr", c.keyframes == 1);  // E2 风暴回归(管线级)
         CHECK("pipe-warm-aus-written", res.aus_written >= 1);
+        bool timestamps_ordered = sink.timestamps.size() == res.aus_written;
+        for (size_t i = 1; i < sink.timestamps.size(); ++i)
+          timestamps_ordered &= sink.timestamps[i - 1] < sink.timestamps[i];
+        CHECK("pipe-warm-delayed-tail-timestamps-ordered", timestamps_ordered);
         const std::vector<uint8_t> stream = ReadAll(tf.get());
         CHECK("pipe-warm-bytes-match", stream.size() == (size_t)res.bytes_written);
         CHECK("pipe-warm-first-au-sps-pps-idr", StreamStartsWithKeyframe(stream));

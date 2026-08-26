@@ -40,6 +40,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -100,6 +101,26 @@ inline uint32_t WarmupFeedBound(uint32_t fps) {
 // 请求最小间隔 500ms). The natural first IDR and rebuild forces are not
 // pipeline-initiated and are not throttled by this.
 inline constexpr uint64_t kIdrMinIntervalMs = 500;
+
+// FIFO identity of successful MFT input submissions. CMSH264EncoderMFT may
+// emit an input's AU many calls later, so output timestamps cannot come from
+// the current Encode call. The cap exceeds both the measured 17-frame
+// lookahead and the 34-feed warm-up bound; overflow is a fatal encoder error.
+class SubmissionLedger {
+ public:
+  bool Submit(uint64_t mono_us);
+  bool Take(uint64_t* mono_us);
+  size_t Pending() const;
+  void Clear();
+
+  // Encode/EncodeNV12 returned before accepting the just-registered input.
+  // Removes only that newest registration; older delayed inputs stay paired.
+  bool RollbackNewest(uint64_t mono_us);
+
+ private:
+  static constexpr size_t kMaxPending = 64;
+  std::deque<uint64_t> pending_;
+};
 
 // Thread-safe, single-snapshot capture store used by idle re-encoding.
 // Update replaces the previous owned FrameBlob; Invalidate drops it across
