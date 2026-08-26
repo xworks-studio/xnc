@@ -662,7 +662,14 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
   const uint64_t t0 = NowMs();
   const uint64_t duration_ms = static_cast<uint64_t>(opt.duration_s) * 1000ull;
   uint32_t next_beat_s = 1;
-  uint64_t last_push_ms = 0;  // capture-side spf pacing anchor
+  // Capture-side pacing: frame-index-aligned absolute deadline (push_t0 +
+  // push_count*spf) instead of relative sleep - relative pacing drifts and
+  // jitters with acquire latency variance, and the RTP timeline mirrors the
+  // capture cadence: interval jitter shows up as playback speed wobble
+  // (jelly effect). Absolute deadline keeps every interval exactly spf
+  // (1 ms timer resolution), recovering naturally after slow acquires.
+  uint64_t push_t0 = 0;
+  uint64_t push_count = 0;
   bool first_frame_logged = false;
   LatencyWindow cap_win;  // capture thread cycle (acquire start -> push done)
   cap_win.label = "cap_cycle_ms";
@@ -778,17 +785,28 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
       handoff.w = blob.w;
       handoff.h = blob.h;
       handoff.pixfmt = blob.pixfmt;
-      handoff.mono_us = blob.mono_us;
+      // Capture-side pacing: frame-index-aligned absolute deadline, sleep
+      // BEFORE the push. The acquire waits for the compositor (0..16.7ms at
+      // 60Hz) and this sleep tops the interval up to exactly spf - without
+      // it the compositor phase leaks into the frame interval (measured
+      // p50 38.9ms vs target 33.3ms), and since the RTP timeline mirrors
+      // the capture cadence that wobble shows up as playback speed uneven
+      // (jelly effect). A slow acquire pushes the deadline but the next
+      // interval snaps back to spf.
+      if (push_t0 == 0) push_t0 = NowMs();
+      push_count++;
+      const uint64_t deadline = push_t0 + push_count * spf_ms;
+      const uint64_t now_ms = NowMs();
+      if (deadline > now_ms) Sleep(static_cast<DWORD>(deadline - now_ms));
+      // Timestamp at the PUSH moment (deadline-aligned), not at acquire
+      // return: acquire return is quantized to the compositor's 60Hz grid
+      // (0..16.7ms wait), so acquire-return timestamps beat against the
+      // 33ms cadence and the RTP interval distribution gets a 33-50ms
+      // wobble (measured p50 39ms). The RTP timeline mirrors this timestamp
+      // - push-time stamps keep playback intervals exactly spf.
+      handoff.mono_us = NowMonoUs();
       queue.Push(std::move(handoff));
       cap_win.Add(t_acq0);  // acquire start -> push done (XIAOXIN split diag)
-      // Capture-side pacing to the target fps (the old SubmitFrame pacing -
-      // the encoder timestamps with the wall clock, so submit cadence ==
-      // frame cadence; the ENCODE thread must run at encode speed instead).
-      if (last_push_ms != 0) {
-        const uint64_t since = NowMs() - last_push_ms;
-        if (since < spf_ms) Sleep(static_cast<DWORD>(spf_ms - since));
-      }
-      last_push_ms = NowMs();
     } else if (acq_err == "err_timeout") {
       // Static screen: no frame, no handoff - the encode thread idles (and
       // runs the warm-up / on-demand re-feed logic itself). Record the

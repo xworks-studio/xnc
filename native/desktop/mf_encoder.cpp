@@ -263,10 +263,6 @@ bool MfSoftEncoder::InitWithMft(IMFTransform* mft, const std::wstring& friendly,
         CodecApiSetUi4(codec_api.Get(), &CODECAPI_AVEncCommonRateControlMode,
                        eAVEncCommonRateControlMode_CBR, "rate_control_cbr_fallback");
       }
-      // GOP-in-seconds 显式归零:文档语义 0 = 使用 GOPSize。生产实测
-      // GOPSize=300 被编码器无视(~1 IDR/s 风暴;探针实测有效 GOP=90 帧),
-      // 显式声明"按帧数"可能恢复 300 帧周期。
-      CodecApiSetUi4(codec_api.Get(), &CODECAPI_AVEncMPVGOPSInSec, 0, "gop_in_sec");
     }
   }
 

@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -56,6 +57,7 @@ type Publisher struct {
 	stateMu   sync.Mutex
 	lastMono  uint64
 	started   bool // 连接后首个 key 帧已写出(viewer 可解码起点)
+	intervalStats frameIntervalStats
 }
 
 // RegisterDesktopCodecs 在 MediaEngine 上注册管线唯一的视频编解码
@@ -220,6 +222,9 @@ func (p *Publisher) WriteFrame(f Frame) error {
 		return nil
 	}
 	d := p.frameDuration(f.MonoUs)
+	if d > 0 && d <= time.Second {
+		p.intervalStats.add(d, p.log)
+	}
 	ws := time.Now()
 	if err := p.track.WriteSample(media.Sample{Data: f.AU, Duration: d}); err != nil {
 		return fmt.Errorf("desktop: write sample: %w", err)
@@ -235,6 +240,40 @@ func (p *Publisher) WriteFrame(f Frame) error {
 	p.stats.frames.Add(1)
 	p.stats.bytes.Add(uint64(len(f.AU)))
 	return nil
+}
+
+// frameIntervalStats 帧间隔分布诊断:播放节奏 = RTP 时间戳间隔 = mono 差,
+// 间隔抖动直接表现为播放速度不均(果冻感)。滑动窗口最近 300 帧,每 10s
+// 输出 min/avg/p50/p95/max——果冻感排查的确定性数据。
+type frameIntervalStats struct {
+	mu      sync.Mutex
+	vals    []time.Duration
+	lastLog time.Time
+}
+
+func (s *frameIntervalStats) add(d time.Duration, log *slog.Logger) {
+	s.mu.Lock()
+	s.vals = append(s.vals, d)
+	if len(s.vals) > 300 {
+		s.vals = s.vals[len(s.vals)-300:]
+	}
+	now := time.Now()
+	if now.Sub(s.lastLog) >= 10*time.Second && len(s.vals) >= 30 {
+		v := make([]time.Duration, len(s.vals))
+		copy(v, s.vals)
+		s.lastLog = now
+		s.mu.Unlock()
+		sort.Slice(v, func(i, j int) bool { return v[i] < v[j] })
+		var sum time.Duration
+		for _, x := range v {
+			sum += x
+		}
+		log.Info("desktop frame interval",
+			"n", len(v), "min", v[0].String(), "avg", (sum / time.Duration(len(v))).String(),
+			"p50", v[len(v)/2].String(), "p95", v[len(v)*95/100].String(), "max", v[len(v)-1].String())
+	} else {
+		s.mu.Unlock()
+	}
 }
 
 // frameDuration 推导本帧时长:mono 差直接采用,回退 DefaultDuration 仅在
