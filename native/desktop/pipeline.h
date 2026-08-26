@@ -24,7 +24,8 @@
 // has ~17 frames of startup lookahead, so the first submitted frame does not
 // emerge as an AU until ~17 inputs later. On a static screen (queue empty,
 // gated on a recent capture timeout) the ENCODE thread re-feeds the cached
-// base frame WITHOUT re-forcing the IDR until the first keyframe AU emerges
+// latest captured frame WITHOUT re-forcing the IDR until the first keyframe
+// AU emerges
 // (old timeout-path semantics, moved with the pacing). Bounds: at most
 // min(2 x lookahead window frames, 2 s at target fps) re-feeds; warm-up feed
 // counts are logged. ForceNextIdr is never called during warm-up (E2).
@@ -39,6 +40,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -98,6 +100,21 @@ inline uint32_t WarmupFeedBound(uint32_t fps) {
 // 请求最小间隔 500ms). The natural first IDR and rebuild forces are not
 // pipeline-initiated and are not throttled by this.
 inline constexpr uint64_t kIdrMinIntervalMs = 500;
+
+// Thread-safe, single-snapshot capture store used by idle re-encoding.
+// Update replaces the previous owned FrameBlob; Invalidate drops it across
+// capture rebuilds so no pre-reset pixels can be submitted afterward.
+class LatestFrameStore {
+ public:
+  void Update(const FrameBlob& f);
+  bool Snapshot(FrameBlob* out) const;
+  void Invalidate();
+
+ private:
+  mutable std::mutex mu_;
+  FrameBlob frame_;
+  bool valid_ = false;
+};
 
 // ---- rebuild-storm backoff (M2-Slice2 Task 1) ----
 // Same-reason CaptureReset executions >= kStormThreshold within

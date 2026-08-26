@@ -80,6 +80,17 @@ ParseOutcome Parse(const std::vector<std::wstring>& args) {
   return p;
 }
 
+xnc::FrameBlob MakeSolidFrame(uint64_t mono_us, uint8_t value) {
+  xnc::FrameBlob frame;
+  frame.bgra = {value, value, value, 0xFF};
+  frame.w = 1;
+  frame.h = 1;
+  frame.pixfmt = xnc::Pixfmt::kBgra;
+  frame.mono_us = mono_us;
+  frame.gpu_scale_us = 0;
+  return frame;
+}
+
 // Selftest-only fake backend: proves ICapture is implementable/abstract and
 // is reusable by Task 5's synthetic-capture pipeline tests.
 struct FakeCapture final : xnc::ICapture {
@@ -1590,6 +1601,15 @@ int SelftestMain() {
     CHECK("fc-double-rebuild-counts", c3.counters().rebuilds == 2);
     CHECK("fc-double-rebuild-one-reason", c3.TakePendingIdrReason() != nullptr &&
                                               c3.TakePendingIdrReason() == nullptr);
+  }
+  {
+    xnc::LatestFrameStore latest;
+    latest.Update(MakeSolidFrame(1, 0x11));
+    latest.Update(MakeSolidFrame(2, 0x22));
+    latest.Update(MakeSolidFrame(3, 0x33));
+    xnc::FrameBlob got;
+    CHECK("latest-frame-snapshot", latest.Snapshot(&got) &&
+                                       got.mono_us == 3 && got.bgra[0] == 0x33);
   }
   { // pipeline-decouple:FrameQueue 交接队列(有界深度 2,满则丢最旧保最新,
     // FIFO 顺序不重排;Shutdown 唤醒等待者且排空后才拒绝)

@@ -20,7 +20,7 @@
 //   dropped) -> sink->OnAu; no pacing beyond the queue (drop-oldest keeps
 //   the latest; under motion encode runs at encode speed, under static the
 //   queue is empty -> idle). While the queue is empty the warm-up / on-
-//   demand IDR re-feed of the cached base frame runs here (the old timeout-
+//   demand IDR re-feed of the latest captured frame runs here (the old timeout-
 //   path semantics, gated on a recent capture timeout so re-feeds still only
 //   happen on a static screen), and the merged IDR request (PendingIdrReason)
 //   is polled here (it owns the encoder). At run end the encode thread
@@ -28,7 +28,7 @@
 //   the lookahead window's AUs via FlushTail through the same shaping path.
 //
 // The FrameCache state machine is shared: capture thread counts captured/
-// timeouts and caches the base frame; encode thread counts encoded/warmup
+// timeouts and snapshots the latest frame; encode thread counts encoded/warmup
 // feeds and observes keyframes - all under one shared mutex (quick ops
 // only; the 17-20ms Encode call itself runs outside it).
 #ifndef WIN32_LEAN_AND_MEAN
@@ -53,6 +53,27 @@
 #include "pipeline.h"
 
 namespace xnc {
+
+void LatestFrameStore::Update(const FrameBlob& f) {
+  std::lock_guard<std::mutex> lk(mu_);
+  frame_ = f;
+  valid_ = true;
+}
+
+bool LatestFrameStore::Snapshot(FrameBlob* out) const {
+  if (out == nullptr) return false;
+  std::lock_guard<std::mutex> lk(mu_);
+  if (!valid_) return false;
+  *out = frame_;
+  return true;
+}
+
+void LatestFrameStore::Invalidate() {
+  std::lock_guard<std::mutex> lk(mu_);
+  frame_ = FrameBlob{};
+  valid_ = false;
+}
+
 namespace {
 
 uint64_t NowMs() { return GetTickCount64(); }
@@ -91,7 +112,7 @@ constexpr uint32_t kResetHardFailStreak = 3;
 // On-demand (subscriber-initiated) IDR state. "Armed" spans from the
 // ForceNextIdr call to the IDR AU actually emerging: while armed no new
 // request is honored (one in flight) and the timeout path re-feeds the
-// cached base frame, bounded like the initial warm-up and never re-forcing
+// latest captured frame, bounded like the initial warm-up and never re-forcing
 // (the force is one-shot and rides the FIRST submission after arming).
 struct OnDemandIdr {
   bool armed = false;
@@ -136,7 +157,8 @@ class FileAuSink final : public AuSink {
 // Everything the two threads must agree on lives here under ONE mutex:
 // the FrameCache state machine (capture thread: OnCapturedFrame/OnTimeout/
 // OnRebuild; encode thread: OnEncoded/OnWarmupFeed/OnKeyframeAu), the cached
-// base frame (capture writes on a new base, encode reads for re-feeds), the
+// latest captured frame (capture replaces it, encode snapshots it for
+// re-feeds), the
 // warm-up / on-demand counters, the encoder dims and the PipelineResult
 // fields. All lock hold times are microseconds - the encoder's Encode/Init
 // calls NEVER run under this mutex.
@@ -144,9 +166,7 @@ struct PipelineShared {
   std::mutex mu;
   FrameCache cache;
   PipelineResult* res = nullptr;  // every write happens under mu
-  std::vector<uint8_t> base;      // cached base frame (owned copy; re-feed source)
-  Pixfmt base_pixfmt = Pixfmt::kBgra;  // base's layout (NV12 on the GPU path)
-  uint64_t base_mono_us = 0;      // base frame capture timestamp (re-feeds)
+  LatestFrameStore latest;
   uint64_t warmup_started_ms = 0; // base submission time (2 s wall bound)
   uint32_t warmup_gen_feeds = 0;  // re-feeds this generation (rebuild resets)
   bool warmup_phase_logged = false;  // one warmup_done/exhausted log per gen
@@ -165,8 +185,7 @@ struct PipelineShared {
 // the end-to-end delay the decoupling removes (was ~acquire-wait + encode
 // serialized; now encode + handoff). Samples whose stamp is older than
 // kLatencyMaxUs are dropped: a stamp that old means the capture clock is not
-// the QPC wall clock (unit/fake captures) or a re-feed of a long-static base
-// frame - neither is a pipeline latency.
+// the QPC wall clock (unit/fake captures), so it is not pipeline latency.
 constexpr uint32_t kLatencyWindowFrames = 60;
 constexpr uint64_t kLatencyMaxUs = 60ull * 1000000ull;  // 60 s sanity bound
 struct LatencyWindow {
@@ -254,8 +273,8 @@ struct EncodeCtx {
 //   1. STATE "recovering" (recoverable): the pipe stays alive and the
 //      cursor/input threads (RtServer-owned) keep serving;
 //   2. rewind the stream state (FrameCache::OnRebuild -> WAIT_BASE_FRAME +
-//      one-shot "rebuild" IDR, base cleared, warm-up reset) so the encode
-//      thread stops re-feeding the old generation while the reset is in
+//      one-shot "rebuild" IDR, latest snapshot cleared, warm-up reset) so the
+//      encode thread stops re-feeding the old generation while the reset is in
 //      flight;
 //   3. while the desktop gate is non-DEFAULT (secure desktop up - T1
 //      evidence: re-duplication/init are DENIED 0x80070005 even as SYSTEM)
@@ -313,9 +332,7 @@ bool RunResetSequence(ResetSequence& s) {
   {
     std::lock_guard<std::mutex> lk(s.sh->mu);
     s.sh->cache.OnRebuild();  // WAIT_BASE_FRAME + one-shot "rebuild" IDR
-    s.sh->base.clear();
-    s.sh->base_pixfmt = Pixfmt::kBgra;
-    s.sh->base_mono_us = 0;
+    s.sh->latest.Invalidate();
     s.sh->warmup_started_ms = 0;
     s.sh->warmup_gen_feeds = 0;
     s.sh->warmup_phase_logged = false;
@@ -402,8 +419,8 @@ bool RunResetSequence(ResetSequence& s) {
 // re-feed): applies any pending one-shot IDR request (armed by a capture
 // rebuild - E2 contract: it rides the next submission exactly once and is
 // never re-armed), encodes, shapes and delivers every output AU to the
-// sink. mono_us is the capture timestamp of the submitted frame (the base
-// frame's for re-feeds) and stamps every AU of this submission. Runs on
+// sink. mono_us stamps every AU of this submission: real frames retain their
+// capture/push time and idle re-feeds use a fresh presentation time. Runs on
 // the ENCODE thread; enc_mu is held by the caller for the whole call (the
 // encoder + its SpsPps cache must stay consistent with the AU shaping).
 void ProcessFrame(EncodeCtx& ctx, const FrameBlob& f, bool warmup) {
@@ -479,7 +496,7 @@ void ProcessFrame(EncodeCtx& ctx, const FrameBlob& f, bool warmup) {
 // One-time warm-up outcome logs per generation (moved with the re-feed
 // logic from the old timeout path). Caller holds ctx.sh.mu.
 void PhaseOutcomeLogs(EncodeCtx& ctx) {
-  const bool have_base = !ctx.sh.cache.NeedsBaseFrame() && !ctx.sh.base.empty();
+  const bool have_base = !ctx.sh.cache.NeedsBaseFrame();
   if (!ctx.sh.warmup_phase_logged && have_base) {
     if (ctx.sh.cache.HaveKeyframe()) {
       ctx.sh.warmup_phase_logged = true;
@@ -533,7 +550,7 @@ void PollIdrRequest(EncodeCtx& ctx) {
 }
 
 // Encode thread's idle path (queue empty = static screen): the warm-up /
-// on-demand IDR re-feed of the cached base frame (old timeout-path
+// on-demand IDR re-feed of the latest captured frame (old timeout-path
 // semantics, spec §7.4/§7.5). Gated on a recent capture timeout so
 // re-feeds only happen on a static screen - under motion real frames flow
 // and the lookahead fills naturally. Re-feeds are paced to spf (old
@@ -557,13 +574,11 @@ bool IdleFeed(EncodeCtx& ctx) {
     ProcessFrame(ctx, f, false);
     return true;
   }
-  std::vector<uint8_t> base_copy;
-  uint64_t base_mono_us = 0;
-  Pixfmt base_pixfmt = Pixfmt::kBgra;
+  FrameBlob feed_frame;
   bool feed = false;
   {
     std::lock_guard<std::mutex> lk(ctx.sh.mu);
-    const bool have_base = !ctx.sh.cache.NeedsBaseFrame() && !ctx.sh.base.empty();
+    const bool have_base = !ctx.sh.cache.NeedsBaseFrame();
     // Old semantics: re-feeds only ever ran on the timeout path. Replicate
     // via the last-timeout gate instead of the (now capture-side) loop.
     const bool static_screen =
@@ -579,25 +594,20 @@ bool IdleFeed(EncodeCtx& ctx) {
     const bool ondemand_feed_ok =
         static_screen && have_base && ctx.sh.cache.HaveKeyframe() &&
         ctx.sh.ondemand.FeedAllowed(NowMs(), ctx.warmup_feed_bound);
-    if (warmup_feed_ok || ondemand_feed_ok) {
+    if ((warmup_feed_ok || ondemand_feed_ok) &&
+        ctx.sh.latest.Snapshot(&feed_frame)) {
       if (warmup_feed_ok) {
         ++ctx.sh.warmup_gen_feeds;
       } else {
         ++ctx.sh.ondemand.feeds;
       }
-      base_copy = ctx.sh.base;
-      base_mono_us = ctx.sh.base_mono_us;
-      base_pixfmt = ctx.sh.base_pixfmt;
       feed = true;
     } else {
       PhaseOutcomeLogs(ctx);
     }
   }
   if (!feed) return false;
-  FrameBlob feed_frame;
-  feed_frame.bgra = std::move(base_copy);
-  feed_frame.pixfmt = base_pixfmt;  // NV12 on the GPU path (encoder routing)
-  feed_frame.mono_us = base_mono_us;
+  feed_frame.mono_us = NowMonoUs();
   ProcessFrame(ctx, feed_frame, true);
   return true;
 }
@@ -741,15 +751,14 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
         Sleep(kIdleSleepMs);  // ride the debounce window
         continue;
       }
-      // Base-frame bookkeeping + cache under the shared lock: a new base
-      // frame refreshes the re-feed source and resets the warm-up counters.
+      // Capture bookkeeping + latest-frame snapshot under the shared lock:
+      // every accepted capture refreshes the idle re-feed source, while a
+      // new base resets the generation's warm-up counters.
       {
         std::lock_guard<std::mutex> lk(sh.mu);
         const bool is_base = sh.cache.OnCapturedFrame();  // captured++ inside
+        sh.latest.Update(blob);
         if (is_base) {
-          sh.base = blob.bgra;  // full frame: warm-up re-feed source
-          sh.base_pixfmt = blob.pixfmt;
-          sh.base_mono_us = blob.mono_us;
           res.width = blob.w;
           res.height = blob.h;
           sh.warmup_started_ms = 0;  // re-anchored at this generation's first submit
@@ -820,13 +829,11 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
     } else if (acq_err == "err_rebuilt") {
       // Backend rebuilt its duplication in place: rewind the state machine
       // (next frame is the new base, full readback) and arm the one-shot
-      // "rebuild" IDR; the old cached base frame is invalid across rebuild.
+      // "rebuild" IDR; the old latest snapshot is invalid across rebuild.
       {
         std::lock_guard<std::mutex> lk(sh.mu);
         sh.cache.OnRebuild();
-        sh.base.clear();
-        sh.base_pixfmt = Pixfmt::kBgra;
-        sh.base_mono_us = 0;
+        sh.latest.Invalidate();
         sh.warmup_started_ms = 0;
         sh.warmup_gen_feeds = 0;
         sh.warmup_phase_logged = false;
