@@ -13,8 +13,11 @@
 #
 #   xnc-desktop.exe --console-diag [--desktop-pipeline-v2] --fps F
 #                   --duration D --out <run>\capture.h264
-#                   --pipe <run pipe> --secret <run secret> --log-file <run>\native.log
+#                   --pipe \\.\pipe\<run pipe> --secret <run secret>
+#                   --log-file <run>\native.log
 #     = capture pipeline + stats.json sidecar + live rt subscribers
+#     (--pipe MUST be the full \\.\pipe\... path: the native feeds it
+#     verbatim to CreateNamedPipeW - fix round 2)
 #   collect-metrics.ps1 -TargetPid <native pid>   (CPU%/working-set JSONL)
 #   e2eviewer.exe -direct-pipe ... per event      (viewer/pli/burst/reconnect)
 #   desktopreport.exe from-diag|verify|merge      (post-processing, in-shell)
@@ -126,7 +129,13 @@ $resultPath    = Join-Path $runFull "runresult.json"
 $tablePath     = Join-Path $runFull "table.md"
 $e2eExe        = Join-Path $runFull "e2eviewer.exe"
 $reportExe     = Join-Path $runFull "desktopreport.exe"
-$pipeName      = "xnc-desktop-soak-" + $ts
+# Fix round 2: the FULL \\.\pipe\... path, not a bare name. RtServer::Start
+# feeds --pipe verbatim to CreateNamedPipeW, which rejects a bare name with
+# err=123 (ERROR_INVALID_NAME) - the rt server then never starts and every
+# soak reads NO-EVIDENCE/FAIL (differential proof: artifacts\desktop-media\
+# pipecheck\check3.ps1). e2eviewer's -direct-pipe also takes the full path
+# (its bare-name normalization is a shell-convenience only).
+$pipeName      = "\\.\pipe\xnc-desktop-soak-" + $ts
 
 # ---- machine metadata (read-only CIM; fills the RunResult identity fields) --
 
@@ -337,12 +346,12 @@ try {
     Write-Host ("native pid {0}" -f $nativePid)
 
     # 2. Wait for the rt pipe (bounded 15s; no pipe = no viewers).
-    $pipePath = "\\.\pipe\" + $pipeName
+    # $pipeName is already the full \\.\pipe\... path (fix round 2).
     $pipeReady = $false
     $deadline = [DateTime]::UtcNow.AddSeconds(15)
     while ([DateTime]::UtcNow -lt $deadline) {
         if ($nativeProc.HasExited) { break }
-        if (Test-Path -LiteralPath $pipePath) { $pipeReady = $true; break }
+        if (Test-Path -LiteralPath $pipeName) { $pipeReady = $true; break }
         Start-Sleep -Milliseconds 200
     }
     if (-not $pipeReady) {
