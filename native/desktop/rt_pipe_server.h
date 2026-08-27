@@ -111,6 +111,7 @@ namespace xnc {
 
 class InputManager;   // input_manager.h (opts pointers only in this header)
 class CursorManager;  // cursor_manager.h
+class MediaPipelineV2;  // media_pipeline_v2.h (ServeV2 takes it by capture seam)
 
 // ---- message types (plan Task 2; 0x0100/0x0101 are core's capture RPCs) ----
 constexpr uint16_t kMsgAttach = 0x0102, kMsgDetach = 0x0103, kMsgKeyframeReq = 0x0104,
@@ -755,6 +756,15 @@ class RtServer : public AuSink {
   // CLI convenience: Start -> Pipeline::Run (this as sink; Ctrl+C ->
   // RequestStop via the console handler; runs until stopped) -> Shutdown.
   int Serve(ICapture& capture, MfSoftEncoder& encoder, const Opts& o);
+
+  // M2 Task 4: Serve on the depth-one GPU media pipeline instead of the M0
+  // two-thread Pipeline. Same contract (Start -> MediaPipelineV2 loop with
+  // this as sink -> Stop -> Shutdown; Ctrl+C stops it); `cap` supplies
+  // Rebuild/Width/Height for the reset path and `surf` the AcquireSurface
+  // seam (the real backends implement both on one object). Both pipelines
+  // publish the same shaped EncodedAU through OnAu - the wire flavor is
+  // still Opts.pipeline_v2.
+  int ServeV2(ICapture& cap, ICaptureSurface& surf, const Opts& o);
 
   // Idempotent: stops the accept loop, broadcasts STATE{stream_end} to the
   // attached subscribers, cancels their IO, joins every connection thread.

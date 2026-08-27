@@ -36,6 +36,7 @@
 #include "../common/log.h"
 #include "cursor_manager.h"
 #include "input_manager.h"
+#include "media_pipeline_v2.h"  // M2 Task 4: ServeV2's engine
 
 namespace xnc {
 namespace {
@@ -303,6 +304,56 @@ int RtServer::Serve(ICapture& cap, MfSoftEncoder& enc, const Opts& o) {
                static_cast<unsigned long long>(c.timeouts),
                static_cast<unsigned long long>(c.warmup_feeds), c.rebuilds,
                static_cast<unsigned long long>(res.aus_written), res.ok ? 1 : 0);
+  return res.ok ? 0 : 1;
+}
+
+// M2 Task 4: the real-time mode on the depth-one GPU media pipeline. Same
+// shape as Serve above (adopt an already-started server, console Ctrl+C
+// stops the loop, Shutdown drains); the single media loop thread owns
+// capture -> convert -> encode and publishes through OnAu exactly like the
+// M0 encode thread did, so subscribers see the identical wire traffic.
+int RtServer::ServeV2(ICapture& cap, ICaptureSurface& surf, const Opts& o) {
+  if (!started_) {
+    if (!Start(o, cap.Width(), cap.Height())) return 1;
+  }
+  g_active_rt.store(this);
+  SetConsoleCtrlHandler(OnRtCtrlEvent, TRUE);
+  XNC_LOG_INFO("console_rt_v2_start pipe=%ls fps=%u bitrate=%u max_subs=%u w=%u h=%u",
+               o.pipe_name.c_str(), o.fps, o.bitrate_bps, o.max_subs,
+               cap.Width(), cap.Height());
+
+  MediaPipelineV2::Config cfg;
+  cfg.cap = &cap;
+  cfg.surf = &surf;
+  cfg.sink = this;
+  cfg.fps = o.fps;
+  cfg.bitrate_bps = o.bitrate_bps;
+  cfg.duration_s = 0;  // until Ctrl+C / RequestStop
+  cfg.stop = &stop_;
+  cfg.desktop_name_fn = o.desktop_name_fn;  // DesktopWatch beat (M2-S1 T1)
+  cfg.desktop_name_ctx = o.desktop_name_ctx;
+  cfg.reset = o.reset;  // unified CaptureReset (M2-S1 T2)
+  MediaPipelineV2 pipe;
+  MediaPipelineV2::Result res;
+  if (pipe.Start(cfg)) {
+    while (pipe.running() && !stop_.load()) Sleep(100);
+    res = pipe.Stop();
+  } else {
+    res.ok = false;
+    res.err = "media pipeline v2 start failed: " + pipe.start_error();
+  }
+
+  SetConsoleCtrlHandler(OnRtCtrlEvent, FALSE);
+  g_active_rt.store(nullptr);
+  Shutdown();
+  XNC_LOG_INFO("console_rt_v2_stop captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu resets=%u aus=%llu ok=%d backend=%s",
+               static_cast<unsigned long long>(res.captured),
+               static_cast<unsigned long long>(res.encoded),
+               static_cast<unsigned long long>(res.keyframes),
+               static_cast<unsigned long long>(res.timeouts),
+               static_cast<unsigned long long>(res.warmup_feeds), res.resets,
+               static_cast<unsigned long long>(res.aus_written), res.ok ? 1 : 0,
+               res.encoder_backend);
   return res.ok ? 0 : 1;
 }
 

@@ -114,10 +114,16 @@ class ICapture {
 // Snapshot()-leased texture may belong to a dead device - the unified
 // CaptureReset (M2-S1) owns the retry that re-Inits it.
 //
-// Threading: the CAPTURE thread drives AcquireSurface (the M2 Task 4
-// wiring), one call at a time per backend - the same single-thread
-// contract as ICapture. timeout_ms mirrors ICapture::Acquire (0 = the
-// backend default; bounds the block for one new frame).
+// Threading (M2 Task 4 ruling 4): under MediaPipelineV2 the MEDIA GPU
+// thread drives AcquireSurface - its single loop owns capture, the
+// LatestSurface copy, the VideoProcessor conversion and the encoder
+// Submit, so "the capture thread" and "the media GPU thread" are the SAME
+// thread (this is how this note and gpu_surface.h's single-thread
+// contract align). One call at a time per backend either way. The M0
+// pipeline's two-thread shape (a capture thread producing FrameBlobs over
+// ICapture::Acquire, a separate encode thread) is the LEGACY configuration
+// - it never touches this interface. timeout_ms mirrors ICapture::Acquire
+// (0 = the backend default; bounds the block for one new frame).
 enum class CaptureStatus : uint8_t {
   kFrame = 0,       // changed: new content copied + the given identity stamped
   kNoChange = 1,    // static screen / cursor-only: surface + identity untouched

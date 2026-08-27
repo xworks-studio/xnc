@@ -39,7 +39,11 @@
 //     lookahead tail) until an epoch pair NEWER than the rebuild floor
 //     (the last pair the server fanned out pre-rebuild) publishes - which
 //     then takes the 0x020B discontinuity path (spec 10.2: old epochs
-//     never publish again after the rebuild);
+//     never publish again after the rebuild). M1-deferred convergence
+//     note: a subscriber ATTACHING between the OnState(capture_rebuilt)
+//     broadcast and the first new-epoch AU has no floor yet and may
+//     briefly adopt an old-epoch tail IDR; the 0x020B that rides the
+//     epoch advance drains it - convergence is guaranteed either way;
 //   - kPaused is reserved (spec 12.3 tab-hidden/explicit pause; no pipe
 //     message drives it yet);
 //   - PushAuV2 never blocks: the key path displaces stale deltas instead

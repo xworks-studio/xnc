@@ -46,14 +46,16 @@
 #include "desktop_watch.h"  // DesktopWatch (M2-Slice1 Task 1/2)
 #include "diag.h"
 #include "dxgi_capture.h"  // DxgiErrIsDesktopAccessDenied
+#include "gdi_capture.h"  // TryCreateGdiCapture (M2 T4 v2 backend)
 #include "input_manager.h"  // InputManager (M1-Slice3)
 #include "jpeg_wic.h"      // DownscaleBgra / WicEncodeJpeg (M2-Slice3 T3)
+#include "media_pipeline_v2.h"  // MediaPipelineV2 (M2 Task 4)
 #include "mf_encoder.h"    // MfSoftEncoder
 #include "pipeline.h"      // Pipeline::Run + stats.json sidecar
 #include "rt_pipe_server.h"  // RtServer (real-time fan-out)
 #include "scaled_capture.h"  // ScaledCapture (--max-w rt/diag downscale)
 
-int SelftestMain();  // desktop_selftest.cpp
+int SelftestMain(bool desktop_pipeline_v2);  // desktop_selftest.cpp
 
 namespace xnc {
 
@@ -65,6 +67,28 @@ namespace xnc {
 // (over-long values are ignored - never parsed) and the logging.
 bool ParsePipelineV2Env(const char* v) {
   return v != nullptr && (_stricmp(v, "1") == 0 || _stricmp(v, "true") == 0);
+}
+
+// M2 Task 4 (ruling 1): the NEW CLI flag --desktop-pipeline-v2 selects
+// MediaPipelineV2 AND the v2 wire TOGETHER (selftest/diag lever; the env
+// XNC_DESKTOP_PIPELINE_V2 is the production switch). ParseDiagArgs's
+// DiagOptions has no field for it, so wmain strips it from argv BEFORE
+// parsing and threads the boolean through the mode entry points. Pure
+// (compacts argv[1..argc) in place, NUL-terminated pointers only) so the
+// selftest can pin the strip matrix. Returns how many were removed.
+int StripDesktopPipelineV2Flag(int* argc, wchar_t** argv) {
+  if (argc == nullptr || argv == nullptr) return 0;
+  int removed = 0;
+  int out = 1;  // argv[0] stays
+  for (int i = 1; i < *argc; ++i) {
+    if (std::wcscmp(argv[i], L"--desktop-pipeline-v2") == 0) {
+      ++removed;
+      continue;
+    }
+    argv[out++] = argv[i];
+  }
+  *argc = out;
+  return removed;
 }
 
 }  // namespace xnc
@@ -225,6 +249,14 @@ void Usage(FILE* out) {
       L"                  before encode (rt fluency fix - encoder Init and\n"
       L"                  HOST_HELLO carry the scaled dims)\n"
       L"  --selftest      arg parsing + FrameBlob/encoder/pipeline/rt selftest\n"
+      L"                  (--selftest --desktop-pipeline-v2 additionally runs\n"
+      L"                  the MediaPipelineV2 scenarios)\n"
+      L"  --desktop-pipeline-v2  select the M2 depth-one GPU media pipeline\n"
+      L"                  AND the v2 media wire TOGETHER (default off = the\n"
+      L"                  M0 pipeline; the env XNC_DESKTOP_PIPELINE_V2 is the\n"
+      L"                  production switch, the CLI flag the selftest/diag\n"
+      L"                  lever). Falls back to the M0 pipeline when the\n"
+      L"                  surface backend cannot start\n"
       L"  --help          this usage text\n"
       L"desktop watch: always on - the secure-desktop observer runs in every\n"
       L"                mode (there is no --desktop-watch flag); it gates the\n"
@@ -485,7 +517,143 @@ bool ParseDiagArgs(int argc, wchar_t** argv, DiagOptions* opt, std::wstring* err
 
 namespace {
 
-int RunConsoleDiag(const xnc::DiagOptions& opt) {
+// M2 Task 4: --console-diag on the depth-one GPU media pipeline. The direct
+// ICaptureSurface backend + the single media loop replace the M0 two-thread
+// pipeline; the file dump (and the optional rt server) are plain AuSinks of
+// the same shaped AUs. Any startup failure returns non-zero AFTER the
+// stats.json sidecar (same "every diag run leaves a sidecar" contract).
+int RunConsoleDiagV2(const xnc::DiagOptions& opt, FILE* out, xnc::ICapture* cap,
+                     xnc::ICaptureSurface* surf, xnc::DesktopWatch* watch,
+                     xnc::CaptureReset* reset, bool force_software) {
+  uint32_t w = cap->Width(), h = cap->Height();
+  if (opt.max_width > 0) {  // stream dims = the VideoProcessor output space
+    uint32_t sw = 0, sh = 0;
+    if (xnc::GpuScaledDims(w, h, xnc::Rotate::kNone, opt.max_width, &sw, &sh)) {
+      w = sw;
+      h = sh;
+    }
+  }
+  const auto fail_result = [](const char* why) {
+    xnc::PipelineResult r;
+    r.ok = false;
+    r.err = why;
+    return r;
+  };
+  const auto write_stats = [&opt, &w, &h](const xnc::PipelineResult& r) {
+    xnc::PipelineOpts po;
+    po.duration_s = opt.duration_s;
+    po.fps = opt.fps;
+    po.target_bitrate_bps = xnc::BitrateForDims(w, h);
+    std::wstring serr;
+    if (!xnc::WriteStatsJson(opt.out_path, r, po, &serr))
+      XNC_LOG_ERROR("stats_json_write_failed err=\"%ls\"", serr.c_str());
+  };
+  if ((w % 2) != 0 || (h % 2) != 0) {  // NV12 pool needs even dims
+    XNC_LOG_ERROR("console_diag_v2 odd dims w=%u h=%u (nv12 requires even)", w, h);
+    write_stats(fail_result("media_v2_odd_dims"));
+    std::fclose(out);
+    return 1;
+  }
+  const uint32_t bitrate_bps = xnc::BitrateForDims(w, h);
+  XNC_LOG_INFO("console_diag_v2 w=%u h=%u bitrate=%u fps=%u max_w=%u", w, h,
+               bitrate_bps, opt.fps, opt.max_width);
+
+  // Optional rt server on the same run (the M0 wiring shape: one run, two
+  // sinks via the Tee).
+  xnc::RtServer rt;
+  std::unique_ptr<xnc::InputManager> input;
+  std::unique_ptr<xnc::CursorManager> cursor;
+  const bool rt_extra = !opt.secret.empty() && !opt.pipe_name.empty();
+  if (rt_extra) {
+    xnc::InputManager::Opts iopt;
+    iopt.hello_w = w;
+    iopt.hello_h = h;
+    input = std::make_unique<xnc::InputManager>(iopt);
+    xnc::CursorManager::Opts copt;
+    copt.hello_w = w;
+    copt.hello_h = h;
+    cursor = std::make_unique<xnc::CursorManager>(copt);
+    xnc::RtServer::Opts ro;
+    ro.pipe_name = opt.pipe_name;
+    ro.secret = opt.secret.data();
+    ro.secret_len = opt.secret.size();
+    ro.max_subs = opt.max_subs;
+    ro.fps = opt.fps;
+    ro.bitrate_bps = bitrate_bps;
+    ro.input = input.get();
+    ro.cursor = cursor.get();
+    ro.pipeline_v2 = true;  // ruling 1: v2 pipeline => v2 wire
+    ro.reset = reset;
+    ro.displays_fn = [](void*) { return xnc::DxgiDisplaysSnapshot(); };
+    ro.switch_display_fn = [](void*, uint32_t idx) { return xnc::DxgiSelectDisplay(idx); };
+    input->StartJanitor();
+    if (!rt.Start(ro, w, h)) {
+      write_stats(fail_result("rt_server_start_failed"));
+      std::fclose(out);
+      return 1;
+    }
+  }
+  xnc::MediaFileSink file_sink(out);
+  xnc::TeeAuSink tee(&file_sink, &rt);
+  xnc::MediaPipelineV2::Config cfg;
+  cfg.cap = cap;
+  cfg.surf = surf;
+  cfg.sink = rt_extra ? static_cast<xnc::AuSink*>(&tee)
+                      : static_cast<xnc::AuSink*>(&file_sink);
+  cfg.fps = opt.fps;
+  cfg.bitrate_bps = bitrate_bps;
+  cfg.duration_s = opt.duration_s;
+  cfg.max_width = opt.max_width;
+  cfg.force_software_encoder = force_software;
+  cfg.desktop_name_fn = &DesktopNameThunk;
+  cfg.desktop_name_ctx = watch;
+  cfg.reset = reset;
+
+  xnc::MediaPipelineV2 pipe;
+  xnc::MediaPipelineV2::Result res;
+  if (pipe.Start(cfg)) {
+    while (pipe.running()) Sleep(100);
+    res = pipe.Stop();
+  } else {
+    res.ok = false;
+    res.err = "media pipeline v2 start failed: " + pipe.start_error();
+  }
+  if (rt_extra) {
+    rt.Shutdown();
+    input->StopJanitor();
+  }
+
+  // stats.json sidecar (the M0 writer, field-mapped).
+  xnc::PipelineResult pr;
+  pr.ok = res.ok;
+  pr.err = res.err;
+  pr.width = res.width != 0 ? res.width : w;
+  pr.height = res.height != 0 ? res.height : h;
+  pr.counters.captured = res.captured;
+  pr.counters.encoded = res.encoded;
+  pr.counters.keyframes = res.keyframes;
+  pr.counters.timeouts = res.timeouts;
+  pr.counters.warmup_feeds = res.warmup_feeds;
+  pr.counters.rebuilds = res.rebuilds;
+  pr.aus_written = res.aus_written;
+  pr.bytes_written = res.bytes_written;
+  pr.resets = res.resets;
+  xnc::CopyReason(pr.last_reset_reason, sizeof(pr.last_reset_reason),
+                  res.last_reset_reason);
+  write_stats(pr);
+  XNC_LOG_INFO("console_diag_v2_stop duration=%us captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu resets=%u aus=%llu ok=%d backend=%s",
+               opt.duration_s, static_cast<unsigned long long>(res.captured),
+               static_cast<unsigned long long>(res.encoded),
+               static_cast<unsigned long long>(res.keyframes),
+               static_cast<unsigned long long>(res.timeouts),
+               static_cast<unsigned long long>(res.warmup_feeds), res.resets,
+               static_cast<unsigned long long>(res.aus_written), res.ok ? 1 : 0,
+               res.encoder_backend);
+  std::fclose(out);
+  return res.ok ? 0 : 1;
+}
+
+int RunConsoleDiag(const xnc::DiagOptions& opt, bool desktop_pipeline_v2) {
   FILE* out = nullptr;
   const errno_t open_err = _wfopen_s(&out, opt.out_path.c_str(), L"wb");
   if (open_err != 0 || !out) {
@@ -530,6 +698,32 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
     r.err = why;
     return r;
   };
+
+  // M2 Task 4 (ruling 1): --desktop-pipeline-v2 / XNC_DESKTOP_PIPELINE_V2
+  // select the depth-one GPU media pipeline + the v2 wire TOGETHER. The V2
+  // path needs an ICaptureSurface backend - the backend ladder does not
+  // expose one, so a direct DXGI/GDI backend is constructed. Any failure
+  // here falls back to the M0 pipeline below (rollback guarantee); with the
+  // env flag set that fallback is exactly the M1 shape: v1 pipeline + v2
+  // wire.
+  const bool v2_env = DesktopPipelineV2Enabled();
+  if (desktop_pipeline_v2 || v2_env) {
+    std::string v2_err;
+    std::unique_ptr<xnc::ICapture> v2_cap =
+        opt.backend == xnc::DiagBackend::kGdi
+            ? xnc::TryCreateGdiCapture(&v2_err)
+            : xnc::TryCreateDxgiCapture(&v2_err);
+    xnc::ICaptureSurface* v2_surf =
+        v2_cap ? dynamic_cast<xnc::ICaptureSurface*>(v2_cap.get()) : nullptr;
+    if (v2_cap && v2_surf) {
+      return RunConsoleDiagV2(opt, out, v2_cap.get(), v2_surf, &watch,
+                              &capture_reset,
+                              opt.encoder == xnc::DiagEncoder::kSoftware);
+    }
+    XNC_LOG_ERROR("desktop_pipeline_v2 backend unavailable err=\"%s\" - "
+                  "falling back to the M0 pipeline",
+                  v2_err.c_str());
+  }
 
   // M2-Slice1 Task 3: the backend ladder IS the capture. DXGI is the
   // default rung; GDI joins via --backend gdi / XNC_FORCE_BACKEND=gdi, a
@@ -628,7 +822,7 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
     ro.bitrate_bps = bitrate_bps;
     ro.input = input.get();
     ro.cursor = cursor.get();
-    ro.pipeline_v2 = DesktopPipelineV2Enabled();  // M1 Task 2 env gate
+    ro.pipeline_v2 = v2_env || desktop_pipeline_v2;  // M1 env gate (+M2 T4 CLI)
     // M2-S3 Task 5: 0x0128 switch + HOST_HELLO displays[].
     ro.displays_fn = [](void*) { return xnc::DxgiDisplaysSnapshot(); };
     ro.switch_display_fn = [](void*, uint32_t idx) { return xnc::DxgiSelectDisplay(idx); };
@@ -665,7 +859,7 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
 // path (0x0108 -> SendInput, stuck-key janitor) and the cursor channel
 // (GetCursorInfo -> 0x0109) on the same server. Capture/encoder init
 // failures mirror the diag markers (no stats.json in this mode).
-int RunConsoleRt(const xnc::DiagOptions& opt) {
+int RunConsoleRt(const xnc::DiagOptions& opt, bool desktop_pipeline_v2) {
   XNC_LOG_INFO("console_rt_boot pipe=%ls max_subs=%u fps=%u",
                opt.pipe_name.c_str(), opt.max_subs, opt.fps);
   // M2-Slice1 Task 1/2 + 3: desktop watch + unified reset + backend ladder
@@ -676,6 +870,69 @@ int RunConsoleRt(const xnc::DiagOptions& opt) {
   xnc::CaptureReset capture_reset(ResetOptsFor(&wiring));
   wiring.watch = &watch;
   wiring.reset = &capture_reset;
+
+  // M2 Task 4 (ruling 1): the depth-one GPU media pipeline + the v2 wire
+  // together when the CLI flag or the env gate selects them. Same fallback
+  // contract as the diag mode: a backend that cannot start (session 0, GDI
+  // refused, odd dims) falls through to the M0 pipeline below - which with
+  // the env flag set is exactly the M1 shape (v1 pipeline + v2 wire).
+  const bool v2_env = DesktopPipelineV2Enabled();
+  if (desktop_pipeline_v2 || v2_env) {
+    std::string v2_err;
+    std::unique_ptr<xnc::ICapture> v2_cap =
+        opt.backend == xnc::DiagBackend::kGdi
+            ? xnc::TryCreateGdiCapture(&v2_err)
+            : xnc::TryCreateDxgiCapture(&v2_err);
+    xnc::ICaptureSurface* v2_surf =
+        v2_cap ? dynamic_cast<xnc::ICaptureSurface*>(v2_cap.get()) : nullptr;
+    uint32_t sw = v2_cap ? v2_cap->Width() : 0, sh = v2_cap ? v2_cap->Height() : 0;
+    if (opt.max_width > 0 && sw != 0) {
+      uint32_t dw = 0, dh = 0;
+      if (xnc::GpuScaledDims(sw, sh, xnc::Rotate::kNone, opt.max_width, &dw, &dh)) {
+        sw = dw;
+        sh = dh;
+      }
+    }
+    const bool v2_dims_ok = sw != 0 && (sw % 2) == 0 && (sh % 2) == 0;
+    if (v2_cap && v2_surf && v2_dims_ok) {
+      const uint32_t bitrate_bps = xnc::BitrateForDims(sw, sh);
+      XNC_LOG_INFO("console_rt_v2_bitrate w=%u h=%u bitrate=%u", sw, sh,
+                   bitrate_bps);
+      xnc::InputManager::Opts iopt;
+      iopt.hello_w = sw;
+      iopt.hello_h = sh;
+      xnc::InputManager input(iopt);
+      input.StartJanitor();
+      xnc::CursorManager::Opts copt;
+      copt.hello_w = sw;
+      copt.hello_h = sh;
+      xnc::CursorManager cursor(copt);
+      xnc::RtServer::Opts ro;
+      ro.pipe_name = opt.pipe_name;
+      ro.secret = opt.secret.data();
+      ro.secret_len = opt.secret.size();
+      ro.max_subs = opt.max_subs;
+      ro.fps = opt.fps;
+      ro.bitrate_bps = bitrate_bps;
+      ro.input = &input;
+      ro.cursor = &cursor;
+      ro.pipeline_v2 = true;  // ruling 1: v2 pipeline => v2 wire
+      watch.Start();
+      ro.desktop_name_fn = &DesktopNameThunk;
+      ro.desktop_name_ctx = &watch;
+      ro.reset = &capture_reset;
+      ro.displays_fn = [](void*) { return xnc::DxgiDisplaysSnapshot(); };
+      ro.switch_display_fn = [](void*, uint32_t idx) { return xnc::DxgiSelectDisplay(idx); };
+      xnc::RtServer server;
+      const int rc = server.ServeV2(*v2_cap, *v2_surf, ro);
+      watch.Stop();
+      input.StopJanitor();  // ReleaseAll already ran in RtServer::Shutdown
+      return rc;
+    }
+    XNC_LOG_ERROR("desktop_pipeline_v2 backend unavailable err=\"%s\" dims=%ux%u - "
+                  "falling back to the M0 pipeline",
+                  v2_err.c_str(), sw, sh);
+  }
 
   xnc::LadderOpts lopt = LadderOptsFor(opt);
   lopt.reset = &capture_reset;
@@ -747,7 +1004,7 @@ int RunConsoleRt(const xnc::DiagOptions& opt) {
   ro.bitrate_bps = bitrate_bps;
   ro.input = &input;
   ro.cursor = &cursor;
-  ro.pipeline_v2 = DesktopPipelineV2Enabled();  // M1 Task 2 env gate
+  ro.pipeline_v2 = v2_env || desktop_pipeline_v2;  // M1 env gate (+M2 T4 CLI)
   // M2-Slice1 Task 1/2: DesktopWatch + unified CaptureReset (RtServer::Serve
   // forwards both into PipelineOpts; the wiring pair was built above so the
   // ladder could bind the same coordinator).
@@ -909,6 +1166,13 @@ int RunJpegSingle(const xnc::DiagOptions& opt) {
 
 int wmain(int argc, wchar_t** argv) {
   xnc::SetLogProcessName("desktop");
+  // M2 Task 4: strip --desktop-pipeline-v2 BEFORE parsing (ruling 1 - the
+  // flag is valid in every mode and threads through as a boolean).
+  const int v2_flags = xnc::StripDesktopPipelineV2Flag(&argc, argv);
+  const bool desktop_pipeline_v2 = v2_flags > 0;
+  if (v2_flags > 1)
+    XNC_LOG_INFO("desktop_pipeline_v2 flag repeated %d times (idempotent)",
+                 v2_flags);
   xnc::DiagOptions opt;
   std::wstring err;
   if (!xnc::ParseDiagArgs(argc, argv, &opt, &err)) {
@@ -927,7 +1191,7 @@ int wmain(int argc, wchar_t** argv) {
     std::string narrow(opt.log_file.begin(), opt.log_file.end());
     xnc::SetLogFile(narrow.c_str());
   }
-  if (opt.selftest) return SelftestMain();
+  if (opt.selftest) return SelftestMain(desktop_pipeline_v2);
   if (opt.secret_stdin) {
     // Service path: the secret enters via stdin, never argv (spec 1.5).
     // The parser guarantees --secret-stdin only survives when a mode that
@@ -938,7 +1202,7 @@ int wmain(int argc, wchar_t** argv) {
       return 2;
     }
   }
-  if (opt.console_rt) return RunConsoleRt(opt);
+  if (opt.console_rt) return RunConsoleRt(opt, desktop_pipeline_v2);
   if (opt.jpeg_single) return RunJpegSingle(opt);
-  return RunConsoleDiag(opt);
+  return RunConsoleDiag(opt, desktop_pipeline_v2);
 }

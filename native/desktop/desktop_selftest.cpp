@@ -52,6 +52,7 @@
 #include "mf_decoder_probe.h"  // Task 5 m0: test-only decode-to-luma-hash probe
 #include "mf_encoder.h"
 #include "mf_gpu_encoder.h"  // M2 Task 3: IEncoderSession + both rungs
+#include "media_pipeline_v2.h"  // M2 Task 4: depth-one GPU media pipeline
 #include "nv12.h"
 #include "pipeline.h"
 #include "rt_pipe_server.h"
@@ -65,6 +66,9 @@ namespace xnc {
 // ruling 1d extracted it from DesktopPipelineV2Enabled; startup-only gate,
 // no shared header - both TUs link into the same exe).
 bool ParsePipelineV2Env(const char* v);
+// M2 Task 4: the --desktop-pipeline-v2 argv stripper (wmain calls it
+// before ParseDiagArgs; pure so this table pins it without re-execing).
+int StripDesktopPipelineV2Flag(int* argc, wchar_t** argv);
 }  // namespace xnc
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -80,6 +84,8 @@ bool ParsePipelineV2Env(const char* v);
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -1830,7 +1836,47 @@ std::unique_ptr<xnc::ICapture> LdMakeGdi(uint32_t max_w, std::string* err) {
 
 }  // namespace
 
-int SelftestMain() {
+int SelftestMain(bool desktop_pipeline_v2) {
+  if (desktop_pipeline_v2)
+    std::printf("SELFTEST NOTE: --desktop-pipeline-v2: MediaPipelineV2 "
+                "scenarios ON\n");
+  { // M2 Task 4: the --desktop-pipeline-v2 argv stripper (pure matrix).
+    const std::vector<std::wstring> args = {L"--selftest",
+                                            L"--desktop-pipeline-v2"};
+    std::vector<wchar_t*> argv;
+    argv.push_back(const_cast<wchar_t*>(L"xnc-desktop.exe"));
+    for (const auto& a : args) argv.push_back(const_cast<wchar_t*>(a.c_str()));
+    int argc = static_cast<int>(argv.size());
+    CHECK("v2-strip-removes",
+          xnc::StripDesktopPipelineV2Flag(&argc, argv.data()) == 1 &&
+              argc == 2 && std::wcscmp(argv[1], L"--selftest") == 0);
+    CHECK("v2-strip-idempotent",
+          xnc::StripDesktopPipelineV2Flag(&argc, argv.data()) == 0 && argc == 2);
+    // Absent flag: nothing stripped, order preserved.
+    const std::vector<std::wstring> args2 = {L"--console-rt", L"--fps",
+                                             L"15"};
+    std::vector<wchar_t*> argv2;
+    argv2.push_back(const_cast<wchar_t*>(L"xnc-desktop.exe"));
+    for (const auto& a : args2) argv2.push_back(const_cast<wchar_t*>(a.c_str()));
+    int argc2 = static_cast<int>(argv2.size());
+    CHECK("v2-strip-absent",
+          xnc::StripDesktopPipelineV2Flag(&argc2, argv2.data()) == 0 &&
+              argc2 == 4 && std::wcscmp(argv2[3], L"15") == 0);
+    // Flag among others keeps the rest in order.
+    const std::vector<std::wstring> args3 = {L"--fps", L"--desktop-pipeline-v2",
+                                             L"30", L"--desktop-pipeline-v2"};
+    std::vector<wchar_t*> argv3;
+    argv3.push_back(const_cast<wchar_t*>(L"xnc-desktop.exe"));
+    for (const auto& a : args3) argv3.push_back(const_cast<wchar_t*>(a.c_str()));
+    int argc3 = static_cast<int>(argv3.size());
+    CHECK("v2-strip-keeps-order",
+          xnc::StripDesktopPipelineV2Flag(&argc3, argv3.data()) == 2 &&
+              argc3 == 3 && std::wcscmp(argv3[1], L"--fps") == 0 &&
+              std::wcscmp(argv3[2], L"30") == 0);
+    // End-to-end shape: the stripped argv parses as the plain mode.
+    ParseOutcome po = Parse({L"--selftest"});
+    CHECK("v2-strip-parse", po.ok && po.opt.selftest);
+  }
   { // M1 Task 1: immutable frame identity - compile-time field order plus
     // the monotonicity ledger's accept/reject rules (spec §5.1/§5.3).
     // The first three checks are the plan's binding test vector.
@@ -7918,6 +7964,754 @@ int SelftestMain() {
                   (unsigned long long)st.keys_enqueued,
                   (unsigned long long)st.frames_dropped_needkey,
                   a.saw_stream_end_ ? 1 : 0);
+    }
+  }
+  // ---- M2 Task 4: MediaPipelineV2 (depth-one GPU media pipeline). These
+  // scenarios run ONLY with --desktop-pipeline-v2 (ruling 1: the CLI flag
+  // selects MediaPipelineV2 + the v2 wire together; the plain selftest
+  // keeps the M0-pinned behavior untouched).
+  if (desktop_pipeline_v2) {
+    // Poll-wait helper (bounded; fakes never block inside AcquireSurface).
+    auto wait_for = [](auto pred, DWORD timeout_ms) {
+      const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+      while (GetTickCount64() < deadline) {
+        if (pred()) return true;
+        Sleep(5);
+      }
+      return pred();
+    };
+
+    // ---- shared fakes (the DeviceSurfaceCapture shape + a script) ----
+
+    // Device-backed scripted ICaptureSurface: per-scripted-frame draws the
+    // synthetic bars frame i into a DEFAULT BGRA texture via
+    // UpdateSubresource (the GDI upload shape) and CopyFrom's it into the
+    // caller-owned LatestSurface with the GIVEN identity (capture.h
+    // contract). Optional injected kAccessLost entries drive the reset
+    // path. Also implements ICapture (Width/Height/Rebuild) for the
+    // pipeline's reset sequence.
+    class ScriptedDeviceCapture final : public xnc::ICapture,
+                                         public xnc::ICaptureSurface {
+     public:
+      enum class Step : uint8_t { kFrame, kAccessLost };
+      ScriptedDeviceCapture(ID3D11Device* dev, ID3D11DeviceContext* ctx,
+                            std::vector<Step> script, uint32_t w, uint32_t h)
+          : dev_(dev), ctx_(ctx), script_(std::move(script)), w_(w), h_(h),
+            bars_(w, h) {
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = w;
+        td.Height = h;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.SampleDesc.Count = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        tex_ = nullptr;
+        dev_->CreateTexture2D(&td, nullptr, &tex_);
+      }
+      ~ScriptedDeviceCapture() override {
+        if (tex_) tex_->Release();
+      }
+      ScriptedDeviceCapture(const ScriptedDeviceCapture&) = delete;
+      ScriptedDeviceCapture& operator=(const ScriptedDeviceCapture&) = delete;
+
+      bool Acquire(xnc::FrameBlob&, std::string* err = nullptr,
+                   uint32_t = 0) override {
+        if (err) *err = "err_timeout";  // CPU path unused under MediaPipelineV2
+        return false;
+      }
+      uint32_t Width() const override { return w_; }
+      uint32_t Height() const override { return h_; }
+      uint32_t RebuildCount() const override { return rebuilds_; }
+      bool Rebuild(std::string*) override {
+        ++rebuilds_;
+        return true;
+      }
+
+      xnc::CaptureStatus AcquireSurface(xnc::LatestSurface& latest,
+                                        uint32_t timeout_ms,
+                                        xnc::FrameIdentity* id,
+                                        std::string* err) override {
+        (void)timeout_ms;
+        if (err) err->clear();
+        if (next_ < script_.size()) {
+          const Step st = script_[next_++];
+          if (st == Step::kAccessLost) {
+            if (err) *err = "err_access_lost";
+            if (id) *id = last_id_;
+            return xnc::CaptureStatus::kAccessLost;
+          }
+          // Distinct content per script index (stripe moves).
+          const uint8_t* px = bars_.Frame(next_ - 1);
+          ctx_->UpdateSubresource(tex_, 0, nullptr, px, w_ * 4, 0);
+          if (latest.width() != w_ || latest.height() != h_) {
+            std::string ierr;
+            if (!latest.Init(dev_, w_, h_, &ierr)) {
+              if (err) *err = "latest init: " + ierr;
+              return xnc::CaptureStatus::kFatal;
+            }
+          }
+          xnc::FrameIdentity stamp = id != nullptr ? *id : xnc::FrameIdentity{};
+          stamp.source_mono_us = xnc::NowMonoUs();
+          stamp.encode_seq = 0;
+          stamp.present_mono_us = 0;
+          std::string cerr_;
+          if (!latest.CopyFrom(ctx_, tex_, stamp, &cerr_)) {
+            if (err) *err = "latest copy: " + cerr_;
+            return xnc::CaptureStatus::kFatal;
+          }
+          last_id_ = stamp;
+          ++frames_;
+          if (id) *id = stamp;
+          return xnc::CaptureStatus::kFrame;
+        }
+        if (err) *err = "err_timeout";  // static screen from here on
+        if (id) *id = last_id_;
+        return xnc::CaptureStatus::kNoChange;
+      }
+
+      size_t frames() const { return frames_.load(); }
+      uint32_t rebuilds() const { return rebuilds_; }
+
+     private:
+      ID3D11Device* dev_;
+      ID3D11DeviceContext* ctx_;
+      ID3D11Texture2D* tex_ = nullptr;
+      std::vector<Step> script_;
+      uint32_t w_, h_;
+      SyntheticBars bars_;
+      size_t next_ = 0;
+      std::atomic<size_t> frames_{0};
+      uint32_t rebuilds_ = 0;
+      xnc::FrameIdentity last_id_{};
+    };
+
+    // Recording IEncoderSession factory target: log survives session
+    // deletion (the pipeline owns/deletes the sessions it creates).
+    // hold=true models the GPU shape (leases + outputs gated until `open`
+    // - the busy-slot coalescing test); hold=false models the CPU shape
+    // (lease completed at consumption, outputs ready immediately).
+    struct SessionLog {
+      struct Rec {
+        xnc::FrameIdentity id{};
+        bool force = false;
+      };
+      std::mutex mu;
+      std::vector<Rec> subs;    // every submission, in order (never erased)
+      std::deque<Rec> fifo;     // pending outputs (hold mode)
+      std::deque<Rec> ready;    // ready outputs (non-hold mode)
+      std::atomic<size_t> submits{0};
+      size_t completes = 0, double_completes = 0;
+      std::atomic<size_t> outputs{0};
+      size_t shutdowns = 0, shutdown_completed = 0;
+      bool hold = false;
+      std::atomic<bool> open{false};
+      uint32_t reconf_bitrate = 0, reconf_fps = 0;
+      bool reconf_ok = true;
+    };
+    class LogSession final : public xnc::IEncoderSession {
+     public:
+      LogSession(SessionLog* log, xnc::Nv12SurfacePool* pool)
+          : log_(log), pool_(pool) {}
+      xnc::SubmitResult Submit(const xnc::FrameIdentity& id,
+                               xnc::SurfaceLease&& lease,
+                               bool force_idr) override {
+        if (!lease.Submit(id.encode_seq)) {
+          lease.Release();
+          return xnc::SubmitResult::kRejected;
+        }
+        SessionLog::Rec r;
+        r.id = id;
+        r.force = force_idr;
+        bool complete_now = false;
+        {
+          std::lock_guard<std::mutex> lk(log_->mu);
+          log_->subs.push_back(r);
+          ++log_->submits;
+          if (log_->hold)
+            log_->fifo.push_back(r);
+          else {
+            log_->ready.push_back(r);
+            complete_now = true;
+          }
+        }
+        if (complete_now) Complete(r.id.encode_seq);
+        return xnc::SubmitResult::kOk;
+      }
+      bool TakeOutput(xnc::EncoderOutput* out, uint32_t) override {
+        if (out == nullptr) return false;
+        SessionLog::Rec r;
+        bool have = false, complete = false;
+        {
+          std::lock_guard<std::mutex> lk(log_->mu);
+          if (log_->hold) {
+            if (log_->open && !log_->fifo.empty()) {
+              r = log_->fifo.front();
+              log_->fifo.pop_front();
+              complete = true;
+              have = true;
+            }
+          } else if (!log_->ready.empty()) {
+            r = log_->ready.front();
+            log_->ready.pop_front();
+            have = true;
+          }
+          if (have) ++log_->outputs;
+        }
+        if (!have) return false;
+        if (complete) Complete(r.id.encode_seq);
+        out->id = r.id;
+        out->submit_id = r.id.encode_seq;
+        out->key = true;  // the fake's single NALU is an IDR (0x65)
+        out->au = {0, 0, 0, 1, 0x65};
+        return true;
+      }
+      bool Reconfigure(uint32_t bitrate, uint32_t fps) override {
+        std::lock_guard<std::mutex> lk(log_->mu);
+        log_->reconf_bitrate = bitrate;
+        log_->reconf_fps = fps;
+        return log_->reconf_ok;
+      }
+      void Shutdown(xnc::ShutdownMode) override {
+        std::vector<uint64_t> sids;
+        {
+          std::lock_guard<std::mutex> lk(log_->mu);
+          ++log_->shutdowns;
+          while (!log_->fifo.empty()) {
+            sids.push_back(log_->fifo.front().id.encode_seq);
+            log_->fifo.pop_front();
+            ++log_->shutdown_completed;
+          }
+        }
+        for (const uint64_t sid : sids) Complete(sid);  // held leases (GPU shape)
+      }
+
+     private:
+      void Complete(uint64_t sid) {
+        if (!pool_->Complete(sid)) {
+          std::lock_guard<std::mutex> lk(log_->mu);
+          ++log_->double_completes;
+        } else {
+          std::lock_guard<std::mutex> lk(log_->mu);
+          ++log_->completes;
+        }
+      }
+      SessionLog* log_;
+      xnc::Nv12SurfacePool* pool_;
+    };
+
+    // Recording AuSink: immutable AUs + state codes + display changes.
+    class V2RecordingSink final : public xnc::AuSink {
+     public:
+      const char* OnAu(const xnc::EncodedAU& au) override {
+        std::lock_guard<std::mutex> lk(mu);
+        aus.push_back(au);
+        return nullptr;
+      }
+      const char* PendingIdrReason() override {
+        std::lock_guard<std::mutex> lk(mu);
+        return pending.empty() ? nullptr : pending.c_str();
+      }
+      void ConsumePendingIdr(const char* reason) override {
+        std::lock_guard<std::mutex> lk(mu);
+        consumed.emplace_back(reason != nullptr ? reason : "?");
+      }
+      void OnState(const char* code, bool recoverable) override {
+        std::lock_guard<std::mutex> lk(mu);
+        states.emplace_back(code != nullptr ? code : "?", recoverable);
+      }
+      void OnDisplayChanged(uint32_t w, uint32_t h, const char*) override {
+        std::lock_guard<std::mutex> lk(mu);
+        ++display_changes;
+        last_w = w;
+        last_h = h;
+      }
+      bool HasState(const char* code) const {
+        std::lock_guard<std::mutex> lk(mu);
+        for (const auto& s : states)
+          if (s.first == code) return true;
+        return false;
+      }
+      std::vector<xnc::EncodedAU> CopyAus() const {
+        std::lock_guard<std::mutex> lk(mu);
+        return aus;
+      }
+      std::vector<xnc::FrameIdentity> CopyIds() const {
+        std::lock_guard<std::mutex> lk(mu);
+        std::vector<xnc::FrameIdentity> ids;
+        ids.reserve(aus.size());
+        for (const auto& a : aus) ids.push_back(a.id);
+        return ids;
+      }
+      mutable std::mutex mu;
+      std::vector<xnc::EncodedAU> aus;
+      std::vector<std::pair<std::string, bool>> states;
+      std::vector<std::string> consumed;
+      std::string pending;  // set by tests wanting the merged-IDR poll
+      uint32_t display_changes = 0, last_w = 0, last_h = 0;
+    };
+
+    // Shared device (hardware -> WARP; the Task 1/3 selftest pattern).
+    UINT v2_flags =
+        D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    Microsoft::WRL::ComPtr<ID3D11Device> v2_dev;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> v2_ctx;
+    D3D_FEATURE_LEVEL v2_fl{};
+    const char* v2_via = "hardware";
+    auto v2_try = [&v2_dev, &v2_ctx, &v2_fl](UINT f, D3D_DRIVER_TYPE dt) {
+      v2_dev.Reset();
+      v2_ctx.Reset();
+      return D3D11CreateDevice(nullptr, dt, nullptr, f, nullptr, 0,
+                               D3D11_SDK_VERSION, &v2_dev, &v2_fl, &v2_ctx);
+    };
+    HRESULT v2_hr = v2_try(v2_flags, D3D_DRIVER_TYPE_HARDWARE);
+    if (FAILED(v2_hr)) {
+      v2_via = "warp";
+      v2_hr = v2_try(v2_flags, D3D_DRIVER_TYPE_WARP);
+    }
+    CHECK("v2-device", SUCCEEDED(v2_hr));
+    if (SUCCEEDED(v2_hr)) {
+      std::printf("SELFTEST NOTE: v2 scenarios device driver=%s\n", v2_via);
+
+      // ---- (A) the mailbox itself: depth-one coalescing + sticky-once ----
+      {
+        xnc::MediaMailbox mb;
+        CHECK("v2a-empty", !mb.HasContent() && !mb.idr_armed() &&
+                               !mb.reset_pending());
+        // Coalescing: publish 1, 2, 3 while "slots are busy" - only 3 left.
+        mb.PublishContent(xnc::FrameIdentity{1, 1, 1, 0, 10, 0});
+        mb.PublishContent(xnc::FrameIdentity{1, 1, 2, 0, 20, 0});
+        mb.PublishContent(xnc::FrameIdentity{1, 1, 3, 0, 30, 0});
+        xnc::FrameIdentity got{};
+        CHECK("v2a-coalesce-latest",
+              mb.TakeContent(&got) && got.content_id == 3 &&
+                  got.source_mono_us == 30);
+        CHECK("v2a-coalesce-drained", !mb.TakeContent(&got) && !mb.HasContent());
+        // Sticky IDR: arm during the wait, consumed exactly once by the
+        // next submission.
+        char reason[32] = {0};
+        mb.ArmIdr("coalesce-test");
+        CHECK("v2a-idr-armed", mb.idr_armed());
+        CHECK("v2a-idr-sticky-across-takes",
+              mb.TakeContent(&got) == false && mb.idr_armed());
+        CHECK("v2a-idr-take-once",
+              mb.TakeIdr(reason, sizeof(reason)) &&
+                  std::strcmp(reason, "coalesce-test") == 0);
+        CHECK("v2a-idr-take-twice-fails", !mb.TakeIdr(reason, sizeof(reason)));
+        // Reconfigure: depth one, latest wins.
+        mb.RequestReconfigure(1500000, 24);
+        mb.RequestReconfigure(900000, 15);
+        uint32_t rb = 0, rf = 0;
+        CHECK("v2a-reconf-latest",
+              mb.TakeReconfigure(&rb, &rf) && rb == 900000 && rf == 15);
+        CHECK("v2a-reconf-drained", !mb.TakeReconfigure(&rb, &rf));
+        // Reset: depth one.
+        mb.RequestReset("desktop_switch");
+        char rr[32] = {0};
+        CHECK("v2a-reset-take",
+              mb.TakeReset(rr, sizeof(rr)) &&
+                  std::strcmp(rr, "desktop_switch") == 0);
+        CHECK("v2a-reset-drained", !mb.TakeReset(rr, sizeof(rr)));
+      }
+
+      // ---- (B) the brief's binding test at the REAL loop: publish
+      // contentIds 1,2,3 while all three NV12 slots are busy; release one
+      // slot and assert ONLY contentId 3 is submitted; an IDR armed during
+      // the wait applies exactly once to that submission. ----
+      {
+        const uint32_t w = 320, h = 240, frames = 6;
+        std::vector<ScriptedDeviceCapture::Step> script(
+            frames, ScriptedDeviceCapture::Step::kFrame);
+        ScriptedDeviceCapture cap(v2_dev.Get(), v2_ctx.Get(), script, w, h);
+        SessionLog log;
+        log.hold = true;  // leases + outputs held until the gate opens
+        V2RecordingSink sink;
+        xnc::MediaPipelineV2::Config cfg;
+        cfg.cap = &cap;
+        cfg.surf = &cap;
+        cfg.sink = &sink;
+        cfg.fps = 60;  // spf 16ms: submissions outpace nothing (slots gate)
+        cfg.duration_s = 30;
+        cfg.session_factory = [](void* ctx, xnc::Nv12SurfacePool* pool) ->
+            xnc::IEncoderSession* {
+              return new LogSession(static_cast<SessionLog*>(ctx), pool);
+        };
+        cfg.session_ctx = &log;
+        xnc::MediaPipelineV2 pipe;
+        CHECK("v2b-start", pipe.Start(cfg));
+        if (pipe.running()) {
+          // Wait until the script is fully captured and 3 submissions
+          // exhausted the pool.
+          CHECK("v2b-busy-reached",
+                wait_for([&] { return log.submits >= 3 && cap.frames() == frames; },
+                         5000));
+          Sleep(150);  // settle: nothing more may be submitted while busy
+          CHECK("v2b-slots-bound-at-three", log.submits == 3);
+          // Arm the sticky IDR during the wait.
+          pipe.RequestIdr("coalesce-test");
+          Sleep(100);
+          CHECK("v2b-idr-held-while-busy", log.submits == 3);
+          // Release ONE slot (the gate): the loop's output collection
+          // completes one lease, freeing one slot.
+          log.open.store(true);
+          CHECK("v2b-next-submit-arrives",
+                wait_for([&] { return log.submits >= 4; }, 5000));
+          const std::vector<SessionLog::Rec> subs = [&] {
+            std::lock_guard<std::mutex> lk(log.mu);
+            return log.subs;
+          }();
+          CHECK("v2b-submission-count", subs.size() == 4);
+          // The binding assertion: contentIds 1 and 2 (script frames 4/5)
+          // were coalesced away - only frame 6 (contentId 6) submitted.
+          bool saw_4 = false, saw_5 = false;
+          for (const auto& s : subs) {
+            if (s.id.content_id == 4) saw_4 = true;
+            if (s.id.content_id == 5) saw_5 = true;
+          }
+          CHECK("v2b-only-latest-content",
+                !saw_4 && !saw_5 && subs[3].id.content_id == 6);
+          // Sticky-once: the base IDR (submission 0) + the armed IDR
+          // (submission 3) and nothing else.
+          size_t forces = 0;
+          for (const auto& s : subs)
+            if (s.force) ++forces;
+          CHECK("v2b-sticky-idr-once",
+                forces == 2 && subs[0].force && subs[3].force &&
+                    !subs[1].force && !subs[2].force);
+          // present_mono_us stamped at submission, source at capture.
+          CHECK("v2b-identity-stamps",
+                subs[3].id.present_mono_us != 0 &&
+                    subs[3].id.source_mono_us != 0 &&
+                    subs[3].id.encode_seq > subs[2].id.encode_seq);
+          // The released output published through the sink as an IDR AU.
+          CHECK("v2b-au-published",
+                wait_for([&] { return sink.CopyAus().size() >= 1; }, 5000));
+          const auto aus_b = sink.CopyAus();
+          CHECK("v2b-au-key", !aus_b.empty() && (aus_b[0].flags &
+                                                xnc::AuFlags::kAuFlagKey) != 0);
+          const xnc::MediaPipelineV2::Result res = pipe.Stop();
+          CHECK("v2b-ok", res.ok);
+          CHECK("v2b-captured", res.captured == frames);
+          CHECK("v2b-leases-released",
+                [&] {
+                  std::lock_guard<std::mutex> lk(log.mu);
+                  return log.completes == log.submits &&
+                         log.double_completes == 0;
+                }());
+          std::printf("SELFTEST NOTE: v2b submits=%llu outputs=%llu aus=%llu\n",
+                      (unsigned long long)log.submits,
+                      (unsigned long long)log.outputs,
+                      (unsigned long long)aus_b.size());
+        }
+      }
+
+      // ---- (D) the reset path: an injected kAccessLost mid-run executes
+      // the full reset sequence (state events, epoch advance, new base
+      // IDR of the new epoch, monotonic identity throughout). ----
+      {
+        const uint32_t w = 320, h = 240;
+        std::vector<ScriptedDeviceCapture::Step> script;
+        for (int i = 0; i < 8; ++i) script.push_back(ScriptedDeviceCapture::Step::kFrame);
+        script.push_back(ScriptedDeviceCapture::Step::kAccessLost);
+        for (int i = 0; i < 8; ++i) script.push_back(ScriptedDeviceCapture::Step::kFrame);
+        ScriptedDeviceCapture cap(v2_dev.Get(), v2_ctx.Get(), script, w, h);
+        SessionLog log;
+        log.hold = false;
+        V2RecordingSink sink;
+        xnc::MediaPipelineV2::Config cfg;
+        cfg.cap = &cap;
+        cfg.surf = &cap;
+        cfg.sink = &sink;
+        cfg.fps = 60;
+        cfg.duration_s = 30;
+        cfg.session_factory = [](void* ctx, xnc::Nv12SurfacePool* pool) ->
+            xnc::IEncoderSession* {
+              return new LogSession(static_cast<SessionLog*>(ctx), pool);
+        };
+        cfg.session_ctx = &log;
+        xnc::MediaPipelineV2 pipe;
+        CHECK("v2d-start", pipe.Start(cfg));
+        if (pipe.running()) {
+          CHECK("v2d-epoch2-published",
+                wait_for([&] {
+                  for (const auto& a : sink.CopyAus())
+                    if (a.id.capture_epoch == 2) return true;
+                  return false;
+                }, 8000));
+          const xnc::MediaPipelineV2::Result res = pipe.Stop();
+          CHECK("v2d-ok", res.ok);
+          CHECK("v2d-resets", res.resets == 1);
+          CHECK("v2d-rebuild-called", cap.rebuilds() == 1);
+          CHECK("v2d-states", sink.HasState("recovering") &&
+                                  sink.HasState("capture_rebuilt") &&
+                                  sink.HasState("stream_end"));
+          const auto aus_d = sink.CopyAus();
+          bool saw_e1 = false, saw_e2 = false, e2_first_key = true,
+               e2_seen = false;
+          for (const auto& a : aus_d) {
+            if (a.id.capture_epoch == 1) saw_e1 = true;
+            if (a.id.capture_epoch == 2) {
+              if (!e2_seen) e2_first_key = (a.flags & xnc::AuFlags::kAuFlagKey) != 0;
+              e2_seen = true;
+              saw_e2 = true;
+            }
+          }
+          CHECK("v2d-epoch-advance", saw_e1 && saw_e2);
+          CHECK("v2d-new-epoch-idr-first", e2_seen && e2_first_key);
+          CHECK("v2d-identity-monotonic",
+                DeliveredIdentitiesValid(sink.CopyIds()));
+          // The test stops as soon as the epoch-2 AUs surface, so only the
+          // pre-reset frames plus the first post-reset frames ran.
+          CHECK("v2d-captured", res.captured >= 10 && res.captured <= 16);
+          std::printf("SELFTEST NOTE: v2d aus=%llu resets=%u rebuilds=%u\n",
+                      (unsigned long long)aus_d.size(), res.resets,
+                      cap.rebuilds());
+        }
+      }
+
+      // ---- (C) end-to-end on the REAL internal ladder: real
+      // VideoProcessor BGRA->NV12 (+ --max-w scaling) + real encoder
+      // session (hardware-first, CPU fallback - under RDP the documented
+      // rung is software), decoded-pixel determinism across a pristine
+      // second run. ----
+      // Delivery-order identity check for the REAL rung: publication
+      // follows the MFT's emission order, which on the software rung is
+      // REORDERED relative to submissions (M1 Task 3 measurement; that is
+      // why the pipeline gates the ledger at the submission boundary). The
+      // wire contract that still must hold: epochs never regress in
+      // delivery order, every identity is unique, and the SET replays
+      // cleanly through a fresh ledger in (epoch, seq) order.
+      auto delivered_set_valid = [](const std::vector<xnc::FrameIdentity>& ids) {
+        bool ok = true;
+        std::vector<xnc::FrameIdentity> sorted = ids;
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const xnc::FrameIdentity& a, const xnc::FrameIdentity& b) {
+                    if (a.capture_epoch != b.capture_epoch)
+                      return a.capture_epoch < b.capture_epoch;
+                    if (a.codec_epoch != b.codec_epoch)
+                      return a.codec_epoch < b.codec_epoch;
+                    return a.encode_seq < b.encode_seq;
+                  });
+        xnc::FrameIdentityLedger l;
+        for (const auto& id : sorted) ok = ok && l.Accept(id);
+        for (size_t i = 1; i < ids.size(); ++i) {
+          if (ids[i].capture_epoch < ids[i - 1].capture_epoch) ok = false;
+          if (ids[i].capture_epoch == ids[i - 1].capture_epoch &&
+              ids[i].codec_epoch < ids[i - 1].codec_epoch)
+            ok = false;
+        }
+        return ok;
+      };
+      auto run_v2_e2e = [&](ScriptedDeviceCapture& cap, V2RecordingSink& sink,
+                            uint32_t max_w, uint32_t fps, uint32_t duration) ->
+          xnc::MediaPipelineV2::Result {
+        xnc::MediaPipelineV2::Config cfg;
+        cfg.cap = &cap;
+        cfg.surf = &cap;
+        cfg.sink = &sink;
+        cfg.fps = fps;
+        cfg.duration_s = duration;
+        cfg.max_width = max_w;
+        xnc::MediaPipelineV2 pipe;
+        if (!pipe.Start(cfg)) {
+          xnc::MediaPipelineV2::Result bad;
+          bad.ok = false;
+          bad.err = "start failed: " + pipe.start_error();
+          return bad;
+        }
+        while (pipe.running()) Sleep(100);
+        return pipe.Stop();
+      };
+      {
+        const uint32_t w = 640, h = 480, frames = 48;
+        std::vector<ScriptedDeviceCapture::Step> script(
+            frames, ScriptedDeviceCapture::Step::kFrame);
+        ScriptedDeviceCapture cap1(v2_dev.Get(), v2_ctx.Get(), script, w, h);
+        V2RecordingSink sink1;
+        const xnc::MediaPipelineV2::Result r1 =
+            run_v2_e2e(cap1, sink1, 320, 30, 5);
+        if (!r1.ok)
+          std::printf("SELFTEST NOTE: v2c run1 err=%s\n", r1.err.c_str());
+        CHECK("v2c-ok", r1.ok);
+        CHECK("v2c-dims", r1.width == 320 && r1.height == 240);
+        CHECK("v2c-aus", r1.aus_written >= 8);
+        CHECK("v2c-keys", r1.keyframes >= 1);
+        const auto ids_c = sink1.CopyIds();
+        size_t reorder_adjacent = 0;
+        for (size_t i = 1; i < ids_c.size(); ++i)
+          if (ids_c[i].encode_seq < ids_c[i - 1].encode_seq) ++reorder_adjacent;
+        CHECK("v2c-identity-monotonic", delivered_set_valid(ids_c));
+        std::printf("SELFTEST NOTE: v2c delivery reorder adjacent=%zu/%zu "
+                    "(software-rung emission order; the ledger gates at "
+                    "submission)\n",
+                    reorder_adjacent, ids_c.size());
+        const auto aus_c = sink1.CopyAus();
+        // Stream contract: 4-byte start codes everywhere; the first key AU
+        // is SPS/PPS-prefixed (7/8 before the IDR 5).
+        bool shaped_ok = !aus_c.empty(), first_key_ok = false, saw_key = false;
+        for (const auto& a : aus_c) {
+          const std::vector<uint8_t>& p = *a.annexb;
+          if (p.size() < 4 || p[0] || p[1] || p[2] || p[3] != 1) shaped_ok = false;
+          if (!saw_key && (a.flags & xnc::AuFlags::kAuFlagKey) != 0) {
+            saw_key = true;
+            first_key_ok = xnc::NalHasType(p.data(), p.size(), 7) &&
+                           xnc::NalHasType(p.data(), p.size(), 8) &&
+                           xnc::NalHasType(p.data(), p.size(), 5);
+          }
+        }
+        CHECK("v2c-shaped-4byte-startcodes", shaped_ok);
+        CHECK("v2c-first-key-spspps-idr", saw_key && first_key_ok);
+        std::printf("SELFTEST NOTE: v2c rung=%s friendly=\"%s\" w=%u h=%u "
+                    "aus=%llu keys=%llu captured=%llu encoded=%llu feeds=%llu\n",
+                    r1.encoder_backend, r1.encoder_friendly.c_str(), r1.width,
+                    r1.height, (unsigned long long)r1.aus_written,
+                    (unsigned long long)r1.keyframes,
+                    (unsigned long long)r1.captured,
+                    (unsigned long long)r1.encoded,
+                    (unsigned long long)r1.warmup_feeds);
+        // Pristine second run: the first IDR AU decodes to the SAME luma
+        // hash (deterministic pixels through the whole V2 chain).
+        ScriptedDeviceCapture cap2(v2_dev.Get(), v2_ctx.Get(), script, w, h);
+        V2RecordingSink sink2;
+        const xnc::MediaPipelineV2::Result r2 =
+            run_v2_e2e(cap2, sink2, 320, 30, 5);
+        CHECK("v2c-run2-ok", r2.ok);
+        const auto aus_2 = sink2.CopyAus();
+        const auto first_key = [](const std::vector<xnc::EncodedAU>& aus) ->
+            std::shared_ptr<const std::vector<uint8_t>> {
+          for (const auto& a : aus)
+            if ((a.flags & xnc::AuFlags::kAuFlagKey) != 0) return a.annexb;
+          return nullptr;
+        };
+        auto fk1 = first_key(aus_c);
+        auto fk2 = first_key(aus_2);
+        CHECK("v2c-run2-first-key", fk1 != nullptr && fk2 != nullptr);
+        if (fk1 != nullptr && fk2 != nullptr) {
+          uint64_t hash1 = 0, hash2 = 0;
+          std::string derr1, derr2;
+          const bool dec1 = xnc::DecodeAnnexBToLumaHash(*fk1, &hash1, &derr1);
+          const bool dec2 = xnc::DecodeAnnexBToLumaHash(*fk2, &hash2, &derr2);
+          if (!dec1 || !dec2)
+            std::printf("SELFTEST NOTE: v2c decode err1=%s err2=%s\n",
+                        derr1.c_str(), derr2.c_str());
+          CHECK("v2c-decode-first-idr", dec1 && dec2);
+          CHECK("v2c-decode-deterministic", hash1 == hash2 && hash1 != 0);
+          std::printf("SELFTEST NOTE: v2c first-IDR luma hash=%016llx\n",
+                      (unsigned long long)hash1);
+        }
+      }
+
+      // ---- (E) the GDI + CPU fallback rung end-to-end (ruling 5): the
+      // real GdiCapture (BitBlt -> CPU upload -> LatestSurface) feeding
+      // the real internal session ladder. ----
+      {
+        std::string gerr;
+        std::unique_ptr<xnc::ICapture> gcap = xnc::TryCreateGdiCapture(&gerr);
+        if (gcap == nullptr) {
+          std::printf("SELFTEST NOTE: v2e GDI capture unavailable err=\"%s\" "
+                      "- scenario SKIPPED (the CPU-shape coverage is v2c)\n",
+                      gerr.c_str());
+          CHECK("v2e-skip-reason", !gerr.empty());
+        } else {
+          auto* gsurf = dynamic_cast<xnc::ICaptureSurface*>(gcap.get());
+          CHECK("v2e-surface-iface", gsurf != nullptr);
+          if (gsurf != nullptr) {
+            V2RecordingSink sink;
+            xnc::MediaPipelineV2::Config cfg;
+            cfg.cap = gcap.get();
+            cfg.surf = gsurf;
+            cfg.sink = &sink;
+            cfg.fps = 60;  // submissions outpace the GDI BitBlt cadence so
+                           // the 2s warm-up wall bound fits enough inputs
+            cfg.duration_s = 10;
+            xnc::MediaPipelineV2 pipe;
+            CHECK("v2e-start", pipe.Start(cfg));
+            if (pipe.running()) {
+              while (pipe.running()) Sleep(100);
+              const xnc::MediaPipelineV2::Result res = pipe.Stop();
+              if (!res.ok)
+                std::printf("SELFTEST NOTE: v2e err=%s\n", res.err.c_str());
+              CHECK("v2e-ok", res.ok);
+              CHECK("v2e-captured", res.captured >= 1);
+              CHECK("v2e-encoded", res.encoded >= 1);
+              if (res.keyframes == 0)
+                std::printf("SELFTEST NOTE: v2e static screen starved the "
+                            "2s warm-up bound (encoded=%llu, no IDR; the "
+                            "pixel proof is v2c's decoded determinism)\n",
+                            (unsigned long long)res.encoded);
+              CHECK("v2e-keys", res.keyframes >= 1 || res.encoded >= 10);
+              CHECK("v2e-identity-monotonic",
+                    delivered_set_valid(sink.CopyIds()));
+              std::printf("SELFTEST NOTE: v2e rung=%s friendly=\"%s\" "
+                          "w=%u h=%u aus=%llu keys=%llu feeds=%llu\n",
+                          res.encoder_backend, res.encoder_friendly.c_str(),
+                          res.width, res.height,
+                          (unsigned long long)res.aus_written,
+                          (unsigned long long)res.keyframes,
+                          (unsigned long long)res.warmup_feeds);
+            }
+          }
+        }
+      }
+
+      // ---- (F) identical publication to the v2 wire: MediaPipelineV2
+      // driving the REAL RtServer (0x0206 HOST_HELLO media_protocol=2 +
+      // validated 0x0205 frames) over a real pipe with a fake viewer. ----
+      {
+        const uint32_t w = 64, h = 48, frames = 40;
+        std::vector<ScriptedDeviceCapture::Step> script(
+            frames, ScriptedDeviceCapture::Step::kFrame);
+        ScriptedDeviceCapture cap(v2_dev.Get(), v2_ctx.Get(), script, w, h);
+        SessionLog log;
+        log.hold = false;
+        xnc::RtServer rt;
+        xnc::RtServer::Opts ro;
+        ro.pipe_name = RtPipeNameOf(15);  // the name table has 16 slots
+        ro.secret = kRtSecret;
+        ro.secret_len = sizeof(kRtSecret);
+        ro.max_subs = 4;
+        ro.fps = 15;
+        ro.bitrate_bps = 500000;
+        ro.sddl_override = L"D:P(A;;GA;;;WD)";  // TEST-ONLY permissive DACL
+        ro.pipeline_v2 = true;  // ruling 1: v2 pipeline + v2 wire together
+        CHECK("v2f-rt-start", rt.Start(ro, w, h));
+        xnc::MediaPipelineV2::Config cfg;
+        cfg.cap = &cap;
+        cfg.surf = &cap;
+        cfg.sink = &rt;
+        cfg.fps = 15;
+        cfg.duration_s = 30;
+        cfg.session_factory = [](void* ctx, xnc::Nv12SurfacePool* pool) ->
+            xnc::IEncoderSession* {
+              return new LogSession(static_cast<SessionLog*>(ctx), pool);
+        };
+        cfg.session_ctx = &log;
+        xnc::MediaPipelineV2 pipe;
+        CHECK("v2f-start", pipe.Start(cfg));
+        if (pipe.running()) {
+          RtTestClient a;
+          CHECK("v2f-connect",
+                a.Connect(ro.pipe_name.c_str(), kRtSecret, sizeof(kRtSecret)));
+          CHECK("v2f-attach-hello", a.Attach(12));
+          a.Pump(5000, [&a] { return a.keys_ >= 1 && a.v2_frames_ >= 2; });
+          const xnc::MediaPipelineV2::Result res = pipe.Stop();
+          a.Pump(1500);  // drain in-flight frames + stream_end
+          rt.Shutdown();
+          CHECK("v2f-hello-v2", a.hello_ok_ &&
+                                   a.media_protocol_ == xnc::kMediaProtocolV2);
+          CHECK("v2f-v2-frames", a.v2_frames_ >= 1);
+          CHECK("v2f-keys", a.keys_ >= 1);
+          CHECK("v2f-stream-end", a.saw_stream_end_);
+          CHECK("v2f-identity-monotonic", DeliveredIdentitiesValid(a.v2_ids_));
+          CHECK("v2f-pipeline-ok", res.ok);
+          std::printf("SELFTEST NOTE: v2f frames=%llu v2=%llu keys=%llu "
+                      "aus=%llu\n",
+                      (unsigned long long)a.frames_,
+                      (unsigned long long)a.v2_frames_,
+                      (unsigned long long)a.keys_,
+                      (unsigned long long)res.aus_written);
+        }
+      }
     }
   }
   if (fails == 0) std::printf("selftest ok\n");

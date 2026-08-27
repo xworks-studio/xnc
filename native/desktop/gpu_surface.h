@@ -11,7 +11,13 @@
 //      without any D3D device at all.
 //
 // Single-thread contract (plan ruling 2): EVERY method below is called from
-// ONE thread in production - the media GPU thread. Members are plain and
+// ONE thread in production - the media GPU thread. Under MediaPipelineV2
+// (M2 Task 4) that thread is the single media loop which ALSO drives
+// ICaptureSurface::AcquireSurface (capture + copy + convert + submit all
+// run there - see capture.h's threading note); "capture thread" and "media
+// GPU thread" are one and the same. The M0 pipeline's two-thread use of
+// ICapture/FrameBlob (a capture thread plus a separate encode thread) is
+// the legacy shape and never touches these objects. Members are plain and
 // unsynchronized; concurrent use from more than one thread is undefined.
 //
 // No GPU->CPU readback anywhere in these wrappers (global constraint): the
