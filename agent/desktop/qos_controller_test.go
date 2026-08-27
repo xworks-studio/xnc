@@ -345,3 +345,39 @@ func TestViewerFeedbackJSONShape(t *testing.T) {
 		t.Fatalf("parsed feedback mismatch: %+v", f)
 	}
 }
+
+// 被网络暂停的旁观者不得晋升 controller(review IMPORTANT 2):controller
+// 离场后,接任者跳过 paused viewer;全部可见 viewer 都被暂停 → 空位
+// (frozen config:无任何决策,持留最后生效配置),后到的好 viewer 可接管。
+func TestQoSPausedSpectatorNotPromotedToController(t *testing.T) {
+	c, _ := newQoSTestController()
+	c.Observe(fb("ctrl", true, 10_000_000, 5)) // controller est = 10M
+	// spec(34%)被暂停。
+	acts := c.Observe(fb("spec", true, 3_400_000, 5))
+	if len(acts) != 1 || acts[0].Kind != actionPauseSpectator {
+		t.Fatalf("spec should be paused, got %+v", acts)
+	}
+	// controller 离场(隐藏):spec 可见但被暂停 → 不得接任(空位)。
+	c.Observe(fb("ctrl", false, 10_000_000, 5))
+	if got := c.ControllerID(); got != "" {
+		t.Fatalf("paused spectator must not be promoted, controller=%q", got)
+	}
+	// 冻结配置:被暂停 viewer 持续反馈 → 无任何动作(不决策、不再暂停)。
+	if acts := c.Observe(fb("spec", true, 1_000, 5)); len(acts) != 0 {
+		t.Fatalf("frozen config: paused viewer feedback must not act, got %+v", acts)
+	}
+	if acts := c.Observe(fb("spec", true, 1_000, 500)); len(acts) != 0 {
+		t.Fatalf("frozen config: congestion from a paused viewer must not act, got %+v", acts)
+	}
+	// 后到的好 viewer 接管并驱动决策(est=2M → target 1.7M < 当前 2.3M)。
+	cfg, ok := configOf(t, c.Observe(fb("viewer", true, 2_000_000, 5)))
+	if !ok || cfg.Bitrate != 1_700_000 || c.ControllerID() != "viewer" {
+		t.Fatalf("healthy viewer must take over globals: ctrl=%q got %+v ok=%v",
+			c.ControllerID(), cfg, ok)
+	}
+	// 在位者若(防御性地)处于 paused 也不保持席位:ctrl 隐藏 → 空位复验。
+	c.Observe(fb("viewer", false, 2_000_000, 5))
+	if got := c.ControllerID(); got != "" {
+		t.Fatalf("vacant seat expected, got %q", got)
+	}
+}

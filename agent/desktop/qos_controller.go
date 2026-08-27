@@ -419,15 +419,18 @@ func (c *QoSController) prune(now time.Time) {
 	}
 }
 
-// promote 重选 controller:在位者可见则保持(先到先得);空位/离场由
-// 字典序最小的可见 viewer 接任(确定性)。
+// promote 重选 controller:在位者可见且未被暂停则保持(先到先得);空位/
+// 离场由字典序最小的可见且未暂停 viewer 接任(确定性)。被网络暂停的旁观
+// 者绝不接任——其退化带宽估计会把共享流拖到底,而先到先得会让后到的好
+// viewer 永远拿不回主导权(review IMPORTANT 2)。全部可见 viewer 都被暂停
+// → 空位(frozen config:无决策、无新暂停,持留最后生效配置)。
 func (c *QoSController) promote() {
 	best := ""
-	if v, ok := c.viewers[c.controllerID]; ok && v.visible {
+	if v, ok := c.viewers[c.controllerID]; ok && v.visible && !v.paused {
 		return
 	}
 	for k, v := range c.viewers {
-		if v.visible && (best == "" || k < best) {
+		if v.visible && !v.paused && (best == "" || k < best) {
 			best = k
 		}
 	}
