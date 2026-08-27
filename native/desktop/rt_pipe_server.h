@@ -11,7 +11,14 @@
 //   MSG_KEYFRAME_REQ 0x0104 req [u32 sub_id][char reason[32]] (NUL padded)
 //   MSG_FRAME       0x0105 event [u32 sub_id_target=0 broadcast][u64 mono_us]
 //                               [u8 key][u32 len][au bytes]
+//   MSG_FRAME_V2    0x0205 event (M1 Task 2, gated by Opts.pipeline_v2)
+//                               validated v2 media frame: 72-byte LE header
+//                               (header_bytes + six identity u64s + w/h +
+//                               flags + payload_len + crc32c) + Annex-B AU;
+//                               see kV2HeaderBytes below
 //   MSG_HOST_HELLO  0x0106 event [u32 gen][u32 w][u32 h][u32 fps][u32 max_subs]
+//                               (M1 Task 2: with pipeline_v2 a trailing
+//                               [u32 media_protocol=2] is appended)
 //   MSG_STATE       0x0107 event [char code[32]][u8 recoverable]
 //   MSG_INPUT       0x0108 req  [u32 sub_id][u64 seq][u8 type][payload']
 //                               (M1-Slice3; see InputMsg below for the six
@@ -75,6 +82,7 @@
 #include <thread>
 #include <vector>
 
+#include "../common/crc32c.h"  // Crc32c (M1 Task 2: v2 frame validation)
 #include "../common/frame.h"
 #include "capture.h"       // ICapture
 #include "capture_reset.h"  // kResetReasonMax, CopyReason (0x010A reason field)
@@ -92,10 +100,14 @@ class CursorManager;  // cursor_manager.h
 constexpr uint16_t kMsgAttach = 0x0102, kMsgDetach = 0x0103, kMsgKeyframeReq = 0x0104,
                    kMsgFrame = 0x0105, kMsgHostHello = 0x0106, kMsgState = 0x0107,
                    kMsgInput = 0x0108, kMsgCursor = 0x0109,
-                   kMsgDisplayChanged = 0x010A, kMsgSwitchDisplay = 0x0128;
+                   kMsgDisplayChanged = 0x010A, kMsgSwitchDisplay = 0x0128,
+                   kMsgFrameV2 = 0x0205;  // M1 Task 2: validated Pipe v2 media frame
 
 // AU payload bound (proto.MaxSessionFrameBytes).
 inline constexpr size_t kMaxAuBytes = size_t(8) << 20;
+
+// M1 Task 2: v2 media protocol id carried by the extended HOST_HELLO.
+inline constexpr uint32_t kMediaProtocolV2 = 2;
 
 namespace rt_detail {
 
@@ -231,6 +243,97 @@ inline bool DecodeFrameEvent(const Frame& f, FrameEventPayload* out) {
   return true;
 }
 
+// ---- MSG_FRAME_V2 0x0205 event (M1 Task 2): validated Pipe v2 frame ----
+//
+// Payload = fixed little-endian header + Annex-B AU. Header layout (all LE):
+//   off  len  field
+//   0    4    header_bytes (= kV2HeaderBytes, self-describing)
+//   4    8    capture_epoch
+//   12   8    codec_epoch
+//   20   8    content_id
+//   28   8    encode_seq
+//   36   8    source_mono_us
+//   44   8    present_mono_us
+//   52   4    width
+//   56   4    height
+//   60   4    flags (AuFlags bits)
+//   64   4    payload_len
+//   68   4    crc32c over header-with-zero-crc plus payload
+//   72   ..   Annex-B AU bytes
+//
+// Encode rejects AUs above kMaxAuBytes (8 MiB) with an empty vector (the
+// caller drops the AU). Decode validates in order: full header present,
+// header_bytes == kV2HeaderBytes, payload_len <= 8 MiB, checked size_t
+// addition matches the frame exactly, then CRC32C - only after all of that
+// is the payload allocated.
+inline constexpr size_t kV2HeaderBytes = 72;
+
+inline std::vector<uint8_t> EncodeFrameEventV2(const EncodedAU& au) {
+  const uint8_t* p = au.annexb != nullptr ? au.annexb->data() : nullptr;
+  const size_t len = au.annexb != nullptr ? au.annexb->size() : 0;
+  if (len > kMaxAuBytes) return {};  // 8 MiB AU bound (8 MiB + 1 rejected)
+  if (kV2HeaderBytes + len > kMaxFrameBytes) return {};  // XNIP frame cap
+  std::vector<uint8_t> f(kV2HeaderBytes + len, 0);
+  uint8_t* h = f.data();
+  rt_detail::PutU32(h + 0, static_cast<uint32_t>(kV2HeaderBytes));
+  rt_detail::PutU64(h + 4, au.id.capture_epoch);
+  rt_detail::PutU64(h + 12, au.id.codec_epoch);
+  rt_detail::PutU64(h + 20, au.id.content_id);
+  rt_detail::PutU64(h + 28, au.id.encode_seq);
+  rt_detail::PutU64(h + 36, au.id.source_mono_us);
+  rt_detail::PutU64(h + 44, au.id.present_mono_us);
+  rt_detail::PutU32(h + 52, au.width);
+  rt_detail::PutU32(h + 56, au.height);
+  rt_detail::PutU32(h + 60, au.flags);
+  rt_detail::PutU32(h + 64, static_cast<uint32_t>(len));  // len <= 8 MiB
+  if (len != 0) std::memcpy(h + kV2HeaderBytes, p, len);
+  // CRC over header-with-zero-crc plus payload: the crc field (offset 68)
+  // is still zero while hashing, then written in place.
+  rt_detail::PutU32(h + 68, Crc32c(f.data(), f.size(), 0));
+  return f;
+}
+
+// Decodes a 0x0205 payload into a full EncodedAU (identity + dims + flags +
+// shared const Annex-B). False on any validation failure; nothing is
+// written to `out` unless the frame is fully valid.
+inline bool DecodeFrameEventV2(const Frame& f, EncodedAU* out) {
+  if (out == nullptr || f.payload.size() < kV2HeaderBytes) return false;
+  const uint8_t* h = f.payload.data();
+  const uint32_t header_bytes = rt_detail::GetU32(h);
+  if (header_bytes != kV2HeaderBytes) return false;  // unknown layout
+  const uint32_t payload_len = rt_detail::GetU32(h + 64);
+  if (payload_len > kMaxAuBytes) return false;  // 8 MiB AU cap (8 MiB + 1)
+  // Checked size_t addition (both terms are validated/bounded, but the
+  // guard makes any future header growth overflow-free by construction).
+  const size_t want = size_t(header_bytes) + size_t(payload_len);
+  if (want != f.payload.size()) return false;  // exact-length, no extra bytes
+  // CRC32C over header-with-zero-crc plus payload: byte-identical to the
+  // encoder (which hashed the whole frame while the crc field was zero).
+  // Without mutating the const input: hash [0,68), then four zero bytes,
+  // then the payload.
+  static const uint8_t kZeroCrc[4] = {0, 0, 0, 0};
+  const uint32_t stored_crc = rt_detail::GetU32(h + 68);
+  const uint32_t computed = Crc32c(
+      h + kV2HeaderBytes, size_t(payload_len),
+      Crc32c(kZeroCrc, 4, Crc32c(h, 68, 0)));
+  if (computed != stored_crc) return false;
+  // All validation passed - only now allocate and fill the output.
+  FrameIdentity id;
+  id.capture_epoch = rt_detail::GetU64(h + 4);
+  id.codec_epoch = rt_detail::GetU64(h + 12);
+  id.content_id = rt_detail::GetU64(h + 20);
+  id.encode_seq = rt_detail::GetU64(h + 28);
+  id.source_mono_us = rt_detail::GetU64(h + 36);
+  id.present_mono_us = rt_detail::GetU64(h + 44);
+  out->id = id;
+  out->width = rt_detail::GetU32(h + 52);
+  out->height = rt_detail::GetU32(h + 56);
+  out->flags = rt_detail::GetU32(h + 60);
+  out->annexb = std::make_shared<const std::vector<uint8_t>>(
+      f.payload.begin() + kV2HeaderBytes, f.payload.end());
+  return true;
+}
+
 // HOST_HELLO: legacy 20 bytes, then (M2-S3 Task 5) the displays block
 // [u32 count]{ [u32 idx][s32 ox][s32 oy][u32 w][u32 h][u8 primary] }.
 inline constexpr size_t kDisplayEntryBytes = 21;
@@ -280,6 +383,29 @@ inline bool DecodeHostHello(const Frame& f, HostHelloPayload* out) {
   out->h = rt_detail::GetU32(f.payload.data() + 8);
   out->fps = rt_detail::GetU32(f.payload.data() + 12);
   out->max_subs = rt_detail::GetU32(f.payload.data() + 16);
+  return true;
+}
+
+// M1 Task 2: extended HOST_HELLO for the v2 media protocol - the displays
+// payload above plus a trailing [u32 media_protocol=kMediaProtocolV2].
+// Same 0x0106 message type; the trailing field is how a client learns that
+// 0x0205 frames will follow. The legacy encode/decode above is untouched
+// (v1 wire stays byte-identical when pipeline_v2 is off).
+inline std::vector<uint8_t> EncodeHostHelloV2(const HostHelloPayload& h) {
+  std::vector<uint8_t> p = EncodeHostHello(h);
+  p.resize(p.size() + 4);
+  rt_detail::PutU32(p.data() + p.size() - 4, kMediaProtocolV2);
+  return p;
+}
+inline bool DecodeHostHelloV2(const Frame& f, HostHelloPayload* out,
+                              uint32_t* media_protocol) {
+  if (out == nullptr || f.payload.size() < 28) return false;
+  const uint32_t mp = rt_detail::GetU32(f.payload.data() + f.payload.size() - 4);
+  if (mp != kMediaProtocolV2) return false;
+  const Frame base{0, kMsgHostHello, 0,
+                   std::vector<uint8_t>(f.payload.begin(), f.payload.end() - 4)};
+  if (!DecodeHostHello(base, out)) return false;
+  if (media_protocol != nullptr) *media_protocol = mp;
   return true;
 }
 
@@ -508,6 +634,11 @@ class RtServer : public AuSink {
     uint32_t max_subs = 4;               // capacity (plan: max 4)
     uint32_t fps = 30;                   // HOST_HELLO + pipeline pacing
     uint32_t bitrate_bps = 2300000;
+    // M1 Task 2: v2 media wire gate (XNC_DESKTOP_PIPELINE_V2). false = the
+    // legacy 0x0105 frames + legacy HOST_HELLO (byte-identical to today);
+    // true = extended HOST_HELLO (trailing u32 media_protocol=2) +
+    // validated 0x0205 frames (CRC32C + full FrameIdentity).
+    bool pipeline_v2 = false;
     // Selftest-only permissive DACL (precedent: native/core/selftest.cpp
     // loopback). Production DACL is built from SYSTEM+Administrators+the
     // spawning user; the pipe secret carries the real authentication.
@@ -582,8 +713,10 @@ class RtServer : public AuSink {
 
   // ---- AuSink (OnAu on the encode thread; states from the capture thread) ----
   // Broadcasts one immutable AU (M1 Task 1: key bit in au.flags,
-  // present_mono_us in au.id; the v1 0x0105 wire event is unchanged);
-  // never fatal (drops per subscriber instead).
+  // present_mono_us in au.id; the v1 0x0105 wire event is unchanged while
+  // opts.pipeline_v2 is false; with the flag on, the validated 0x0205 v2
+  // frame carries the full identity); never fatal (drops per subscriber
+  // instead).
   const char* OnAu(const EncodedAU& au) override;
   const char* PendingIdrReason() override;
   void ConsumePendingIdr(const char* reason) override;

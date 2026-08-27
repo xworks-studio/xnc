@@ -485,9 +485,12 @@ void RtServer::ReaderLoop(std::shared_ptr<SubConn> c) {
 
     // HOST_HELLO immediately after attach (plan Task 2). M2-S3 Task 5: the
     // payload carries the full displays table (empty when no provider).
+    // M1 Task 2: pipeline_v2 appends the u32 media_protocol=2 field.
     HostHelloPayload hh{gen_.load(), src_w_, src_h_, opts_.fps, opts_.max_subs};
     hh.displays = CurrentDisplays();
-    if (!PushControlTo(c.get(), Frame{kFlagEvent, kMsgHostHello, 0, EncodeHostHello(hh)}))
+    const std::vector<uint8_t> hello =
+        opts_.pipeline_v2 ? EncodeHostHelloV2(hh) : EncodeHostHello(hh);
+    if (!PushControlTo(c.get(), Frame{kFlagEvent, kMsgHostHello, 0, hello}))
       break;  // control backlog: wedged connection
     // First subscriber: the cursor poller runs only while someone watches
     // (8ms GetCursorInfo cadence, change-only 0x0109 events).
@@ -694,19 +697,26 @@ const char* RtServer::OnAu(const EncodedAU& au) {
     stats_.frames_oversize++;
     return nullptr;
   }
-  // M1 Task 1: the v1 0x0105 wire event is unchanged - the key bit and the
-  // timeline timestamp come out of the immutable AU's flags/identity.
+  // M1 Task 1: the v1 0x0105 wire event is unchanged while pipeline_v2 is
+  // off - the key bit and the timeline timestamp come out of the immutable
+  // AU's flags/identity. M1 Task 2: with pipeline_v2 on, the validated
+  // 0x0205 frame (full identity + CRC32C) rides the wire instead.
   const bool is_idr = (au.flags & AuFlags::kAuFlagKey) != 0;
   const uint64_t mono_us = au.id.present_mono_us;
-  std::vector<uint8_t> payload = EncodeFrameEvent(mono_us, is_idr, p, len);
-  if (payload.empty()) {  // > XNIP frame cap safety net
+  std::vector<uint8_t> payload;
+  const uint16_t msg_type = opts_.pipeline_v2 ? kMsgFrameV2 : kMsgFrame;
+  if (opts_.pipeline_v2)
+    payload = EncodeFrameEventV2(au);
+  else
+    payload = EncodeFrameEvent(mono_us, is_idr, p, len);
+  if (payload.empty()) {  // > AU bound / > XNIP frame cap safety net
     XNC_LOG_ERROR("rt_au_frame_cap len=%llu (dropped)",
                   static_cast<unsigned long long>(len));
     std::lock_guard<std::mutex> lk(mu_);
     stats_.frames_oversize++;
     return nullptr;
   }
-  const Frame ev{kFlagEvent, kMsgFrame, 0, std::move(payload)};
+  const Frame ev{kFlagEvent, msg_type, 0, std::move(payload)};
   std::lock_guard<std::mutex> lk(mu_);
   stats_.aus_emitted++;
   for (auto& kv : conns_) {
@@ -771,8 +781,11 @@ void RtServer::OnState(const char* code, bool recoverable) {
     if (rebuilt) {
       HostHelloPayload hh{gen_.load(), src_w_, src_h_, opts_.fps, opts_.max_subs};
       hh.displays = CurrentDisplays();
+      // M1 Task 2: pipeline_v2 appends the u32 media_protocol=2 field.
+      const std::vector<uint8_t> hello =
+          opts_.pipeline_v2 ? EncodeHostHelloV2(hh) : EncodeHostHello(hh);
       kv.second->q->PushControl(
-          Frame{kFlagEvent, kMsgHostHello, 0, EncodeHostHello(hh)});
+          Frame{kFlagEvent, kMsgHostHello, 0, hello});
     }
     kv.second->cv.notify_all();
   }

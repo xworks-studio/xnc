@@ -32,6 +32,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>  // _stricmp (XNC_DESKTOP_PIPELINE_V2 parse)
 #include <cwchar>
 #include <memory>
 #include <string>
@@ -146,6 +147,24 @@ xnc::CaptureReset::Opts ResetOptsFor(ResetWiring* wiring) {
   o.desktop_fn = &ResetGateThunk;
   o.desktop_ctx = wiring;
   return o;
+}
+
+// M1 Task 2: XNC_DESKTOP_PIPELINE_V2 gates the v2 media wire (extended
+// HOST_HELLO + validated 0x0205 frames). Default off = v1 wire, byte-
+// identical to today. Read ONCE at startup ("1"/"true" enable; the flag is
+// threaded into RtServer::Opts - the host's only startup-time config path).
+bool DesktopPipelineV2Enabled() {
+  char buf[32];
+  const DWORD len =
+      GetEnvironmentVariableA("XNC_DESKTOP_PIPELINE_V2", buf, sizeof(buf));
+  if (len > 0 && len < sizeof(buf)) {
+    const bool on = _stricmp(buf, "1") == 0 || _stricmp(buf, "true") == 0;
+    XNC_LOG_INFO("desktop_pipeline_v2 env=\"%s\" -> %s", buf, on ? "on" : "off");
+    return on;
+  }
+  if (len > 0)
+    XNC_LOG_ERROR("desktop_pipeline_v2 env too long (len=%lu, max 31; ignored)", len);
+  return false;
 }
 
 void Usage(FILE* out) {
@@ -595,6 +614,7 @@ int RunConsoleDiag(const xnc::DiagOptions& opt) {
     ro.bitrate_bps = bitrate_bps;
     ro.input = input.get();
     ro.cursor = cursor.get();
+    ro.pipeline_v2 = DesktopPipelineV2Enabled();  // M1 Task 2 env gate
     // M2-S3 Task 5: 0x0128 switch + HOST_HELLO displays[].
     ro.displays_fn = [](void*) { return xnc::DxgiDisplaysSnapshot(); };
     ro.switch_display_fn = [](void*, uint32_t idx) { return xnc::DxgiSelectDisplay(idx); };
@@ -713,6 +733,7 @@ int RunConsoleRt(const xnc::DiagOptions& opt) {
   ro.bitrate_bps = bitrate_bps;
   ro.input = &input;
   ro.cursor = &cursor;
+  ro.pipeline_v2 = DesktopPipelineV2Enabled();  // M1 Task 2 env gate
   // M2-Slice1 Task 1/2: DesktopWatch + unified CaptureReset (RtServer::Serve
   // forwards both into PipelineOpts; the wiring pair was built above so the
   // ladder could bind the same coordinator).

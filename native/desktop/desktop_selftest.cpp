@@ -575,9 +575,13 @@ class RtTestClient {
       if (!ReadFrameT(f, 3000)) return false;
       if (f.message_type == xnc::kMsgHostHello) {
         hello_ok_ = xnc::DecodeHostHello(f, &hello_);
+        media_protocol_ = 0;
+        if (!hello_ok_)  // M1 Task 2: v2 servers append u32 media_protocol=2
+          hello_ok_ = xnc::DecodeHostHelloV2(f, &hello_, &media_protocol_);
         return hello_ok_;
       }
-      if (f.message_type == xnc::kMsgFrame) {
+      if (f.message_type == xnc::kMsgFrame ||
+          f.message_type == xnc::kMsgFrameV2) {
         frame_before_hello_ = true;
         return false;
       }
@@ -653,6 +657,27 @@ class RtTestClient {
           last_key_payload_ = ev.au;
         }
       }
+    } else if (f.message_type == xnc::kMsgFrameV2) {
+      // M1 Task 2: 0x0205 frames decode into a full EncodedAU (identity +
+      // dims + flags + Annex-B); key = AuFlags::kAuFlagKey.
+      xnc::EncodedAU v2;
+      if (xnc::DecodeFrameEventV2(f, &v2) && v2.annexb) {
+        frames_++;
+        v2_frames_++;
+        if ((v2.flags & xnc::AuFlags::kAuFlagKey) != 0) {
+          keys_++;
+          first_key_mono_us_ = first_key_mono_us_ == 0 ? v2.id.present_mono_us
+                                                       : first_key_mono_us_;
+          last_key_mono_us_ = v2.id.present_mono_us;
+          last_key_payload_ = *v2.annexb;
+          if (!first_key_id_set_) {
+            first_key_id_ = v2.id;
+            first_key_w_ = v2.width;
+            first_key_h_ = v2.height;
+            first_key_id_set_ = true;
+          }
+        }
+      }
     } else if (f.message_type == xnc::kMsgState) {
       xnc::StateEventPayload st;
       if (xnc::DecodeStateEvent(f, &st)) {
@@ -672,12 +697,17 @@ class RtTestClient {
   uint64_t frames_ = 0, keys_ = 0;
   uint64_t first_key_mono_us_ = 0, last_key_mono_us_ = 0;
   std::vector<uint8_t> last_key_payload_;
+  uint64_t v2_frames_ = 0;  // M1 Task 2: 0x0205 frames decoded
+  xnc::FrameIdentity first_key_id_{};  // identity of the first v2 key AU
+  uint32_t first_key_w_ = 0, first_key_h_ = 0;
+  bool first_key_id_set_ = false;
   uint64_t cursors_ = 0;
   int32_t cursor_x_ = -1, cursor_y_ = -1;
   uint8_t cursor_visible_ = 0xFF;
   std::vector<xnc::DisplayChangedPayload> displays_;
   std::vector<std::string> state_codes_;
   xnc::HostHelloPayload hello_{};
+  uint32_t media_protocol_ = 0;  // HOST_HELLO v2 trailing u32 (0 = legacy)
   bool hello_ok_ = false, saw_stream_end_ = false, frame_before_hello_ = false;
 
   bool SawState(const char* code) const {
@@ -693,8 +723,8 @@ class RtTestClient {
 const uint8_t kRtSecret[16] = {'r', 't', '-', 's', 'e', 'l', 'f', 't',
                                'e', 's', 't', '-', 'k', 'e', 'y', '1'};
 const wchar_t* RtPipeNameOf(int slot) {
-  static wchar_t names[8][96] = {};
-  if (slot >= 0 && slot < 8)
+  static wchar_t names[16][96] = {};
+  if (slot >= 0 && slot < 16)
     std::swprintf(names[slot], 96, L"\\\\.\\pipe\\xnc-desktop-rt-selftest-%lu-%d",
                   static_cast<unsigned long>(GetCurrentProcessId()), slot);
   return names[slot];
@@ -2881,6 +2911,150 @@ int SelftestMain() {
     std::vector<uint8_t> ok_au(1000, 0xAB);
     CHECK("codec-frame-normal-nonempty",
           !xnc::EncodeFrameEvent(1, false, ok_au.data(), ok_au.size()).empty());
+  }
+  { // ---- M1 Task 2: Pipe v2 codec (0x0205) golden vectors + validation ----
+    // CRC32C (Castagnoli) check value: the standard iSCSI test vector.
+    CHECK("crc32c-check-value",
+          xnc::Crc32c(reinterpret_cast<const uint8_t*>("123456789"), 9, 0) ==
+              0xE3069283u);
+    CHECK("crc32c-null-data", xnc::Crc32c(nullptr, 0, 0) == 0);
+    CHECK("crc32c-zero-len", xnc::Crc32c(reinterpret_cast<const uint8_t*>(""), 0, 0) == 0);
+    // The binding golden AU: IDs 1..6, 1920x1080, key flag, payload
+    // {0,0,0,1,0x65} (the same AU the plan pins).
+    xnc::EncodedAU au;
+    au.id = xnc::FrameIdentity{1, 2, 3, 4, 5, 6};
+    au.width = 1920;
+    au.height = 1080;
+    au.flags = xnc::AuFlags::kAuFlagKey;
+    au.annexb = std::make_shared<const std::vector<uint8_t>>(
+        std::vector<uint8_t>{0, 0, 0, 1, 0x65});
+    const std::vector<uint8_t> w2 = xnc::EncodeFrameEventV2(au);
+    CHECK("v2-size", w2.size() == xnc::kV2HeaderBytes + 5);
+    CHECK("v2-header-bytes", xnc::rt_detail::GetU32(w2.data()) == 72);
+    CHECK("v2-id-capture-epoch", xnc::rt_detail::GetU64(w2.data() + 4) == 1);
+    CHECK("v2-id-codec-epoch", xnc::rt_detail::GetU64(w2.data() + 12) == 2);
+    CHECK("v2-id-content-id", xnc::rt_detail::GetU64(w2.data() + 20) == 3);
+    CHECK("v2-id-encode-seq", xnc::rt_detail::GetU64(w2.data() + 28) == 4);
+    CHECK("v2-id-source-mono-us", xnc::rt_detail::GetU64(w2.data() + 36) == 5);
+    CHECK("v2-id-present-mono-us", xnc::rt_detail::GetU64(w2.data() + 44) == 6);
+    CHECK("v2-dims-flags", xnc::rt_detail::GetU32(w2.data() + 52) == 1920 &&
+                               xnc::rt_detail::GetU32(w2.data() + 56) == 1080 &&
+                               xnc::rt_detail::GetU32(w2.data() + 60) == 1);
+    CHECK("v2-payload-len", xnc::rt_detail::GetU32(w2.data() + 64) == 5);
+    CHECK("v2-payload-bytes",
+          w2[72] == 0 && w2[73] == 0 && w2[74] == 0 && w2[75] == 1 &&
+              w2[76] == 0x65);
+    // CRC = Crc32c over header-with-zero-crc plus payload: hash [0,68),
+    // then the four zeroed crc bytes, then the payload - exactly the
+    // encoder's input while the crc field was still zero.
+    static const uint8_t kZero4[4] = {0, 0, 0, 0};
+    const uint32_t want_crc =
+        xnc::Crc32c(w2.data() + 72, 5,
+                    xnc::Crc32c(kZero4, 4, xnc::Crc32c(w2.data(), 68, 0)));
+    CHECK("v2-crc-self-consistent",
+          xnc::rt_detail::GetU32(w2.data() + 68) == want_crc);
+    // Full byte-for-byte golden vector (ruling 4 - the Task 3 Go test uses
+    // exactly these bytes). 72-byte header + {0,0,0,1,0x65} payload, LE
+    // CRC32C stored as 0xE7B136AB.
+    const uint8_t want_v2[77] = {
+        0x48, 0x00, 0x00, 0x00,                          // header_bytes = 72
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // capture_epoch = 1
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // codec_epoch = 2
+        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // content_id = 3
+        0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // encode_seq = 4
+        0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // source_mono_us = 5
+        0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // present_mono_us = 6
+        0x80, 0x07, 0x00, 0x00,                          // width = 1920
+        0x38, 0x04, 0x00, 0x00,                          // height = 1080
+        0x01, 0x00, 0x00, 0x00,                          // flags = kAuFlagKey
+        0x05, 0x00, 0x00, 0x00,                          // payload_len = 5
+        0xAB, 0x36, 0xB1, 0xE7,                          // crc32c (LE)
+        0x00, 0x00, 0x00, 0x01, 0x65,                    // Annex-B AU
+    };
+    CHECK("v2-golden-exact-bytes",
+          w2.size() == sizeof(want_v2) &&
+              std::equal(w2.begin(), w2.end(), want_v2));
+    // Round-trip: every identity field, dims, flags and the payload.
+    xnc::EncodedAU rt;
+    CHECK("v2-roundtrip",
+          xnc::DecodeFrameEventV2(xnc::Frame{0, xnc::kMsgFrameV2, 0, w2}, &rt) &&
+              rt.id.capture_epoch == 1 && rt.id.codec_epoch == 2 &&
+              rt.id.content_id == 3 && rt.id.encode_seq == 4 &&
+              rt.id.source_mono_us == 5 && rt.id.present_mono_us == 6 &&
+              rt.width == 1920 && rt.height == 1080 &&
+              rt.flags == xnc::AuFlags::kAuFlagKey && rt.annexb != nullptr &&
+              rt.annexb->size() == 5 && rt.annexb->data()[4] == 0x65);
+    // CRC rejection after one flipped byte (payload and header field).
+    std::vector<uint8_t> flip = w2;
+    flip[76] ^= 1;
+    CHECK("v2-crc-reject-payload-flip",
+          !xnc::DecodeFrameEventV2(xnc::Frame{0, xnc::kMsgFrameV2, 0, flip}, &rt));
+    flip = w2;
+    flip[4] ^= 0xFF;  // capture_epoch low byte
+    CHECK("v2-crc-reject-header-flip",
+          !xnc::DecodeFrameEventV2(xnc::Frame{0, xnc::kMsgFrameV2, 0, flip}, &rt));
+    // Truncated header: 71 bytes < the 72-byte fixed header -> reject.
+    CHECK("v2-truncated-header-rejected",
+          !xnc::DecodeFrameEventV2(
+              xnc::Frame{0, xnc::kMsgFrameV2, 0, std::vector<uint8_t>(71, 0)}, &rt));
+    // header_bytes must equal the 72-byte v2 layout.
+    std::vector<uint8_t> badh = w2;
+    xnc::rt_detail::PutU32(badh.data(), 73);
+    CHECK("v2-header-bytes-mismatch-rejected",
+          !xnc::DecodeFrameEventV2(xnc::Frame{0, xnc::kMsgFrameV2, 0, badh}, &rt));
+    // Declared payload_len past the AU bound is rejected WITHOUT a payload
+    // present (the cap check runs before any allocation).
+    std::vector<uint8_t> caph(72, 0);
+    xnc::rt_detail::PutU32(caph.data(), 72);
+    xnc::rt_detail::PutU32(caph.data() + 64, static_cast<uint32_t>(xnc::kMaxAuBytes + 1));
+    CHECK("v2-decode-8mib-plus-1-rejected",
+          !xnc::DecodeFrameEventV2(xnc::Frame{0, xnc::kMsgFrameV2, 0, caph}, &rt));
+    // Encode side: an 8 MiB + 1 AU yields an empty vector (caller drops).
+    std::vector<uint8_t> big(xnc::kMaxAuBytes + 1, 0xAB);
+    xnc::EncodedAU bigau = au;
+    bigau.annexb = std::make_shared<const std::vector<uint8_t>>(big);
+    CHECK("v2-encode-8mib-plus-1-empty", xnc::EncodeFrameEventV2(bigau).empty());
+    // Boundary: an exactly-8 MiB AU is accepted and round-trips.
+    std::vector<uint8_t> exact(xnc::kMaxAuBytes, 0xCD);
+    xnc::EncodedAU exau = au;
+    exau.annexb = std::make_shared<const std::vector<uint8_t>>(std::move(exact));
+    const std::vector<uint8_t> wex = xnc::EncodeFrameEventV2(exau);
+    xnc::EncodedAU rtex;
+    CHECK("v2-8mib-accepted-roundtrip",
+          !wex.empty() && wex.size() == xnc::kV2HeaderBytes + xnc::kMaxAuBytes &&
+              xnc::DecodeFrameEventV2(xnc::Frame{0, xnc::kMsgFrameV2, 0, wex}, &rtex) &&
+              rtex.annexb != nullptr && rtex.annexb->size() == xnc::kMaxAuBytes);
+    CHECK("v2-null-out-rejected",
+          !xnc::DecodeFrameEventV2(xnc::Frame{0, xnc::kMsgFrameV2, 0, w2}, nullptr));
+    // HOST_HELLO v2: the 24-byte payload + trailing u32 media_protocol=2.
+    const xnc::HostHelloPayload hh2{1, 64, 48, 15, 4};
+    const std::vector<uint8_t> hv2 = xnc::EncodeHostHelloV2(hh2);
+    CHECK("v2-hello-size", hv2.size() == 28);
+    CHECK("v2-hello-base-prefix",
+          hv2[0] == 1 && hv2[4] == 64 && hv2[8] == 48 && hv2[12] == 15 &&
+              hv2[16] == 4);
+    CHECK("v2-hello-trailing-protocol",
+          xnc::rt_detail::GetU32(hv2.data() + 24) == xnc::kMediaProtocolV2);
+    xnc::HostHelloPayload hback;
+    uint32_t mp = 0;
+    CHECK("v2-hello-decode",
+          xnc::DecodeHostHelloV2(xnc::Frame{0, xnc::kMsgHostHello, 0, hv2}, &hback,
+                                 &mp) &&
+              mp == xnc::kMediaProtocolV2 && hback.gen == 1 && hback.w == 64 &&
+              hback.h == 48 && hback.fps == 15 && hback.max_subs == 4);
+    CHECK("v2-hello-truncated-rejected",
+          !xnc::DecodeHostHelloV2(
+              xnc::Frame{0, xnc::kMsgHostHello, 0, std::vector<uint8_t>(27, 0)},
+              &hback, &mp));
+    std::vector<uint8_t> wrongmp = hv2;
+    xnc::rt_detail::PutU32(wrongmp.data() + 24, 1);
+    CHECK("v2-hello-wrong-protocol-rejected",
+          !xnc::DecodeHostHelloV2(xnc::Frame{0, xnc::kMsgHostHello, 0, wrongmp},
+                                  &hback, &mp));
+    // Full golden frame dump for the Task 3 Go test vector (ruling 4).
+    std::printf("SELFTEST NOTE: v2-golden ");
+    for (uint8_t b : w2) std::printf("%02x", b);
+    std::printf("\n");
   }
   { // M2-Slice1 Task 2:0x010A DISPLAY_CHANGED codec(精确字节向量)
     const xnc::DisplayChangedPayload dc{3, 1920, 1080, "resolution"};
@@ -5777,6 +5951,65 @@ int SelftestMain() {
       std::printf("SELFTEST NOTE: rt8 switch_accepted=%llu switch_invalid=%llu reset_reqs=%u\n",
                   (unsigned long long)st.switch_accepted,
                   (unsigned long long)st.switch_invalid, reset.requests());
+    }
+  }
+  { // rt 场景 ⑨(M1 Task 2):XNC_DESKTOP_PIPELINE_V2 路径端到端 - opts
+    // 直设 pipeline_v2=true(不依赖进程环境),服务器发扩展 HOST_HELLO
+    // (media_protocol=2)+ 0x0205 v2 帧;断言客户端收到合法 v2 帧且身份正确。
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(kRtW, kRtH, kRtFps, kRtBitrate, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: rt9-init err=%s\n", err.c_str());
+    CHECK("rt9-init", init_ok);
+    if (init_ok) {
+      xnc::RtServer rt;
+      xnc::RtServer::Opts ro = rt_opts(8);
+      ro.pipeline_v2 = true;  // M1 Task 2: v2 media wire (opts, not env)
+      CHECK("rt9-start", rt.Start(ro, kRtW, kRtH));
+      ScriptedCapture cap(kRtW, kRtH, 3);
+      xnc::PipelineOpts po;
+      po.duration_s = 3;
+      po.fps = kRtFps;
+      po.target_bitrate_bps = kRtBitrate;
+      xnc::PipelineResult res;
+      std::thread pipe_th([&] { res = xnc::Pipeline::Run(cap, enc, rt, po); });
+      RtTestClient a;
+      CHECK("rt9-connect", a.Connect(ro.pipe_name.c_str(), kRtSecret, sizeof(kRtSecret)));
+      CHECK("rt9-attach-hello", a.Attach(10));
+      CHECK("rt9-no-frame-before-hello", !a.frame_before_hello_);
+      CHECK("rt9-hello-v2",
+            a.hello_ok_ && a.media_protocol_ == xnc::kMediaProtocolV2 &&
+                a.hello_.w == kRtW && a.hello_.h == kRtH && a.hello_.gen == 1);
+      a.Pump(2800, [&a] { return a.keys_ >= 1; });
+      pipe_th.join();
+      a.Pump(700);
+      rt.Shutdown();
+      CHECK("rt9-first-key", a.keys_ >= 1);
+      CHECK("rt9-v2-frames-received", a.v2_frames_ >= 1);
+      CHECK("rt9-frames-received", a.frames_ >= 1);
+      // Identity correctness (pipeline.cpp assigns epochs=1 on a fresh run,
+      // content/seq from 1, timestamps from the real clock).
+      CHECK("rt9-key-identity",
+            a.first_key_id_set_ && a.first_key_id_.capture_epoch == 1 &&
+                a.first_key_id_.codec_epoch == 1 &&
+                a.first_key_id_.content_id >= 1 &&
+                a.first_key_id_.encode_seq >= 1 &&
+                a.first_key_id_.source_mono_us >= 1 &&
+                a.first_key_id_.present_mono_us >= 1);
+      CHECK("rt9-key-dims", a.first_key_w_ == kRtW && a.first_key_h_ == kRtH);
+      CHECK("rt9-key-payload-shaped", StreamStartsWithKeyframe(a.last_key_payload_));
+      CHECK("rt9-stream-end-state", a.saw_stream_end_);
+      CHECK("rt9-pipeline-ok", res.ok);
+      const xnc::RtServer::Stats st = rt.stats();
+      CHECK("rt9-stats", st.aus_emitted >= 1 && st.frames_enqueued >= 1);
+      std::printf("SELFTEST NOTE: rt9 v2_frames=%llu keys=%llu id=[cap=%llu codec=%llu content=%llu seq=%llu src=%llu present=%llu]\n",
+                  (unsigned long long)a.v2_frames_, (unsigned long long)a.keys_,
+                  (unsigned long long)a.first_key_id_.capture_epoch,
+                  (unsigned long long)a.first_key_id_.codec_epoch,
+                  (unsigned long long)a.first_key_id_.content_id,
+                  (unsigned long long)a.first_key_id_.encode_seq,
+                  (unsigned long long)a.first_key_id_.source_mono_us,
+                  (unsigned long long)a.first_key_id_.present_mono_us);
     }
   }
   if (fails == 0) std::printf("selftest ok\n");
