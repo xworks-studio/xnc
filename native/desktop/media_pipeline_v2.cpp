@@ -438,6 +438,7 @@ struct MediaPipelineV2::Impl {
   // ---- M2 Task 6: stage histograms + the 10 s emission cadence ----
   StageHists stages;
   uint32_t next_hist_beat_s = 10;
+  bool stages_semantics_logged = false;  // one-time preamble per run
 
   Result res;
   std::atomic<bool> running{false};
@@ -1522,11 +1523,18 @@ class Loop {
     if (line.empty()) return;
     const uint32_t elapsed_s =
         static_cast<uint32_t>((NowMs() - im_.t0) / 1000);
+    // Fix round 1: the semantics ride the EMITTED output, not just the
+    // source comments - once per run, ahead of the first histogram line.
+    if (!im_.stages_semantics_logged) {
+      im_.stages_semantics_logged = true;
+      XNC_LOG_INFO("media_v2_stages_semantics note=\"%s\"",
+                   StageSemanticsNote());
+    }
     XNC_LOG_INFO("media_v2_stages%s elapsed=%us %s",
                  final_summary ? "_final" : "", elapsed_s, line.c_str());
     if (final_summary) {
-      im_.res.stages_json =
-          FormatStagesJson(stats, n, im_.res.cpu_readbacks);
+      im_.res.stages_json = FormatStagesJson(stats, n, im_.res.cpu_readbacks,
+                                             im_.res.encoder_backend);
       return;
     }
     im_.stages.gpu_copy.win.Reset();

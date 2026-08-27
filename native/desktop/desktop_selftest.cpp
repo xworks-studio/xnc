@@ -4160,7 +4160,7 @@ int SelftestMain(bool desktop_pipeline_v2) {
           log_line.find("z_us") == std::string::npos &&
               log_line.find("a_us=20/40/40(n=4)") != std::string::npos &&
               log_line.find("b_us=1/2/2(n=2)") != std::string::npos);
-    const std::string json = xnc::FormatStagesJson(stats, 3, 7);
+    const std::string json = xnc::FormatStagesJson(stats, 3, 7, "software");
     CHECK("hist-json-absent-when-zero",
           json.find("z_us") == std::string::npos);
     CHECK("hist-json-members",
@@ -4173,15 +4173,29 @@ int SelftestMain(bool desktop_pipeline_v2) {
               json.find("},") != std::string::npos);
     CHECK("hist-json-readback-count",
           json.find("\"cpu_readbacks\": 7") != std::string::npos);
+    // Fix round 1: the sidecar must carry the semantics + rung labels in
+    // the DURABLE output - a stage_semantics member (wait-inclusive /
+    // enqueue-cost wording from StageSemanticsNote) and the encoder_backend
+    // that makes cpu_readbacks interpretable.
+    CHECK("hist-json-encoder-backend",
+          json.find("\"encoder_backend\": \"software\"") != std::string::npos);
+    CHECK("hist-json-stage-semantics",
+          json.find("\"stage_semantics\": ") != std::string::npos &&
+              json.find(xnc::StageSemanticsNote()) != std::string::npos &&
+              std::strstr(xnc::StageSemanticsNote(), "wait-inclusive") !=
+                  nullptr &&
+              std::strstr(xnc::StageSemanticsNote(), "enqueue") != nullptr);
     // Sidecar splice: stages land BEFORE "ok"; an empty block keeps the
     // M0 stats.json byte-identical (no "stages" key at all).
     xnc::PipelineResult r2;
     xnc::PipelineOpts o2;
-    r2.stages_json = xnc::FormatStagesJson(stats, 3, 0);
+    r2.stages_json = xnc::FormatStagesJson(stats, 3, 0, "factory");
     const std::string with = xnc::FormatStatsJson(r2, o2);
     CHECK("statsjson-stages-spliced",
           with.find("\"stages\": {") != std::string::npos &&
               with.find("\"ok\"") > with.find("\"stages\""));
+    CHECK("statsjson-backend-spliced",
+          with.find("\"encoder_backend\": \"factory\"") != std::string::npos);
     r2.stages_json.clear();
     CHECK("statsjson-m0-unchanged",
           xnc::FormatStatsJson(r2, o2).find("\"stages\"") ==
@@ -8604,6 +8618,14 @@ int SelftestMain(bool desktop_pipeline_v2) {
                     res.stages_json.find("capture_to_au_us") !=
                         std::string::npos);
           CHECK("v2b-no-cpu-readback", res.cpu_readbacks == 0);
+          // Fix round 1: the durable block carries the semantics + the
+          // serving rung's label (the factory session ran the "factory"
+          // rung here).
+          CHECK("v2b-stages-labeled",
+                res.stages_json.find("\"stage_semantics\": ") !=
+                    std::string::npos &&
+                    res.stages_json.find("\"encoder_backend\": \"factory\"") !=
+                        std::string::npos);
           std::printf("SELFTEST NOTE: v2b submits=%llu outputs=%llu aus=%llu\n",
                       (unsigned long long)log.submits,
                       (unsigned long long)log.outputs,

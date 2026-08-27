@@ -272,13 +272,24 @@ struct StageStat {
 // samples (the caller skips the log line entirely).
 std::string FormatStageLog(const StageStat* stats, size_t n);
 
-// stats.json sidecar block (one line per SAMPLED stage, 4-space member
-// indent, zero-sample stages ABSENT - never fake-zero) plus the V2
-// cpu_readbacks accounting line. Trailing-comma terminated for splicing
+// The canonical stage-semantics note (single source of truth; JSON-safe -
+// no double quotes): what each stage measures, INCLUDING the
+// wait-inclusive / enqueue-cost caveats, so every emitted histogram is
+// self-describing. Emitted as the stage_semantics sidecar member and the
+// one-time media_v2_stages_semantics log preamble.
+const char* StageSemanticsNote();
+
+// stats.json sidecar block: a stage_semantics member first, then one line
+// per SAMPLED stage (4-space member indent, zero-sample stages ABSENT -
+// never fake-zero), then the V2 accounting lines (cpu_readbacks +
+// encoder_backend - the rung label that makes cpu_readbacks interpretable:
+// the software rung maps NV12 once per submit by design, the capture/
+// convert stages never read back). Trailing-comma terminated for splicing
 // before the "ok" member in FormatStatsJson. Empty string when no stage
 // has samples (keeps the M0 sidecar byte-identical).
 std::string FormatStagesJson(const StageStat* stats, size_t n,
-                             uint64_t cpu_readbacks);
+                             uint64_t cpu_readbacks,
+                             const char* encoder_backend);
 
 // Appends every NALU of `data` except parameter sets (7/8) and AUD (9),
 // each re-emitted with a 4-byte start code, trailing zero bytes before the

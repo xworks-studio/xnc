@@ -1354,8 +1354,24 @@ std::string FormatStageLog(const StageStat* stats, size_t n) {
   return out;
 }
 
+const char* StageSemanticsNote() {
+  // JSON-safe (no double quotes). Fix round 1: the semantics must live in
+  // the EMITTED output, not only in source comments - every histogram line
+  // and sidecar carries this note (or is preceded by the log preamble).
+  return "loop-thread wall time in us; gpu_copy_us is wait-inclusive "
+         "(AcquireNextFrame compositor wait up to spf_ms plus the async "
+         "CopyResource enqueue), gpu_convert_us is the async "
+         "VideoProcessorBlt enqueue cost, mft_submit_to_output_us and "
+         "capture_to_au_us include the encoder rung lookahead, "
+         "inflight_slots counts pool leases (0-3), queue_age_us is the "
+         "depth-one mailbox wait; read cpu_readbacks together with "
+         "encoder_backend - the software rung maps NV12 once per submit by "
+         "design, the capture/convert stages never read back";
+}
+
 std::string FormatStagesJson(const StageStat* stats, size_t n,
-                             uint64_t cpu_readbacks) {
+                             uint64_t cpu_readbacks,
+                             const char* encoder_backend) {
   std::string members;
   for (size_t i = 0; i < n; ++i) {
     if (!stats[i].p.has_samples) continue;  // zero-sample: absent, not zero
@@ -1371,11 +1387,17 @@ std::string FormatStagesJson(const StageStat* stats, size_t n,
   }
   if (members.empty()) return std::string();
   std::string out = "  \"stages\": {\n";
+  out += "    \"stage_semantics\": \"";
+  out += StageSemanticsNote();
+  out += "\",\n";
   out += members;
   out += "  },\n";
-  char buf[64];
+  char buf[96];
   std::snprintf(buf, sizeof(buf), "  \"cpu_readbacks\": %llu,\n",
                 static_cast<unsigned long long>(cpu_readbacks));
+  out += buf;
+  std::snprintf(buf, sizeof(buf), "  \"encoder_backend\": \"%s\",\n",
+                encoder_backend != nullptr ? encoder_backend : "");
   out += buf;
   return out;
 }
