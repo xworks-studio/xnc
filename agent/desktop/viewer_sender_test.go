@@ -321,18 +321,23 @@ func TestViewerSenderEpochJumpWithoutEvent(t *testing.T) {
 // (立即写出)、进入 waitIDR、恰一次合并请求、后续 delta 抑制。
 func TestViewerSenderQueueAgeOverflowFlushesAndRequestsKeyOnce(t *testing.T) {
 	s := newFakeViewerSenderWithBudget(2_000_000) // 85% → ~212KB/s:20KB 帧约 80ms 铺完(入队且有余包)
-	au := vsBigIDRAU(20_000)                      // ~20KB → FU-A 多包
-	f := Frame{Key: true, PresentMonoUs: vsMono(1), AU: au}
+	// C2 后关键帧豁免年龄冲刷 —— 年龄溢出转移由增量帧触发:小 IDR 开流,
+	// 在队的是 ~20KB 大 delta(FU-A 多包)。
+	if err := s.Enqueue(idr(0)); err != nil {
+		t.Fatalf("small idr: %v", err)
+	}
+	base := s.sent()
+	au := vsNAL(false, 1, 20_000) // ~20KB 非 key AU → FU-A 多包
+	f := Frame{PresentMonoUs: vsMono(1), AU: au}
 	if err := s.Enqueue(f); err != nil {
-		t.Fatalf("big idr: %v", err)
+		t.Fatalf("big delta: %v", err)
 	}
 	if s.state() != stateLive {
 		t.Fatalf("state=%v, want live", s.state())
 	}
-	immediate := s.sent()
-	total := expectedPacketCount(t, au)
-	if immediate >= total {
-		t.Fatalf("pacing did not defer anything: sent=%d total=%d", immediate, total)
+	total := base + expectedPacketCount(t, au)
+	if s.sent() >= total {
+		t.Fatalf("pacing did not defer anything: sent=%d total=%d", s.sent(), total)
 	}
 	if q := s.vs.Stats().QueuePackets; q == 0 {
 		t.Fatalf("queue empty after enqueue (pacing broken)")
@@ -504,6 +509,126 @@ func TestViewerSenderTokenBucketPacing(t *testing.T) {
 		if wantMarker := i == len(pkts)-1; p.Marker != wantMarker {
 			t.Fatalf("packet %d marker=%v, want %v", i, p.Marker, wantMarker)
 		}
+	}
+}
+
+// ---- final-fixwave C2:控制器预算下的真尺寸 IDR 必须完整可交付 ----
+
+// assertCompleteAUOrder 校验 sink 尾部 total 个包构成一个完整按序 AU:
+// 序列号连续、同一 RTP 时戳、仅最后一包 Marker。
+func assertCompleteAUOrder(t *testing.T, pkts []*rtp.Packet, total int) {
+	t.Helper()
+	tail := pkts[len(pkts)-total:]
+	for i := 1; i < len(tail); i++ {
+		if tail[i].SequenceNumber != tail[i-1].SequenceNumber+1 {
+			t.Fatalf("sequence not consecutive at %d: %d -> %d",
+				i, tail[i-1].SequenceNumber, tail[i].SequenceNumber)
+		}
+	}
+	for i, p := range tail {
+		if p.Timestamp != tail[0].Timestamp {
+			t.Fatalf("packet %d timestamp=%d, want %d (same AU)", i, p.Timestamp, tail[0].Timestamp)
+		}
+		if wantMarker := i == len(tail)-1; p.Marker != wantMarker {
+			t.Fatalf("packet %d marker=%v, want %v", i, p.Marker, wantMarker)
+		}
+	}
+}
+
+// TestViewerSenderKeyframeDeliveredUnderControllerBudget:2.3Mbps 预算
+//(QoS 控制器接线后的真实形态)下 ~60KB 的恢复 IDR:修前 100ms 入队门
+// 整帧拒收(铺完需 ~230ms)→ waitIDR + pacer 请求 → 观众永久卡死;修后
+// 关键帧豁免入队门:头段按令牌节奏铺开、尾段在 100ms 视界处有界突发,
+// 全部包按序送出(Marker 收尾)、状态全程 LIVE、零关键帧请求;随后 delta
+// 正常入队按节奏送出(关键帧债务被钳到 50ms 目标窗口等值)。
+func TestViewerSenderKeyframeDeliveredUnderControllerBudget(t *testing.T) {
+	s := newFakeViewerSenderWithBudget(2_300_000)
+	au := vsBigIDRAU(60_000)
+	total := expectedPacketCount(t, au)
+	if err := s.Enqueue(Frame{Key: true, PresentMonoUs: vsMono(1), AU: au}); err != nil {
+		t.Fatalf("big idr: %v", err)
+	}
+	if s.state() != stateLive {
+		t.Fatalf("state=%v, want live (keyframe admission must not reject)", s.state())
+	}
+	// 100ms 视界(+时钟余量)后全部送出。
+	s.clk.advance(105 * time.Millisecond)
+	if err := s.vs.drainNow(); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if s.sent() != total {
+		t.Fatalf("sent=%d, want %d (complete IDR AU under 2.3Mbps budget)", s.sent(), total)
+	}
+	assertCompleteAUOrder(t, s.sink.snapshot(), total)
+	if reqs := s.keyRequests(); len(reqs) != 0 {
+		t.Fatalf("key requests=%v, want none (IDR must be deliverable)", reqs)
+	}
+	if st := s.vs.Stats(); st.FramesSent != 1 || st.DeadlineDropped != 0 {
+		t.Fatalf("stats: framesSent=%d deadlineDropped=%d, want 1/0", st.FramesSent, st.DeadlineDropped)
+	}
+	// 随后 delta:正常入队送出(不为关键帧爆偿债务)。
+	if err := s.Enqueue(delta(2)); err != nil {
+		t.Fatalf("post-idr delta: %v", err)
+	}
+	s.clk.advance(30 * time.Millisecond)
+	if err := s.vs.drainNow(); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if s.sent() != total+1 {
+		t.Fatalf("post-idr delta: sent=%d, want %d (deltas pace normally after IDR)", s.sent(), total+1)
+	}
+	if s.state() != stateLive {
+		t.Fatalf("state=%v, want live after delta", s.state())
+	}
+}
+
+// TestViewerSenderKeyframeDeliveredAtFloorBudget:500k 码率下限时 ~60KB
+// IDR 铺完需 ~1.1s —— 100ms 视界处有界突发收尾;队列年龄界绝不冲刷进行
+// 中的关键帧(冲刷会转 waitIDR,恢复自残),帧间年龄界照旧对增量帧成立。
+func TestViewerSenderKeyframeDeliveredAtFloorBudget(t *testing.T) {
+	s := newFakeViewerSenderWithBudget(500_000)
+	au := vsBigIDRAU(60_000)
+	total := expectedPacketCount(t, au)
+	if err := s.Enqueue(Frame{Key: true, PresentMonoUs: vsMono(1), AU: au}); err != nil {
+		t.Fatalf("big idr: %v", err)
+	}
+	// 60ms:头段按令牌节奏部分送出(铺开仍在进行)。
+	s.clk.advance(60 * time.Millisecond)
+	if err := s.vs.drainNow(); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if mid := s.sent(); mid == 0 || mid >= total {
+		t.Fatalf("mid-drain sent=%d, want 0 < sent < total=%d (pacing head)", mid, total)
+	}
+	// 110ms:年龄已超 100ms —— 关键帧完成(全部按序送出)而非被冲刷;
+	// 冲刷路径会转 waitIDR 并触发 overflow 请求,这里必须都没有。
+	s.clk.advance(50 * time.Millisecond)
+	if err := s.vs.drainNow(); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if s.sent() != total {
+		t.Fatalf("sent=%d, want %d (in-progress keyframe completes past the age bound)", s.sent(), total)
+	}
+	assertCompleteAUOrder(t, s.sink.snapshot(), total)
+	if s.state() != stateLive {
+		t.Fatalf("state=%v, want live (keyframe completion is not an overflow)", s.state())
+	}
+	if reqs := s.keyRequests(); len(reqs) != 0 {
+		t.Fatalf("key requests=%v, want none", reqs)
+	}
+	if st := s.vs.Stats(); st.OverflowFlushes != 0 || st.FramesSent != 1 {
+		t.Fatalf("stats: overflowFlushes=%d framesSent=%d, want 0/1", st.OverflowFlushes, st.FramesSent)
+	}
+	// 随后 delta 照常入门(债务已钳制)。
+	if err := s.Enqueue(delta(2)); err != nil {
+		t.Fatalf("post-idr delta: %v", err)
+	}
+	s.clk.advance(100 * time.Millisecond)
+	if err := s.vs.drainNow(); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if s.sent() != total+1 {
+		t.Fatalf("post-idr delta: sent=%d, want %d", s.sent(), total+1)
 	}
 }
 

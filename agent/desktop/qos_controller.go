@@ -16,10 +16,15 @@
 //     与稳定窗);码率已在 500kbps 下限 → fps 沿 {60,30,20,15,10,5} 降一档;
 //     fps 已在 5 → height 沿 {1440,1080,900,720} 降一档(max_w 推导见下)。
 //     全部到底后拥塞不再有动作(default-safe)。
-//   - 非拥塞降档(85%×est < 当前码率,如 TWCC 估计跌落):≤1/s 一次。
+//   - 非拥塞降档(85%×est < 当前码率,如 TWCC 估计跌落)+ C1 迟滞
+//     (final-fixwave):还须 headroom 比率(est/码率)较上一拍衰减 ≥5%
+//     或 est 深于 0.95×85%×码率;≤1/s 一次。纯「85%×est < 码率」对
+//     goodput 形反馈(est ≈ 0.85×码率)是恒真式 —— 修前每拍棘轮 ~15%
+//     直到 500k 下限,升档(需 est > 1.18×码率)永不可达。
 //   - 升档:稳定(无拥塞且有富余)≥10s 后,≤1/3s 一次;顺序 bitrate →
 //     fps → height(先恢复最便宜的 knob,再动需要 codec epoch 重建的
-//     height),目标 = min(85%×est, 15Mbps),且 fps/height 不越过初始值。
+//     height),码率每步至多 +15% 或 +1Mbps(spec §14.2 ramp;远目标
+//     85%×est 需多个 3s 步逼近),且 fps/height 不越过初始值。
 //   - 旁观者暂停:旁观者 est < 35%×controller est → PauseSpectator(恰一
 //     次,幂等;无自动恢复——恢复通道是后续任务)。controller 自身与隐藏
 //     旁观者不受此规则约束。
@@ -51,6 +56,17 @@ const (
 	qosBandwidthFraction = 0.85
 	// qosDownshiftFactor:拥塞立即通道的码率砍幅(30% downshift)。
 	qosDownshiftFactor = 0.70
+	// qosDownRatioDecayGuard / qosDownDeepRatio(C1 final-fixwave 迟滞):
+	// 非拥塞降档除水平判据(85%×est < 码率)外还需降档证据 —— headroom
+	// 比率(est/码率)较上一拍衰减 ≥5%(真实恶化的边沿;goodput 跟随时
+	// 比率恒定,永不触发),或 est 深于 0.95×85%×码率(≥19% 深亏;出生
+	// 即低的通路无边沿可言,持续深亏必须能降,一步收敛到 85%×est)。
+	qosDownRatioDecayGuard = 0.95
+	qosDownDeepRatio       = 0.95 * 0.85
+	// qosUpStepAddBps(I2 final-fixwave):升档步幅上限 —— spec §14.2
+	// 「每 3 秒最多增加 15% 或 1 Mbps」(15% 走整数 ×115/100)。远目标
+	// 需多个 3s 步阶梯逼近,绝不一步直达 85%×est。
+	qosUpStepAddBps = 1_000_000
 	// qosSpectatorPauseFraction:旁观者暂停线(35% of controller est)。
 	qosSpectatorPauseFraction = 0.35
 	// qosMinBitrateBps / qosMaxBitrateBps:码率工作区 500kbps–15Mbps。
@@ -151,6 +167,13 @@ type QoSController struct {
 	stableSince time.Time // 稳定窗锚点(零值 = 未在稳定期)
 	lastDownAt  time.Time
 	lastUpAt    time.Time
+
+	// C1 迟滞参考:上一拍 controller 观测的 (est, 该拍生效码率[动作前])。
+	// 以动作前码率为参考,我们自己降档后 goodput 的等比例回落(比率回
+	// 到 ~0.85)不构成新证据 —— 真实 dip 之后的棘轮同样止步。
+	estRefKnown bool
+	lastEstBps  uint64
+	lastRefBps  uint32
 }
 
 // newQoSController 建控制器(决策入口只有 Observe)。
@@ -224,6 +247,17 @@ func (c *QoSController) Observe(fb ViewerFeedback) []Action {
 func (c *QoSController) decide(fb ViewerFeedback, now time.Time) []Action {
 	c.controllerBps = fb.EstimatedBps
 
+	// C1 迟滞(final-fixwave):降档判据从恒真式改为「带证据的降」。
+	// goodput 形反馈(est ≈ 0.85×码率 —— pacing 令牌桶速率的直接投影)
+	// 令 0.85×est < 码率恒真;headroom 比率的衰减边沿 + 深亏线把「带宽
+	// 证据」与「发送速率的影子」区分开(常数文档见上)。
+	headroom := float64(fb.EstimatedBps) / float64(c.cur.Bitrate)
+	decay := c.estRefKnown &&
+		headroom < qosDownRatioDecayGuard*(float64(c.lastEstBps)/float64(c.lastRefBps))
+	deep := headroom < qosDownDeepRatio
+	// 参考值记录当拍动作前的码率(decide 自此至动作只读 c.cur)。
+	c.lastEstBps, c.lastRefBps, c.estRefKnown = fb.EstimatedBps, c.cur.Bitrate, true
+
 	target := qosTargetBitrate(fb.EstimatedBps)
 	if fb.QueueMs > qosQueueAgeMs {
 		// 拥塞:稳定窗作废;立即 30% 通道(绕过 1/s 限速)。
@@ -236,8 +270,9 @@ func (c *QoSController) decide(fb ViewerFeedback, now time.Time) []Action {
 		return nil
 	}
 
-	if target < c.cur.Bitrate {
-		// 带宽估计跌落(尚未排队):常规降档,≤1/s。
+	if target < c.cur.Bitrate && (decay || deep) {
+		// 带宽估计跌落(尚未排队):常规降档,≤1/s;仅当有降档证据
+		//(比率衰减或深亏)—— 恒平的 goodput 形反馈不再触发。
 		c.stableSince = time.Time{}
 		if now.Sub(c.lastDownAt) < qosDownMinInterval {
 			return nil
@@ -289,10 +324,20 @@ func (c *QoSController) stepDown() VideoConfig {
 }
 
 // stepUp 计算稳定后的上一档(顺序:码率 → fps → height;不越初始值)。
+// I2(final-fixwave):码率步幅 ≤ max(+15%, +1Mbps)(spec §14.2 ramp)
+// —— 远目标(85%×est,封顶 15M)由多个 3s 步阶梯逼近,绝不一步直达
+// (修前 500k→12.75M 一跳把恢复变成新的突发)。
 func (c *QoSController) stepUp(target uint32) VideoConfig {
 	next := c.cur
 	if target > next.Bitrate {
-		next.Bitrate = target
+		step := next.Bitrate * 115 / 100 // +15%(整数下取整)
+		if add := next.Bitrate + qosUpStepAddBps; add > step {
+			step = add // 小码率区 +1Mbps 更大(spec 允许二者取大)
+		}
+		if step > target {
+			step = target
+		}
+		next.Bitrate = step
 		return next
 	}
 	if fps, ok := ladderAbove(fpsLadder, next.FPS, c.initial.FPS); ok {

@@ -12,10 +12,11 @@ package desktop
 
 import (
 	"bytes"
+	crand "crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand/v2"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -70,6 +71,20 @@ type Publisher struct {
 	iceFn     func(webrtc.ICECandidateInit)
 	stateMu   sync.Mutex
 	lastMono  uint64
+}
+
+// cryptoSessionKey 抽取 frame-meta 会话键(final-fixwave minor 4:
+// 键控 hash 的 key 必须不可预测 —— math/rand/v2 的会话键理论上可被旁观
+// 重构;crypto/rand 之下碰撞/预测均不可行)。crypto/rand.Read 在受支持
+// 平台不会失败;不可达的错误路径回退到时间抖动值,绝不因遥测键丢会话。
+// (RTP 时钟基点/序列器种子仍用 math/rand —— 可预测性无关紧要。)
+func cryptoSessionKey() uint64 {
+	var b [8]byte
+	if _, err := crand.Read(b[:]); err == nil {
+		return binary.LittleEndian.Uint64(b[:])
+	}
+	ns := uint64(time.Now().UnixNano())
+	return ns*0x9E3779B97F4A7C15 ^ ns>>29 // best-effort:仅遥测关联键
 }
 
 // RegisterDesktopCodecs 在 MediaEngine 上注册管线唯一的视频编解码
@@ -154,7 +169,7 @@ func NewPublisher(cfg PublisherConfig) (*Publisher, error) {
 		pc:      pc,
 		sender:  sender,
 		track:   track,
-		metaKey: rand.Uint64(), // 会话键控 hash 的 64 位键(裁决 1;仅内存)
+		metaKey: cryptoSessionKey(), // 会话键控 hash 的 64 位键(裁决 1;仅内存)
 	}
 	// 每 viewer 一个发送器:发包/单帧队列/令牌桶 pacing/WAIT_IDR 状态机
 	// 全部私有(与其它 viewer 完全隔离)。合并关键帧回调与 Publisher 的

@@ -1020,7 +1020,7 @@ func runNetworkCase(t *testing.T, tc netCase, dir string) {
 	spec.sendFeedback(tc.bps, 5, tc.rttMs)
 	time.Sleep(1050 * time.Millisecond)
 	ctrl.sendFeedback(tc.bps, 5, tc.rttMs)
-	time.Sleep(200 * time.Millisecond) // 第二轮 settle(1M 档 est 跌落落 ctrlSrc)
+	time.Sleep(200 * time.Millisecond) // 第二轮 settle(final-fixwave C1 后 flat est 不再降档;controllerBps 已刷新)
 
 	// ③ Phase B(spectator 限速至 30% 档位带宽 < 35% 暂停线)→ 只有
 	// spectator 暂停:state 帧 + 帧流冻结;controller 保持 LIVE。
@@ -1055,11 +1055,18 @@ func runNetworkCase(t *testing.T, tc netCase, dir string) {
 	}
 
 	// ④ Phase C(档位拥塞):controller queueMs = 档位排队反馈。>100 →
-	// 立即 30% 降档;<100 → 无降档(升档需 10s 稳定窗,本用例内不触发)。
+	// 立即 30% 降档;连发拥塞反馈(250ms 间隔)走立即通道连降 ——
+	// final-fixwave C1 后 est 路径带迟滞(flat est 不再触发降档),拥塞
+	// 立即通道是本相位唯一的降档来源,≤700k 只能由它到达;<100 → 无降档
+	//(升档需 10s 稳定窗,本用例内不触发)。
 	ctrl.sendFeedback(tc.bps, tc.queueMs, tc.rttMs)
 	if tc.congest {
-		// 1M 档先有 est 跌落(85%×1M=850k),拥塞再 30%(595k);
-		// ≤700k 只能由拥塞立即通道到达(est 降档是幂等的 850k)。
+		// 1M 档连降 4 拍:2.3M→1.61M→1.127M→789k→552k(≤700k 达标,
+		// 仍 ≥500k 下限;立即通道绕过 1/s 限速)。
+		for i := 0; i < 3; i++ {
+			time.Sleep(250 * time.Millisecond)
+			ctrl.sendFeedback(tc.bps, tc.queueMs, tc.rttMs)
+		}
 		pollUntil(t, 5*time.Second, "congestion downshift (immediate 30% channel)", func() bool {
 			return anyVideoConfig(func(c desktop.VideoConfig) bool { return c.Bitrate <= 700_000 })
 		})

@@ -7,10 +7,16 @@
 //	hidden viewers excluded from global decisions
 //	controller (priority viewer) dominates
 //	spectator paused below 35% of controller bandwidth
+//
+// final-fixwave 增补:C1(goodput 形反馈不得棘轮 + 真实恶化仍及时降)、
+// I2(升档步幅 ≤ max(+15%, +1Mbps))、I1(迟到会话 attach 即继承当前配置)。
 package desktop
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"testing"
 	"time"
 )
@@ -102,7 +108,8 @@ func TestQoSDownRateLimitedPerSecond(t *testing.T) {
 	}
 }
 
-// 10s 稳定前不升档;稳定后 up ≤1/3s;目标 = 85% × est,上限 15Mbps;
+// 10s 稳定前不升档;稳定后 up ≤1/3s;I2(final-fixwave):每步步幅
+// ≤ max(+15%, +1Mbps),远目标(85%×est)由多个 3s 步逼近,上限 15Mbps;
 // 拥塞重置稳定窗口。
 func TestQoSNoUpshiftBeforeTenStableSeconds(t *testing.T) {
 	c, clk := newQoSTestController()
@@ -114,8 +121,8 @@ func TestQoSNoUpshiftBeforeTenStableSeconds(t *testing.T) {
 	}
 	clk.advance(100 * time.Millisecond) // t=10s
 	cfg, ok := configOf(t, c.Observe(fb("s1", true, 8_000_000, 5)))
-	if !ok || cfg.Bitrate != 6_800_000 {
-		t.Fatalf("upshift to 85%% of estimate at 10s stable: got %+v ok=%v", cfg, ok)
+	if !ok || cfg.Bitrate != 3_300_000 { // 2.3M + max(15%,1Mbps) = 3.3M
+		t.Fatalf("first upshift steps by max(+15%%,+1Mbps): got %+v ok=%v", cfg, ok)
 	}
 	// up ≤1/3s:11s 时 est 升(→ target 8.5M)但窗口内 → 抑制。
 	clk.advance(1 * time.Second)
@@ -124,14 +131,28 @@ func TestQoSNoUpshiftBeforeTenStableSeconds(t *testing.T) {
 	}
 	clk.advance(2100 * time.Millisecond) // t=13.1s
 	cfg, ok = configOf(t, c.Observe(fb("s1", true, 10_000_000, 5)))
-	if !ok || cfg.Bitrate != 8_500_000 {
-		t.Fatalf("up after 3s window: got %+v ok=%v", cfg, ok)
+	if !ok || cfg.Bitrate != 4_300_000 { // 3.3M + max(15%,1Mbps) = 4.3M
+		t.Fatalf("up after 3s window steps by max(+15%%,+1Mbps): got %+v ok=%v", cfg, ok)
 	}
-	// 上限钳制:est=100Mbps → target 15M。
-	clk.advance(4 * time.Second)
-	cfg, ok = configOf(t, c.Observe(fb("s1", true, 100_000_000, 5)))
-	if !ok || cfg.Bitrate != 15_000_000 {
-		t.Fatalf("bitrate ceiling 15Mbps: got %+v ok=%v", cfg, ok)
+	// 上限钳制:est=100Mbps → 多步 ramp 逼近 15M(绝不一步直达)。
+	prev := cfg.Bitrate
+	for i := 0; i < 40 && prev < 15_000_000; i++ {
+		clk.advance(3100 * time.Millisecond)
+		cfg, ok = configOf(t, c.Observe(fb("s1", true, 100_000_000, 5)))
+		if !ok {
+			break
+		}
+		limit := prev + qosUpStepAddBps
+		if lim15 := prev * 115 / 100; lim15 > limit {
+			limit = lim15
+		}
+		if cfg.Bitrate > limit || cfg.Bitrate > 15_000_000 {
+			t.Fatalf("ramp step %d: %d -> %d exceeds max(+15%%,+1Mbps) or ceiling", i, prev, cfg.Bitrate)
+		}
+		prev = cfg.Bitrate
+	}
+	if prev != 15_000_000 {
+		t.Fatalf("ramp must converge to the 15Mbps ceiling, got %d", prev)
 	}
 	// 拥塞:立即 30% 降 + 稳定窗口重置(10s 内不再升档)。
 	clk.advance(100 * time.Millisecond)
@@ -175,10 +196,11 @@ func TestQoSControllerDominatesSpectatorFeedback(t *testing.T) {
 	if acts := c.Observe(fb("spec", true, 7_000_000, 500)); len(acts) != 0 {
 		t.Fatalf("spectator congestion must not downshift the shared stream, got %+v", acts)
 	}
-	// controller 的低延迟反馈照常驱动升档(10s 稳定后)。
+	// controller 的低延迟反馈照常驱动升档(10s 稳定后;I2 ramp 首步
+	// 2.3M+max(15%,1Mbps)=3.3M)。
 	clk.advance(10 * time.Second)
 	cfg, ok := configOf(t, c.Observe(fb("ctrl", true, 8_000_000, 5)))
-	if !ok || cfg.Bitrate != 6_800_000 {
+	if !ok || cfg.Bitrate != 3_300_000 {
 		t.Fatalf("controller's own feedback still drives upshift: got %+v ok=%v", cfg, ok)
 	}
 	if c.ControllerID() != "ctrl" {
@@ -258,21 +280,23 @@ func TestQoSLadderEscalationAndRecovery(t *testing.T) {
 		t.Fatalf("all rungs at floor: congestion is a no-op, got %+v", acts)
 	}
 
-	// 恢复:干净样本重标稳定窗;10s 后先升码率到 target(est=30M → 15M)。
+	// 恢复:干净样本重标稳定窗;10s 后先升码率 —— I2 ramp:500k+
+	// max(15%,1Mbps)=1.5M,远目标(est=30M → 15M)由多个 3s 步逼近。
 	clk.advance(20 * time.Second)
 	if acts := c.Observe(fb("s1", true, 30_000_000, 5)); len(acts) != 0 {
 		t.Fatalf("first clean sample only marks stability, got %+v", acts)
 	}
 	clk.advance(10 * time.Second)
 	got, _ := configOf(t, c.Observe(fb("s1", true, 30_000_000, 5)))
-	if got.Bitrate != 15_000_000 || got.FPS != 5 || got.MaxW != 1280 {
-		t.Fatalf("recovery raises bitrate first: got %+v", got)
+	if got.Bitrate != 1_500_000 || got.FPS != 5 || got.MaxW != 1280 {
+		t.Fatalf("recovery raises bitrate first (ramped first step 1.5M): got %+v", got)
 	}
-	// 码率到顶后恢复 fps(5→10→15→20→30;60 越过初始 30 上限),再 height
-	// (720→900 得 1600、→1080 得 1920;1440 档推导 2560>1920 不再升)。
+	// 码率 ramp 到顶(每步 ≤ +max(15%,1Mbps)),到顶后恢复 fps
+	// (5→10→15→20→30;60 越过初始 30 上限),再 height(720→900 得
+	// 1600、→1080 得 1920;1440 档推导 2560>1920 不再升)。
 	var steps []VideoConfig
-	for i := 0; i < 7; i++ {
-		clk.advance(4 * time.Second)
+	for i := 0; i < 40; i++ {
+		clk.advance(3500 * time.Millisecond)
 		cfg, ok := configOf(t, c.Observe(fb("s1", true, 30_000_000, 5)))
 		if !ok {
 			break
@@ -280,6 +304,17 @@ func TestQoSLadderEscalationAndRecovery(t *testing.T) {
 		steps = append(steps, cfg)
 	}
 	want := []VideoConfig{
+		{Bitrate: 2_500_000, FPS: 5, MaxW: 1280},
+		{Bitrate: 3_500_000, FPS: 5, MaxW: 1280},
+		{Bitrate: 4_500_000, FPS: 5, MaxW: 1280},
+		{Bitrate: 5_500_000, FPS: 5, MaxW: 1280},
+		{Bitrate: 6_500_000, FPS: 5, MaxW: 1280},
+		{Bitrate: 7_500_000, FPS: 5, MaxW: 1280},
+		{Bitrate: 8_625_000, FPS: 5, MaxW: 1280},
+		{Bitrate: 9_918_750, FPS: 5, MaxW: 1280},
+		{Bitrate: 11_406_562, FPS: 5, MaxW: 1280},
+		{Bitrate: 13_117_546, FPS: 5, MaxW: 1280},
+		{Bitrate: 15_000_000, FPS: 5, MaxW: 1280},
 		{Bitrate: 15_000_000, FPS: 10, MaxW: 1280},
 		{Bitrate: 15_000_000, FPS: 15, MaxW: 1280},
 		{Bitrate: 15_000_000, FPS: 20, MaxW: 1280},
@@ -343,6 +378,123 @@ func TestViewerFeedbackJSONShape(t *testing.T) {
 	if !f.Visible || f.EstimatedBps != 4_200_000 || f.QueueMs != 12.5 ||
 		f.DecodeQueue != 2 || f.RTTMs != 38.2 {
 		t.Fatalf("parsed feedback mismatch: %+v", f)
+	}
+}
+
+// ---- final-fixwave C1:goodput 形反馈不得单调棘轮 ----
+
+// goodputOf 模拟「goodput 跟随发送速率」的 viewer:est 恒等于当前码率的
+// 85%(pacing 令牌桶速率 = 0.85×budget 的直接投影)。修前 0.85×est <
+// cur.Bitrate 对这种反馈是恒真式 —— 每拍(1/s 限速)降 ~28% 直到 500k
+// 下限,且升档需 est > 1.18×bitrate 永不可达:持续运动 = 必然棘轮。
+func goodputOf(c *QoSController) uint64 { return uint64(c.Current().Bitrate) * 85 / 100 }
+
+// TestQoSGoodputShapedFeedbackDoesNotRatchet:est = cur.Bitrate×0.85 的
+// goodput 形反馈连续 ≥10 拍不得触发任何降档(码率纹丝不动)。这是 C1 的
+// 核心回归:降档判据必须区分「带宽证据」与「发送速率的影子」。
+func TestQoSGoodputShapedFeedbackDoesNotRatchet(t *testing.T) {
+	c, clk := newQoSTestController()
+	// controller 就位即以 goodput 形上报(稳态形状,无跳变边沿)。
+	if acts := c.Observe(fb("s1", true, goodputOf(c), 5)); len(acts) != 1 {
+		t.Fatalf("first feedback should only emit the initial config, got %+v", acts)
+	}
+	for i := 0; i < 10; i++ {
+		clk.advance(1 * time.Second) // web 侧 1s 反馈节奏
+		if acts := c.Observe(fb("s1", true, goodputOf(c), 5)); len(acts) != 0 {
+			t.Fatalf("observation %d: goodput-shaped feedback must not act, got %+v", i+1, acts)
+		}
+	}
+	if got := c.Current().Bitrate; got != 2_300_000 {
+		t.Fatalf("bitrate ratchered to %d under goodput-shaped feedback, want stable 2.3M", got)
+	}
+}
+
+// TestQoSSharplyDegradingEstStillDownshiftsPromptly:真实恶化(est 对半跌)
+// 必须当拍即降(C1 迟滞不得吞掉真证据);且降档后 goodput 形的等比例回落
+//(est 跟到 0.85×新码率)不构成新的降档证据 —— 棘轮在真实 dips 之后同样
+// 必须止步。
+func TestQoSSharplyDegradingEstStillDownshiftsPromptly(t *testing.T) {
+	c, clk := newQoSTestController()
+	c.Observe(fb("s1", true, goodputOf(c), 5)) // 稳态:1.955M goodput 形
+	clk.advance(1 * time.Second)
+	// est 对半跌:977,500 → target 830,875,当拍即降。
+	cfg, ok := configOf(t, c.Observe(fb("s1", true, 977_500, 5)))
+	if !ok || cfg.Bitrate != 830_875 {
+		t.Fatalf("halved est must downshift promptly to 85%% target: got %+v ok=%v", cfg, ok)
+	}
+	// 降后 goodput 跟随到 0.85×830,875:10 拍零动作(棘轮止步)。
+	for i := 0; i < 10; i++ {
+		clk.advance(1 * time.Second)
+		if acts := c.Observe(fb("s1", true, goodputOf(c), 5)); len(acts) != 0 {
+			t.Fatalf("post-dip observation %d: goodput-shaped feedback must not act, got %+v", i+1, acts)
+		}
+	}
+	if got := c.Current().Bitrate; got != 830_875 {
+		t.Fatalf("post-dip bitrate ratchered to %d, want stable 830875", got)
+	}
+}
+
+// ---- final-fixwave I2:升档步幅上限(spec §14.2:每 3s 最多 +15% 或 +1Mbps)----
+
+// TestQoSUpshiftRampStepCap:500k 下限、est=12M 稳定时,首拍升档落在
+// cur+max(15%,1Mbps)=1.5M,第二拍 2.5M —— 远目标(10.2M)需多个 3s 步
+// 阶梯逼近,绝不一步直达(修前一步 10.2M 会把恢复变成新的突发)。
+func TestQoSUpshiftRampStepCap(t *testing.T) {
+	c, clk := newQoSTestController()
+	c.Observe(fb("s1", true, 8_000_000, 5))
+	// 拥塞立即通道 ×0.7 连降 5 拍到 500k 下限(fps/height 未动)。
+	for i := 0; i < 5; i++ {
+		clk.advance(100 * time.Millisecond)
+		c.Observe(fb("s1", true, 1_000, 500))
+	}
+	if got := c.Current().Bitrate; got != 500_000 {
+		t.Fatalf("floor setup: bitrate=%d, want 500k", got)
+	}
+	// est=12M 干净到达:首拍只标记稳定窗。
+	clk.advance(10 * time.Second)
+	if acts := c.Observe(fb("s1", true, 12_000_000, 5)); len(acts) != 0 {
+		t.Fatalf("first clean sample only marks stability, got %+v", acts)
+	}
+	clk.advance(10 * time.Second)
+	cfg, ok := configOf(t, c.Observe(fb("s1", true, 12_000_000, 5)))
+	if !ok || cfg.Bitrate != 1_500_000 {
+		t.Fatalf("first upshift must step by max(+15%%,+1Mbps) to 1.5M, got %+v ok=%v", cfg, ok)
+	}
+	clk.advance(3100 * time.Millisecond)
+	cfg, ok = configOf(t, c.Observe(fb("s1", true, 12_000_000, 5)))
+	if !ok || cfg.Bitrate != 2_500_000 {
+		t.Fatalf("second upshift must step to 2.5M, got %+v ok=%v", cfg, ok)
+	}
+}
+
+// ---- final-fixwave I1:迟到会话 attach 即继承当前配置 ----
+
+// TestStreamQoSAttachAppliesCurrentConfig:controller 已决策(emitted)之后
+// 才 attach 的会话,发送器预算立刻等于当前配置码率 × 85% —— 不等下一个
+// Action(修前迟到 viewer 以 20Mbps 缺省预算狂奔到下一次决策)。
+func TestStreamQoSAttachAppliesCurrentConfig(t *testing.T) {
+	clk := newManualClock()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	q := newStreamQoS(QoSControllerConfig{
+		Initial:  VideoConfig{Bitrate: 2_300_000, FPS: 30, MaxW: 1920},
+		AspectW:  1920,
+		AspectH:  1080,
+		Now:      clk.Now,
+	}, log)
+	q.observe(fb("s1", true, 8_000_000, 5)) // controller 就位,初始下发
+	clk.advance(1 * time.Second)
+	if acts := q.observe(fb("s1", true, 2_000_000, 5)); len(acts) == 0 {
+		t.Fatal("est halving should downshift the shared stream")
+	}
+	pub, err := NewPublisher(PublisherConfig{Log: log})
+	if err != nil {
+		t.Fatalf("publisher: %v", err)
+	}
+	defer pub.Close()
+	q.attach("s2", context.Background(), nil, pub)
+	want := float64(1_700_000) / 8 * pacingBudgetFraction
+	if got := pub.vs.bucket.rate; got != want {
+		t.Fatalf("late-join pacing rate=%v, want %v (current 1.7M config × 85%%)", got, want)
 	}
 }
 

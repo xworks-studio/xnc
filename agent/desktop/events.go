@@ -113,7 +113,10 @@ func (e *sessionEvents) onViewerFeedback(raw []byte) {
 	}
 	var f viewerFeedbackFrame
 	if err := json.Unmarshal(raw, &f); err != nil {
-		return // 非 JSON/字段错:忽略,信令流自愈
+		// final-fixwave minor 3:畸形反馈留一条观测线(忽略不变,信令流
+		// 自愈——但静默吞掉会让协议漂移不可见)。
+		e.log.Debug("desktop viewer_feedback malformed; ignored", "err", err)
+		return
 	}
 	acts := e.qos.observe(ViewerFeedback{
 		SessionID:    e.sessionID,

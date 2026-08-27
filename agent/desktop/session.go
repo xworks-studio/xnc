@@ -110,10 +110,16 @@ func (q *streamQoS) observe(fb ViewerFeedback) []Action {
 }
 
 // attach 注册一个会话的 QoS 应用端点(pub 已建联;Handle 收线时 detach)。
+// I1(final-fixwave):注册即把当前生效配置套上 —— 迟到会话(controller
+// 已决策之后才 offer 建联)的发送器预算立刻等于 cur.Bitrate×85%,不等
+// 下一个 Action(修前迟到 viewer 挂 20Mbps 缺省预算狂奔到下一次决策)。
+// 首个决策未发生时 Current() 即初始配置,同样成立(缺省预算只会更宽)。
 func (q *streamQoS) attach(sessionID string, ctx context.Context, w *wsWriter, pub *Publisher) {
 	q.mu.Lock()
 	q.sessions[sessionID] = &qosSession{ctx: ctx, w: w, pub: pub}
+	cur := q.ctrl.Current() // q.mu 即 ctrl 的串行锁(observe 同锁调用)
 	q.mu.Unlock()
+	pub.SetPacingBudget(int(cur.Bitrate))
 }
 
 // detach 注销会话端点(幂等)。

@@ -16,12 +16,22 @@
 // 队列语义(全局约束:发送侧排队目标 50ms、硬上限 100ms):
 //   - 队列至多容纳一帧的包;新帧入队时旧帧余包整帧冲刷(立即写出),
 //     绝不出现两帧叠压(有界内存)。
-//   - 入队门:最后一包的 plan 发送时刻超过入队时刻 + maxQueueAge 的帧
-//     整帧不入队(无任何部分包发出),并进入 waitIDR —— 抑制只丢不采样,
-//     绝不「丢一帧 P 帧后继续发后续 P 帧」。
-//   - 队列年龄(实际时刻)超过 maxQueueAge:冲刷在队包(立即写出以完成
-//     在途帧,避免撕裂帧)、清空队列/重传状态、进入 waitIDR,并恰一次
-//     触发合并关键帧回调。
+//   - 入队门(增量帧):最后一包的 plan 发送时刻超过入队时刻 +
+//     maxQueueAge 的帧整帧不入队(无任何部分包发出),并进入 waitIDR
+//     —— 抑制只丢不采样,绝不「丢一帧 P 帧后继续发后续 P 帧」。
+//   - 关键帧豁免(C2,final-fixwave):真实 1080p 桌面 IDR 数十至数百
+//     KB、native 无 VBV/IDR 尺寸钳制,100ms 门在控制器预算下只容 ~28KB
+//     (2.3Mbps)/~9KB(500k 下限)—— 修前恢复 IDR(PLI/溢出/恢复/epoch)
+//     整帧被拒 → waitIDR 棘轮 = 观众永久卡死。IDR 绝不拒收:头段按令牌
+//     节奏铺开,尾段截止钳到入队 +100ms(有界突发,与冲刷同类);令牌
+//     债务钳到 50ms 目标窗口等值(后续 delta 照常入门)。
+//   - 队列年龄(实际时刻)超过 maxQueueAge(增量帧):冲刷在队包(立即
+//     写出以完成在途帧,避免撕裂帧)、清空队列、进入 waitIDR,并恰一次
+//     触发合并关键帧回调。进行中的关键帧不被年龄界冲刷(冲刷会转
+//     waitIDR,恢复自残)—— 其截止已钳到 100ms 视界,帧间年龄界照旧
+//     (硬上限对增量帧始终成立)。
+//   - (重传不在本层:发送器无 per-sender 重传状态 —— NACK 重发在
+//     publisher PC 的 pion 拦截器链里,per-PC 一份。)
 //
 // 合并关键帧回调是 Task 2(KeyframeCoordinator)将接管的 seam:溢出
 // ("overflow")、pacer 拒收("pacer")、恢复("resume")与 Publisher 侧的
@@ -52,6 +62,11 @@ const (
 	// pacingBurstBytes 是令牌桶容量(3×MTU):每帧首批包立即送出,余下
 	// 按速率铺开——首包延迟为零,整帧有界。
 	pacingBurstBytes = 3 * rtpMTU
+	// pacingDebtFloor(C2 final-fixwave):关键帧债务钳制 —— 豁免入队门
+	// 的 IDR 最多给令牌桶留下「50ms 排队目标窗口」等值的债务,保证随后
+	// 的增量帧仍在 100ms 门内可入队、按节奏铺开(不为一次关键帧长期
+	// 还债,否则恢复 IDR 之后 delta 接连被拒,流退化为 IDR-only)。
+	pacingDebtFloor = 50 * time.Millisecond
 	// defaultPacingBudgetBps 是预算缺省值(bits/s;BudgetBps=0 时生效)。
 	// 拥塞控制(后续任务)将按 TWCC 反馈驱动预算。
 	defaultPacingBudgetBps = 20_000_000
@@ -140,6 +155,7 @@ type ViewerSender struct {
 	pendingEpoch  frameEpoch // Discontinuity 后等待的代际(0 = 不校验)
 	queue         []queuedPacket
 	queueEnqueued time.Time // 当前在队帧的入队时刻(年龄判据)
+	queueKey      bool      // 当前在队帧是否关键帧(C2 完成保证)
 	queueBytes    int       // 在队帧的 AU 字节累计
 	stats         viewerStatsN
 	pumpStarted   bool
@@ -168,7 +184,7 @@ type viewerStatsN struct {
 	epochDropped    uint64 // 旧/异代 epoch 抑制的帧
 	pausedDropped   uint64
 	closedDropped   uint64
-	deadlineDropped uint64 // 截止超 100ms 未入队的帧
+	deadlineDropped uint64 // 截止超 100ms 未入队的增量帧(关键帧豁免,C2)
 	overflowFlushes uint64 // 队列年龄超限冲刷次数
 	keyRequests     uint64 // 合并关键帧请求触发次数
 }
@@ -218,13 +234,12 @@ func (b *tokenBucket) refill(now time.Time) {
 	}
 }
 
-// reserve 为一帧的全部包计算计划发送时刻。若最后一包的截止超过
-// now+maxQueueAge,则整帧拒收(不消耗任何令牌)——「超过 100ms 的包
-// 不入队」的入队门。sizes 为各包的线缆字节数(MarshalSize)。
-func (b *tokenBucket) reserve(sizes []int, now time.Time) (deadlines []time.Time, ok bool) {
+// plan 为一帧的全部包计算计划发送时刻(不改余额;返回影子余额)。
+// sizes 为各包的线缆字节数(MarshalSize)。
+func (b *tokenBucket) plan(sizes []int, now time.Time) (deadlines []time.Time, tokens float64) {
 	b.refill(now)
 	deadlines = make([]time.Time, len(sizes))
-	tokens := b.tokens
+	tokens = b.tokens
 	for i, n := range sizes {
 		if deficit := float64(n) - tokens; deficit > 0 {
 			deadlines[i] = now.Add(time.Duration(deficit / b.rate * float64(time.Second)))
@@ -233,11 +248,40 @@ func (b *tokenBucket) reserve(sizes []int, now time.Time) (deadlines []time.Time
 		}
 		tokens -= float64(n)
 	}
+	return deadlines, tokens
+}
+
+// reserve(增量帧)为一帧的全部包计算计划发送时刻。若最后一包的截止
+// 超过 now+maxQueueAge,则整帧拒收(不消耗任何令牌)——「超过 100ms 的
+// 包不入队」的入队门。
+func (b *tokenBucket) reserve(sizes []int, now time.Time) (deadlines []time.Time, ok bool) {
+	deadlines, tokens := b.plan(sizes, now)
 	if last := deadlines[len(deadlines)-1]; last.Sub(now) > maxQueueAge {
 		return nil, false
 	}
 	b.tokens = tokens
 	return deadlines, true
+}
+
+// reserveKeyframe(C2 final-fixwave):关键帧豁免 100ms 入队门 —— 绝不
+// 拒收。头段截止按令牌节奏(plan 原值),尾段钳到 now+maxQueueAge:
+// 整帧铺开仍受 100ms 视界约束(超出部分以有界突发送出,与冲刷已接受
+// 的突发同类),配 drainLocked 的「进行中关键帧不被年龄界冲刷」保证
+// AU 必然完整送出。余额照记(长期速率公平),但债务钳到
+// pacingDebtFloor 等值 —— 后续增量帧照常入门、按节奏铺开。
+func (b *tokenBucket) reserveKeyframe(sizes []int, now time.Time) []time.Time {
+	deadlines, tokens := b.plan(sizes, now)
+	gate := now.Add(maxQueueAge)
+	for i := range deadlines {
+		if deadlines[i].After(gate) {
+			deadlines[i] = gate
+		}
+	}
+	if floor := -b.rate * float64(pacingDebtFloor) / float64(time.Second); tokens < floor {
+		tokens = floor
+	}
+	b.tokens = tokens
+	return deadlines
 }
 
 // newViewerSender 建一个发送器(不启动常驻泵;Publisher 随后 start())。
@@ -364,10 +408,14 @@ func (s *ViewerSender) Enqueue(f Frame) error {
 		_ = s.flushQueueLocked("superseded")
 	}
 
-	// 入队门:最后一包截止超 maxQueueAge → 整帧不入队。抑制只丢不采样:
-	// 进入 waitIDR 并恰一次合并请求,绝无「丢 P 帧后继续发后续 P 帧」。
-	deadlines, ok := s.bucket.reserve(sizes, now)
-	if !ok {
+	// 入队门:增量帧的最后一包截止超 maxQueueAge → 整帧不入队(抑制只
+	// 丢不采样:进入 waitIDR 并恰一次合并请求,绝无「丢 P 帧后继续发
+	// 后续 P 帧」);关键帧走 reserveKeyframe 豁免(C2,见其注释)——
+	// 恢复 IDR 永远可交付。
+	var deadlines []time.Time
+	if f.Key {
+		deadlines = s.bucket.reserveKeyframe(sizes, now)
+	} else if d, ok := s.bucket.reserve(sizes, now); !ok {
 		s.stats.deadlineDropped++
 		s.state = stateWaitIDR
 		if keyReason == "" {
@@ -376,6 +424,8 @@ func (s *ViewerSender) Enqueue(f Frame) error {
 		s.mu.Unlock()
 		s.fireKey(keyReason)
 		return nil
+	} else {
+		deadlines = d
 	}
 	// frame-meta(M3 Task 4,修正轮):身份在本帧 admitted 入队时绑定
 	//(此刻 per-viewer 时戳已定),随队列槽位携带——任何写出顺序(入口
@@ -385,6 +435,7 @@ func (s *ViewerSender) Enqueue(f Frame) error {
 	if s.makeMeta != nil {
 		meta = s.makeMeta(f, ts)
 	}
+	s.queueKey = f.Key // 单帧队列:此刻队列必空(上方已冲刷/丢弃)
 	for i := range pkts {
 		s.queue = append(s.queue, queuedPacket{
 			pkt:      pkts[i],
@@ -546,6 +597,7 @@ func (s *ViewerSender) discontinuityLocked(fe frameEpoch) {
 // dropQueueLocked 丢弃全部在队包(旧代数据无效)。
 func (s *ViewerSender) dropQueueLocked() {
 	s.queue = nil
+	s.queueKey = false
 	s.queueBytes = 0
 }
 
@@ -566,9 +618,10 @@ func (s *ViewerSender) flushQueueLocked(cause string) error {
 }
 
 // ageOverflowLocked 是「队列年龄超限」的统一转移(drainLocked 的检测点
-// 与单测直接驱动同一入口):冲刷在队包(立即写出以完成在途帧)、清空
-// 队列/重传状态、进入 waitIDR。返回应触发的合并关键帧 reason(仅
-// live→waitIDR 的转移触发;已在 waitIDR 时返回 ""——等待中的请求已合并)。
+// 与单测直接驱动同一入口;C2 后仅增量帧可入):冲刷在队包(立即写出以
+// 完成在途帧)、清空队列、进入 waitIDR。返回应触发的合并关键帧 reason
+// (仅 live→waitIDR 的转移触发;已在 waitIDR 时返回 ""——等待中的请求
+// 已合并)。
 func (s *ViewerSender) ageOverflowLocked(now time.Time) string {
 	_ = now // 冲刷即立即写出;now 仅用于日志/一致性扩展
 	if s.state != stateLive {
@@ -599,14 +652,17 @@ func (s *ViewerSender) writeLocked(q queuedPacket) error {
 	return nil
 }
 
-// drainLocked 送出截止时刻已到的在队包;若当前在队帧年龄超过
-// maxQueueAge 则先走 ageOverflow 转移。返回(待触发的合并请求 reason,
-// 首个写错误)。写错误视为发送面死亡:弃队列并转入 closed。
+// drainLocked 送出截止时刻已到的在队包;若当前在队帧(增量帧)年龄超过
+// maxQueueAge 则先走 ageOverflow 转移。C2:进行中的关键帧不被年龄界冲刷
+// —— 其截止已钳到入队 +100ms(reserveKeyframe),这里跳过冲刷判定让
+// AU 必然完整送出(冲刷虽也整帧写出,但会转 waitIDR = 恢复自残);帧
+// 间年龄界照旧。返回(待触发的合并请求 reason,首个写错误)。写错误
+// 视为发送面死亡:弃队列并转入 closed。
 func (s *ViewerSender) drainLocked(now time.Time) (string, error) {
 	if len(s.queue) == 0 {
 		return "", nil
 	}
-	if now.Sub(s.queueEnqueued) > maxQueueAge {
+	if now.Sub(s.queueEnqueued) > maxQueueAge && !s.queueKey {
 		return s.ageOverflowLocked(now), nil
 	}
 	t0 := time.Now()

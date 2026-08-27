@@ -115,7 +115,8 @@ type VideoElementWithRvfc = HTMLVideoElement & { requestVideoFrameCallback?: Rvf
 interface ViewerFeedbackFrame {
   type: string;
   visible: boolean;
-  /** Downlink goodput estimate (bps). */
+  /** Downlink available-bandwidth estimate (bps): transport-cc
+   * availableIncomingBitrate preferred; goodput fallback (C1). */
   estimatedBps: number;
   /** Avg jitter-buffer delay per emitted frame this window (ms). */
   queueMs: number;
@@ -597,12 +598,19 @@ export default function DesktopLive() {
 
     // ---- M3 Task 5: 1s viewer_feedback uplink ----
     // Metric derivations (all downlink-side; documented per plan ruling 4):
-    //  - estimatedBps: inbound-rtp bytesReceived delta × 8 / elapsed —
-    //    the viewer's downlink goodput (never the outbound direction).
-    //    Fallback when the delta is 0: candidate-pair
-    //    availableIncomingBitrate. With no estimate at all the report
-    //    is skipped — a 0 would read as deep congestion to the agent's
-    //    QoS controller.
+    //  - estimatedBps: candidate-pair availableIncomingBitrate (the
+    //    browser's transport-cc estimate of the path's available downlink
+    //    bandwidth) when present and > 0 — the agent's target is 85% of
+    //    AVAILABLE bandwidth (spec §14.2), and only this stat measures the
+    //    path rather than our own sending. Goodput (inbound-rtp
+    //    bytesReceived delta × 8 / elapsed) is a FALLBACK for when no
+    //    estimate exists: goodput tracks the send rate (≤ encoder bitrate,
+    //    further capped ~15% by pacing), so feeding it as "available
+    //    bandwidth" made the controller's downshift test an identity and
+    //    ratcheted the bitrate to the floor under sustained motion
+    //    (final-review C1). With no estimate and no goodput the report is
+    //    skipped — a 0 would read as deep congestion to the agent's QoS
+    //    controller.
     //  - queueMs: (jitterBufferDelay delta / jitterBufferEmittedCount
     //    delta) × 1000 — average jitter-buffer sojourn per emitted
     //    frame over the window (both stats are cumulative seconds /
@@ -683,7 +691,9 @@ export default function DesktopLive() {
       }
       const elapsedS = Math.max((sample.at - fbBase.at) / 1000, 0.001);
       const goodput = Math.round(((sample.bytes - fbBase.bytes) * 8) / elapsedS);
-      const estimatedBps = goodput > 0 ? goodput : Math.round(availBps);
+      // C1 (final review): the transport-cc available-bandwidth estimate is
+      // primary; goodput (a shadow of our own send rate) only when absent.
+      const estimatedBps = availBps > 0 ? Math.round(availBps) : goodput;
       const base = fbBase;
       fbBase = sample; // advance the window even when we skip below
       if (estimatedBps <= 0) return; // nothing measurable — 0 would look like congestion
