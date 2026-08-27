@@ -36,9 +36,11 @@
 //	56 字节记录本身也不入日志。captureEpoch 不进记录/不进 hash(编码
 //	代际已足以标识编码身份;采集重建语义由 0x020B/state 帧承载)。
 //
-// 本文件只含纯编解码(无 webrtc 依赖);通道创建与发送接线见
-// transport.go(attachFrameMeta/frameMetaTracker/frameMetaRelay)与
-// session.go(setupPublisher,HandleOffer 前随输入通道一同创建)。
+// 本文件只含纯编解码(无 webrtc 依赖);通道创建与发送接线:发送器侧
+// 帧边界 seam(viewer_sender.go 的 MakeFrameMeta/OnFrameSent——身份在
+// 入队时绑定,本帧最后一包成功写出后恰一次汇出)+ Publisher 侧中继
+// (transport.go 的 attachFrameMeta/frameMetaRelay)+ 建立时序
+// (session.go 的 setupPublisher,HandleOffer 前随输入通道一同创建)。
 package desktop
 
 import (

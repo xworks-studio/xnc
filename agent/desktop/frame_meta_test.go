@@ -4,9 +4,11 @@
 //  1. 编解码:56 字节黄金向量(固定输入 + 固定 key;Task 5 TS 侧逐字节
 //     平移同一向量)、小端字段落位、长度/版本拒绝、会话键控 hash 语义
 //     (同 key 同输入确定;异 key 异 hash;绝无「裸内容指纹」)。
-//  2. 发送路径接线(PC-free):tracker 只在本帧最后一包(Marker)写出后
-//     恰一次汇出 meta(未被送出的帧——抑制/丢弃——绝不发);relay 的
-//     非阻塞入队(满则丢 + 计数,绝不为遥测阻塞媒体)。
+//  2. 发送路径接线(PC-free):ViewerSender 的帧边界 seam(MakeFrameMeta/
+//     OnFrameSent)在「本帧最后一包成功写出」后恰一次汇出 meta——身份在
+//     入队时绑定(修正轮:合帧冲刷/深度赤字下的零包写出窗口绝不错位),
+//     未被送出的帧(抑制/暂停/关闭)绝不发;relay 的非阻塞入队(满则丢
+//     + 计数,绝不为遥测阻塞媒体)与出口卡死时有界收线。
 //  3. 回环门(真实双 PeerConnection):viewer 侧 "frame-meta" 通道按
 //     unordered + 不重传协商;meta 的 rtpTimestamp 与该帧 RTP 最后一包
 //     实际盖章的时戳逐帧相等(裁决 4:meta 是 per-viewer 的)。
@@ -24,7 +26,6 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -210,105 +211,192 @@ func TestFrameMetaV1KeyedHashSemantics(t *testing.T) {
 	}
 }
 
-// ---- 发送路径接线(PC-free)----
+// ---- 发送路径接线(PC-free;ViewerSender 帧边界 seam)----
 
-// metaRecorder 收集 tracker 汇出的 meta(线程安全)。
-type metaRecorder struct {
-	mu sync.Mutex
-	ms []FrameMetaV1
+// metaSink 收集 OnFrameSent 汇出的 meta(线程安全)。
+type metaSink struct {
+	mu  sync.Mutex
+	ms  []FrameMetaV1
+	key uint64
 }
 
-func (r *metaRecorder) emit(m FrameMetaV1) {
+func (r *metaSink) make(f Frame, ts uint32) *FrameMetaV1 {
+	m := newFrameMetaV1(r.key, f, ts)
+	return &m
+}
+
+func (r *metaSink) sent(m *FrameMetaV1) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.ms = append(r.ms, m)
+	r.ms = append(r.ms, *m)
 }
 
-func (r *metaRecorder) metas() []FrameMetaV1 {
+func (r *metaSink) metas() []FrameMetaV1 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]FrameMetaV1(nil), r.ms...)
 }
 
-func metaPkt(ts uint32, marker bool) *rtp.Packet {
-	return &rtp.Packet{Header: rtp.Header{Timestamp: ts, Marker: marker}}
+// newMetaSender 建一个接好 frame-meta seam 的发送器(假出口 + 手动时钟;
+// 不启动常驻泵——全部转移经 Enqueue/drainNow 公共路径驱动)。
+func newMetaSender(bps int) (*ViewerSender, *fakeRTPSink, *manualClock, *metaSink) {
+	sink := &fakeRTPSink{}
+	clk := newManualClock()
+	ms := &metaSink{key: 0x1234_5678_9ABC_DEF0}
+	vs, err := newViewerSender(ViewerSenderConfig{
+		WritePacket:  sink.write,
+		BudgetBps:    bps,
+		Now:          clk.Now,
+		Log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MakeFrameMeta: ms.make,
+		OnFrameSent:  ms.sent,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return vs, sink, clk, ms
 }
 
-// TestFrameMetaTrackerEmitsAfterMarkerOnly:meta 只在本帧最后一包
-//(Marker)写出后汇出恰一次;身份/时戳取自该帧;未被送出的帧(抑制/
-// 丢弃/冲刷前弃包)绝不发;合帧冲刷(旧帧余包在新帧 Enqueue 内写出)
-// 的交错形态仍归属正确。
-func TestFrameMetaTrackerEmitsAfterMarkerOnly(t *testing.T) {
-	const key = 0xABCD_EF01_2345_6789
-	rec := &metaRecorder{}
-	tr := newFrameMetaTracker(key, rec.emit)
-
-	fA := Frame{CodecEpoch: 1, ContentID: 10, EncodeSeq: 100, SourceMonoUs: 1000}
-	fB := Frame{CodecEpoch: 1, ContentID: 11, EncodeSeq: 101, SourceMonoUs: 2000} // 从未写出(被抑制)
-	fC := Frame{CodecEpoch: 2, ContentID: 12, EncodeSeq: 102, SourceMonoUs: 3000}
-	fD := Frame{CodecEpoch: 2, ContentID: 12, EncodeSeq: 103, SourceMonoUs: 4000} // 与 fD' 同身份异帧
-
-	const tsA, tsC, tsD, tsD2 uint32 = 1000, 2000, 3000, 4000
-
-	// 帧 A:两包无 marker → 不发;stage B(将被丢弃,永不写出)→ stage C
-	//(模拟合帧:在 C 的 Enqueue 内 A 的余包被冲刷写出)。
-	tr.stage(fA)
-	tr.onPacket(metaPkt(tsA, false))
-	tr.onPacket(metaPkt(tsA, false))
-	if got := rec.metas(); len(got) != 0 {
-		t.Fatalf("meta before marker: %+v", got)
+// metaFrame 产一个带唯一身份的帧(n 字节填充载荷;key → IDR)。
+func metaFrame(key bool, i uint64, n int) Frame {
+	hdr := byte(0x41)
+	if key {
+		hdr = 0x65
 	}
-	tr.stage(fB)
-	tr.stage(fC)
-	// A 的最后一包在 C 入队期间写出 → meta A(在最后一包之后)。
-	tr.onPacket(metaPkt(tsA, true))
-	// C 的包:首包换时戳 → 身份切到 C;最后一包 → meta C。
-	tr.onPacket(metaPkt(tsC, false))
-	tr.onPacket(metaPkt(tsC, true))
-
-	// 同身份两帧(仅时戳前进):各发各的 meta。
-	tr.stage(fD)
-	tr.onPacket(metaPkt(tsD, true))
-	tr.stage(fD)
-	tr.onPacket(metaPkt(tsD2, true))
-
-	got := rec.metas()
-	if len(got) != 4 {
-		t.Fatalf("emits = %d (%+v), want 4 (A,C,D,D)", len(got), got)
+	au := []byte{0x00, 0x00, 0x00, 0x01, hdr, 0x88, byte(i), byte(i >> 8)}
+	for j := 0; j < n; j++ {
+		au = append(au, 0xa5)
 	}
-	want := []struct {
-		f  Frame
-		ts uint32
-	}{{fA, tsA}, {fC, tsC}, {fD, tsD}, {fD, tsD2}}
-	for i, w := range want {
-		g := got[i]
-		if g.CodecEpoch != w.f.CodecEpoch || g.ContentID != w.f.ContentID ||
-			g.EncodeSeq != w.f.EncodeSeq || g.SourceMonoUs != w.f.SourceMonoUs {
-			t.Fatalf("emit %d identity = %+v, want frame %+v", i, g, w.f)
-		}
-		if g.RTPTimestamp != w.ts {
-			t.Fatalf("emit %d rtpTimestamp = %d, want %d (per-viewer clock value)", i, g.RTPTimestamp, w.ts)
-		}
-		if g.Hash64 != frameMetaHash64(key, newFrameMetaV1(key, w.f, w.ts)) {
-			t.Fatalf("emit %d hash = %#x, want keyed hash over identity", i, g.Hash64)
-		}
-	}
-	// B 从未送出:不发 meta(上面 len==4 已含此断言;显式复核无 ContentID==11)。
-	for i, g := range got {
-		if g.ContentID == fB.ContentID {
-			t.Fatalf("emit %d is never-sent frame B", i)
-		}
-	}
+	return Frame{Key: key, PresentMonoUs: i * 33_000,
+		CodecEpoch: 7, ContentID: 100 + i, EncodeSeq: i, SourceMonoUs: i*33_000 - 500, AU: au}
 }
 
-// TestFrameMetaTrackerNothingStagedNoEmit:未 stage 任何帧时包写出不产生
-// meta(防御形态;生产上 WriteFrame 先于一切包写出)。
-func TestFrameMetaTrackerNothingStagedNoEmit(t *testing.T) {
-	rec := &metaRecorder{}
-	tr := newFrameMetaTracker(1, rec.emit)
-	tr.onPacket(metaPkt(7, true))
-	if got := rec.metas(); len(got) != 0 {
-		t.Fatalf("unstaged packet produced meta: %+v", got)
+// TestFrameMetaZeroWrittenPacketsSupersedeWindow 钉死修正轮所治的窗口:
+// 深度令牌赤字下帧 A 全部在队(零包写出),B 的 Enqueue 把 A 整帧合帧
+// 冲刷送出——汇出的 meta 必须携带 A 的身份与 A 的 RTP 时戳(旧「首包
+// 换时戳即切 next」的单槽归属会在此发出 B 的身份 + A 的时戳)。B 自身
+// 的 meta 在其最后一包写出后照常汇出。
+func TestFrameMetaZeroWrittenPacketsSupersedeWindow(t *testing.T) {
+	vs, sink, clk, ms := newMetaSender(4_000_000) // 85% → ~425KB/s:20KB 帧铺 ~46ms
+
+	// Z:大 IDR,即刻只出 burst 部分,余包在队(制造赤字)。
+	z := metaFrame(true, 1, 20_000)
+	totalZ := expectedPacketCount(t, z.AU)
+	if err := vs.Enqueue(z); err != nil {
+		t.Fatalf("enqueue Z: %v", err)
+	}
+	if c := sink.count(); c == 0 || c >= totalZ {
+		t.Fatalf("Z pacing shape: wrote %d/%d, want 0 < n < total", c, totalZ)
+	}
+
+	// A(33ms 后):入口 drain 写出到期的 Z 余包,合帧冲刷送完 Z(→
+	// metaZ);A 全部入队且零包写出(首包截止 ~15ms 外)。
+	a := metaFrame(false, 2, 20_000)
+	totalA := expectedPacketCount(t, a.AU)
+	clk.advance(33 * time.Millisecond)
+	if err := vs.Enqueue(a); err != nil {
+		t.Fatalf("enqueue A: %v", err)
+	}
+	if c := sink.count(); c != totalZ {
+		t.Fatalf("after Enqueue(A): wrote %d, want %d (Z fully flushed)", c, totalZ)
+	}
+	if q := vs.Stats().QueuePackets; q != totalA {
+		t.Fatalf("A queue = %d packets, want %d (all queued, none written)", q, totalA)
+	}
+	if got := ms.metas(); len(got) != 1 || got[0].ContentID != z.ContentID {
+		t.Fatalf("metas after Enqueue(A) = %+v, want exactly [Z]", got)
+	}
+
+	// 窗口时刻:2ms 后 B 到达——A 零包已写出,B 的 Enqueue 合帧冲刷 A
+	// 整帧。汇出的必须是 A(身份 + 时戳),绝不是 B。
+	b := metaFrame(false, 3, 600)
+	totalB := expectedPacketCount(t, b.AU)
+	clk.advance(2 * time.Millisecond)
+	before := sink.count()
+	if err := vs.Enqueue(b); err != nil {
+		t.Fatalf("enqueue B: %v", err)
+	}
+	if c := sink.count(); c != before+totalA {
+		t.Fatalf("supersede flush: wrote %d, want %d (A fully flushed)", c-before, totalA)
+	}
+	got := ms.metas()
+	if len(got) != 2 {
+		t.Fatalf("metas after window = %d (%+v), want 2 (Z, A)", len(got), got)
+	}
+	ma := got[1]
+	if ma.ContentID != a.ContentID || ma.EncodeSeq != a.EncodeSeq ||
+		ma.CodecEpoch != a.CodecEpoch || ma.SourceMonoUs != a.SourceMonoUs {
+		t.Fatalf("window meta identity = %+v, want A's (ContentID=%d)", ma, a.ContentID)
+	}
+	// 归属铁证:metaA 的时戳 == A 的实际包突发(sink 中 [totalZ,totalZ+totalA)
+	// 区段)盖章的时戳;B 的时戳严格在其后。
+	pktsEarly := sink.snapshot()
+	tsA := pktsEarly[totalZ].Timestamp
+	for i := totalZ; i < totalZ+totalA; i++ {
+		if pktsEarly[i].Timestamp != tsA {
+			t.Fatalf("packet %d ts=%d, want %d (same frame)", i, pktsEarly[i].Timestamp, tsA)
+		}
+	}
+	if ma.RTPTimestamp != tsA {
+		t.Fatalf("window meta ts=%d, want A's stamped ts=%d (never B's)", ma.RTPTimestamp, tsA)
+	}
+	if ma.RTPTimestamp == got[0].RTPTimestamp {
+		t.Fatal("Z and A share an RTP timestamp")
+	}
+
+	// B 的余包按节奏送出后:恰第三条 meta,身份 B、时戳 = B 的包时戳。
+	for i := 0; i < 20 && sink.count() < totalZ+totalA+totalB; i++ {
+		clk.advance(10 * time.Millisecond)
+		if err := vs.drainNow(); err != nil {
+			t.Fatalf("drain: %v", err)
+		}
+	}
+	if c := sink.count(); c != totalZ+totalA+totalB {
+		t.Fatalf("final wrote %d, want %d", c, totalZ+totalA+totalB)
+	}
+	got = ms.metas()
+	if len(got) != 3 {
+		t.Fatalf("metas = %d, want 3 (Z, A, B)", len(got))
+	}
+	mb := got[2]
+	if mb.ContentID != b.ContentID || mb.RTPTimestamp != sink.snapshot()[totalZ+totalA].Timestamp {
+		t.Fatalf("B meta = %+v, want identity B with its stamped ts", mb)
+	}
+	if mb.RTPTimestamp == ma.RTPTimestamp {
+		t.Fatal("A and B share an RTP timestamp")
+	}
+	vs.Close()
+}
+
+// TestFrameMetaSuppressedFramesNeverEmit:WAIT_IDR 抑制(pre-key delta)、
+// 暂停、关闭的帧没有任何包写出 → 绝不汇出 meta;正常送出的帧恰一条
+//(身份 + per-viewer 时戳齐全)。
+func TestFrameMetaSuppressedFramesNeverEmit(t *testing.T) {
+	vs, sink, _, ms := newMetaSender(0)
+
+	if err := vs.Enqueue(metaFrame(false, 1, 600)); err != nil {
+		t.Fatalf("pre-key delta: %v", err)
+	}
+	if c := sink.count(); c != 0 {
+		t.Fatalf("pre-key delta wrote %d packets", c)
+	}
+	if err := vs.Enqueue(metaFrame(true, 2, 40)); err != nil {
+		t.Fatalf("idr: %v", err)
+	}
+	if got := ms.metas(); len(got) != 1 {
+		t.Fatalf("metas after IDR = %d, want 1", len(got))
+	}
+
+	vs.Pause()
+	if err := vs.Enqueue(metaFrame(false, 3, 600)); err != nil {
+		t.Fatalf("paused delta: %v", err)
+	}
+	vs.Close()
+	if err := vs.Enqueue(metaFrame(true, 4, 40)); err != nil {
+		t.Fatalf("closed idr: %v", err)
+	}
+	if got := ms.metas(); len(got) != 1 {
+		t.Fatalf("suppressed/closed frames emitted meta: %+v", got)
 	}
 }
 
@@ -318,6 +406,7 @@ func TestFrameMetaTrackerNothingStagedNoEmit(t *testing.T) {
 func TestFrameMetaRelayNonBlockingAndDrops(t *testing.T) {
 	// ① 出口永久阻塞:批量入队仍即刻返回(绝不阻塞媒体路径)。
 	block := make(chan struct{})
+	block2 := make(chan struct{})
 	stuck := newFrameMetaRelay(func([]byte) error { <-block; return nil })
 	done := make(chan struct{})
 	go func() {
@@ -334,8 +423,30 @@ func TestFrameMetaRelayNonBlockingAndDrops(t *testing.T) {
 	if d := stuck.drops.Load(); d == 0 {
 		t.Fatal("drops not counted on overflow of a stuck relay")
 	}
-	close(block)
+	// ② 出口仍卡死时 close 必须有界返回(修正轮:Publisher.Close 先关
+	// PC 解阻塞 dc.Send;relay 侧再有界等待兜底——遥测泵绝不悬挂会话
+	// 收线)。
+	wedged := newFrameMetaRelay(func([]byte) error { <-block2; return nil })
+	wedged.enqueue(frameMetaGolden)
+	cdone := make(chan struct{})
+	go func() {
+		wedged.close()
+		close(cdone)
+	}()
+	select {
+	case <-cdone: // 有界放弃:close 在出口卡死期间返回
+	case <-time.After(frameMetaCloseGrace + 2*time.Second):
+		t.Fatal("relay close hung on a wedged send")
+	}
+	wedged.enqueue(frameMetaGolden) // close 后残余入队:不 panic;灌满缓冲验证丢弃计数
+	for i := 0; i < frameMetaQueueDepth+8; i++ {
+		wedged.enqueue(frameMetaGolden)
+	}
+	waitFor(t, time.Second, func() bool { return wedged.drops.Load() >= 1 })
+	close(block2) // 解卡:被放弃的泵退出,无泄漏
+	close(block)  // 同理解卡 ① 的泵
 	stuck.close()
+	wedged.close() // 幂等
 
 	// ② 发送失败计数;成功送达。
 	var mu sync.Mutex

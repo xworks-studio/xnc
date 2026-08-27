@@ -22,7 +22,6 @@ import (
 	"time"
 
 	"github.com/pion/interceptor"
-	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -47,8 +46,10 @@ type PublisherConfig struct {
 
 // Publisher 承载一个 viewer 会话的发送侧 PeerConnection + H264 视频轨,
 // 并拥有该 viewer 的 ViewerSender(发包/队列/状态机)。frame-meta 遥测
-// (M3 Task 4)随发包出口搭车:writePacketWithMeta 在本帧最后一包写出
-// 后汇出 FrameMetaV1(布局/键控 hash 见 frame_meta.go)。
+// (M3 Task 4)经发送器的帧边界 seam 汇出:身份在入队时绑定、本帧最后
+// 一包成功写出后回调(修正轮:任何写出顺序下归属都不错位;布局/键控
+// hash 见 frame_meta.go,seam 见 viewer_sender.go 的 MakeFrameMeta/
+// OnFrameSent)。
 type Publisher struct {
 	log    *slog.Logger
 	pc     *webrtc.PeerConnection
@@ -59,7 +60,6 @@ type Publisher struct {
 	metaKey   uint64
 	metaDC    *webrtc.DataChannel
 	metaRelay *frameMetaRelay
-	metaTrack *frameMetaTracker
 	// defDur/lastMono 只保留给旧 frameDuration 单测，不在发送热路径上。
 	defDur    time.Duration
 	stats     pubStats
@@ -158,14 +158,16 @@ func NewPublisher(cfg PublisherConfig) (*Publisher, error) {
 	}
 	// 每 viewer 一个发送器:发包/单帧队列/令牌桶 pacing/WAIT_IDR 状态机
 	// 全部私有(与其它 viewer 完全隔离)。合并关键帧回调与 Publisher 的
-	// OnKeyRequest 同一 seam(connect/pli/fir 也经它汇出)。WritePacket 经
-	// writePacketWithMeta 包装:成功写出后喂 frame-meta tracker(最后一包
-	// Marker 处汇出 meta,见文件尾)。
+	// OnKeyRequest 同一 seam(connect/pli/fir 也经它汇出)。frame-meta:
+	// MakeFrameMeta 在帧 admitted 入队时绑定身份+per-viewer 时戳,
+	// OnFrameSent 在本帧最后一包成功写出后恰一次汇出(viewer_sender.go)。
 	vs, err := newViewerSender(ViewerSenderConfig{
-		WritePacket: p.writePacketWithMeta,
-		KeyRequest:  p.fireKeyRequest,
-		BudgetBps:   cfg.PacingBudgetBps,
-		Log:         log,
+		WritePacket:   track.WriteRTP,
+		KeyRequest:    p.fireKeyRequest,
+		BudgetBps:     cfg.PacingBudgetBps,
+		Log:           log,
+		MakeFrameMeta: p.makeFrameMeta,
+		OnFrameSent:   p.onFrameSent,
 	})
 	if err != nil {
 		_ = pc.Close()
@@ -242,9 +244,8 @@ func (p *Publisher) AddCandidate(c webrtc.ICECandidateInit) error {
 
 // WriteFrame 将一帧 Annex-B AU 交给本 viewer 的发送器(分包/队列/pacing/
 // 状态机见 viewer_sender.go)。同一 AU 的所有包使用同一个
-// PresentMonoUs@90kHz 时戳,仅最后一包置 Marker。frame-meta:入队前把帧
-// 身份 stage 进 tracker(实际汇出发生在最后一包成功写出之后;未被送出
-// 的帧——抑制/丢弃——因此绝不发 meta)。
+// PresentMonoUs@90kHz 时戳,仅最后一包置 Marker。frame-meta 由发送器的
+// 帧边界 seam 汇出(入队绑定身份;未被送出的帧——抑制/丢弃——绝不发)。
 //
 // 首帧语义(双保险,见 NewPublisher 的 Connected 钩子):连接就绪前的帧
 // 一律丢弃(RTPSender 未启动,写了也静默蒸发);连接后由发送器的
@@ -257,9 +258,6 @@ func (p *Publisher) WriteFrame(f Frame) error {
 	if !p.connReady.Load() {
 		p.stats.preConnDropped.Add(1)
 		return nil
-	}
-	if t := p.metaTrack; t != nil {
-		t.stage(f)
 	}
 	return p.vs.Enqueue(f)
 }
@@ -336,15 +334,17 @@ func (p *Publisher) Stats() PubStats {
 
 // Close 关闭发送器(停 pace 泵)与 PeerConnection,等 RTCP 泵退出;幂等。
 // 关闭时打一条统计摘要日志(不含任何凭据;frame-meta 的 56 字节记录与
-// 会话键从不入日志)。
+// 会话键从不入日志)。顺序(修正轮):PC 先于 frame-meta 泵关闭——
+// pc.Close 会中止 SCTP 关联、解阻塞可能卡死的 dc.Send;relay.close 自身
+// 再有界等待兜底,遥测面绝不悬挂会话收线。
 func (p *Publisher) Close() error {
 	var err error
 	p.closeO.Do(func() {
 		p.vs.Close()
-		if r := p.metaRelay; r != nil {
-			r.close() // 先于 PC 关闭:余量 meta 尽力送出
-		}
 		err = p.pc.Close()
+		if r := p.metaRelay; r != nil {
+			r.close()
+		}
 		p.wg.Wait()
 		st := p.Stats()
 		p.log.Info("desktop publisher closed",
@@ -360,7 +360,9 @@ func (p *Publisher) Close() error {
 
 // attachFrameMeta 创建 frame-meta 通道(unordered + 不重传)并启动非阻塞
 // 中继泵。必须在 HandleOffer 之前调用(与输入通道同一约束:answer 需含
-// SCTP);恰调用一次。
+// SCTP);恰调用一次。发送器的帧边界 seam(NewPublisher 已接线)自此有
+// 出口——连接前帧进不了发送器(WriteFrame 的 connReady 门),时序上
+// attach 必先于任何 meta 产生。
 func (p *Publisher) attachFrameMeta() error {
 	dc, err := p.newDataChannel(dcLabelFrameMeta, true)
 	if err != nil {
@@ -368,7 +370,6 @@ func (p *Publisher) attachFrameMeta() error {
 	}
 	p.metaDC = dc
 	p.metaRelay = newFrameMetaRelay(dc.Send)
-	p.metaTrack = newFrameMetaTracker(p.metaKey, p.metaRelay.enqueue)
 	return nil
 }
 
@@ -381,67 +382,21 @@ func (p *Publisher) TelemetryDrops() uint64 {
 	return 0
 }
 
-// writePacketWithMeta 包装 track.WriteRTP:每个成功写出的包喂 frame-meta
-// tracker——本帧最后一包(Marker)写出之后才汇出该帧的 meta(裁决 3)。
-// meta 失败/丢弃绝不影响此处的返回值(媒体面不被遥测拖累)。
-func (p *Publisher) writePacketWithMeta(pkt *rtp.Packet) error {
-	if err := p.track.WriteRTP(pkt); err != nil {
-		return err
+// makeFrameMeta 是发送器 seam 的组装侧(Enqueue 持锁调用):身份 + 该帧
+// RTP 包实际将盖章的 per-viewer 时戳 → 会话键控记录。
+func (p *Publisher) makeFrameMeta(f Frame, rtpTS uint32) *FrameMetaV1 {
+	if p.metaRelay == nil {
+		return nil // attach 前(防御;连接前帧本就进不来)
 	}
-	if t := p.metaTrack; t != nil {
-		t.onPacket(pkt)
-	}
-	return nil
+	m := newFrameMetaV1(p.metaKey, f, rtpTS)
+	return &m
 }
 
-// frameMetaTracker 把「写出的 RTP 包」关联回「最近 stage 的帧身份」,
-// 在每帧最后一包(Marker)写出后恰一次汇出 FrameMetaV1。
-//
-// 正确性依据(WriteFrame/Enqueue 的单帧队列语义):
-//   - Enqueue 期间旧帧余包的冲写(entry drain + superseded flush)全部
-//     发生在新帧首包写出之前 → 包流上任意时刻至多一个帧的身份在途;
-//   - 首个携带新时戳的包即新帧的第一包 → 此刻把 cur 切到 next(最近一次
-//     stage 的帧);同帧包时戳相同(90kHz 严格单调映射保证逐帧前进);
-//   - marker 包只在帧尾写出一次 → 只在此时汇出;被抑制/丢弃/弃包的帧
-//     没有 marker 写出 → 绝不发 meta。
-type frameMetaTracker struct {
-	key  uint64
-	emit func(FrameMetaV1)
-
-	mu        sync.Mutex
-	cur       FrameMetaV1 // 当前在途帧的身份(ts 于首包写出时回填)
-	next      FrameMetaV1 // 最近一次 stage 的帧身份(WriteFrame 入队前)
-	haveNext  bool        // 至少 stage 过一帧(防御:未 stage 不汇出)
-	haveTS    bool        // cur 的时戳已回填(区分「尚未见包」与 ts==0)
-}
-
-func newFrameMetaTracker(key uint64, emit func(FrameMetaV1)) *frameMetaTracker {
-	return &frameMetaTracker{key: key, emit: emit}
-}
-
-// stage 记录最近一次进入发送器的帧身份(时戳由包出口回填——per-viewer
-// 时钟只在 ViewerSender 内部,Publisher 不推算,裁决 4)。
-func (t *frameMetaTracker) stage(f Frame) {
-	id := newFrameMetaV1(t.key, f, 0)
-	t.mu.Lock()
-	t.next, t.haveNext = id, true
-	t.mu.Unlock()
-}
-
-// onPacket 观察一个成功写出的包;marker 包触发汇出(emit 在锁外调用)。
-// 从未 stage 过帧时不汇出(不伪造溯源;生产上 WriteFrame 先于一切包写出,
-// 此为防御形态)。
-func (t *frameMetaTracker) onPacket(pkt *rtp.Packet) {
-	t.mu.Lock()
-	if !t.haveTS || pkt.Timestamp != t.cur.RTPTimestamp {
-		t.cur = t.next
-		t.cur.RTPTimestamp = pkt.Timestamp
-		t.haveTS = true
-	}
-	m, done := t.cur, pkt.Marker && t.haveNext
-	t.mu.Unlock()
-	if done {
-		t.emit(m)
+// onFrameSent 是发送器 seam 的汇出侧(本帧最后一包成功写出后,持锁
+// 调用):非阻塞入中继;缓冲满即丢弃计数,绝不影响发送面。
+func (p *Publisher) onFrameSent(m *FrameMetaV1) {
+	if r := p.metaRelay; r != nil {
+		r.enqueue(*m)
 	}
 }
 
@@ -461,6 +416,11 @@ type frameMetaRelay struct {
 // frameMetaQueueDepth 是中继缓冲容量(帧数;~1s @30fps。遥测可丢:
 // 消费不动即丢弃,绝不反压)。
 const frameMetaQueueDepth = 32
+
+// frameMetaCloseGrace 是 close 等待泵退出的宽限(修正轮:Publisher.Close
+// 先关 PC 解阻塞 dc.Send,正常路径远在宽限内退出;宽限是「pion 关联
+// 关闭仍不解阻塞」形态的兜底——宁可放弃遥测泵,绝不悬挂会话收线)。
+const frameMetaCloseGrace = 500 * time.Millisecond
 
 func newFrameMetaRelay(send func([]byte) error) *frameMetaRelay {
 	r := &frameMetaRelay{
@@ -498,11 +458,21 @@ func (r *frameMetaRelay) loop() {
 	}
 }
 
-// close 停泵并等其退出;幂等。q 不 close:关闭后残余 enqueue 只会堆积
-// 计丢弃,绝不 panic。
+// close 停泵并等其退出(有界:宽限后放弃——最坏泄漏一个 goroutine,
+// 由 Publisher.Close 先行的 pc.Close 解阻塞兜底);幂等。q 不 close:
+// 关闭后残余 enqueue 只会堆积计丢弃,绝不 panic。
 func (r *frameMetaRelay) close() {
 	r.closeO.Do(func() { close(r.done) })
-	r.wg.Wait()
+	waited := make(chan struct{})
+	go func() {
+		r.wg.Wait()
+		close(waited)
+	}()
+	select {
+	case <-waited:
+	case <-time.After(frameMetaCloseGrace):
+		// 放弃:泵仍卡在 DC.Send(关联关闭未解阻塞)。会话收线优先。
+	}
 }
 
 // ConnectionState 透传 PC 连接状态(会话侧观测用)。

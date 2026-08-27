@@ -108,15 +108,26 @@ type ViewerSenderConfig struct {
 	// 队列年龄与令牌桶截止)。注入非真实时钟时勿 start() 常驻泵。
 	Now func() time.Time
 	Log *slog.Logger
+	// MakeFrameMeta 组装一帧的 frame-meta 遥测记录(可为 nil = 无遥测;
+	// M3 Task 4)。在 Enqueue 把帧 admitted 入队时调用,rtpTS 恰是将盖章
+	// 在该帧全部包上的 per-viewer 90kHz 时戳。持发送器锁调用:须快速
+	// 返回(只做记录组装,不做 I/O)。
+	MakeFrameMeta func(f Frame, rtpTS uint32) *FrameMetaV1
+	// OnFrameSent 在一帧最后一包成功写出后恰一次调用(frameEnd 边界)。
+	// 合帧冲刷完成的帧同样计入(它们确实被完整送出);被抑制/丢弃/弃包
+	// 的帧永不回调。持发送器锁调用:必须非阻塞、失败只许自行计数。
+	OnFrameSent func(m *FrameMetaV1)
 }
 
 // ViewerSender 拥有一个 viewer 的全部发送侧状态(见文件头)。mu 之外的
 // 字段构造后不可变。
 type ViewerSender struct {
-	log      *slog.Logger
-	nowFn    func() time.Time
-	writePkt func(*rtp.Packet) error
-	keyReq   func(reason string)
+	log        *slog.Logger
+	nowFn      func() time.Time
+	writePkt   func(*rtp.Packet) error
+	keyReq     func(reason string)
+	makeMeta   func(Frame, uint32) *FrameMetaV1 // frame-meta 组装(入队时;nil = 无遥测)
+	onFrameSnt func(*FrameMetaV1)               // frame-meta 汇出(最后一包写出后)
 
 	clock      *rtpClock // 90kHz 显式映射(mono→ticks,严格拒绝回退)
 	packetizer rtp.Packetizer
@@ -143,8 +154,9 @@ type ViewerSender struct {
 type queuedPacket struct {
 	pkt      *rtp.Packet
 	sendAt   time.Time
-	frameEnd bool // 本帧最后一包
-	auBytes  int  // 本帧 AU 字节数(仅 frameEnd 有效)
+	frameEnd bool         // 本帧最后一包
+	auBytes  int          // 本帧 AU 字节数(仅 frameEnd 有效)
+	meta     *FrameMetaV1 // 本帧溯源记录(入队时绑定身份+时戳;frameEnd 包成功写出后经 OnFrameSent 汇出)
 }
 
 // viewerStatsN 是 mu 保护下的计数器集(Stats 快照用)。
@@ -242,10 +254,12 @@ func newViewerSender(cfg ViewerSenderConfig) (*ViewerSender, error) {
 		log = slog.Default()
 	}
 	return &ViewerSender{
-		log:      log,
-		nowFn:    nowFn,
-		writePkt: cfg.WritePacket,
-		keyReq:   cfg.KeyRequest,
+		log:        log,
+		nowFn:      nowFn,
+		writePkt:   cfg.WritePacket,
+		keyReq:     cfg.KeyRequest,
+		makeMeta:   cfg.MakeFrameMeta,
+		onFrameSnt: cfg.OnFrameSent,
 		// 惰性常量:pt/ssrc 会被 TrackLocalStaticRTP 按 binding 重写
 		// (见文件头 TWCC/SSRC 平价说明);序列空间自此私有。
 		clock:      newRTPClock(rand.Uint32()),
@@ -363,12 +377,21 @@ func (s *ViewerSender) Enqueue(f Frame) error {
 		s.fireKey(keyReason)
 		return nil
 	}
+	// frame-meta(M3 Task 4,修正轮):身份在本帧 admitted 入队时绑定
+	//(此刻 per-viewer 时戳已定),随队列槽位携带——任何写出顺序(入口
+	// drain/合帧冲刷/pacing 泵)下归属都不可能错位;只有最后一包真正
+	// 写出的帧才在 writeLocked 汇出。
+	var meta *FrameMetaV1
+	if s.makeMeta != nil {
+		meta = s.makeMeta(f, ts)
+	}
 	for i := range pkts {
 		s.queue = append(s.queue, queuedPacket{
 			pkt:      pkts[i],
 			sendAt:   deadlines[i],
 			frameEnd: i == len(pkts)-1,
 			auBytes:  len(f.AU),
+			meta:     meta,
 		})
 	}
 	if len(s.queue) == len(pkts) {
@@ -558,7 +581,9 @@ func (s *ViewerSender) ageOverflowLocked(now time.Time) string {
 	return "overflow"
 }
 
-// writeLocked 写出一个包并结算统计;调用方持 mu。
+// writeLocked 写出一个包并结算统计;调用方持 mu。frameEnd 包成功写出即
+// 经 OnFrameSent 汇出该帧的 frame-meta(回调必须非阻塞;失败只许自行
+// 计数,绝不影响发送面)。
 func (s *ViewerSender) writeLocked(q queuedPacket) error {
 	if err := s.writePkt(q.pkt); err != nil {
 		return err
@@ -567,6 +592,9 @@ func (s *ViewerSender) writeLocked(q queuedPacket) error {
 	if q.frameEnd {
 		s.stats.framesSent++
 		s.stats.bytesSent += uint64(q.auBytes)
+		if q.meta != nil && s.onFrameSnt != nil {
+			s.onFrameSnt(q.meta)
+		}
 	}
 	return nil
 }
