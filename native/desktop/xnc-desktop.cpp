@@ -55,6 +55,20 @@
 
 int SelftestMain();  // desktop_selftest.cpp
 
+namespace xnc {
+
+// XNC_DESKTOP_PIPELINE_V2 value parser (pure, no env access; M1 Task 5
+// ruling 1d extracted it from DesktopPipelineV2Enabled below so the selftest
+// can pin the value matrix without mutating process env): "1"/"true"
+// (case-insensitive) enable; "0"/"false", empty, garbage and null leave the
+// v1 default. The wrapper still owns the env read, the 31-char bound
+// (over-long values are ignored - never parsed) and the logging.
+bool ParsePipelineV2Env(const char* v) {
+  return v != nullptr && (_stricmp(v, "1") == 0 || _stricmp(v, "true") == 0);
+}
+
+}  // namespace xnc
+
 namespace {
 
 // PipelineOpts desktop-name thunk (M2-Slice1 Task 1): the beat runs on the
@@ -158,7 +172,7 @@ bool DesktopPipelineV2Enabled() {
   const DWORD len =
       GetEnvironmentVariableA("XNC_DESKTOP_PIPELINE_V2", buf, sizeof(buf));
   if (len > 0 && len < sizeof(buf)) {
-    const bool on = _stricmp(buf, "1") == 0 || _stricmp(buf, "true") == 0;
+    const bool on = xnc::ParsePipelineV2Env(buf);
     XNC_LOG_INFO("desktop_pipeline_v2 env=\"%s\" -> %s", buf, on ? "on" : "off");
     return on;
   }

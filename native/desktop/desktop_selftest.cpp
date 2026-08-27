@@ -49,6 +49,13 @@
 
 #include "../common/handshake.h"
 
+namespace xnc {
+// xnc-desktop.cpp: pure XNC_DESKTOP_PIPELINE_V2 value parser (M1 Task 5
+// ruling 1d extracted it from DesktopPipelineV2Enabled; startup-only gate,
+// no shared header - both TUs link into the same exe).
+bool ParsePipelineV2Env(const char* v);
+}  // namespace xnc
+
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -664,6 +671,7 @@ class RtTestClient {
       if (xnc::DecodeFrameEventV2(f, &v2) && v2.annexb) {
         frames_++;
         v2_frames_++;
+        v2_ids_.push_back(v2.id);  // M1 Task 5 (ruling 1a): delivery-order capture
         // M1 Task 4: 重建信号之后,旧 epoch 的 AU 不得再发布(spec 10.2)。
         if (saw_rebuilt_state_ && v2.id.capture_epoch == 1)
           old_epoch_after_rebuilt_++;
@@ -724,6 +732,7 @@ class RtTestClient {
   uint64_t first_key_mono_us_ = 0, last_key_mono_us_ = 0;
   std::vector<uint8_t> last_key_payload_;
   uint64_t v2_frames_ = 0;  // M1 Task 2: 0x0205 frames decoded
+  std::vector<xnc::FrameIdentity> v2_ids_;  // M1 Task 5: decoded v2 identities, arrival order
   xnc::FrameIdentity first_key_id_{};  // identity of the first v2 key AU
   uint32_t first_key_w_ = 0, first_key_h_ = 0;
   bool first_key_id_set_ = false;
@@ -1078,6 +1087,7 @@ struct RecordingSink final : xnc::AuSink {
     aus++;
     if ((au.flags & xnc::AuFlags::kAuFlagKey) != 0) keys++;
     timestamps.push_back(au.id.present_mono_us);
+    ids.push_back(au.id);  // M1 Task 5 (ruling 1a): sink-level identity capture
     return nullptr;
   }
   void OnState(const char* code, bool recoverable) override {
@@ -1106,6 +1116,7 @@ struct RecordingSink final : xnc::AuSink {
   mutable std::mutex mu;
   uint64_t aus = 0, keys = 0;
   std::vector<uint64_t> timestamps;
+  std::vector<xnc::FrameIdentity> ids;  // every delivered AU, in delivery order
   std::vector<std::string> states;
   std::vector<bool> states_recoverable;
   struct Disp {
@@ -1114,6 +1125,24 @@ struct RecordingSink final : xnc::AuSink {
   };
   std::vector<Disp> displays;
 };
+
+// Delivered-AU identity contract (M1 Task 5, ruling 1a): every AU sequence a
+// sink actually received must (a) replay clean through a fresh production
+// FrameIdentityLedger - i.e. epochs never regress and within one epoch pair
+// content_id never regresses while encode_seq strictly increases - and
+// (b) carry source_mono_us <= present_mono_us (capture precedes encoder
+// submission; spec §5.1/§5.2). The pipeline ledger-gates every submitted
+// identity and delivers FIFO, so any real scenario's captured AUs must
+// satisfy this; asserting it end-to-end catches publish-order regressions.
+bool DeliveredIdentitiesValid(const std::vector<xnc::FrameIdentity>& ids) {
+  if (ids.empty()) return false;
+  xnc::FrameIdentityLedger replay;
+  for (const xnc::FrameIdentity& id : ids) {
+    if (id.source_mono_us > id.present_mono_us) return false;
+    if (!replay.Accept(id)) return false;
+  }
+  return true;
+}
 
 // Deterministic MFT-boundary fault plan for submission-ledger failure tests.
 // The pipeline, ledger, shaping, sink delivery, and cleanup remain real; only
@@ -1551,6 +1580,23 @@ int SelftestMain() {
     CHECK("identity-accept-epoch-advance", l.Accept(gen2));
     CHECK("identity-reject-epoch-regress", !l.Accept(id));
     CHECK("identity-reset-forgets", (l.Reset(), l.Accept(id)));
+    // Codec-epoch edges WITHIN one capture epoch (M1 Task 5, ruling 1b - the
+    // checks above only ever move codec_epoch alongside a capture advance):
+    // a codec_epoch advance alone re-baselines (content/seq may restart from
+    // 1), a codec_epoch regress in the same capture epoch rejects, and the
+    // re-baselined pair then enforces the usual in-epoch monotonicity.
+    xnc::FrameIdentityLedger cl;
+    CHECK("identity-codec-advance-baseline",
+          cl.Accept(xnc::FrameIdentity{5, 3, 10, 100, 1, 2}));
+    CHECK("identity-codec-advance-rebaseline",
+          cl.Accept(xnc::FrameIdentity{5, 4, 1, 1, 3, 4}));
+    CHECK("identity-codec-advance-repeat-rejected",
+          !cl.Accept(xnc::FrameIdentity{5, 4, 1, 1, 3, 4}));
+    CHECK("identity-codec-regress-rejected",
+          !cl.Accept(xnc::FrameIdentity{5, 3, 20, 200, 5, 6}));
+    CHECK("identity-codec-rebaseline-monotonic",
+          cl.Accept(xnc::FrameIdentity{5, 4, 2, 2, 7, 8}) &&
+              !cl.Accept(xnc::FrameIdentity{5, 4, 1, 9, 7, 8}));
     // EncodedAU: AuFlags key bit and the immutable shared Annex-B payload.
     CHECK("au-flag-none-zero", xnc::AuFlags::kAuFlagNone == 0);
     xnc::EncodedAU au;
@@ -3045,6 +3091,17 @@ int SelftestMain() {
     xnc::rt_detail::PutU32(caph.data() + 64, static_cast<uint32_t>(xnc::kMaxAuBytes + 1));
     CHECK("v2-decode-8mib-plus-1-rejected",
           !xnc::DecodeFrameEventV2(xnc::Frame{0, xnc::kMsgFrameV2, 0, caph}, &rt));
+    // Exact-length rejectors (M1 Task 5, ruling 1c): a truncated payload
+    // (header declares payload_len=5, only 2 bytes present) and trailing
+    // extra bytes past header+payload_len are both rejected.
+    std::vector<uint8_t> shortp = w2;
+    shortp.resize(xnc::kV2HeaderBytes + 2);
+    CHECK("v2-decode-truncated-payload-rejected",
+          !xnc::DecodeFrameEventV2(xnc::Frame{0, xnc::kMsgFrameV2, 0, shortp}, &rt));
+    std::vector<uint8_t> extra = w2;
+    extra.push_back(0xEE);
+    CHECK("v2-decode-trailing-extra-rejected",
+          !xnc::DecodeFrameEventV2(xnc::Frame{0, xnc::kMsgFrameV2, 0, extra}, &rt));
     // Encode side: an 8 MiB + 1 AU yields an empty vector (caller drops).
     std::vector<uint8_t> big(xnc::kMaxAuBytes + 1, 0xAB);
     xnc::EncodedAU bigau = au;
@@ -3091,6 +3148,30 @@ int SelftestMain() {
     std::printf("SELFTEST NOTE: v2-golden ");
     for (uint8_t b : w2) std::printf("%02x", b);
     std::printf("\n");
+  }
+  { // M1 Task 5 (ruling 1d): XNC_DESKTOP_PIPELINE_V2 value matrix on the
+    // pure parser extracted from DesktopPipelineV2Enabled into
+    // xnc::ParsePipelineV2Env (xnc-desktop.cpp; both TUs link into the same
+    // exe, no shared header). The wrapper's env side stays startup-only:
+    // unset (len=0) and over-long (>= 32 chars) values never reach the
+    // parser - the matrix pins the semantics it delegates to, plus that
+    // over-long runs must not accidentally match.
+    CHECK("v2env-one", xnc::ParsePipelineV2Env("1"));
+    CHECK("v2env-true", xnc::ParsePipelineV2Env("true"));
+    CHECK("v2env-true-upper", xnc::ParsePipelineV2Env("TRUE"));
+    CHECK("v2env-true-mixed", xnc::ParsePipelineV2Env("tRuE"));
+    CHECK("v2env-zero", !xnc::ParsePipelineV2Env("0"));
+    CHECK("v2env-false", !xnc::ParsePipelineV2Env("false"));
+    CHECK("v2env-false-upper", !xnc::ParsePipelineV2Env("False"));
+    CHECK("v2env-empty", !xnc::ParsePipelineV2Env(""));
+    CHECK("v2env-garbage", !xnc::ParsePipelineV2Env("garbage"));
+    CHECK("v2env-yes", !xnc::ParsePipelineV2Env("yes"));
+    CHECK("v2env-null", !xnc::ParsePipelineV2Env(nullptr));
+    CHECK("v2env-no-prefix-suffix",
+          !xnc::ParsePipelineV2Env("true1") && !xnc::ParsePipelineV2Env("1x"));
+    CHECK("v2env-overlong-ignored",
+          !xnc::ParsePipelineV2Env("1111111111111111111111111111111111111111") &&
+              !xnc::ParsePipelineV2Env("truetruetruetruetruetruetruetrue"));
   }
   { // M2-Slice1 Task 2:0x010A DISPLAY_CHANGED codec(精确字节向量)
     const xnc::DisplayChangedPayload dc{3, 1920, 1080, "resolution"};
@@ -5073,6 +5154,10 @@ int SelftestMain() {
       CHECK("rsC-new-dims", res.width == 96 && res.height == 64);
       CHECK("rsC-frames-after", res.counters.captured >= 20);
       CHECK("rsC-idr-after-reset", sink.keys >= 2);
+      // M1 Task 5 (ruling 1a): sink-level identity contract on the delivered
+      // AUs - this scenario spans a resolution reset (capture AND codec epoch
+      // advance), so the replay also covers the re-baseline across epochs.
+      CHECK("rsC-delivered-identity-monotonic", DeliveredIdentitiesValid(sink.ids));
       std::printf("SELFTEST NOTE: rsC captured=%llu keys=%llu resets=%u w=%u h=%u\n",
                   (unsigned long long)res.counters.captured, (unsigned long long)sink.keys,
                   res.resets, res.width, res.height);
@@ -6188,6 +6273,11 @@ int SelftestMain() {
                 a.first_key_id_.present_mono_us >= 1);
       CHECK("rt9-key-dims", a.first_key_w_ == kRtW && a.first_key_h_ == kRtH);
       CHECK("rt9-key-payload-shaped", StreamStartsWithKeyframe(a.last_key_payload_));
+      // M1 Task 5 (ruling 1a): every 0x0205 AU the wire delivered replays
+      // clean through a fresh ledger (in-epoch strict monotonicity) and
+      // carries source_mono_us <= present_mono_us - end-to-end, encoder to
+      // decoded subscriber frame.
+      CHECK("rt9-delivered-identity-monotonic", DeliveredIdentitiesValid(a.v2_ids_));
       CHECK("rt9-stream-end-state", a.saw_stream_end_);
       CHECK("rt9-pipeline-ok", res.ok);
       const xnc::RtServer::Stats st = rt.stats();
@@ -6298,6 +6388,10 @@ int SelftestMain() {
       CHECK("rt11-last-key-epoch",
             a.last_key_id_set_ && a.last_key_id_.capture_epoch == 2);
       CHECK("rt11-old-epoch-suppressed", a.old_epoch_after_rebuilt_ == 0);
+      // M1 Task 5 (ruling 1a): the delivered sequence spans the epoch-1 →
+      // epoch-2 advance (capture rebuild); the fresh-ledger replay proves the
+      // re-baseline held end-to-end and no in-epoch regression slipped out.
+      CHECK("rt11-delivered-identity-monotonic", DeliveredIdentitiesValid(a.v2_ids_));
       CHECK("rt11-pipeline-ok", res.ok);
       const xnc::RtServer::Stats st = rt.stats();
       CHECK("rt11-stats-disc", st.stream_discontinuities >= 1);

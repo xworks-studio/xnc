@@ -994,6 +994,10 @@ func TestFrameV2LengthReject(t *testing.T) {
 	if _, err := decodeFrameV2(v2Golden(t)[:71]); err == nil {
 		t.Fatal("71-byte payload accepted")
 	}
+	// 截断载荷:header 声明 payload_len=5,仅 2 字节在场(72+2 = 74)。
+	if _, err := decodeFrameV2(v2Golden(t)[:74]); err == nil {
+		t.Fatal("truncated payload accepted (payload_len=5, 2 bytes present)")
+	}
 	// header_bytes != 72(未知布局)。
 	bad := v2Golden(t)
 	tPut32(bad, 0, 73)
