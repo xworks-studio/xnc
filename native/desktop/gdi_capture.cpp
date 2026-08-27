@@ -20,11 +20,16 @@
 #endif
 #include <windows.h>  // GetDC/BitBlt/GetDIBits/GetSystemMetrics/Sleep
 
+#include <d3d11.h>  // M2 Task 2: the surface-path upload device
+#include <wrl/client.h>
+
 #include <cstdio>
+#include <string>
 
 #include "../common/log.h"
 #include "dxgi_capture.h"  // NowMonoUs (shared mono-us clock)
 #include "gdi_capture.h"
+#include "gpu_surface.h"  // LatestSurface (AcquireSurface destination)
 
 namespace xnc {
 
@@ -42,6 +47,18 @@ struct GdiCapture::Impl {
   HDC mem_dc = nullptr;     // compatible memory DC holding the bitmap
   HBITMAP bmp = nullptr;    // w_ x h_ compatible bitmap (capture target)
   HBITMAP old = nullptr;    // SelectObject return (restored before delete)
+
+  // M2 Task 2 (ICaptureSurface): the upload device for the surface path.
+  // upload_ is a w_ x h_ DEFAULT-usage BGRA texture: UpdateSubresource
+  // fills it from the compact GetDIBits buffer, then the desc-identical
+  // LatestSurface::CopyFrom stamps it into the caller-owned surface. The
+  // device is created lazily (hardware -> WARP) and deliberately NOT
+  // touched by Teardown: Init/Rebuild only recycle the GDI objects, and a
+  // LatestSurface already Init'ed on this device must stay valid. The
+  // ComPtrs release when Impl is deleted (~GdiCapture).
+  Microsoft::WRL::ComPtr<ID3D11Device> dev;
+  Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx;
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> upload;
 
   void Teardown() {
     if (mem_dc != nullptr && old != nullptr) {
@@ -100,6 +117,7 @@ bool GdiCapture::Init(std::string* err) {
   have_frame_ = false;      // first frame after (re)create is always a frame
   last_crc_ = 0;
   last_capture_ms_ = 0;
+  have_surface_base_ = false;  // M2 Task 2: next surface frame is the base
   XNC_LOG_INFO("gdi init w=%u h=%u", w_, h_);
   return true;
 }
@@ -207,6 +225,117 @@ bool GdiCapture::Acquire(FrameBlob& blob, std::string* err, uint32_t timeout_ms)
   if (first) XNC_LOG_INFO("gdi base frame w=%u h=%u mono_us=%llu", w_, h_,
                           static_cast<unsigned long long>(blob.mono_us));
   return true;
+}
+
+// M2 Task 2: lazily creates the D3D upload device (hardware -> WARP, the
+// selftest device pattern; the GDI rung may be a VM/RDP box where WARP is
+// the only certainty) and keeps the w_ x h_ DEFAULT-usage BGRA upload
+// texture in step with the current screen metrics.
+bool GdiCapture::EnsureGpuUpload(std::string* err) {
+  if (!impl_->dev) {
+    D3D_FEATURE_LEVEL fl{};
+    HRESULT hr = D3D11CreateDevice(
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION,
+        &impl_->dev, &fl, &impl_->ctx);
+    if (FAILED(hr)) {
+      hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr,
+                             D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
+                             D3D11_SDK_VERSION, &impl_->dev, &fl, &impl_->ctx);
+    }
+    if (FAILED(hr)) {
+      char buf[96];
+      _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                  "D3D11CreateDevice(upload): hr=0x%08lX",
+                  static_cast<unsigned long>(hr));
+      if (err) *err = buf;
+      return false;
+    }
+    XNC_LOG_INFO("gdi surface upload device ready");
+  }
+  if (impl_->upload) {
+    D3D11_TEXTURE2D_DESC ud{};
+    impl_->upload->GetDesc(&ud);
+    if (ud.Width == w_ && ud.Height == h_) return true;
+    impl_->upload.Reset();
+  }
+  // CopyFrom demands a desc-identical source: 1 mip / 1 array slice / 1
+  // sample / BGRA / DEFAULT usage, exactly like LatestSurface's texture.
+  D3D11_TEXTURE2D_DESC td{};
+  td.Width = w_;
+  td.Height = h_;
+  td.MipLevels = 1;
+  td.ArraySize = 1;
+  td.SampleDesc.Count = 1;
+  td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  td.Usage = D3D11_USAGE_DEFAULT;
+  const HRESULT hr = impl_->dev->CreateTexture2D(&td, nullptr, &impl_->upload);
+  if (FAILED(hr)) {
+    char buf[112];
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "CreateTexture2D(gdi upload): hr=0x%08lX",
+                static_cast<unsigned long>(hr));
+    if (err) *err = buf;
+    return false;
+  }
+  return true;
+}
+
+// M2 Task 2 (ICaptureSurface, ruling 3): BitBlt/DIB acquisition stays (the
+// CPU Acquire IS the acquisition - pacing, self-heal and the sampled-CRC
+// change detection included), then the compact BGRA rides
+// UpdateSubresource into the upload texture and CopyFrom stamps it into
+// the caller-owned LatestSurface. No duplication exists in GDI, so there
+// is no ReleaseFrame-equivalent resource to release - nothing outlives the
+// call. Statuses/identity semantics: capture.h (the GDI acquire timestamp
+// blob.mono_us becomes source_mono_us).
+CaptureStatus GdiCapture::AcquireSurface(LatestSurface& latest,
+                                         uint32_t timeout_ms, FrameIdentity* id,
+                                         std::string* err) {
+  if (err) err->clear();
+  FrameBlob blob;
+  std::string aerr;
+  if (!Acquire(blob, &aerr, timeout_ms)) {
+    if (err) *err = aerr;
+    if (id) *id = last_surface_id_;  // echo what the surface still holds
+    return CaptureStatusFromErr(aerr);
+  }
+  std::string uerr;
+  if (!EnsureGpuUpload(&uerr)) {
+    if (err) *err = "gdi surface: " + uerr;
+    return CaptureStatus::kFatal;
+  }
+  // Caller-owned surface on THIS backend's device at the current metrics
+  // (a fresh surface reports width 0; a metrics change re-Inits - which
+  // drops its content + the identity mirror, matching LatestSurface::Init).
+  if (latest.width() != w_ || latest.height() != h_) {
+    if (!latest.Init(impl_->dev.Get(), w_, h_, &uerr)) {
+      if (err) *err = "gdi latest init: " + uerr;
+      return CaptureStatus::kFatal;
+    }
+    last_surface_id_ = FrameIdentity{};
+  }
+  // CPU -> GPU upload of the tightly packed GetDIBits rows (row pitch w*4).
+  impl_->ctx->UpdateSubresource(impl_->upload.Get(), 0, nullptr,
+                                blob.bgra.data(), w_ * 4, 0);
+  // Complete the GIVEN identity (ruling 1a): only the acquire timestamp is
+  // backend-assigned; encode_seq/present_mono_us belong to the encode thread.
+  FrameIdentity stamp = id != nullptr ? *id : FrameIdentity{};
+  stamp.source_mono_us = blob.mono_us;
+  stamp.encode_seq = 0;
+  stamp.present_mono_us = 0;
+  if (!latest.CopyFrom(impl_->ctx.Get(), impl_->upload.Get(), stamp, &uerr)) {
+    if (err) *err = "gdi latest copy: " + uerr;
+    return CaptureStatus::kFatal;
+  }
+  last_surface_id_ = stamp;
+  if (!have_surface_base_) {
+    have_surface_base_ = true;
+    XNC_LOG_INFO("gdi surface base frame w=%u h=%u mono_us=%llu", w_, h_,
+                 static_cast<unsigned long long>(stamp.source_mono_us));
+  }
+  if (id) *id = stamp;
+  return CaptureStatus::kFrame;
 }
 
 std::unique_ptr<ICapture> TryCreateGdiCapture(std::string* err) {

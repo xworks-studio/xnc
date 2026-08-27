@@ -38,8 +38,9 @@
 #include <memory>
 #include <string>
 
-#include "capture.h"       // ICapture, FrameBlob
+#include "capture.h"       // ICapture, ICaptureSurface, FrameBlob
 #include "dxgi_capture.h"  // Fnv1a64, BgraBytes
+#include "gpu_surface.h"   // LatestSurface (AcquireSurface destination)
 
 namespace xnc {
 
@@ -92,8 +93,13 @@ inline uint64_t GdiSampledCrc(const uint8_t* bgra, uint32_t w, uint32_t h,
 }
 
 // GDI fallback backend (spec §7.6 rung below DXGI). Single-threaded use
-// only (pipeline thread), same as DxgiCapture.
-class GdiCapture final : public ICapture {
+// only (pipeline thread), same as DxgiCapture. M2 Task 2: also implements
+// ICaptureSurface - the BitBlt/DIB acquisition is kept and the compact BGRA
+// is uploaded into the caller-owned LatestSurface (UpdateSubresource) on an
+// internal D3D device (hardware -> WARP), so even the fallback rung can
+// feed the GPU pipeline. The CPU FrameBlob path REMAINS (the software
+// fallback pipeline keeps using it - Task 4 wires which one runs).
+class GdiCapture final : public ICapture, public ICaptureSurface {
  public:
   GdiCapture();
   ~GdiCapture() override;
@@ -105,6 +111,17 @@ class GdiCapture final : public ICapture {
   // (GDI paces itself to the 15 fps cap).
   bool Acquire(FrameBlob& blob, std::string* err = nullptr,
                uint32_t timeout_ms = 0) override;
+  // ICaptureSurface (M2 Task 2, ruling 3): keep the BitBlt/GetDIBits
+  // acquisition (Acquire above - unchanged CPU FrameBlob path), then upload
+  // the compact BGRA into the caller-owned LatestSurface: UpdateSubresource
+  // into a backend-owned DEFAULT-usage BGRA texture on the backend's
+  // internal D3D device, followed by the desc-identical CopyFrom that
+  // stamps the GIVEN identity (gpu_surface.h has no direct CPU-upload
+  // entry - the upload rides the backend texture). There is no
+  // duplication-held resource in GDI (no ReleaseFrame equivalent): nothing
+  // outlives the call. Statuses/identity semantics: see capture.h.
+  CaptureStatus AcquireSurface(LatestSurface& latest, uint32_t timeout_ms,
+                               FrameIdentity* id, std::string* err) override;
   uint32_t Width() const override { return w_; }
   uint32_t Height() const override { return h_; }
   uint32_t RebuildCount() const override { return rebuilds_; }
@@ -117,13 +134,21 @@ class GdiCapture final : public ICapture {
   bool Init(std::string* err);
 
  private:
-  struct Impl;  // HDC/HBITMAP (windows.h stays out of this header)
+  struct Impl;  // HDC/HBITMAP + the D3D upload device (windows.h/d3d11.h stay
+                // out of this header)
   Impl* impl_;
   uint32_t w_ = 0, h_ = 0;
   uint32_t rebuilds_ = 0;
   bool have_frame_ = false;   // first frame after create/rebuild always emits
   uint64_t last_crc_ = 0;     // last frame's sampled CRC (change detection)
   uint64_t last_capture_ms_ = 0;  // 15 fps pacing anchor
+  // M2 Task 2 surface state (the D3D device/textures live in Impl):
+  // last_surface_id_ mirrors the identity stamped into the caller's
+  // LatestSurface (the kNoChange echo); have_surface_base_ logs the first
+  // surface frame after (re)create.
+  bool EnsureGpuUpload(std::string* err);
+  FrameIdentity last_surface_id_{};
+  bool have_surface_base_ = false;
 };
 
 // Factory (mirrors TryCreateDxgiCapture): null + *err on failure.

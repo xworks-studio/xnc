@@ -1,7 +1,9 @@
 // capture.h - frame capture seam for xnc-desktop (plan M1-Slice1 Task 2).
 // FrameBlob is the unit handed to the encoder pipeline (Task 4/5); ICapture
 // is the backend interface - Task 3 implements DXGI DuplicateOutput with CPU
-// readback (dxgi_capture.h/.cpp), selftests use fakes.
+// readback (dxgi_capture.h/.cpp), selftests use fakes. M2 Task 2 adds the
+// GPU twin ICaptureSurface: backends publish the newest desktop into a
+// caller-owned LatestSurface with a full-resource GPU copy (no readback).
 #ifndef XNC_NATIVE_DESKTOP_CAPTURE_H_
 #define XNC_NATIVE_DESKTOP_CAPTURE_H_
 
@@ -9,6 +11,9 @@
 #include <memory>
 #include <string>
 #include <vector>
+
+#include "gpu_surface.h"  // LatestSurface (ICaptureSurface's destination);
+                          // brings media_types.h (FrameIdentity) along
 
 namespace xnc {
 
@@ -80,6 +85,77 @@ class ICapture {
     return false;
   }
 };
+
+// ---- M2 Task 2: GPU surface acquisition (ICaptureSurface) ----
+//
+// The surface twin of ICapture::Acquire: instead of a CPU FrameBlob, the
+// backend publishes the newest desktop INTO a caller-owned LatestSurface
+// (gpu_surface.h) with a full-resource GPU CopyResource - no readback
+// anywhere on this path. The conceptual return is the plan's
+// CapturedSurface (below); concretely the texture + identity arrive via
+// LatestSurface::Snapshot and `changed` rides the CaptureStatus.
+//
+// Identity authority (controller ruling 1): the CALLER assigns
+// capture_epoch/codec_epoch/content_id and passes them in *id; the backend
+// COMPLETES that identity (source_mono_us = the acquire timestamp;
+// encode_seq/present_mono_us are zeroed - the encode thread fills them at
+// successful submission) and stamps it into the surface with the copy. The
+// backend never invents content ids: cursor-only frames (DXGI
+// LastPresentTime == 0) and static screens return kNoChange WITHOUT
+// touching the surface, so a cursor move never counts as changed content.
+// On kNoChange *id echoes the identity currently stamped in the surface.
+//
+// Ownership (DXGI, ruling 1c): ReleaseFrame fires immediately after the
+// CopyResource, before the method returns - the duplication is never held
+// into encoder work. The LatestSurface OBJECT is caller-owned; the backend
+// (re)Inits it (backend device, backend dims) whenever its device is
+// recreated or the mode changed, so the caller passes the SAME LatestSurface
+// to every call of one backend. After kRetry/kAccessLost a previously
+// Snapshot()-leased texture may belong to a dead device - the unified
+// CaptureReset (M2-S1) owns the retry that re-Inits it.
+//
+// Threading: the CAPTURE thread drives AcquireSurface (the M2 Task 4
+// wiring), one call at a time per backend - the same single-thread
+// contract as ICapture. timeout_ms mirrors ICapture::Acquire (0 = the
+// backend default; bounds the block for one new frame).
+enum class CaptureStatus : uint8_t {
+  kFrame = 0,       // changed: new content copied + the given identity stamped
+  kNoChange = 1,    // static screen / cursor-only: surface + identity untouched
+  kRetry = 2,       // "err_rebuilt": backend healed in place, call again
+  kAccessLost = 3,  // "err_access_lost": the unified CaptureReset owns retrying
+  kFatal = 4,       // anything else; *err carries the detail
+};
+
+// The plan's conceptual AcquireSurface return shape: `id` + `texture` are
+// exactly what LatestSurface::Snapshot() leases after a kFrame status, and
+// `changed` is the kFrame-vs-kNoChange half of CaptureStatus. Kept concrete
+// so later tasks (and the selftest) can phrase things in its terms.
+struct CapturedSurface {
+  FrameIdentity id{};
+  ID3D11Texture2D* texture = nullptr;  // AddRef'd by Snapshot()
+  bool changed = false;
+};
+
+class ICaptureSurface {
+ public:
+  virtual ~ICaptureSurface() = default;
+  // *id is IN/OUT (see the identity-authority note above). *err mirrors the
+  // ICapture vocabulary on the non-frame statuses ("err_timeout" /
+  // "err_rebuilt" / "err_access_lost"; detail text for kFatal) and is
+  // untouched on kFrame.
+  virtual CaptureStatus AcquireSurface(LatestSurface& latest,
+                                       uint32_t timeout_ms, FrameIdentity* id,
+                                       std::string* err) = 0;
+};
+
+// The err-string -> status mapping the backends (and the selftest fakes)
+// share: the surface statuses are the ICapture::Acquire err vocabulary.
+inline CaptureStatus CaptureStatusFromErr(const std::string& err) {
+  if (err == "err_timeout") return CaptureStatus::kNoChange;
+  if (err == "err_rebuilt") return CaptureStatus::kRetry;
+  if (err == "err_access_lost") return CaptureStatus::kAccessLost;
+  return CaptureStatus::kFatal;
+}
 
 // Task 3 implements this (DXGI CPU readback). Returns null and sets *err
 // when no output can be duplicated; declared here since Task 2 pins the

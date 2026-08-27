@@ -28,6 +28,13 @@
 // pipeline feeds the encoder's NV12 entry directly. Drivers without the NV12
 // video-processor conversion degrade IN PLACE to the legacy BGRA path
 // (logged) - the CPU ScaledCapture wrapper then works as before.
+//
+// M2 Task 2 (desktop-media-m2): AcquireSurface adds the no-readback GPU
+// twin of Acquire - the acquired desktop texture is CopyResource'd into a
+// caller-owned LatestSurface (full resource, never reconstructed from
+// dirty/move rects) and the duplication is released IMMEDIATELY after the
+// copy. Cursor-only frames (LastPresentTime == 0) never touch the surface.
+// The CPU FrameBlob path below stays (the software-fallback rung keeps it).
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -510,6 +517,8 @@ bool DxgiCapture::Reduplicate(std::string* err) {
 }
 
 bool DxgiCapture::Init(std::string* err) {
+  ++device_gen_;  // M2 Task 2: any LatestSurface Init'ed before this is on a
+  have_surface_base_ = false;  // dead device; AcquireSurface re-Inits it
   impl_->dupl.Reset();
   impl_->staging_[0].Reset();
   impl_->staging_[1].Reset();
@@ -662,6 +671,7 @@ bool DxgiCapture::HandleAccessLost(std::string* err, long hr_long) {
   if (ok) {
     consecutive_rebuild_failures_ = 0;
     have_base_frame_ = false;  // next content frame is the new base frame
+    have_surface_base_ = false;
     XNC_LOG_INFO("dxgi rebuilt total=%u w=%u h=%u", rebuilds_, w_, h_);
     if (err) *err = "err_rebuilt";  // retryable, no frame this call
     return false;
@@ -832,6 +842,108 @@ bool DxgiCapture::Acquire(FrameBlob& blob, std::string* err, uint32_t timeout_ms
     XNC_LOG_INFO("dxgi base frame w=%u h=%u mono_us=%llu", w_, h_, blob.mono_us);
   }
   return true;
+}
+
+// M2 Task 2: the caller-owned LatestSurface must live on THIS backend's
+// device at the duplication's native dims. Re-Init (which resets its
+// content + identity) whenever the device generation or the mode changed;
+// a fresh caller surface (width 0) re-Inits the same way. CopyResource
+// against another device's texture is undefined at best, so this runs
+// BEFORE every acquire.
+bool DxgiCapture::EnsureLatestSurface(LatestSurface& latest, std::string* err) {
+  if (latest_gen_ == device_gen_ && latest.width() == w_ && latest.height() == h_)
+    return true;
+  std::string ierr;
+  if (!latest.Init(impl_->dev.Get(), w_, h_, &ierr)) {
+    if (err) *err = "latest init: " + ierr;
+    return false;
+  }
+  latest_gen_ = device_gen_;
+  last_surface_id_ = FrameIdentity{};  // Init dropped the surface content
+  return true;
+}
+
+// M2 Task 2 (ICaptureSurface): acquire -> cursor-only check -> FULL-RESOURCE
+// GPU copy into the caller's LatestSurface -> ReleaseFrame IMMEDIATELY. No
+// staging, no Map, no readback - the owned texture is the retained desktop.
+CaptureStatus DxgiCapture::AcquireSurface(LatestSurface& latest,
+                                          uint32_t timeout_ms, FrameIdentity* id,
+                                          std::string* err) {
+  if (err) err->clear();
+  if (!impl_->dupl) {
+    // No duplication = access lost (M2-S1 T2 semantics): the unified reset
+    // owns re-creation; never fatal.
+    if (err) *err = "err_access_lost";
+    return CaptureStatus::kAccessLost;
+  }
+  if (!EnsureLatestSurface(latest, err)) return CaptureStatus::kFatal;
+
+  DXGI_OUTDUPL_FRAME_INFO info{};
+  ComPtr<IDXGIResource> res;
+  const UINT wait_ms = timeout_ms != 0 ? timeout_ms : kAcquireTimeoutMs;
+  HRESULT hr = impl_->dupl->AcquireNextFrame(wait_ms, &info, &res);
+  if (hr == DXGI_ERROR_WAIT_TIMEOUT) {  // static screen: surface untouched
+    if (err) *err = "err_timeout";
+    if (id) *id = last_surface_id_;
+    return CaptureStatus::kNoChange;
+  }
+  if (hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_DEVICE_REMOVED) {
+    std::string aerr;
+    HandleAccessLost(&aerr, hr);  // always false; aerr says which retryable
+    if (err) *err = aerr;
+    if (id) *id = last_surface_id_;
+    return CaptureStatusFromErr(aerr);
+  }
+  if (FAILED(hr)) {
+    SetHrErr(err, "AcquireNextFrame(surface)", hr);
+    return CaptureStatus::kFatal;
+  }
+
+  // Cursor/metadata-only (LastPresentTime == 0) is NOT content (ruling 1b):
+  // no copy, no stamp, no content increment - ReleaseFrame immediately and
+  // report no-change. A present without a QI-able texture is the same.
+  if (info.LastPresentTime.QuadPart == 0) {
+    impl_->dupl->ReleaseFrame();
+    if (err) *err = "err_timeout";
+    if (id) *id = last_surface_id_;
+    return CaptureStatus::kNoChange;
+  }
+  ComPtr<ID3D11Texture2D> tex;
+  if (!res || FAILED(res.As(&tex))) {
+    impl_->dupl->ReleaseFrame();
+    if (err) *err = "err_timeout";
+    if (id) *id = last_surface_id_;
+    return CaptureStatus::kNoChange;
+  }
+
+  // Complete the GIVEN identity (ruling 1a): the caller owns
+  // epochs/content_id; the backend adds only the acquire timestamp. The
+  // encode thread fills encode_seq/present_mono_us at submission.
+  FrameIdentity stamp = id != nullptr ? *id : FrameIdentity{};
+  stamp.source_mono_us = NowMonoUs();
+  stamp.encode_seq = 0;
+  stamp.present_mono_us = 0;
+
+  // Full-resource GPU copy (ruling 2 - never reconstructed from dirty/move
+  // rects in M2). CopyResource enqueues on the immediate context; the
+  // duplication can be released as soon as the copy command is issued.
+  std::string cperr;
+  if (!latest.CopyFrom(impl_->ctx.Get(), tex.Get(), stamp, &cperr)) {
+    impl_->dupl->ReleaseFrame();  // never hold the frame on a failure path
+    if (err) *err = "latest copy: " + cperr;
+    return CaptureStatus::kFatal;
+  }
+  tex.Reset();
+  impl_->dupl->ReleaseFrame();  // ruling 1c: IMMEDIATELY after the copy,
+                                // before any encoder-visible work / return
+  last_surface_id_ = stamp;
+  if (!have_surface_base_) {
+    have_surface_base_ = true;  // this copy IS the surface base frame
+    XNC_LOG_INFO("dxgi surface base frame w=%u h=%u mono_us=%llu", w_, h_,
+                 static_cast<unsigned long long>(stamp.source_mono_us));
+  }
+  if (id) *id = stamp;
+  return CaptureStatus::kFrame;
 }
 
 bool DxgiErrIsDesktopAccessDenied(const std::string& err) {

@@ -22,6 +22,10 @@
 // LatestSurface/Nv12SurfacePool wrappers over a self-created device
 // (hardware -> WARP; XNC_D3D_DEBUG=1 gates the debug-layer assertions:
 // no ERROR/CORRUPTION D3D messages + zero live leases after teardown).
+// Task 2 adds the fake captured-surface ownership test (ReleaseFrame
+// immediately after the copy and before any encoder callback; cursor-only
+// LastPresentTime==0 never increments content) plus a real-LatestSurface
+// seam check inside the device block.
 // Pure-logic cases need no desktop;
 // the encoder/pipeline scenarios feed synthetic color bars straight into the
 // MF software H.264 MFT, so no capture is involved and they run on any
@@ -406,6 +410,123 @@ class Nv12ScriptedCapture final : public xnc::ICapture {
   SyntheticBars bars_;
   uint32_t w_, h_, total_, next_ = 0;
   std::vector<uint8_t> nv12_;
+};
+
+// ---- M2 Task 2: ICaptureSurface fakes (ownership test, plan Step 1) ----
+
+// Test-local instrumentation of the duplication CONTRACT (controller ruling
+// 4: assert the ownership invariants on a scripted fake; the real DXGI path
+// is Task 6's device matrix). Every call appends to the event log; held()
+// is the AcquireNextFrame-minus-ReleaseFrame balance (0 = nothing is held
+// when AcquireSurface returns, which is what "ReleaseFrame immediately
+// after CopyResource" guarantees).
+class ScriptedDupl {
+ public:
+  enum class Ev : uint8_t { kAcquire = 0, kCopy, kRelease, kEncoder };
+  enum class Acq : uint8_t { kFrame, kTimeout };
+  struct Frame {
+    uint64_t last_present_us;  // mirrors DXGI_OUTDUPL_FRAME_INFO.LastPresentTime
+    bool has_texture;          // mirrors a successful QI(ID3D11Texture2D)
+  };
+  explicit ScriptedDupl(std::vector<Frame> frames) : frames_(std::move(frames)) {}
+
+  Acq AcquireNextFrame(uint32_t timeout_ms, uint64_t* last_present_us,
+                       bool* has_texture) {
+    (void)timeout_ms;
+    events_.push_back(Ev::kAcquire);
+    if (next_ >= frames_.size()) return Acq::kTimeout;
+    *last_present_us = frames_[next_].last_present_us;
+    *has_texture = frames_[next_].has_texture;
+    ++next_;
+    ++held_;
+    return Acq::kFrame;
+  }
+  void CopyResource() {
+    events_.push_back(Ev::kCopy);
+    ++copies_;
+  }
+  void ReleaseFrame() {
+    events_.push_back(Ev::kRelease);
+    if (held_ > 0) --held_;
+  }
+  // Any encoder-visible callback the pipeline fires AFTER AcquireSurface
+  // returned (in production no encoder work ever runs between the copy and
+  // ReleaseFrame).
+  void EncoderWork() { events_.push_back(Ev::kEncoder); }
+
+  int held() const { return held_; }
+  int copies() const { return copies_; }
+  const std::vector<Ev>& events() const { return events_; }
+
+ private:
+  std::vector<Frame> frames_;
+  size_t next_ = 0;
+  int held_ = 0;
+  int copies_ = 0;
+  std::vector<Ev> events_;
+};
+
+// Fake ICaptureSurface mirroring DxgiCapture::AcquireSurface's control flow
+// (acquire -> cursor-only check -> full-resource copy -> IMMEDIATE release
+// -> stamp the given identity), so the invariants the test pins are the
+// ones the real backend implements. Device-free: the LatestSurface is
+// bookkept, not driven (the real CopyFrom/Snapshot seam is covered inside
+// the D3D device block below). Implements BOTH interfaces on one object,
+// like the real backends do.
+class ScriptedSurfaceCapture final : public xnc::ICapture,
+                                     public xnc::ICaptureSurface {
+ public:
+  explicit ScriptedSurfaceCapture(std::vector<ScriptedDupl::Frame> script)
+      : dupl_(std::move(script)) {}
+
+  // ICapture: unused here - the surface path is ADDITIVE (the CPU FrameBlob
+  // pipeline stays for the software/GDI fallback rung).
+  bool Acquire(xnc::FrameBlob&, std::string* err = nullptr,
+               uint32_t = 0) override {
+    if (err) *err = "err_timeout";
+    return false;
+  }
+  uint32_t Width() const override { return 64; }
+  uint32_t Height() const override { return 48; }
+
+  xnc::CaptureStatus AcquireSurface(xnc::LatestSurface& latest,
+                                    uint32_t timeout_ms, xnc::FrameIdentity* id,
+                                    std::string* err) override {
+    (void)latest;  // device-free fake: identity bookkeeping only
+    if (err) err->clear();
+    uint64_t present_us = 0;
+    bool has_texture = false;
+    if (dupl_.AcquireNextFrame(timeout_ms, &present_us, &has_texture) ==
+        ScriptedDupl::Acq::kTimeout) {
+      if (err) *err = "err_timeout";
+      if (id) *id = last_id_;
+      return xnc::CaptureStatus::kNoChange;  // static screen
+    }
+    // Cursor/metadata-only (LastPresentTime == 0) or no QI-able texture:
+    // NOT content - no copy, no stamp, ReleaseFrame immediately.
+    if (present_us == 0 || !has_texture) {
+      dupl_.ReleaseFrame();
+      if (err) *err = "err_timeout";
+      if (id) *id = last_id_;
+      return xnc::CaptureStatus::kNoChange;
+    }
+    dupl_.CopyResource();  // the full-resource copy into the surface
+    xnc::FrameIdentity stamp = id != nullptr ? *id : xnc::FrameIdentity{};
+    stamp.source_mono_us = xnc::NowMonoUs();  // the acquire timestamp
+    stamp.encode_seq = 0;
+    stamp.present_mono_us = 0;
+    dupl_.ReleaseFrame();  // immediately after the copy, before returning
+    last_id_ = stamp;
+    if (id) *id = stamp;
+    return xnc::CaptureStatus::kFrame;
+  }
+
+  ScriptedDupl& dupl() { return dupl_; }
+  const ScriptedDupl& dupl() const { return dupl_; }
+
+ private:
+  ScriptedDupl dupl_;
+  xnc::FrameIdentity last_id_{};
 };
 
 // rt 场景 ③ 专用:确定性 LCG 噪声帧(320x240,逐帧全噪声 → 压缩后 AU
@@ -1860,6 +1981,79 @@ int SelftestMain() {
       CHECK("pool-zero-live-after-teardown",
             pool.LiveLeases() == 0 &&
                 pool.FreeCount() == xnc::Nv12SurfacePool::kSlotCount);
+      // ---- M2 Task 2: the surface seam over the REAL LatestSurface ----
+      // A minimal ICaptureSurface backend (the exact Init / CopyFrom /
+      // Snapshot wiring DXGI/GDI implement, minus their duplication
+      // plumbing): the caller-owned surface is Init'ed by the backend, the
+      // full-resource copy stamps the GIVEN identity, and Snapshot leases
+      // the AddRef'd texture + that identity back - the concrete
+      // CapturedSurface shape from capture.h.
+      class DeviceSurfaceCapture final : public xnc::ICaptureSurface {
+       public:
+        DeviceSurfaceCapture(ID3D11Device* dev, ID3D11DeviceContext* ctx,
+                             ID3D11Texture2D* src, uint32_t w, uint32_t h)
+            : dev_(dev), ctx_(ctx), src_(src), w_(w), h_(h) {}
+        xnc::CaptureStatus AcquireSurface(xnc::LatestSurface& latest,
+                                          uint32_t timeout_ms,
+                                          xnc::FrameIdentity* id,
+                                          std::string* e) override {
+          (void)timeout_ms;
+          if (e) e->clear();
+          // Backend-owned Init: an uninitialized or resized caller surface
+          // is (re)created on the backend's device, exactly like
+          // DxgiCapture::EnsureLatestSurface.
+          if (latest.width() != w_ || latest.height() != h_) {
+            if (!latest.Init(dev_, w_, h_, e))
+              return xnc::CaptureStatus::kFatal;
+          }
+          xnc::FrameIdentity stamp = id != nullptr ? *id : xnc::FrameIdentity{};
+          stamp.source_mono_us = xnc::NowMonoUs();
+          stamp.encode_seq = 0;
+          stamp.present_mono_us = 0;
+          if (!latest.CopyFrom(ctx_, src_, stamp, e))
+            return xnc::CaptureStatus::kFatal;
+          if (id != nullptr) *id = stamp;
+          return xnc::CaptureStatus::kFrame;
+        }
+
+       private:
+        ID3D11Device* dev_;
+        ID3D11DeviceContext* ctx_;
+        ID3D11Texture2D* src_;
+        uint32_t w_, h_;
+      };
+      DeviceSurfaceCapture dsc(dev.Get(), dev_ctx.Get(), src.Get(), lw, lh);
+      xnc::LatestSurface owned;                    // caller-owned surface
+      xnc::FrameIdentity seam_id{7, 4, 901, 0, 0, 0};  // caller-assigned
+      std::string serr;
+      CHECK("surface-seam-frame",
+            dsc.AcquireSurface(owned, 16, &seam_id, &serr) ==
+                xnc::CaptureStatus::kFrame);
+      xnc::CapturedSurface got;  // the plan's conceptual return, filled
+      CHECK("surface-seam-snapshot",
+            owned.Snapshot(&got.id, &got.texture) && got.texture != nullptr);
+      got.changed = true;  // kFrame - the changed half of CapturedSurface
+      CHECK("surface-seam-identity",
+            got.id.capture_epoch == 7 && got.id.codec_epoch == 4 &&
+                got.id.content_id == 901 && got.id.source_mono_us != 0 &&
+                got.id.encode_seq == 0 && got.id.present_mono_us == 0);
+      D3D11_TEXTURE2D_DESC gotd{};
+      if (got.texture) got.texture->GetDesc(&gotd);
+      CHECK("surface-seam-texture",
+            got.texture != nullptr && gotd.Width == lw && gotd.Height == lh &&
+                gotd.Format == DXGI_FORMAT_B8G8R8A8_UNORM);
+      if (got.texture) got.texture->Release();
+      // A second acquire re-stamps: the snapshot identity follows the copy.
+      xnc::FrameIdentity sid2{7, 4, 902, 0, 0, 0};
+      CHECK("surface-seam-second-frame",
+            dsc.AcquireSurface(owned, 16, &sid2, &serr) ==
+                xnc::CaptureStatus::kFrame);
+      xnc::FrameIdentity leased2{};
+      ID3D11Texture2D* leased2_tex = nullptr;
+      CHECK("surface-seam-restamp",
+            owned.Snapshot(&leased2, &leased2_tex) && leased2_tex != nullptr &&
+                leased2.content_id == 902 && leased2.source_mono_us != 0);
+      if (leased2_tex) leased2_tex->Release();
       // Ruling 3 verdict: no ERROR/CORRUPTION D3D debug messages during the
       // surface tests (only when the debug layer actually came up).
       if (debug_layer && iq) {
@@ -1883,6 +2077,128 @@ int SelftestMain() {
         CHECK("gpu-surface-no-d3d-errors", !bad);
       }
     }
+  }
+  { // M2 Task 2 (plan Step 1): fake captured-surface OWNERSHIP. Pins the
+    // AcquireSurface contract on a scripted fake (controller ruling 4):
+    //   (a) ReleaseFrame fires immediately after the full-resource copy and
+    //       BEFORE the method returns / any encoder callback (the
+    //       duplication is never held into encoder work);
+    //   (b) cursor-only frames (LastPresentTime == 0, with or without a
+    //       QI-able texture) do not copy and do not count as changed, so
+    //       the CALLER-side content_id never increments for them (exactly
+    //       one component - the caller - assigns content);
+    //   (c) the backend stamps the identity it was GIVEN (caller-assigned
+    //       epochs + content_id), completed with the acquire timestamp - it
+    //       never invents content_id/epochs.
+    // Device-free (the ScriptedCapture pattern).
+    std::vector<ScriptedDupl::Frame> script{
+        {1, true},   // content frame A
+        {0, true},   // cursor-only move: LastPresentTime == 0
+        {0, false},  // cursor-only again, no QI-able texture
+        {2, true},   // content frame B
+    };
+    ScriptedSurfaceCapture cap(script);
+    xnc::LatestSurface latest;  // caller-owned (the fake only bookkeeps it)
+    std::string err;
+    uint64_t next_content = 0;            // the CALLER's content authority
+    std::vector<uint64_t> committed_ids;  // content ids committed on kFrame
+    auto acquire = [&](xnc::FrameIdentity* id_out) {
+      xnc::FrameIdentity id{};
+      id.capture_epoch = 5;             // caller-owned identity fields
+      id.codec_epoch = 3;
+      id.content_id = next_content + 1;  // SPECULATIVE: committed on kFrame
+      const xnc::CaptureStatus st = cap.AcquireSurface(latest, 16, &id, &err);
+      if (st == xnc::CaptureStatus::kFrame) {
+        next_content = id.content_id;
+        committed_ids.push_back(id.content_id);
+      }
+      *id_out = id;
+      return st;
+    };
+    using Ev = ScriptedDupl::Ev;
+    auto tail_is = [&](size_t mark, std::vector<Ev> want) {
+      const auto& ev = cap.dupl().events();
+      return ev.size() == mark + want.size() &&
+             std::equal(ev.begin() + mark, ev.end(), want.begin());
+    };
+    size_t mark = 0;
+    xnc::FrameIdentity id{};
+
+    // Frame A: acquire -> copy -> release; nothing held at the return.
+    CHECK("surface-frame-a", acquire(&id) == xnc::CaptureStatus::kFrame);
+    CHECK("surface-frame-a-order",
+          tail_is(mark, {Ev::kAcquire, Ev::kCopy, Ev::kRelease}));
+    CHECK("surface-frame-a-not-held", cap.dupl().held() == 0);
+    CHECK("surface-frame-a-given-identity",
+          id.capture_epoch == 5 && id.codec_epoch == 3 && id.content_id == 1 &&
+              id.encode_seq == 0 && id.present_mono_us == 0 &&
+              id.source_mono_us != 0);
+    const uint64_t src_a = id.source_mono_us;
+    cap.dupl().EncoderWork();  // the encoder callback fires after the return
+    mark = cap.dupl().events().size();
+
+    // Cursor-only move: no copy, no change, no content increment; the
+    // surface identity echoes the last STAMPED frame (the speculative id 2
+    // was never committed).
+    CHECK("surface-cursor-move",
+          acquire(&id) == xnc::CaptureStatus::kNoChange && err == "err_timeout");
+    CHECK("surface-cursor-move-order",
+          tail_is(mark, {Ev::kAcquire, Ev::kRelease}));
+    CHECK("surface-cursor-move-no-copy", cap.dupl().copies() == 1);
+    CHECK("surface-cursor-move-no-content",
+          committed_ids.size() == 1 && next_content == 1 && id.content_id == 1);
+    mark = cap.dupl().events().size();
+
+    // Cursor-only without a texture: identical no-change semantics.
+    CHECK("surface-cursor-notext",
+          acquire(&id) == xnc::CaptureStatus::kNoChange && err == "err_timeout");
+    CHECK("surface-cursor-notext-order",
+          tail_is(mark, {Ev::kAcquire, Ev::kRelease}));
+    CHECK("surface-cursor-notext-no-content", next_content == 1);
+    mark = cap.dupl().events().size();
+
+    // Frame B: content again - the caller's next id commits, and the new
+    // acquire timestamp is stamped.
+    CHECK("surface-frame-b", acquire(&id) == xnc::CaptureStatus::kFrame);
+    CHECK("surface-frame-b-order",
+          tail_is(mark, {Ev::kAcquire, Ev::kCopy, Ev::kRelease}));
+    CHECK("surface-frame-b-not-held", cap.dupl().held() == 0);
+    CHECK("surface-frame-b-content",
+          id.content_id == 2 && committed_ids.size() == 2 &&
+              committed_ids[1] == 2 && id.source_mono_us >= src_a);
+    cap.dupl().EncoderWork();
+    mark = cap.dupl().events().size();
+
+    // Script exhausted: static screen -> no change, identity still echoed.
+    CHECK("surface-static",
+          acquire(&id) == xnc::CaptureStatus::kNoChange && err == "err_timeout");
+    CHECK("surface-static-order", tail_is(mark, {Ev::kAcquire}));
+    CHECK("surface-static-echoes-last",
+          id.content_id == 2 && id.source_mono_us != 0);
+
+    // The whole session, end to end: every ReleaseFrame precedes the
+    // encoder work that follows it; cursor-only acquires never copied.
+    const auto& evs = cap.dupl().events();
+    CHECK("surface-session-events", evs.size() == 13);
+    size_t last_release = 0, last_encoder = 0;
+    for (size_t i = 0; i < evs.size(); ++i) {
+      if (evs[i] == Ev::kRelease) last_release = i;
+      if (evs[i] == Ev::kEncoder) last_encoder = i;
+    }
+    CHECK("surface-release-before-encoder", last_release < last_encoder);
+    CHECK("surface-total-copies", cap.dupl().copies() == 2);
+    // The err-string -> status mapping both real backends share.
+    CHECK("surface-status-map-timeout",
+          xnc::CaptureStatusFromErr("err_timeout") ==
+              xnc::CaptureStatus::kNoChange);
+    CHECK("surface-status-map-rebuilt",
+          xnc::CaptureStatusFromErr("err_rebuilt") == xnc::CaptureStatus::kRetry);
+    CHECK("surface-status-map-access-lost",
+          xnc::CaptureStatusFromErr("err_access_lost") ==
+              xnc::CaptureStatus::kAccessLost);
+    CHECK("surface-status-map-fatal",
+          xnc::CaptureStatusFromErr("AcquireNextFrame: hr=0x80004005") ==
+              xnc::CaptureStatus::kFatal);
   }
   { // Delayed encoder output must retain submission order, not call order.
     xnc::SubmissionLedger ledger;

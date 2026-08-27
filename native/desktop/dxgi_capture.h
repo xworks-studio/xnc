@@ -16,7 +16,8 @@
 #include <cstring>
 #include <string>
 
-#include "capture.h"  // ICapture, FrameBlob, TryCreateDxgiCapture
+#include "capture.h"  // ICapture, ICaptureSurface, FrameBlob, TryCreateDxgiCapture
+#include "gpu_surface.h"  // LatestSurface (AcquireSurface destination)
 
 namespace xnc {
 
@@ -275,7 +276,10 @@ inline bool GpuScaledDims(uint32_t w, uint32_t h, Rotate rot, uint32_t max_w,
 }
 
 // DXGI Desktop Duplication with CPU readback. Single-threaded use only.
-class DxgiCapture final : public ICapture {
+// M2 Task 2: also implements ICaptureSurface - AcquireSurface publishes the
+// newest desktop into a caller-owned LatestSurface with a full-resource GPU
+// copy (no readback), the GPU twin of the Acquire CPU path.
+class DxgiCapture final : public ICapture, public ICaptureSurface {
  public:
   DxgiCapture();
   ~DxgiCapture() override;
@@ -291,6 +295,19 @@ class DxgiCapture final : public ICapture {
   // wake at the target frame cadence.
   bool Acquire(FrameBlob& blob, std::string* err = nullptr,
                uint32_t timeout_ms = 0) override;
+  // ICaptureSurface (M2 Task 2): full-resource GPU CopyResource of the
+  // acquired desktop texture into `latest` (ruling 2: NO dirty/move-rect
+  // reconstruction in M2 - spec §3.1 simplicity trade), then ReleaseFrame
+  // IMMEDIATELY, before the method returns / any encoder-visible work
+  // (ruling 1c). Cursor-only frames (LastPresentTime == 0) never copy:
+  // kNoChange, surface + identity untouched, no content increment. Operates
+  // at the duplication's NATIVE dims (w_ x h_, pre-rotation - the later
+  // convert task applies rotation) and is orthogonal to the GPU-NV12 blob
+  // mode: AcquireSurface always copies the full-resolution BGRA. See
+  // capture.h for the identity authority, LatestSurface re-Init rules and
+  // the status/err vocabulary.
+  CaptureStatus AcquireSurface(LatestSurface& latest, uint32_t timeout_ms,
+                               FrameIdentity* id, std::string* err) override;
   // GPU path: the VideoProcessor OUTPUT (scaled/rotated) dims - the stream,
   // encoder Init and HOST_HELLO all live in that (scaled) space. BGRA path:
   // the duplication's native dims.
@@ -340,6 +357,17 @@ class DxgiCapture final : public ICapture {
   // staging textures for out_w_ x out_h_. Must be called after w_/h_/rot_/
   // out_w_/out_h_ are set. On failure the caller degrades to the BGRA path.
   bool MakeGpuPipeline(std::string* err);
+
+  // M2 Task 2 surface state: device_gen_ bumps on every Init (the D3D device
+  // is re-created there); the caller's LatestSurface is re-Init'ed whenever
+  // the generation or the duplication mode changed (EnsureLatestSurface -
+  // CopyResource demands same-device textures). last_surface_id_ mirrors
+  // the identity stamped into that surface (the kNoChange echo).
+  bool EnsureLatestSurface(LatestSurface& latest, std::string* err);
+  uint64_t device_gen_ = 0;
+  uint64_t latest_gen_ = 0;
+  FrameIdentity last_surface_id_{};
+  bool have_surface_base_ = false;  // first surface frame after (re)create
 
   struct Impl;  // COM pointers (d3d11.h stays out of this header)
   Impl* impl_;
