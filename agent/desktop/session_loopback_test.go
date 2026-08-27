@@ -42,7 +42,8 @@ import (
 type fakeSource struct {
 	mu        sync.Mutex
 	keyReqs   []string
-	nextKey   bool // 下帧强制 IDR(镜像 host 的 needsKeyframe)
+	cfgs      []VideoConfig // QoS 决策记录(M3 Task 3)
+	nextKey   bool          // 下帧强制 IDR(镜像 host 的 needsKeyframe)
 	closed    bool
 	closeOnce sync.Once
 	// gapAfterConnect 仅供主 RTP 回环门使用：等待 connect IDR 请求后
@@ -115,6 +116,21 @@ func (s *fakeSource) RequestKeyframe(reason string) error {
 	s.nextKey = true
 	s.mu.Unlock()
 	return nil
+}
+
+// SetVideoConfig 记录 QoS 决策(M3 Task 3;fake 恒受理)。
+func (s *fakeSource) SetVideoConfig(cfg VideoConfig) error {
+	s.mu.Lock()
+	s.cfgs = append(s.cfgs, cfg)
+	s.mu.Unlock()
+	return nil
+}
+
+// VideoConfigs 返回已收 VideoConfig 快照。
+func (s *fakeSource) VideoConfigs() []VideoConfig {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]VideoConfig(nil), s.cfgs...)
 }
 
 // SubID/SendInput/RecvCursor:Slice3 Source 接口扩展的最小实现(视频回环

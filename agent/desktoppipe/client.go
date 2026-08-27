@@ -26,6 +26,13 @@
 //	MSG_DISPLAY_CHANGED 0x010A event [u32 gen][u32 w][u32 h][char reason[24]]
 //	                            (M2-Slice1 Task 2 入站;统一 CaptureReset 改变
 //	                            流几何时广播;消费侧视作 HOST_HELLO 更新)
+//	MSG_SET_VIDEO_CONFIG 0x0129 req (M3 Task 3 出站)
+//	                            [u32 bitrate_kbps][u32 fps][u32 max_w]
+//	                            —— QoS 决策下发:bitrate/fps 热更新(编码器
+//	                            Reconfigure),max_w 变更走 reset/dims 路径
+//	                            (codec epoch 前进)。仅 v2 扩展 HOST_HELLO 的
+//	                            capabilities 广告了 CapSetVideoConfig 的 host
+//	                            支持;v1 wire host 不发(决策留在 agent 侧)。
 //	MSG_STREAM_DISCONTINUITY 0x020B event (M1 Task 4;v2 模式):[u64 capture_epoch]
 //	                            [u64 codec_epoch][char reason[32]](固定 reason)
 //	                            host 在 epoch 前进(capture 重建)时广播;消费侧
@@ -56,7 +63,8 @@ import (
 	"xnc/proto/ipc"
 )
 
-// 消息类型(0x0102-0x010A, 0x0205;native/desktop/rt_pipe_server.h 镜像)。
+// 消息类型(0x0102-0x010A, 0x0128/0x0129, 0x0205;native/desktop/
+// rt_pipe_server.h 镜像)。
 const (
 	msgAttach      uint16 = 0x0102
 	msgDetach      uint16 = 0x0103
@@ -68,6 +76,7 @@ const (
 	msgCursor      uint16 = 0x0109
 	msgDisplayChg  uint16 = 0x010A
 	msgSwitchDisp  uint16 = 0x0128
+	msgSetVideoCfg uint16 = 0x0129 // M3 Task 3:QoS 决策下发(出站)
 	msgFrameV2     uint16 = 0x0205 // M1 Task 2/3:v2 已验证媒体帧
 	msgStreamDisc  uint16 = 0x020B // M1 Task 4:断流(v2 模式;v1 收到即拒)
 )
@@ -124,6 +133,16 @@ const (
 	mediaProtocolV2 uint32 = 2
 	// flagKey 是 v2 flags 的 key 位(镜像 native AuFlags::kAuFlagKey)。
 	flagKey uint32 = 1 << 0
+	// setVideoConfigBytes 是 0x0129 payload 宽度(12B 定长)。
+	setVideoConfigBytes = 12
+)
+
+// HOST_HELLO v2 扩展的 capabilities 位(M3 Task 3;native
+// kHostCap* 镜像)。字段缺席 = 0 = 无能力(v1 wire host 恒无此字段)。
+const (
+	// CapSetVideoConfig:host 处理 SET_VIDEO_CONFIG 0x0129(bitrate/fps 热
+	// 更新 + max_w reset 路径)。
+	CapSetVideoConfig uint32 = 1 << 0
 )
 
 // crc32cTable 是 v2 帧 CRC32C(Castagnoli,反射多项式 0x82F63B78,
@@ -156,6 +175,8 @@ type Frame struct {
 // Displays 是 M2-S3 Task 5 的 displays[] 块(旧 server 不携带 = nil);
 // W/H 恒为「当前活动显示器」几何(与 displays[] 中某一项一致)。
 // MediaProtocol 是 v2 扩展的尾随 u32(0 = 旧 host / 无字段,M1 Task 2)。
+// Capabilities 是 M3 Task 3 起再尾随的 u32 能力位(缺席 = 0;见
+// CapSetVideoConfig)——仅 v2 hello 携带。
 type HelloInfo struct {
 	Gen           uint32
 	W, H          uint32
@@ -163,6 +184,7 @@ type HelloInfo struct {
 	MaxSubs       uint32
 	Displays      []Display
 	MediaProtocol uint32
+	Capabilities  uint32
 }
 
 // Display 是 HOST_HELLO displays[] 的一项(M2-S3 Task 5;与 native
@@ -228,17 +250,21 @@ type Sub struct {
 	conn  net.Conn
 	subID uint32
 
-	writeMu sync.Mutex // 串行化 DETACH/KEYFRAME_REQ 写
+	writeMu sync.Mutex // 串行化 DETACH/KEYFRAME_REQ/0x0129 控制帧写
 
-	mu         sync.Mutex // 守护 hello/mediaProto/needKey/closed/pumpErr
+	mu         sync.Mutex // 守护 hello/needKey/closed/pumpErr
 	hello      *HelloInfo
-	mediaProto uint32 // 协商媒体协议(hello 尾随字段;0 = v1)
-	needKey    bool   // WAIT_IDR 镜像:抑制 delta 直到下一个 IDR(泵独占读)
-	closed     bool
-	pumpErr    error
-	closeOne   sync.Once
-	closeErr   error
-	ledger     frameLedger // v2 帧身份单调性(pump 独占)
+	mediaProto uint32 // 协商媒体协议(0 = v1)。归属:pump 独占写(Dial
+	// 建立初值 + HOST_HELLO 更新),hello 副本化读取经 mu 顺带可见;
+	// pump 自身只读不锁(pump 单线程,写后读无竞态)。此前注释声称
+	// 「mu 守护 mediaProto」是误导——Dial 阶段的写发生在 pump 启动前,
+	// mu 只是搭 hello 的便车,不是它的所有权证明(M1 遗留注释订正)。
+	needKey  bool // WAIT_IDR 镜像:抑制 delta 直到下一个 IDR(泵独占读)
+	closed   bool
+	pumpErr  error
+	closeOne sync.Once
+	closeErr error
+	ledger   frameLedger // v2 帧身份单调性(pump 独占)
 
 	frameCh   chan Frame
 	stateCh   chan StateEvent
@@ -486,6 +512,27 @@ func (s *Sub) SendSwitchDisplay(idx uint32) error {
 	return s.writeCtrl(&ipc.Frame{MessageType: msgSwitchDisp, RequestID: 1, Payload: p})
 }
 
+// ErrVideoConfigUnsupported:host 未广告 CapSetVideoConfig(v1 wire host
+// 或未接 reconfigure 处理器的 v2 host)。调用方应记一次日志即停发——决策
+// 留在 agent 侧,不再触达 pipe。
+var ErrVideoConfigUnsupported = errors.New("desktoppipe: host does not support SET_VIDEO_CONFIG")
+
+// SendVideoConfig 发送 0x0129 [u32 bitrate_kbps][u32 fps][u32 max_w]
+// (M3 Task 3;QoS 决策下发)。仅当最近 HOST_HELLO 的 capabilities 广告了
+// CapSetVideoConfig 才发送,否则返回 ErrVideoConfigUnsupported(不发)。
+// 与其它控制帧一样 fire-and-forget:host 的受理/拒答经 FlagResponse 表
+// 达,调用方不等待。bitrate 单位 kbps(管控面约定;ATTACH 仍用 bps)。
+func (s *Sub) SendVideoConfig(bitrateKbps, fps, maxW uint32) error {
+	if h := s.Hello(); h == nil || h.Capabilities&CapSetVideoConfig == 0 {
+		return ErrVideoConfigUnsupported
+	}
+	p := make([]byte, setVideoConfigBytes)
+	binary.LittleEndian.PutUint32(p, bitrateKbps)
+	binary.LittleEndian.PutUint32(p[4:], fps)
+	binary.LittleEndian.PutUint32(p[8:], maxW)
+	return s.writeCtrl(&ipc.Frame{MessageType: msgSetVideoCfg, RequestID: 1, Payload: p})
+}
+
 // Close 发送 DETACH(尽力而为)、关闭连接并置 done(解除泵的可能
 // 阻塞);数据通道由泵退出时统一关闭(泵是唯一发送方,杜绝
 // send-on-closed 竞态)。幂等;返回底层连接关闭错误。
@@ -722,6 +769,11 @@ func (s *Sub) deliverFrame(frm Frame) bool {
 
 // drainFrameCh 非阻塞排空 FrameCh(泵是唯一发送方,排空后再投递必有余量;
 // 溢出/断流时被丢的缓冲帧是不可恢复的历史,丢弃正是恢复语义)。
+//
+// 调用守卫(M1 遗留注释补记):仅可在 pump 存活期间调用。teardown 已
+// close(frameCh) 后本函数的 `<-s.frameCh` 会立即返回零值并无限自旋——
+// 当前调用点(deliverFrame/msgStreamDisc)全在 pump 自身,先于 teardown,
+// 不可达;未来新增调用方必须维持该前置。
 func (s *Sub) drainFrameCh() {
 	for {
 		select {
@@ -865,19 +917,37 @@ func decodeFrameV2(p []byte) (Frame, error) {
 	}, nil
 }
 
-// decodeHostHello 解码 HOST_HELLO:先按 legacy 形态(20B 或 24+21n)解;
-// 失败再尝试 v2 扩展(尾随 u32 media_protocol=2;镜像 native 的先
-// DecodeHostHello 后 DecodeHostHelloV2 顺序,避免 displays 尾 4 字节
-// 巧合 == 2 的歧义)。两者皆失败 = 未知版本,拒绝。
+// decodeHostHello 解码 HOST_HELLO,按形状依次尝试(镜像 native 的先
+// DecodeHostHello 后 DecodeHostHelloV2 顺序,避免 displays 尾 4 字节巧合
+// == 2 的歧义):
+//
+//	legacy:20B 或 24+21n
+//	v2:24+21n + 尾随 u32 media_protocol=2(M1 Task 2)
+//	v2+caps:24+21n + media_protocol=2 + 再尾随 u32 capabilities
+//	        (M3 Task 3;capabilities 的取位使「最后 u32 == 2」歧义不可能
+//	         ——能力位 0 只定义了 bit0,capabilities ∈ {0,1})
+//
+// 两者皆失败 = 未知版本,拒绝。
 func decodeHostHello(p []byte) (*HelloInfo, error) {
 	if h, err := decodeHostHelloLegacy(p); err == nil {
 		return h, nil
 	}
+	// v2(无 capabilities)。
 	if len(p) >= 28 {
-		mp := binary.LittleEndian.Uint32(p[len(p)-4:])
-		if mp == mediaProtocolV2 {
+		if mp := binary.LittleEndian.Uint32(p[len(p)-4:]); mp == mediaProtocolV2 {
 			if h, err := decodeHostHelloLegacy(p[:len(p)-4]); err == nil {
 				h.MediaProtocol = mp
+				return h, nil
+			}
+		}
+	}
+	// v2 + capabilities(M3 Task 3):倒数第二 u32 是 media_protocol。
+	if len(p) >= 32 {
+		mp := binary.LittleEndian.Uint32(p[len(p)-8:])
+		if mp == mediaProtocolV2 {
+			if h, err := decodeHostHelloLegacy(p[:len(p)-8]); err == nil {
+				h.MediaProtocol = mp
+				h.Capabilities = binary.LittleEndian.Uint32(p[len(p)-4:])
 				return h, nil
 			}
 		}

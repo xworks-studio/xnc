@@ -453,6 +453,11 @@ class MediaPipelineV2 {
   void RequestIdr(const char* reason);
   // Reconfigure request; applied by the loop before its next iteration.
   void Reconfigure(uint32_t bitrate_bps, uint32_t fps);
+  // M3 Task 3 (SET_VIDEO_CONFIG): live max_w. Any thread. A change requests
+  // a unified reset (reason=resolution): the rebuild's InitStream re-derives
+  // the scaled dims, re-Init's pool/converter/session (new codec epoch) and
+  // resets are where subscribers recover via 0x020B/WAIT_IDR.
+  void SetMaxWidth(uint32_t max_w);
   // Requests a capture reset (rebuild + new generation + forced IDR).
   void Reset(const char* reason);
 

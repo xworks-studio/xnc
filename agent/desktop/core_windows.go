@@ -382,6 +382,19 @@ func (p *pipeSource) SwitchDisplay(index uint32) error {
 	return p.sub.SendSwitchDisplay(index)
 }
 
+// SetVideoConfig 下发 0x0129(M3 Task 3;bitrate 取 kbps——管控面约定)。
+// host 未广告能力 → errVideoConfigUnsupported(desktoppipe 同名错误的平台
+// 内映射;调用方记一次即停发);写失败随连接终结由意图自愈重建。
+func (p *pipeSource) SetVideoConfig(cfg VideoConfig) error {
+	if err := p.sub.SendVideoConfig(cfg.Bitrate/1000, cfg.FPS, cfg.MaxW); err != nil {
+		if errors.Is(err, desktoppipe.ErrVideoConfigUnsupported) {
+			return errVideoConfigUnsupported
+		}
+		return err
+	}
+	return nil
+}
+
 func (p *pipeSource) RequestKeyframe(reason string) error { return p.sub.RequestKeyframe(reason) }
 
 func (p *pipeSource) Close() error { return p.sub.Close() }

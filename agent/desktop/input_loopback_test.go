@@ -221,6 +221,9 @@ func (s *inputFakeSource) RequestKeyframe(reason string) error {
 	return nil
 }
 
+// SetVideoConfig:M3 Task 3 接口扩展的最小实现(输入用例不驱动 QoS)。
+func (s *inputFakeSource) SetVideoConfig(VideoConfig) error { return nil }
+
 func (s *inputFakeSource) SubID() uint32 { return s.subID }
 
 func (s *inputFakeSource) SendInput(payload []byte) error {

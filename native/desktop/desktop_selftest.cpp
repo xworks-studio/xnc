@@ -870,8 +870,9 @@ class RtTestClient {
       if (f.message_type == xnc::kMsgHostHello) {
         hello_ok_ = xnc::DecodeHostHello(f, &hello_);
         media_protocol_ = 0;
+        caps_ = 0;
         if (!hello_ok_)  // M1 Task 2: v2 servers append u32 media_protocol=2
-          hello_ok_ = xnc::DecodeHostHelloV2(f, &hello_, &media_protocol_);
+          hello_ok_ = xnc::DecodeHostHelloV2(f, &hello_, &media_protocol_, &caps_);
         return hello_ok_;
       }
       if (f.message_type == xnc::kMsgFrame ||
@@ -1032,6 +1033,7 @@ class RtTestClient {
   std::vector<std::string> state_codes_;
   xnc::HostHelloPayload hello_{};
   uint32_t media_protocol_ = 0;  // HOST_HELLO v2 trailing u32 (0 = legacy)
+  uint32_t caps_ = 0;            // M3 Task 3: further-trailing capabilities u32
   bool hello_ok_ = false, saw_stream_end_ = false, frame_before_hello_ = false;
   // M1 Task 4: 0x020B STREAM_DISCONTINUITY observations.
   uint64_t discontinuities_ = 0;
@@ -7804,6 +7806,43 @@ int SelftestMain(bool desktop_pipeline_v2) {
     CHECK("sw-dec", xnc::DecodeSwitchDisplay(sf, &sidx) && sidx == 2);
     xnc::Frame bad{0, xnc::kMsgSwitchDisplay, 3, {1, 2, 3}};
     CHECK("sw-dec-badsize", !xnc::DecodeSwitchDisplay(bad, &sidx));
+
+    // 0x0129 codec (M3 Task 3): [u32 kbps][u32 fps][u32 max_w],12B 定长。
+    xnc::VideoConfigPayload vc{2300, 30, 1920};
+    const std::vector<uint8_t> vcwire = xnc::EncodeSetVideoConfig(vc);
+    CHECK("vc-enc", vcwire.size() == 12 && vcwire[0] == 0xFC && vcwire[4] == 30 &&
+                      vcwire[8] == 0x80 && vcwire[9] == 0x07);
+    xnc::VideoConfigPayload vback{};
+    xnc::Frame vf{0, xnc::kMsgSetVideoConfig, 5, vcwire};
+    CHECK("vc-dec", xnc::DecodeSetVideoConfig(vf, &vback) &&
+                      vback.bitrate_kbps == 2300 && vback.fps == 30 &&
+                      vback.max_w == 1920);
+    xnc::Frame vbad{0, xnc::kMsgSetVideoConfig, 5, {1, 2, 3}};
+    CHECK("vc-dec-badsize", !xnc::DecodeSetVideoConfig(vbad, &vback));
+
+    // HOST_HELLO v2 capabilities 扩展(M3 Task 3):v2 形状 + 尾随 caps u32;
+    // 无 handler 的 v2 形状照旧(caps=0),legacy 不受影响;两种形状互不
+    // 误读(caps ∈ {0,1} != 2,位移 8B 后 legacy 校验必败)。
+    xnc::HostHelloPayload chh;
+    chh.gen = 4; chh.w = 2560; chh.h = 1440; chh.fps = 30; chh.max_subs = 4;
+    const std::vector<uint8_t> capswire =
+        xnc::EncodeHostHelloV2Caps(chh, xnc::kHostCapSetVideoConfig);
+    CHECK("hhv2c-size", capswire.size() == 24 + 4 + 4);
+    CHECK("hhv2c-tail", capswire.size() == 32 &&
+                          xnc::rt_detail::GetU32(capswire.data() + 24) == 2 &&
+                          xnc::rt_detail::GetU32(capswire.data() + 28) ==
+                              xnc::kHostCapSetVideoConfig);
+    xnc::HostHelloPayload cback{};
+    uint32_t mp = 0, caps = 0;
+    xnc::Frame cf{0, xnc::kMsgHostHello, 0, capswire};
+    CHECK("hhv2c-dec", xnc::DecodeHostHelloV2(cf, &cback, &mp, &caps) &&
+                         cback.w == 2560 && mp == 2 &&
+                         caps == xnc::kHostCapSetVideoConfig);
+    // 纯 v2 形状(无 caps 字段)仍可解,caps 报 0。
+    const std::vector<uint8_t> plainv2 = xnc::EncodeHostHelloV2(chh);
+    xnc::Frame pf{0, xnc::kMsgHostHello, 0, plainv2};
+    CHECK("hhv2-plain-dec", xnc::DecodeHostHelloV2(pf, &cback, &mp, &caps) &&
+                              mp == 2 && caps == 0);
   }
   { // rt 场景 ⑧(M2-S3 Task 5):HOST_HELLO 带 displays;0x0128 非法 idx →
     // STATE{invalid_display}(可恢复,无 reset);合法 idx → 受理 + reset 请求
@@ -8061,6 +8100,79 @@ int SelftestMain(bool desktop_pipeline_v2) {
                   (unsigned long long)st.frames_dropped_needkey,
                   a.saw_stream_end_ ? 1 : 0);
     }
+  }
+  { // rt 场景 ⑫(M3 Task 3):SET_VIDEO_CONFIG 0x0129 —— v2 wire + 已接 applier
+    // 的 host:扩展 HOST_HELLO 广告 kHostCapSetVideoConfig;合法 payload →
+    // FlagResponse(受理,applier 收到 bps 换算值);坏 payload →
+    // FlagResponse|FlagError + 记账;未接 applier 的 host 不广告能力且
+    // 受理失败。无需管线(0x0129 是 opts 层管控面)。
+    xnc::RtServer rt;
+    xnc::RtServer::Opts ro = rt_opts(11);
+    ro.pipeline_v2 = true;  // 能力广告只走 v2 扩展 HOST_HELLO
+    // 静态记账(场景 ⑧ 同款):applier 收到的参数。
+    static uint32_t got_bps = 0, got_fps = 0, got_maxw = 0;
+    got_bps = got_fps = got_maxw = 0;
+    ro.set_video_config_fn = [](void*, uint32_t bps, uint32_t fps, uint32_t mw) {
+      got_bps = bps; got_fps = fps; got_maxw = mw;
+      return true;
+    };
+    CHECK("rt12-start", rt.Start(ro, kRtW, kRtH));
+    RtTestClient a;
+    CHECK("rt12-connect", a.Connect(ro.pipe_name.c_str(), kRtSecret, sizeof(kRtSecret)));
+    CHECK("rt12-attach", a.Attach(12));
+    CHECK("rt12-hello-caps", a.hello_ok_ && a.media_protocol_ == 2 &&
+                               a.caps_ == xnc::kHostCapSetVideoConfig);
+    // 合法 0x0129:1500kbps → 1.5Mbps;FlagResponse 无错误。
+    CHECK("rt12-send", a.SendRaw(xnc::kMsgSetVideoConfig,
+                                 xnc::EncodeSetVideoConfig({1500, 20, 1280})));
+    // 坏 payload(4B)→ FlagResponse|FlagError。
+    CHECK("rt12-send-bad", a.SendRaw(xnc::kMsgSetVideoConfig, {1, 2, 3, 4}));
+    bool ok_resp = false, err_resp = false;
+    const ULONGLONG dl = GetTickCount64() + 2500;
+    while (GetTickCount64() < dl && !(ok_resp && err_resp)) {
+      xnc::Frame f;
+      if (!a.ReadFrameT(f, 200)) break;
+      a.CountFrame(f);
+      if (f.message_type == xnc::kMsgSetVideoConfig) {
+        if ((f.flags & xnc::kFlagError) != 0) err_resp = true;
+        if ((f.flags & xnc::kFlagResponse) != 0 && (f.flags & xnc::kFlagError) == 0)
+          ok_resp = true;
+      }
+    }
+    rt.Shutdown();
+    CHECK("rt12-ok-resp", ok_resp);
+    CHECK("rt12-bad-resp", err_resp);
+    CHECK("rt12-applier", got_bps == 1500000 && got_fps == 20 && got_maxw == 1280);
+    const xnc::RtServer::Stats st = rt.stats();
+    CHECK("rt12-stats", st.video_configs == 1 && st.video_config_rejected == 1);
+
+    // 对照:未接 applier(v1 wire + 无 handler)→ 无能力广告 + 受理失败。
+    xnc::RtServer rt2;
+    xnc::RtServer::Opts ro2 = rt_opts(12);
+    CHECK("rt12b-start", rt2.Start(ro2, kRtW, kRtH));
+    RtTestClient b;
+    CHECK("rt12b-connect", b.Connect(ro2.pipe_name.c_str(), kRtSecret, sizeof(kRtSecret)));
+    CHECK("rt12b-attach", b.Attach(13));
+    CHECK("rt12b-no-caps", b.hello_ok_ && b.caps_ == 0);
+    CHECK("rt12b-send", b.SendRaw(xnc::kMsgSetVideoConfig,
+                                  xnc::EncodeSetVideoConfig({1500, 20, 1280})));
+    bool err2 = false;
+    const ULONGLONG dl2 = GetTickCount64() + 2500;
+    while (GetTickCount64() < dl2 && !err2) {
+      xnc::Frame f;
+      if (!b.ReadFrameT(f, 200)) break;
+      b.CountFrame(f);
+      if (f.message_type == xnc::kMsgSetVideoConfig &&
+          (f.flags & xnc::kFlagError) != 0)
+        err2 = true;
+    }
+    rt2.Shutdown();
+    CHECK("rt12b-err-resp", err2);
+    CHECK("rt12b-stats", rt2.stats().video_config_rejected == 1);
+    std::printf("SELFTEST NOTE: rt12 ok=%d err=%d bps=%u fps=%u max_w=%u stats=[%llu,%llu]\n",
+                ok_resp ? 1 : 0, err_resp ? 1 : 0, got_bps, got_fps, got_maxw,
+                (unsigned long long)st.video_configs,
+                (unsigned long long)st.video_config_rejected);
   }
   // ---- M2 Task 4: MediaPipelineV2 (depth-one GPU media pipeline). These
   // scenarios run ONLY with --desktop-pipeline-v2 (ruling 1: the CLI flag

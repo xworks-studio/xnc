@@ -296,8 +296,11 @@ struct EncodeCtx {
   std::vector<std::vector<uint8_t>> aus;  // per-submission encoder outputs
   std::vector<uint8_t> shaped;            // shaped-AU scratch
   LatencyWindow lat;
-  uint32_t spf_ms = 0;
-  uint32_t warmup_feed_bound = 0;
+  // M3 Task 3 (SET_VIDEO_CONFIG fps_hint): spf_ms/warmup_feed_bound are
+  // atomics - the capture thread re-keys them when the live fps hint moves
+  // while the encode thread paces idle re-feeds off them.
+  std::atomic<uint32_t> spf_ms{0};
+  std::atomic<uint32_t> warmup_feed_bound{0};
   uint32_t static_grace_ms = 0;  // re-feed gate: a timeout within this
                                  // window means "static screen"
   uint64_t last_feed_ms = 0;     // re-feed pacing anchor (old SubmitFrame
@@ -425,9 +428,18 @@ bool RunResetSequence(ResetSequence& s) {
       if (new_w != old_w || new_h != old_h) {
         // Serialize with the encode thread: an in-flight Encode/FlushTail
         // must finish before the MFT is torn down and re-negotiated.
+        // M3 Task 3: the reset re-init honors the LIVE 0x0129 hints (a hot
+        // reconfigure must not be silently reverted by the next rebuild).
+        const uint32_t fps_now =
+            s.opt->fps_hint != nullptr && s.opt->fps_hint->load() != 0
+                ? s.opt->fps_hint->load()
+                : s.opt->fps;
+        const uint32_t bitrate_now =
+            s.opt->bitrate_hint != nullptr && s.opt->bitrate_hint->load() != 0
+                ? s.opt->bitrate_hint->load()
+                : s.opt->target_bitrate_bps;
         std::lock_guard<std::mutex> elk(*s.enc_mu);
-        ok = s.enc->Init(new_w, new_h, s.opt->fps, s.opt->target_bitrate_bps,
-                         &rerr);
+        ok = s.enc->Init(new_w, new_h, fps_now, bitrate_now, &rerr);
         // Init starts a new MFT lifecycle even when negotiation fails: its
         // Shutdown first discards every delayed output from the old MFT.
         std::lock_guard<std::mutex> lk(s.sh->mu);
@@ -668,12 +680,12 @@ void PhaseOutcomeLogs(EncodeCtx& ctx) {
       ctx.sh.warmup_phase_logged = true;
       XNC_LOG_INFO("warmup_done feeds=%u keyframes=%llu", ctx.sh.warmup_gen_feeds,
                    static_cast<unsigned long long>(ctx.sh.cache.counters().keyframes));
-    } else if (ctx.sh.warmup_gen_feeds >= ctx.warmup_feed_bound ||
+    } else if (ctx.sh.warmup_gen_feeds >= ctx.warmup_feed_bound.load() ||
                (ctx.sh.warmup_started_ms != 0 &&
                 NowMs() - ctx.sh.warmup_started_ms >= kWarmupWallBoundMs)) {
       ctx.sh.warmup_phase_logged = true;
       XNC_LOG_INFO("warmup_exhausted feeds=%u bound=%u keyframes=%llu",
-                   ctx.sh.warmup_gen_feeds, ctx.warmup_feed_bound,
+                   ctx.sh.warmup_gen_feeds, ctx.warmup_feed_bound.load(),
                    static_cast<unsigned long long>(ctx.sh.cache.counters().keyframes));
     }
   }
@@ -681,11 +693,11 @@ void PhaseOutcomeLogs(EncodeCtx& ctx) {
   // stays consumed and the IDR surfaces with the next real frame batch
   // (still never re-forced).
   if (ctx.sh.ondemand.armed && !ctx.sh.ondemand.exhaust_logged && have_base &&
-      !ctx.sh.ondemand.FeedAllowed(NowMs(), ctx.warmup_feed_bound)) {
+      !ctx.sh.ondemand.FeedAllowed(NowMs(), ctx.warmup_feed_bound.load())) {
     ctx.sh.ondemand.exhaust_logged = true;
     XNC_LOG_INFO("idr_feed_exhausted reason=%s feeds=%u bound=%u",
                  ctx.sh.ondemand.reason, ctx.sh.ondemand.feeds,
-                 ctx.warmup_feed_bound);
+                 ctx.warmup_feed_bound.load());
   }
 }
 
@@ -754,13 +766,13 @@ bool IdleFeed(EncodeCtx& ctx) {
         ctx.sh.warmup_started_ms != 0 ? NowMs() - ctx.sh.warmup_started_ms : 0;
     const bool warmup_feed_ok =
         static_screen && have_base && !ctx.sh.cache.HaveKeyframe() &&
-        ctx.sh.warmup_gen_feeds < ctx.warmup_feed_bound &&
+        ctx.sh.warmup_gen_feeds < ctx.warmup_feed_bound.load() &&
         warmup_elapsed < kWarmupWallBoundMs;
     // On-demand IDR re-feed (static screen + armed subscriber request):
     // same source frame, same bounds, never a second force (§7.5).
     const bool ondemand_feed_ok =
         static_screen && have_base && ctx.sh.cache.HaveKeyframe() &&
-        ctx.sh.ondemand.FeedAllowed(NowMs(), ctx.warmup_feed_bound);
+        ctx.sh.ondemand.FeedAllowed(NowMs(), ctx.warmup_feed_bound.load());
     if ((warmup_feed_ok || ondemand_feed_ok) &&
         ctx.sh.latest.Snapshot(&feed_frame, &feed_generation)) {
       candidate = true;
@@ -826,7 +838,9 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
   }
   TimePeriodGuard tpg;  // 1 ms timer granularity for the pacing Sleeps
 
-  const uint32_t spf_ms = 1000u / opt.fps;
+  // M3 Task 3: spf is LIVE when fps_hint is wired (SET_VIDEO_CONFIG hot
+  // fps); otherwise it stays the fixed opts.fps derivation (pre-M3 path).
+  uint32_t spf_ms = 1000u / opt.fps;
   const uint32_t warmup_feed_bound = WarmupFeedBound(opt.fps);
 
   PipelineShared sh;
@@ -873,6 +887,27 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
     if (NowMs() - t0 >= duration_ms) break;
     if (opt.stop != nullptr && opt.stop->load()) break;
     if (ctx.fatal.load(std::memory_order_relaxed)) break;  // encode died
+
+    // M3 Task 3: hot fps hint (SET_VIDEO_CONFIG). Checked once per capture
+    // iteration; a change re-keys spf for the acquire timeout and the pacing
+    // deadline, rebases the absolute-deadline anchor (so the NEXT interval is
+    // exactly the new spf instead of carrying the old cadence), and pushes
+    // the fresh spf/warm-up bound into the encode context (atomics).
+    if (opt.fps_hint != nullptr) {
+      const uint32_t want_fps = opt.fps_hint->load(std::memory_order_relaxed);
+      if (want_fps != 0) {
+        const uint32_t want_spf = 1000u / want_fps;
+        if (want_spf != spf_ms) {
+          spf_ms = want_spf;
+          if (push_t0 != 0)
+            push_t0 = NowMs() - static_cast<uint64_t>(push_count) * spf_ms;
+          ctx.spf_ms.store(spf_ms, std::memory_order_relaxed);
+          ctx.warmup_feed_bound.store(WarmupFeedBound(want_fps),
+                                      std::memory_order_relaxed);
+          XNC_LOG_INFO("fps_hint applied fps=%u spf_ms=%u", want_fps, spf_ms);
+        }
+      }
+    }
 
     // Unified capture reset (M2-Slice1 Task 2): consume a merged/debounced
     // request and run suspend -> wait-desktop -> rebuild -> resume. A

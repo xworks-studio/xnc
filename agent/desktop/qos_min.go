@@ -10,7 +10,10 @@
 //     新订阅绕过 250ms 冷却;其余常规);
 //   - 计数器透传:PubStats 快照供 session/日志/e2e 观测(不含任何凭据)。
 //
-// Slice3 扩展位:按 TWCC/REMB 反馈调码率、按 NACK 率降帧率(本片不实现)。
+// Slice3 扩展位已由 M3 Task 3 落地:viewer_feedback(信令帧,session.go
+// 解析)→ QoSController(qos_controller.go)驱动码率/fps/max_w 阶梯与
+// 旁观者暂停,决策经 SET_VIDEO_CONFIG 0x0129(desktoppipe)下发 host;
+// RTCP 面的 TWCC 计数仍在此透传(估计带宽由 viewer 侧 getStats 汇总上报)。
 package desktop
 
 import (

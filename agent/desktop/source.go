@@ -69,6 +69,17 @@ type DisplayChangedEvent struct {
 	Reason string
 }
 
+// VideoConfig 是共享编码流的参数(M3 Task 3:QoSController 的决策载体,
+// 经 Source.SetVideoConfig 下发 host 管控消息 SET_VIDEO_CONFIG 0x0129)。
+// 语义:Bitrate(bps)与 FPS 热更新(编码器 Reconfigure);MaxW 变更走
+// reset/dims 路径(codec epoch 前进——重建后的首帧即 IDR,发送侧经
+// 0x020B/WAIT_IDR 自然恢复,无需显式关键帧请求)。
+type VideoConfig struct {
+	Bitrate uint32 // bps
+	FPS     uint32
+	MaxW    uint32 // 0 = 不缩(native 只缩不放)
+}
+
 // Source 是一条已 ATTACH 的桌面帧订阅(见 desktoppipe.Sub)。
 type Source interface {
 	// RecvFrame 阻塞取下一视频帧;ok=false = 源终结(关闭/断连/ctx 取消)。
@@ -84,6 +95,11 @@ type Source interface {
 	Hello() *HelloInfo
 	// RequestKeyframe 请求 host 立即产新 IDR(reason 进 host 记账)。
 	RequestKeyframe(reason string) error
+	// SetVideoConfig 下发共享编码参数(M3 Task 3;见 VideoConfig)。host
+	// 无该能力(v1 wire / 未广告 capability)时返回
+	// desktoppipe.ErrVideoConfigUnsupported 形态的错误,调用方记一次
+	// "unsupported" 即停发(决策留在 agent 侧)。
+	SetVideoConfig(VideoConfig) error
 	// SubID 返回本订阅的 sub_id(0x0108 输入消息必须携带)。
 	SubID() uint32
 	// SendInput 发送一条已编码的 0x0108 payload([u32 sub_id][u64 seq]

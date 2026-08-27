@@ -339,6 +339,15 @@ func (s intentSource) RequestKeyframe(reason string) error {
 	return context.Canceled
 }
 
+// SetVideoConfig 转发 0x0129 到当前源(M3 Task 3;重挂后的新源接同一
+// 决策流——host 侧配置随重建回到缺省,下一次决策即重新同步)。
+func (s intentSource) SetVideoConfig(cfg VideoConfig) error {
+	if src := s.cur(); src != nil {
+		return src.SetVideoConfig(cfg)
+	}
+	return context.Canceled
+}
+
 func (s intentSource) SubID() uint32 {
 	if src := s.cur(); src != nil {
 		return src.SubID()

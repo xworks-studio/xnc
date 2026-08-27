@@ -37,6 +37,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <atomic>  // M3 Task 3: RtVideoConfigTarget hint/pointer atomics
 
 #include "../common/log.h"
 #include "backend_ladder.h"  // LadderCapture (M2-Slice1 Task 3)
@@ -870,6 +871,60 @@ int RunConsoleDiag(const xnc::DiagOptions& opt, bool desktop_pipeline_v2) {
   return res.ok ? 0 : 1;
 }
 
+// ---- M3 Task 3: SET_VIDEO_CONFIG 0x0129 rt wiring ----
+//
+// RtVideoConfigTarget must exist BEFORE RtServer::Start: the first
+// HOST_HELLO advertises kHostCapSetVideoConfig from
+// Opts::set_video_config_fn != null, and a subscriber can attach the instant
+// the pipe exists. The encoder/wrapper pointers are stored as soon as those
+// objects exist (atomics - a reader thread may deliver 0x0129 at any moment;
+// before they are set the thunk answers "rejected" and the agent retries on
+// its next decision). The V2 pipeline is NOT wired through here: ServeV2
+// owns it and prefers its own internal pointer (see rt_pipe_server.cpp) -
+// this target's stub exists purely to advertise the capability from the
+// first hello.
+struct RtVideoConfigTarget {
+  RtVideoConfigTarget(uint32_t bitrate, uint32_t fps_in, uint32_t max_w_in)
+      : bitrate_bps(bitrate), fps(fps_in), max_w(max_w_in) {}
+  std::atomic<uint32_t> bitrate_bps{0};   // last accepted (hot effective value)
+  std::atomic<uint32_t> fps{0};
+  std::atomic<uint32_t> max_w{0};
+  std::atomic<uint32_t> hint_fps{0};      // M0: PipelineOpts::fps_hint source
+  std::atomic<uint32_t> hint_bitrate{0};  // M0: reset re-init bitrate source
+  std::atomic<xnc::MfSoftEncoder*> m0_enc{nullptr};
+  std::atomic<xnc::ScaledCapture*> m0_scaled{nullptr};
+};
+
+// M0 applier: bitrate HOT via the encoder codec API; fps via the pacing hint
+// (RtServer::Serve forwards it into PipelineOpts); max_w via the
+// ScaledCapture wrapper (the GPU rung caveat is documented on SetMaxW - in
+// that topology the V2 pipeline is the path that scales).
+bool RtApplySetVideoConfigM0(void* ctx, uint32_t bitrate_bps, uint32_t fps,
+                             uint32_t max_w) {
+  auto* t = static_cast<RtVideoConfigTarget*>(ctx);
+  if (bitrate_bps != 0) t->bitrate_bps.store(bitrate_bps);
+  if (fps != 0) t->fps.store(fps);
+  if (max_w != 0) t->max_w.store(max_w);
+  auto* enc = t->m0_enc.load();
+  if (enc == nullptr) return false;  // not serving yet (logon wait / init)
+  if (bitrate_bps != 0) {
+    enc->ReconfigureRate(bitrate_bps);
+    t->hint_bitrate.store(bitrate_bps);
+  }
+  if (fps != 0) t->hint_fps.store(fps);
+  if (max_w != 0)
+    if (auto* sc = t->m0_scaled.load()) sc->SetMaxW(max_w);
+  return true;
+}
+
+// V2 stub: advertises the capability at hello time; the actual application
+// goes through ServeV2's internal pipeline pointer (set the moment its
+// Start succeeds - a request racing that store is acked but lands nowhere;
+// the agent re-sends on its next decision).
+bool RtAdvertiseSetVideoConfigV2(void*, uint32_t, uint32_t, uint32_t) {
+  return true;
+}
+
 // Real-time mode (M1-Slice2 Task 2): same capture/encode pipeline, AUs
 // fanned out to pipe subscribers until Ctrl+C. M1-Slice3 adds the input
 // path (0x0108 -> SendInput, stuck-key janitor) and the cursor channel
@@ -939,6 +994,10 @@ int RunConsoleRt(const xnc::DiagOptions& opt, bool desktop_pipeline_v2) {
       ro.reset = &capture_reset;
       ro.displays_fn = [](void*) { return xnc::DxgiDisplaysSnapshot(); };
       ro.switch_display_fn = [](void*, uint32_t idx) { return xnc::DxgiSelectDisplay(idx); };
+      // M3 Task 3: 0x0129 capability advertisement (the application goes
+      // through ServeV2's internal pipeline pointer).
+      ro.set_video_config_fn = &RtAdvertiseSetVideoConfigV2;
+      ro.set_video_config_ctx = nullptr;
       xnc::RtServer server;
       // Fix round 1 (finding 2): --max-w rides into the pipeline's
       // VideoProcessor; ServeV2 starts the HOST_HELLO at the same scaled
@@ -1044,6 +1103,17 @@ int RunConsoleRt(const xnc::DiagOptions& opt, bool desktop_pipeline_v2) {
   // picks the desired index up at SwapToDxgi's fresh Init).
   ro.displays_fn = [](void*) { return xnc::DxgiDisplaysSnapshot(); };
   ro.switch_display_fn = [](void*, uint32_t idx) { return xnc::DxgiSelectDisplay(idx); };
+  // M3 Task 3 (SET_VIDEO_CONFIG): the applier must be wired BEFORE the
+  // logon-wait Start below (the first hello advertises the capability);
+  // encoder/wrapper pointers land as soon as those objects exist. Bitrate
+  // starts provisional (logon-wait geometry) and is re-keyed below.
+  RtVideoConfigTarget vca{bitrate_bps, opt.fps, opt.max_width};
+  vca.hint_fps.store(opt.fps);
+  vca.hint_bitrate.store(bitrate_bps);
+  ro.set_video_config_fn = &RtApplySetVideoConfigM0;
+  ro.set_video_config_ctx = &vca;
+  ro.fps_hint = &vca.hint_fps;
+  ro.bitrate_hint = &vca.hint_bitrate;
   xnc::RtServer server;
   if (logon_wait) {
     XNC_LOG_INFO("console_rt_logon_wait (pipe up with provisional dims; probing for the Default desktop)");
@@ -1086,11 +1156,13 @@ int RunConsoleRt(const xnc::DiagOptions& opt, bool desktop_pipeline_v2) {
   // feat/rt-scale: --max-w downscales every frame before encode (the
   // encoder, HOST_HELLO and input/cursor mapping all see the scaled dims).
   std::unique_ptr<xnc::ICapture> capture;
+  xnc::ScaledCapture* scaled = nullptr;  // M3 T3: live max_w target
   if (opt.max_width > 0) {
     const uint32_t sw = ladder->Width(), sh = ladder->Height();
     uint32_t dw = 0, dh = 0;
     xnc::ScaledDims(sw, sh, opt.max_width, &dw, &dh);
     capture = std::make_unique<xnc::ScaledCapture>(std::move(ladder), opt.max_width);
+    scaled = static_cast<xnc::ScaledCapture*>(capture.get());
     XNC_LOG_INFO("capture_scale enabled max_w=%u src=%ux%u -> %ux%u%s",
                  opt.max_width, sw, sh, dw, dh,
                  sw == dw && sh == dh ? " (gpu path: scale+NV12 in video processor)"
@@ -1115,6 +1187,11 @@ int RunConsoleRt(const xnc::DiagOptions& opt, bool desktop_pipeline_v2) {
   const uint32_t enc_bitrate_bps =
       xnc::BitrateForDims(capture->Width(), capture->Height());
   ro.bitrate_bps = enc_bitrate_bps;
+  // M3 T3: re-key the 0x0129 target onto the real encode geometry before
+  // Serve picks the hints up, and arm the encoder/wrapper pointers.
+  vca.bitrate_bps.store(enc_bitrate_bps);
+  vca.max_w.store(opt.max_width);
+  vca.hint_bitrate.store(enc_bitrate_bps);
   xnc::MfSoftEncoder encoder;
   encoder.SetForceSoftware(opt.encoder == xnc::DiagEncoder::kSoftware);
   std::string enc_err;
@@ -1124,6 +1201,8 @@ int RunConsoleRt(const xnc::DiagOptions& opt, bool desktop_pipeline_v2) {
     if (logon_wait) { server.Shutdown(); input.StopJanitor(); }
     return 1;
   }
+  vca.m0_enc.store(&encoder);
+  vca.m0_scaled.store(scaled);
   const int rc = server.Serve(*capture, encoder, ro);
   watch.Stop();
   input.StopJanitor();  // ReleaseAll already ran in RtServer::Shutdown

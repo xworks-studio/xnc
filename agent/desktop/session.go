@@ -15,6 +15,7 @@ package desktop
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -31,13 +32,17 @@ import (
 // Handle 直接报错(注册侧应保证非 nil)。serverLease 登记表惰性建立:每
 // Handler 一份 = 一个 Starter = 一个采集实例(M2-Slice3 Task 4:仲裁在
 // server,agent 只登记/比对 params 携带的 server leaseId;测试可预置
-// h.leases 注入)。
+// h.leases 注入)。streamQoS 同理(每 Handler 一份 = 一条共享流的决策点;
+// M3 Task 3)。
 type Handler struct {
 	Log     *slog.Logger
 	Starter Starter
 
 	leaseOnce sync.Once
 	leases    *serverLease
+
+	qosOnce sync.Once
+	qos     *streamQoS
 }
 
 func (h *Handler) serverLeases() *serverLease {
@@ -47,6 +52,139 @@ func (h *Handler) serverLeases() *serverLease {
 		}
 	})
 	return h.leases
+}
+
+// errVideoConfigUnsupported:host 未广告 SET_VIDEO_CONFIG 能力(v1 wire /
+// 未接处理器的 v2 host;core_windows.go 把 desktoppipe 的同名错误映射到
+// 此,session/qos 侧保持平台无关)。
+var errVideoConfigUnsupported = errors.New("desktop: host does not support SET_VIDEO_CONFIG")
+
+// qosManager 惰性建共享 QoS(种子 = 首个会话的 HOST_HELLO:初始码率按
+// 流宽镜像 native 缺省、fps/max_w/aspect 取流几何)。hello 为 nil(测试
+// fake 允许)→ 不建:viewer_feedback 解析后安全忽略,预算保持缺省。
+func (h *Handler) qosManager(hello *HelloInfo) *streamQoS {
+	h.qosOnce.Do(func() {
+		if hello == nil || hello.W == 0 || hello.H == 0 {
+			return
+		}
+		fps := hello.Fps
+		if fps == 0 {
+			fps = 30
+		}
+		log := h.Log
+		if log == nil {
+			log = slog.Default()
+		}
+		h.qos = newStreamQoS(QoSControllerConfig{
+			Initial: VideoConfig{Bitrate: bitrateForWidth(hello.W), FPS: fps, MaxW: hello.W},
+			AspectW: hello.W,
+			AspectH: hello.H,
+		}, log)
+	})
+	return h.qos
+}
+
+// streamQoS 是一条共享流(一个 Starter/采集)的 QoS 汇点:纯决策器
+// (qos_controller.go)+ 在场会话表。任何会话的 viewer_feedback 都汇入
+// 同一决策器;动作路由回目标会话(SetVideoConfig → 全体 pacing 预算 +
+// 观察会话的 Source 下发;PauseSpectator → 目标会话)。
+type streamQoS struct {
+	log  *slog.Logger
+	ctrl *QoSController
+
+	mu               sync.Mutex
+	sessions         map[string]*qosSession // sessionID → 应用端点(pub 建联后注册)
+	configSend       bool                   // host 未拒能力前持续下发
+	unsupportedNoted bool
+}
+
+func newStreamQoS(cfg QoSControllerConfig, log *slog.Logger) *streamQoS {
+	return &streamQoS{log: log, ctrl: newQoSController(cfg), sessions: make(map[string]*qosSession), configSend: true}
+}
+
+// observe 消费一条反馈并返回决策(控制器互斥;动作应用在锁外)。
+func (q *streamQoS) observe(fb ViewerFeedback) []Action {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.ctrl.Observe(fb)
+}
+
+// attach 注册一个会话的 QoS 应用端点(pub 已建联;Handle 收线时 detach)。
+func (q *streamQoS) attach(sessionID string, ctx context.Context, w *wsWriter, pub *Publisher) {
+	q.mu.Lock()
+	q.sessions[sessionID] = &qosSession{ctx: ctx, w: w, pub: pub}
+	q.mu.Unlock()
+}
+
+// detach 注销会话端点(幂等)。
+func (q *streamQoS) detach(sessionID string) {
+	q.mu.Lock()
+	delete(q.sessions, sessionID)
+	q.mu.Unlock()
+}
+
+// apply 应用一批动作:SetVideoConfig → 全体在场会话的 pacing 预算(裁决
+// 2:发送器预算来源 = controller 决策)+ 观察会话的 Source 下发(host 无
+// 能力 → 记一次 unsupported 即停发,决策仍留在 agent 侧);PauseSpectator
+// → 目标会话的 spectator_network_paused 稳定态 + ViewerSender.Pause()。
+func (q *streamQoS) apply(acts []Action, src Source) {
+	for _, a := range acts {
+		switch a.Kind {
+		case actionSetVideoConfig:
+			q.mu.Lock()
+			sessions := make([]*qosSession, 0, len(q.sessions))
+			for _, s := range q.sessions {
+				sessions = append(sessions, s)
+			}
+			send := q.configSend
+			q.mu.Unlock()
+			for _, s := range sessions {
+				s.apply(a) // 每会话自己的发送器预算
+			}
+			if !send {
+				continue // host 已判不支持:决策留在 agent 侧(预算仍接线)
+			}
+			if err := src.SetVideoConfig(a.Config); err != nil {
+				if errors.Is(err, errVideoConfigUnsupported) {
+					q.mu.Lock()
+					first := !q.unsupportedNoted
+					q.configSend = false
+					q.unsupportedNoted = true
+					q.mu.Unlock()
+					if first {
+						q.log.Info("desktop qos: host lacks SET_VIDEO_CONFIG support; decisions stay agent-side")
+					}
+				} else {
+					q.log.Debug("desktop qos: set_video_config failed", "err", err)
+				}
+			}
+		case actionPauseSpectator:
+			q.mu.Lock()
+			s := q.sessions[a.ViewerID]
+			q.mu.Unlock()
+			if s != nil {
+				s.apply(a)
+			}
+		}
+	}
+}
+
+// qosSession 是一个会话的 QoS 应用端点(锁外回调:WS 写 + 发送器)。
+type qosSession struct {
+	ctx context.Context
+	w   *wsWriter
+	pub *Publisher
+}
+
+func (s *qosSession) apply(a Action) {
+	switch a.Kind {
+	case actionSetVideoConfig:
+		s.pub.SetPacingBudget(int(a.Config.Bitrate))
+	case actionPauseSpectator:
+		s.w.write(s.ctx, stateFrame{
+			Type: vocabState, Code: vocabStateSpectatorPaused, Recoverable: true})
+		s.pub.Pause()
+	}
 }
 
 // Handle 承载一个 viewer 的 desktop 会话直至 ctx 取消或 WS 断开。
@@ -136,14 +274,19 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 
 	// ④ 信令主循环:offer 建联(恰好一次),ice 喂候选;分发在 events.go
 	// (sessionEvents.handle,各 case 独立方法)。
+	qos := h.qosManager(hello)
 	ev := &sessionEvents{
 		h: h, ctx: ctx, log: log, w: w,
 		dyn: dyn, src: src,
 		params: &p, defDur: defDur, ictl: ictl,
+		sessionID: sessionID, qos: qos,
 	}
 	pubOnce := sync.Once{}
 	defer func() {
 		if ev.pub != nil {
+			if qos != nil {
+				qos.detach(sessionID) // 先注销 QoS 端点,再关发送器
+			}
 			pubOnce.Do(func() { _ = ev.pub.Close() })
 		}
 	}()

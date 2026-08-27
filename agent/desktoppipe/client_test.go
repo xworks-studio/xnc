@@ -1309,3 +1309,76 @@ func TestStreamDiscontinuityV1Reject(t *testing.T) {
 		t.Fatal("pump must tear down on v1 discontinuity")
 	}
 }
+
+// ---- M3 Task 3:HOST_HELLO capabilities 扩展 + SET_VIDEO_CONFIG ----
+
+// tEncHostHelloCaps:v2 扩展 hello(displays 块 + media_protocol=2 + 尾随
+// capabilities;镜像 native EncodeHostHelloV2Caps)。
+func tEncHostHelloCaps(gen, w, h, fps, maxSubs uint32, caps uint32) []byte {
+	p := tEncHostHello(gen, w, h, fps, maxSubs)
+	p = append(p, 0, 0, 0, 0) // [u32 displays count = 0]
+	p = append(p, 2, 0, 0, 0) // [u32 media_protocol = 2]
+	p = append(p, byte(caps), byte(caps>>8), byte(caps>>16), byte(caps>>24))
+	return p
+}
+
+// TestDecodeHostHelloCapabilities:三种形状各自成立——legacy(无扩展)、
+// v2(尾随 media_protocol)、v2+caps(再尾随 capabilities;M3 Task 3);
+// capabilities 值透传,缺省 0。
+func TestDecodeHostHelloCapabilities(t *testing.T) {
+	h, err := decodeHostHello(tEncHostHello(1, 64, 48, 15, 4))
+	if err != nil || h.MediaProtocol != 0 || h.Capabilities != 0 {
+		t.Fatalf("legacy hello: h=%+v err=%v", h, err)
+	}
+	h, err = decodeHostHello(tEncHostHelloCaps(2, 64, 48, 15, 4, 0))
+	if err != nil || h.MediaProtocol != 2 || h.Capabilities != 0 {
+		t.Fatalf("v2 hello (no caps): h=%+v err=%v", h, err)
+	}
+	h, err = decodeHostHello(tEncHostHelloCaps(3, 1920, 1080, 30, 4, CapSetVideoConfig))
+	if err != nil || h.Gen != 3 || h.W != 1920 || h.Fps != 30 ||
+		h.MediaProtocol != 2 || h.Capabilities != CapSetVideoConfig {
+		t.Fatalf("v2+caps hello: h=%+v err=%v", h, err)
+	}
+	// 截断/displays 巧合字节仍拒绝。
+	if _, err := decodeHostHello(tEncHostHelloCaps(1, 64, 48, 15, 4, CapSetVideoConfig)[:30]); err == nil {
+		t.Fatal("truncated v2+caps hello must be rejected")
+	}
+}
+
+// TestSendVideoConfigWire:能力广告在场 → 0x0129 [u32 kbps][u32 fps]
+// [u32 max_w];未广告 → ErrVideoConfigUnsupported 且不写线。
+func TestSendVideoConfigWire(t *testing.T) {
+	c, s := net.Pipe()
+	defer c.Close()
+	defer s.Close()
+	sub := &Sub{conn: c, subID: 5, hello: &HelloInfo{MediaProtocol: 2, Capabilities: CapSetVideoConfig}}
+	errCh := make(chan error, 1)
+	go func() { errCh <- sub.SendVideoConfig(2300, 30, 1920) }()
+	f, err := ipc.ReadFrame(s)
+	if err != nil {
+		t.Fatalf("read frame: %v", err)
+	}
+	if f.MessageType != msgSetVideoCfg {
+		t.Fatalf("message type = %#04x, want 0x0129", f.MessageType)
+	}
+	if len(f.Payload) != 12 ||
+		binary.LittleEndian.Uint32(f.Payload) != 2300 ||
+		binary.LittleEndian.Uint32(f.Payload[4:]) != 30 ||
+		binary.LittleEndian.Uint32(f.Payload[8:]) != 1920 {
+		t.Fatalf("payload = %v, want [2300 30 1920] LE", f.Payload)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	// 未广告能力(v1 host / 旧 v2 host):拒绝,不触达 pipe。
+	noCap := &Sub{conn: c, subID: 6, hello: &HelloInfo{}}
+	if err := noCap.SendVideoConfig(1, 2, 3); err == nil ||
+		err.Error() != ErrVideoConfigUnsupported.Error() {
+		t.Fatalf("want ErrVideoConfigUnsupported, got %v", err)
+	}
+	s.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if _, err := ipc.ReadFrame(s); err == nil {
+		t.Fatal("unsupported host must not see a 0x0129 on the wire")
+	}
+}

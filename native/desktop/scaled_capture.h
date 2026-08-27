@@ -16,6 +16,7 @@
 #ifndef XNC_NATIVE_DESKTOP_SCALED_CAPTURE_H_
 #define XNC_NATIVE_DESKTOP_SCALED_CAPTURE_H_
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -33,7 +34,8 @@ bool ScaledDims(uint32_t w, uint32_t h, uint32_t max_w, uint32_t* ow,
 
 // ICapture decorator performing the downscale. Thread contract: used on the
 // pipeline CAPTURE thread only (pipeline-decouple), like the backends it
-// wraps.
+// wraps. SetMaxW is the exception: callable from any thread (M3 Task 3's
+// SET_VIDEO_CONFIG applier thread; the field is atomic).
 class ScaledCapture final : public ICapture {
  public:
   // Takes ownership of inner; max_w == 0 disables scaling (pure passthrough).
@@ -44,10 +46,17 @@ class ScaledCapture final : public ICapture {
   uint32_t Height() const override;
   uint32_t RebuildCount() const override;
   bool Rebuild(std::string* err) override;
+  // M3 Task 3 (SET_VIDEO_CONFIG): live max_w change. Applies at the NEXT
+  // Acquire (CPU downscale path); the resulting blob dims then differ from
+  // the encoder's, which the pipeline routes through the unified reset
+  // (reason=resolution) -> encoder re-Init -> codec epoch. NOTE: while the
+  // GPU rung serves (inner emits NV12) Acquire is a passthrough and a max_w
+  // change is a no-op there - the V2 pipeline owns scaling in that topology.
+  void SetMaxW(uint32_t max_w);
 
  private:
   std::unique_ptr<ICapture> inner_;
-  uint32_t max_w_ = 0;
+  std::atomic<uint32_t> max_w_{0};
   uint32_t scaled_w_ = 0, scaled_h_ = 0;  // last scaled dims seen (Width
                                           // fallback when inner dims are 0)
 };

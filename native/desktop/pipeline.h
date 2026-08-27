@@ -72,6 +72,14 @@ struct PipelineOpts {
   // -> ForceIDR; STATE recovering/capture_rebuilt; DISPLAY_CHANGED on
   // dimension change). Null = legacy behavior (those errors stay fatal).
   CaptureReset* reset = nullptr;
+  // M3 Task 3 (SET_VIDEO_CONFIG 0x0129): optional LIVE parameter hints,
+  // written by the rt wiring's applier thread. fps_hint re-keys the capture
+  // pacing (spf) and the reset re-init fps; bitrate_hint re-keys the encoder
+  // bitrate a reset re-Init uses (the hot path reconfigures via
+  // MfSoftEncoder::ReconfigureRate directly). Null = the fixed opts values
+  // (pre-M3 behavior, identical).
+  const std::atomic<uint32_t>* fps_hint = nullptr;
+  const std::atomic<uint32_t>* bitrate_hint = nullptr;
 };
 
 struct PipelineResult {

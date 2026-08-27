@@ -194,6 +194,18 @@ func (p *Publisher) OnICECandidate(fn func(webrtc.ICECandidateInit)) { p.iceFn =
 // OnKeyRequest 注册关键帧请求回调(PLI/FIR 到达时触发,reason="pli"/"fir")。
 func (p *Publisher) OnKeyRequest(fn func(reason string)) { p.keyFn = fn }
 
+// RequestKeyframe 从会话侧发起一条合并关键帧请求(M3 Task 3 carry:
+// viewer-pli 等会话级请求经此汇入 coordinator 接管的同一 seam,而非直打
+// Source)。urgent 判定沿用 keyRequestIsUrgent(reason)。
+func (p *Publisher) RequestKeyframe(reason string) { p.fireKeyRequest(reason) }
+
+// SetPacingBudget 更新本 viewer 发送器的 pacing 预算(M3 Task 3 裁决 2:
+// 预算来源 = QoS controller 的当前码率)。
+func (p *Publisher) SetPacingBudget(bps int) { p.vs.SetBudget(bps) }
+
+// Pause 暂停本 viewer 的发送(M3 Task 3:PauseSpectator action)。
+func (p *Publisher) Pause() { p.vs.Pause() }
+
 // HandleOffer 消费 viewer 的 offer SDP 并返回本地 answer SDP(含 SetLocal)。
 func (p *Publisher) HandleOffer(offerSDP string) (string, error) {
 	if err := p.pc.SetRemoteDescription(webrtc.SessionDescription{

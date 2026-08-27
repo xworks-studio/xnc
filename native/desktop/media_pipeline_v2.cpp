@@ -405,6 +405,10 @@ struct MediaPipelineV2::Impl {
   uint64_t submit_t0 = 0, submit_count = 0;
   uint32_t spf_ms = 33;
   uint32_t warmup_feed_bound = 34;
+  // M3 Task 3 (SET_VIDEO_CONFIG): live max_w (mirrors cfg.max_width at
+  // Start; SetMaxWidth stores from any thread, InitStream loads on the media
+  // loop - the atomic is the whole synchronization).
+  std::atomic<uint32_t> max_width{0};
   std::vector<uint8_t> shaped;
   uint64_t t0 = 0;
   uint64_t duration_ms = 0;
@@ -779,7 +783,13 @@ class Loop {
     const bool ok = im_.session->Reconfigure(bitrate, fps);
     XNC_LOG_INFO("media_v2_reconfigure bitrate=%u fps=%u ok=%d", bitrate, fps,
                  ok ? 1 : 0);
+    // M3 Task 3: re-key the config the NEXT reset re-init uses (CreateSession
+    // reads cfg.bitrate_bps/cfg.fps) so a hot SET_VIDEO_CONFIG is not
+    // silently reverted by a rebuild. cfg is Impl state touched only on this
+    // (media loop) thread.
+    if (bitrate != 0) im_.cfg.bitrate_bps = bitrate;
     if (fps != 0) {
+      im_.cfg.fps = fps;
       im_.spf_ms = 1000u / fps;
       im_.warmup_feed_bound = WarmupFeedBound(fps);
     }
@@ -1078,10 +1088,11 @@ class Loop {
     im_.src_w = im_.latest.width();
     im_.src_h = im_.latest.height();
     uint32_t ow = im_.src_w, oh = im_.src_h;
-    if (im_.cfg.max_width > 0) {
+    const uint32_t max_w = im_.max_width.load();  // M3 T3: live (SetMaxWidth)
+    if (max_w > 0) {
       uint32_t sw = 0, sh = 0;
       if (!GpuScaledDims(im_.src_w, im_.src_h, Rotate::kNone,
-                         im_.cfg.max_width, &sw, &sh) ||
+                         max_w, &sw, &sh) ||
           (sw % 2) != 0 || (sh % 2) != 0) {
         if (err) *err = "scaled dims rejected (nv12 needs even)";
         return false;
@@ -1615,6 +1626,7 @@ bool MediaPipelineV2::Start(const Config& cfg) {
     return false;
   }
   impl_->cfg = cfg;
+  impl_->max_width.store(cfg.max_width);  // M3 T3: live mirror for SetMaxWidth
   impl_->res = Result{};
   impl_->enc_lock = cfg.encoder_lock != nullptr ? cfg.encoder_lock
                                                 : ProcessEncoderLock();
@@ -1641,6 +1653,17 @@ void MediaPipelineV2::RequestIdr(const char* reason) {
 
 void MediaPipelineV2::Reconfigure(uint32_t bitrate_bps, uint32_t fps) {
   impl_->mbox.RequestReconfigure(bitrate_bps, fps);
+}
+
+// M3 Task 3 (SET_VIDEO_CONFIG): live max_w. Any thread. A change requests a
+// unified reset (reason=resolution) - the rebuild's InitStream re-derives
+// the scaled dims from the new value, re-Init's pool/converter/session (new
+// codec epoch; subscribers recover through the 0x020B/WAIT_IDR machine).
+void MediaPipelineV2::SetMaxWidth(uint32_t max_w) {
+  if (max_w == 0) return;
+  if (impl_->max_width.exchange(max_w) == max_w) return;  // no change
+  impl_->mbox.RequestReset(kResetReasonResolution);
+  XNC_LOG_INFO("media_v2_set_max_w max_w=%u (reset reason=resolution)", max_w);
 }
 
 void MediaPipelineV2::Reset(const char* reason) {

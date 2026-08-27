@@ -292,6 +292,8 @@ int RtServer::Serve(ICapture& cap, MfSoftEncoder& enc, const Opts& o) {
   popt.desktop_name_fn = o.desktop_name_fn;      // DesktopWatch beat (M2-S1 T1)
   popt.desktop_name_ctx = o.desktop_name_ctx;
   popt.reset = o.reset;                          // unified CaptureReset (M2-S1 T2)
+  popt.fps_hint = o.fps_hint;        // M3 T3: hot 0x0129 fps pacing + reset reinit
+  popt.bitrate_hint = o.bitrate_hint;  // (bitrate re-keying after a reset)
   const PipelineResult res = Pipeline::Run(cap, enc, *this, popt);
 
   SetConsoleCtrlHandler(OnRtCtrlEvent, FALSE);
@@ -365,6 +367,12 @@ int RtServer::ServeV2(ICapture& cap, ICaptureSurface& surf, const Opts& o,
   MediaPipelineV2 pipe;
   MediaPipelineV2::Result res;
   if (pipe.Start(cfg)) {
+    // M3 Task 3: 0x0129 now reaches the live pipeline (bitrate/fps HOT via
+    // the mailbox; max_w via SetMaxWidth's resolution reset). Until this
+    // store a racing request falls through to Opts::set_video_config_fn
+    // (xnc-desktop wires a stub there so the capability is advertised from
+    // the FIRST hello).
+    v2_pipe_.store(&pipe);
     while (pipe.running() && !stop_.load()) Sleep(100);
     res = pipe.Stop();
   } else {
@@ -375,6 +383,7 @@ int RtServer::ServeV2(ICapture& cap, ICaptureSurface& surf, const Opts& o,
   SetConsoleCtrlHandler(OnRtCtrlEvent, FALSE);
   g_active_rt.store(nullptr);
   Shutdown();
+  v2_pipe_.store(nullptr);  // readers are joined; the pipe is going away
   XNC_LOG_INFO("console_rt_v2_stop captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu resets=%u aus=%llu reorder_gap_skips=%llu reorder_late_drops=%llu ok=%d backend=%s",
                static_cast<unsigned long long>(res.captured),
                static_cast<unsigned long long>(res.encoded),
@@ -567,12 +576,17 @@ void RtServer::ReaderLoop(std::shared_ptr<SubConn> c) {
 
     // HOST_HELLO immediately after attach (plan Task 2). M2-S3 Task 5: the
     // payload carries the full displays table (empty when no provider).
-    // M1 Task 2: pipeline_v2 appends the u32 media_protocol=2 field.
-    HostHelloPayload hh{gen_.load(), src_w_, src_h_, opts_.fps, opts_.max_subs};
-    hh.displays = CurrentDisplays();
-    const std::vector<uint8_t> hello =
-        opts_.pipeline_v2 ? EncodeHostHelloV2(hh) : EncodeHostHello(hh);
-    if (!PushControlTo(c.get(), Frame{kFlagEvent, kMsgHostHello, 0, hello}))
+    // M1 Task 2: pipeline_v2 appends the u32 media_protocol=2 field; M3 Task 3
+    // additionally appends the capabilities u32 when a 0x0129 applier is
+    // wired. fps is snapshotted under mu_ (a 0x0129 from another connection
+    // may update it concurrently).
+    uint32_t hello_fps = 0;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      hello_fps = opts_.fps;
+    }
+    if (!PushControlTo(c.get(),
+                       Frame{kFlagEvent, kMsgHostHello, 0, BuildHelloPayload(hello_fps)}))
       break;  // control backlog: wedged connection
     // First subscriber: the cursor poller runs only while someone watches
     // (8ms GetCursorInfo cadence, change-only 0x0109 events).
@@ -690,6 +704,61 @@ void RtServer::ReaderLoop(std::shared_ptr<SubConn> c) {
             opts_.reset->RequestReset(kResetReasonSwitch);
           if (!PushControlTo(c.get(), Frame{kFlagResponse, kMsgSwitchDisplay,
                                              f.request_id, {}}))
+            goto conn_done;
+          break;
+        }
+        case kMsgSetVideoConfig: {
+          // M3 Task 3: the agent-side QoS decision. bitrate/fps are HOT; a
+          // max_w change rides the reset/dims path. Preference: the V2
+          // pipeline ServeV2 owns (Reconfigure/SetMaxWidth), then the Opts
+          // applier (the M0 wiring). Neither = the capability was never
+          // advertised; answer unsupported (the agent stops sending and keeps
+          // its decisions local).
+          VideoConfigPayload vc;
+          if (!DecodeSetVideoConfig(f, &vc)) {
+            std::lock_guard<std::mutex> lk(mu_);
+            stats_.video_config_rejected++;
+            PushControlTo(c.get(), Frame{kFlagResponse | kFlagError,
+                                          kMsgSetVideoConfig, f.request_id, {}});
+            break;
+          }
+          const uint32_t bitrate_bps =
+              vc.bitrate_kbps != 0 ? vc.bitrate_kbps * 1000u : 0;
+          // Effective values for partial updates (0 field = keep current).
+          uint32_t eff_bitrate = 0, eff_fps = 0;
+          {
+            std::lock_guard<std::mutex> lk(mu_);
+            eff_bitrate = bitrate_bps != 0 ? bitrate_bps : opts_.bitrate_bps;
+            eff_fps = vc.fps != 0 ? vc.fps : opts_.fps;
+          }
+          bool ok = false;
+          if (MediaPipelineV2* p = v2_pipe_.load(std::memory_order_acquire)) {
+            if (bitrate_bps != 0 || vc.fps != 0) p->Reconfigure(eff_bitrate, eff_fps);
+            if (vc.max_w != 0) p->SetMaxWidth(vc.max_w);
+            ok = true;
+          } else if (opts_.set_video_config_fn != nullptr) {
+            ok = opts_.set_video_config_fn(opts_.set_video_config_ctx, bitrate_bps,
+                                           vc.fps, vc.max_w);
+          }
+          {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (ok) {
+              stats_.video_configs++;
+              // Future HOST_HELLOs carry the effective config (snapshot sites
+              // read under mu_).
+              if (vc.fps != 0) opts_.fps = vc.fps;
+              if (bitrate_bps != 0) opts_.bitrate_bps = bitrate_bps;
+            } else {
+              stats_.video_config_rejected++;
+            }
+          }
+          XNC_LOG_INFO("rt set_video_config sub=%u bitrate_kbps=%u fps=%u max_w=%u ok=%d",
+                       c->sub_id, vc.bitrate_kbps, vc.fps, vc.max_w, ok ? 1 : 0);
+          const uint8_t resp_flags =
+              ok ? kFlagResponse
+                 : static_cast<uint8_t>(kFlagResponse | kFlagError);
+          if (!PushControlTo(c.get(),
+                             Frame{resp_flags, kMsgSetVideoConfig, f.request_id, {}}))
             goto conn_done;
           break;
         }
@@ -916,13 +985,8 @@ void RtServer::OnState(const char* code, bool recoverable) {
       // behavior.
       if (opts_.pipeline_v2 && fan_out_seen_)
         kv.second->q->OnRebuildDiscontinuity(last_au_cap_, last_au_codec_);
-      HostHelloPayload hh{gen_.load(), src_w_, src_h_, opts_.fps, opts_.max_subs};
-      hh.displays = CurrentDisplays();
-      // M1 Task 2: pipeline_v2 appends the u32 media_protocol=2 field.
-      const std::vector<uint8_t> hello =
-          opts_.pipeline_v2 ? EncodeHostHelloV2(hh) : EncodeHostHello(hh);
-      kv.second->q->PushControl(
-          Frame{kFlagEvent, kMsgHostHello, 0, hello});
+      kv.second->q->PushControl(Frame{
+          kFlagEvent, kMsgHostHello, 0, BuildHelloPayload(opts_.fps)});
     }
     kv.second->cv.notify_all();
   }
@@ -964,6 +1028,18 @@ void RtServer::OnDisplayChanged(uint32_t w, uint32_t h, const char* reason) {
 std::vector<DisplayInfo> RtServer::CurrentDisplays() {
   if (opts_.displays_fn == nullptr) return {};
   return opts_.displays_fn(opts_.displays_ctx);
+}
+
+// HOST_HELLO payload (M3 Task 3): legacy / v2 / v2+capabilities per opts_.
+// Callers on threads that can race a 0x0129 snapshot fps under mu_ first.
+// Displays are fetched via the provider (documented thread-safe).
+std::vector<uint8_t> RtServer::BuildHelloPayload(uint32_t fps) {
+  HostHelloPayload hh{gen_.load(), src_w_, src_h_, fps, opts_.max_subs};
+  hh.displays = CurrentDisplays();
+  if (!opts_.pipeline_v2) return EncodeHostHello(hh);
+  if (opts_.set_video_config_fn != nullptr)
+    return EncodeHostHelloV2Caps(hh, kHostCapSetVideoConfig);
+  return EncodeHostHelloV2(hh);
 }
 
 // Pushes a control frame (never dropped while healthy). False = control

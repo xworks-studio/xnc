@@ -50,6 +50,11 @@
 //	                                            → Source(DisplaySwitcher)→
 //	                                            0x0128;非法 idx 由 host 回
 //	                                            STATE{invalid_display}。
+//	{"type":"viewer_feedback","visible":true,   viewer 网络观测(M3 Task 3;
+//	 "estimatedBps":4200000,                    getStats 汇总,~1s 一报)→
+//	 "queueMs":12.5,"decodeQueue":2,            QoSController.Observe →
+//	 "rttMs":38.2}                              Action(SET_VIDEO_CONFIG
+//	                                            0x0129 / 旁观者暂停)。
 //
 // agent → viewer(SAS 结果帧,M2-Slice1 Task 5):
 //
@@ -103,10 +108,15 @@ const (
 	// M2-Slice3 Task 5:显示器切换(control 上行;host 侧回
 	// STATE{invalid_display} / DISPLAY_CHANGED reason=switch 下行)。
 	vocabSwitchDisplay = "switch_display"
+	// M3 Task 3:viewer 网络观测上行(见文件头字段契约)。
+	vocabViewerFeedback = "viewer_feedback"
 	// M2-Slice3 Task 2:意图自愈通知(经既有 state 帧形态;未知 code 的
 	// 旧 viewer 按未知 state 忽略,向后兼容)。
 	vocabStateReattached  = "reattached"
 	vocabStateCaptureLost = "capture_lost"
+	// M3 Task 3:旁观者网络暂停的稳定态(PauseSpectator action 下发;
+	// 经既有 state 帧形态,旧 viewer 按未知 code 忽略)。
+	vocabStateSpectatorPaused = "spectator_network_paused"
 )
 
 const (
@@ -145,11 +155,11 @@ func (w *wsWriter) write(ctx context.Context, v any) {
 // ---- 出站信令帧形态(T5/T6 的 JSON 契约载体)----
 
 type readyFrame struct {
-	Type     string       `json:"type"`
-	Width    uint32       `json:"width,omitempty"`
-	Height   uint32       `json:"height,omitempty"`
-	Fps      uint32       `json:"fps,omitempty"`
-	Gen      uint32       `json:"gen,omitempty"`
+	Type     string        `json:"type"`
+	Width    uint32        `json:"width,omitempty"`
+	Height   uint32        `json:"height,omitempty"`
+	Fps      uint32        `json:"fps,omitempty"`
+	Gen      uint32        `json:"gen,omitempty"`
 	Displays []displayJSON `json:"displays,omitempty"`
 }
 
@@ -157,6 +167,17 @@ type readyFrame struct {
 type switchDisplayFrame struct {
 	Type  string `json:"type"`
 	Index int64  `json:"index"`
+}
+
+// viewerFeedbackFrame 是 {"type":"viewer_feedback",...} 上行帧(M3 Task 3;
+// 字段契约见文件头。queueMs/rttMs 是毫秒;decodeQueue 是帧数)。
+type viewerFeedbackFrame struct {
+	Type         string  `json:"type"`
+	Visible      bool    `json:"visible"`
+	EstimatedBps uint64  `json:"estimatedBps"`
+	QueueMs      float64 `json:"queueMs"`
+	DecodeQueue  float64 `json:"decodeQueue"`
+	RTTMs        float64 `json:"rttMs"`
 }
 
 // displayJSON 是 displays[] 的 viewer 契约形态(与 Display 镜像)。

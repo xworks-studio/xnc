@@ -402,6 +402,20 @@ func (s *ViewerSender) Discontinuity(captureEpoch, codecEpoch uint64) {
 	s.mu.Unlock()
 }
 
+// SetBudget 更新 pacing 预算(M3 Task 3 裁决 2:预算来源 = QoS controller
+// 的当前码率决策;无反馈时保持构造值 = defaultPacingBudgetBps)。速率即
+// 时生效,令牌余额保留(在队帧的计划不受扰动)。bps<=0 忽略。
+func (s *ViewerSender) SetBudget(bps int) {
+	if bps <= 0 {
+		return
+	}
+	s.mu.Lock()
+	if r := float64(bps) / 8 * pacingBudgetFraction; r > 0 {
+		s.bucket.rate = r
+	}
+	s.mu.Unlock()
+}
+
 // Pause 暂停发送:新帧丢弃(计数),不触发关键帧请求;在途帧的余包
 // 仍会按节奏送完(队列不弃)。幂等。
 func (s *ViewerSender) Pause() {

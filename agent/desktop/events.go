@@ -15,17 +15,20 @@ import (
 
 // sessionEvents 持有信令分发所需的本会话状态(Handle 组装;各 case 处理
 // 函数都是它的方法)。pub 在建联成功后由 onOffer 写入,Handle 的 defer 依
-// 此结清。
+// 此结清。qos 是 Handler 级共享决策点(可为 nil:无 HOST_HELLO 的测试
+// 拓扑);sessionID 是本 viewer 的路由键(M3 Task 3)。
 type sessionEvents struct {
-	h      *Handler
-	ctx    context.Context
-	log    *slog.Logger
-	w      *wsWriter
-	dyn    Source // 意图动态源:重挂后输入/光标/状态自动走新 sub
-	src    Source // 当前实源(keyframe 请求直达;重挂后更新)
-	params *proto.DesktopParams
-	defDur time.Duration // fps 推导的默认帧时长(offer 建联用)
-	ictl   *inputController
+	h         *Handler
+	ctx       context.Context
+	log       *slog.Logger
+	w         *wsWriter
+	dyn       Source // 意图动态源:重挂后输入/光标/状态自动走新 sub
+	src       Source // 当前实源(keyframe 请求直达;重挂后更新)
+	params    *proto.DesktopParams
+	defDur    time.Duration // fps 推导的默认帧时长(offer 建联用)
+	ictl      *inputController
+	sessionID string     // 本 viewer 会话 id(QoS 路由)
+	qos       *streamQoS // 共享 QoS(可 nil)
 
 	pub         *Publisher
 	sasInFlight atomic.Bool // 同会话并发 SAS ≤1(M2-Slice2 Task 1)
@@ -47,13 +50,16 @@ func (e *sessionEvents) handle(f compactFrame, raw []byte) bool {
 		e.onSecureAttention()
 	case vocabSwitchDisplay:
 		e.onSwitchDisplay(raw)
+	case vocabViewerFeedback:
+		e.onViewerFeedback(raw)
 	default:
 		// 未知 type:忽略(向后兼容词汇演进)。
 	}
 	return true
 }
 
-// onOffer 建 PC + answer(恰一次;重复 offer 忽略)。
+// onOffer 建 PC + answer(恰一次;重复 offer 忽略)。建联成功后向共享 QoS
+// 注册本会话端点(其发送器预算/暂停由此驱动,M3 Task 3)。
 func (e *sessionEvents) onOffer(f compactFrame) bool {
 	if e.pub != nil {
 		return true // 重复 offer:忽略(已应答)
@@ -65,6 +71,9 @@ func (e *sessionEvents) onOffer(f compactFrame) bool {
 		return false
 	}
 	e.pub = pub
+	if e.qos != nil {
+		e.qos.attach(e.sessionID, e.ctx, e.w, pub)
+	}
 	return true
 }
 
@@ -79,10 +88,43 @@ func (e *sessionEvents) onICE(f compactFrame) {
 }
 
 // onKeyframeReq 浏览器 PLI 按钮(T6):无法从 JS 发 RTCP PLI,信令帧走同一
-// RequestKeyframe 路径(reason="viewer-pli" 进 host 记账)。
+// 合并关键帧路径(reason="viewer-pli 进 host 记账)。M3 Task 3 carry(裁决
+// 1):经 KeyframeCoordinator(Publisher 的合并 seam;connect 之外的
+// reason 常规冷却,在途请求不复制),不再直打 Source——与 RTCP PLI/FIR、
+// overflow/pacer/resume 同一条 250ms 合并面。建联前的请求(无 pub)保持
+// 直打 Source(协调器尚未存在,首帧语义不受冷却影响)。
 func (e *sessionEvents) onKeyframeReq() {
+	if e.pub != nil {
+		e.pub.RequestKeyframe("viewer-pli")
+		return
+	}
 	if err := e.src.RequestKeyframe("viewer-pli"); err != nil {
 		e.log.Debug("viewer keyframe request failed", "err", err)
+	}
+}
+
+// onViewerFeedback M3 Task 3:viewer 网络观测(getStats 汇总)→ 共享
+// QoSController.Observe → Action 应用(SET_VIDEO_CONFIG 0x0129 下发 host
+// + 全体发送器 pacing 预算;旁观者带宽不足 → spectator_network_paused
+// + 暂停)。qos 为 nil(无 HOST_HELLO 的测试拓扑)时安全忽略。
+func (e *sessionEvents) onViewerFeedback(raw []byte) {
+	if e.qos == nil {
+		return
+	}
+	var f viewerFeedbackFrame
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return // 非 JSON/字段错:忽略,信令流自愈
+	}
+	acts := e.qos.observe(ViewerFeedback{
+		SessionID:    e.sessionID,
+		Visible:      f.Visible,
+		EstimatedBps: f.EstimatedBps,
+		QueueMs:      f.QueueMs,
+		DecodeQueue:  f.DecodeQueue,
+		RTTMs:        f.RTTMs,
+	})
+	if len(acts) > 0 {
+		e.qos.apply(acts, e.dyn)
 	}
 }
 

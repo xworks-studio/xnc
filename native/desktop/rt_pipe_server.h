@@ -43,6 +43,25 @@
 //                                 [u32 h][u8 primary] } (21 bytes/entry);
 //                               legacy w/h/fps/max_subs stay = the ACTIVE
 //                               display's geometry.
+//   MSG_SET_VIDEO_CONFIG 0x0129 req (M3 Task 3) [u32 bitrate_kbps][u32 fps]
+//                               [u32 max_w] - the agent-side QoS decision.
+//                               bitrate/fps are HOT (Opts::set_video_config_fn
+//                               reconfigures the encoder / pipeline pacing);
+//                               a max_w change rides the reset/dims path
+//                               (codec epoch advances; subscribers recover
+//                               via the v2 WAIT_IDR machine). FlagResponse on
+//                               acceptance, FlagResponse|FlagError when
+//                               malformed or no applier is wired. The
+//                               capability is advertised ONLY through the
+//                               extended HOST_HELLO capabilities field below -
+//                               v1-wire hosts never see 0x0129 (the agent
+//                               keeps its decisions local).
+//                               HOST_HELLO v2 extension (M3 Task 3,
+//                               compatible): pipeline_v2 hellos may carry a
+//                               further trailing [u32 capabilities] after
+//                               media_protocol (absent = 0 = none). Bit 0
+//                               (kHostCapSetVideoConfig) = set_video_config_fn
+//                               is wired.
 //   MSG_STREAM_DISCONTINUITY 0x020B event (M1 Task 4; v2 mode ONLY)
 //                               [u64 capture_epoch][u64 codec_epoch]
 //                               [char reason[32]] with a FIXED reason
@@ -119,6 +138,7 @@ constexpr uint16_t kMsgAttach = 0x0102, kMsgDetach = 0x0103, kMsgKeyframeReq = 0
                    kMsgFrame = 0x0105, kMsgHostHello = 0x0106, kMsgState = 0x0107,
                    kMsgInput = 0x0108, kMsgCursor = 0x0109,
                    kMsgDisplayChanged = 0x010A, kMsgSwitchDisplay = 0x0128,
+                   kMsgSetVideoConfig = 0x0129,  // M3 Task 3: QoS decision
                    kMsgFrameV2 = 0x0205;  // M1 Task 2: validated Pipe v2 media frame
 // M1 Task 4: stream discontinuity (v2 mode only; see header comment).
 constexpr uint16_t kMsgStreamDiscontinuity = 0x020B;
@@ -132,6 +152,12 @@ inline constexpr size_t kMaxAuBytes = size_t(8) << 20;
 
 // M1 Task 2: v2 media protocol id carried by the extended HOST_HELLO.
 inline constexpr uint32_t kMediaProtocolV2 = 2;
+
+// M3 Task 3: capability bits carried by the further-extended HOST_HELLO
+// (trailing u32 `capabilities` after media_protocol; absent = 0 = none).
+// Values stay in {0,1} for now - bit assignments only, so the two hello
+// shapes can never be confused on the wire (see DecodeHostHelloV2).
+inline constexpr uint32_t kHostCapSetVideoConfig = 1u << 0;
 
 namespace rt_detail {
 
@@ -422,15 +448,50 @@ inline std::vector<uint8_t> EncodeHostHelloV2(const HostHelloPayload& h) {
   return p;
 }
 inline bool DecodeHostHelloV2(const Frame& f, HostHelloPayload* out,
-                              uint32_t* media_protocol) {
-  if (out == nullptr || f.payload.size() < 28) return false;
-  const uint32_t mp = rt_detail::GetU32(f.payload.data() + f.payload.size() - 4);
-  if (mp != kMediaProtocolV2) return false;
-  const Frame base{0, kMsgHostHello, 0,
-                   std::vector<uint8_t>(f.payload.begin(), f.payload.end() - 4)};
-  if (!DecodeHostHello(base, out)) return false;
-  if (media_protocol != nullptr) *media_protocol = mp;
-  return true;
+                              uint32_t* media_protocol,
+                              uint32_t* capabilities = nullptr) {
+  if (out == nullptr) return false;
+  if (capabilities != nullptr) *capabilities = 0;
+  // Shape A (M1 T2): [legacy][u32 media_protocol]. Shape B (M3 T3):
+  // [legacy][u32 media_protocol][u32 capabilities]. A is tried first with
+  // full legacy validation; B only when A did not fit. The two shapes cannot
+  // alias: a B frame's last u32 is a capabilities value (0/1 today, != 2),
+  // and stripping 8 bytes off a 28+21n A frame leaves 20+21n bytes, which is
+  // never a valid legacy payload.
+  if (f.payload.size() >= 24 &&
+      rt_detail::GetU32(f.payload.data() + f.payload.size() - 4) ==
+          kMediaProtocolV2) {
+    const Frame base{0, kMsgHostHello, 0,
+                     std::vector<uint8_t>(f.payload.begin(), f.payload.end() - 4)};
+    if (DecodeHostHello(base, out)) {
+      if (media_protocol != nullptr) *media_protocol = kMediaProtocolV2;
+      return true;
+    }
+  }
+  if (f.payload.size() >= 32) {
+    const uint32_t mp = rt_detail::GetU32(f.payload.data() + f.payload.size() - 8);
+    if (mp == kMediaProtocolV2) {
+      const Frame base{0, kMsgHostHello, 0,
+                       std::vector<uint8_t>(f.payload.begin(), f.payload.end() - 8)};
+      if (DecodeHostHello(base, out)) {
+        if (media_protocol != nullptr) *media_protocol = mp;
+        if (capabilities != nullptr)
+          *capabilities = rt_detail::GetU32(f.payload.data() + f.payload.size() - 4);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// M3 Task 3: HOST_HELLO v2 + trailing capabilities u32 (after
+// media_protocol). Emitted only when Opts::set_video_config_fn is wired.
+inline std::vector<uint8_t> EncodeHostHelloV2Caps(const HostHelloPayload& h,
+                                                  uint32_t capabilities) {
+  std::vector<uint8_t> p = EncodeHostHelloV2(h);
+  p.resize(p.size() + 4);
+  rt_detail::PutU32(p.data() + p.size() - 4, capabilities);
+  return p;
 }
 
 // ---- 0x0128 MSG_SWITCH_DISPLAY req: [u32 idx] (M2-Slice3 Task 5) ----
@@ -443,6 +504,28 @@ inline std::vector<uint8_t> EncodeSwitchDisplay(uint32_t idx) {
 inline bool DecodeSwitchDisplay(const Frame& f, uint32_t* idx) {
   if (idx == nullptr || f.payload.size() != 4) return false;
   *idx = rt_detail::GetU32(f.payload.data());
+  return true;
+}
+
+// ---- 0x0129 MSG_SET_VIDEO_CONFIG req (M3 Task 3):
+// [u32 bitrate_kbps][u32 fps][u32 max_w] ----
+
+struct VideoConfigPayload {
+  uint32_t bitrate_kbps = 0, fps = 0, max_w = 0;
+};
+
+inline std::vector<uint8_t> EncodeSetVideoConfig(const VideoConfigPayload& v) {
+  std::vector<uint8_t> p(12, 0);
+  rt_detail::PutU32(p.data(), v.bitrate_kbps);
+  rt_detail::PutU32(p.data() + 4, v.fps);
+  rt_detail::PutU32(p.data() + 8, v.max_w);
+  return p;
+}
+inline bool DecodeSetVideoConfig(const Frame& f, VideoConfigPayload* out) {
+  if (out == nullptr || f.payload.size() != 12) return false;
+  out->bitrate_kbps = rt_detail::GetU32(f.payload.data());
+  out->fps = rt_detail::GetU32(f.payload.data() + 4);
+  out->max_w = rt_detail::GetU32(f.payload.data() + 8);
   return true;
 }
 
@@ -721,6 +804,20 @@ class RtServer : public AuSink {
     // invalid_display; no reset). Optional - null = same as always-false.
     bool (*switch_display_fn)(void*, uint32_t idx) = nullptr;
     void* switch_display_ctx = nullptr;
+    // M3 Task 3: 0x0129 SET_VIDEO_CONFIG applier (bitrate_bps already
+    // converted from the wire's kbps; fps/max_w as carried). Non-null is what
+    // advertises kHostCapSetVideoConfig in the extended HOST_HELLO - wire it
+    // BEFORE Start (the first hello must be able to carry the bit). Return
+    // false = rejected (error response; the agent stops sending). Optional -
+    // null = capability never advertised, requests answered with an error.
+    bool (*set_video_config_fn)(void* ctx, uint32_t bitrate_bps, uint32_t fps,
+                                uint32_t max_w) = nullptr;
+    void* set_video_config_ctx = nullptr;
+    // M3 Task 3 (M0 pipeline): live fps pacing + reset-reinit bitrate hints,
+    // forwarded into PipelineOpts (null = opts.fps/target_bitrate_bps fixed,
+    // the pre-M3 behavior). V2 path ignores these (Reconfigure is hot there).
+    const std::atomic<uint32_t>* fps_hint = nullptr;
+    const std::atomic<uint32_t>* bitrate_hint = nullptr;
   };
 
   struct Stats {
@@ -742,6 +839,8 @@ class RtServer : public AuSink {
     uint64_t display_changes = 0; // 0x010A events broadcast (M2-S1 T2)
     uint64_t switch_accepted = 0; // 0x0128 accepted -> reset(reason=switch)
     uint64_t switch_invalid = 0;  // 0x0128 rejected idx / no handler (M2-S3 T5)
+    uint64_t video_configs = 0;   // 0x0129 accepted (hot apply) - M3 Task 3
+    uint64_t video_config_rejected = 0;  // 0x0129 malformed / no applier
     uint64_t stream_discontinuities = 0;  // 0x020B sent (v2 epoch advances; M1 Task 4)
   };
 
@@ -824,6 +923,10 @@ class RtServer : public AuSink {
   void SenderLoop(std::shared_ptr<SubConn> c);
   // Displays-table snapshot (opts_.displays_fn; empty when not wired).
   std::vector<DisplayInfo> CurrentDisplays();
+  // HOST_HELLO payload for the given fps (M3 Task 3: callers snapshot fps
+  // under mu_ - a 0x0129 may update it from any reader thread; the v2 shape
+  // carries the capabilities u32 iff set_video_config_fn is wired).
+  std::vector<uint8_t> BuildHelloPayload(uint32_t fps);
   // Pushes a control frame to one subscriber (never dropped; backlog
   // overflow returns false = wedged connection, caller disconnects).
   bool PushControlTo(SubConn* c, const Frame& f);
@@ -844,6 +947,10 @@ class RtServer : public AuSink {
   uint32_t src_w_ = 0, src_h_ = 0;
   std::atomic<bool> stop_{false};
   std::atomic<uint32_t> gen_{1};
+  // M3 Task 3: the V2 pipeline ServeV2 owns (set once its Start succeeded;
+  // cleared after Shutdown joined the readers). 0x0129 prefers it over
+  // Opts::set_video_config_fn - Reconfigure/SetMaxWidth are any-thread APIs.
+  std::atomic<MediaPipelineV2*> v2_pipe_{nullptr};
   // M1 Task 4: epoch pair of the last AU fanned out (under mu_; the encode
   // thread updates it in OnAu, the capture thread reads it in OnState as
   // the SubSendQueue rebuild floor that suppresses the pre-rebuild

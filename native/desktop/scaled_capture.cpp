@@ -59,9 +59,10 @@ bool ScaledCapture::Acquire(FrameBlob& blob, std::string* err, uint32_t timeout_
   }
 
   uint32_t nw = 0, nh = 0;
-  if (!ScaledDims(raw.w, raw.h, max_w_, &nw, &nh)) {
+  const uint32_t max_w = max_w_.load();  // M3 T3: SetMaxW may run off-thread
+  if (!ScaledDims(raw.w, raw.h, max_w, &nw, &nh)) {
     if (err) *err = "scaled dims rejected";
-    XNC_LOG_ERROR("scaled_capture dims rejected w=%u h=%u max_w=%u", raw.w, raw.h, max_w_);
+    XNC_LOG_ERROR("scaled_capture dims rejected w=%u h=%u max_w=%u", raw.w, raw.h, max_w);
     return false;
   }
   scaled_w_ = nw;
@@ -118,7 +119,7 @@ uint32_t ScaledCapture::Width() const {
   const uint32_t h = inner_ != nullptr ? inner_->Height() : 0;
   if (w == 0 || h == 0) return scaled_w_;
   uint32_t ow = 0, oh = 0;
-  if (ScaledDims(w, h, max_w_, &ow, &oh)) return ow;
+  if (ScaledDims(w, h, max_w_.load(), &ow, &oh)) return ow;
   return scaled_w_;
 }
 
@@ -127,8 +128,16 @@ uint32_t ScaledCapture::Height() const {
   const uint32_t h = inner_ != nullptr ? inner_->Height() : 0;
   if (w == 0 || h == 0) return scaled_h_;
   uint32_t ow = 0, oh = 0;
-  if (ScaledDims(w, h, max_w_, &ow, &oh)) return oh;
+  if (ScaledDims(w, h, max_w_.load(), &ow, &oh)) return oh;
   return scaled_h_;
+}
+
+// M3 Task 3 (SET_VIDEO_CONFIG): live max_w. Any thread; applies at the next
+// Acquire (see header note for the reset/dims routing and the GPU-rung gap).
+void ScaledCapture::SetMaxW(uint32_t max_w) {
+  if (max_w == 0) return;
+  max_w_.store(max_w);
+  XNC_LOG_INFO("scaled_capture set_max_w=%u (applies at the next acquire)", max_w);
 }
 
 uint32_t ScaledCapture::RebuildCount() const {
