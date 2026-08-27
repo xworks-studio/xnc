@@ -279,8 +279,9 @@ class AuSink {
 
   // One immutable shaped AU (M1 Task 1): SPS/PPS-prefixed on IDR (the key
   // bit in au.flags), 4-byte start codes, no AUD; au.id.present_mono_us =
-  // the capture timestamp of the submission that produced it and
-  // au.id.source_mono_us = the desktop-capture time of its pixels. The
+  // the mono_us stamp of the submission that produced it (push-time for
+  // captured frames, feed-time for re-feeds) and au.id.source_mono_us =
+  // the desktop-capture time of its pixels. The
   // payload is shared const and must not be mutated. Returns nullptr on
   // success; a non-null fatal message aborts the run
   // (PipelineResult::err = message).
