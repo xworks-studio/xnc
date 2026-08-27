@@ -4105,6 +4105,88 @@ int SelftestMain(bool desktop_pipeline_v2) {
       }
     }
   }
+  { // M2 Task 6: bounded stage histograms (pipeline.h). Pure math on
+    // synthetic samples: nearest-rank percentiles, the ring's
+    // keep-newest bound, zero-sample ABSENCE (never fake-zero), and the
+    // log/sidecar rendering. Runs in BOTH selftest modes - the V2
+    // scenarios only wire the same helper into the media loop.
+    uint64_t v = 0;
+    xnc::StageHistogram s("s_us", 128);
+    CHECK("hist-empty", s.Empty() && s.Count() == 0);
+    CHECK("hist-empty-percentile-rejected", !s.Percentile(50.0, &v));
+    CHECK("hist-empty-summary-invalid", !s.Summary().has_samples);
+    for (uint64_t i = 1; i <= 100; ++i) s.Add(i);
+    CHECK("hist-count", s.Count() == 100);
+    // Nearest-rank: rank(p) = ceil(p*n/100), value = rank-th smallest.
+    // n=100: p50 -> 50th (50), p95 -> 95th (95), p99 -> 99th (99), p100 -> max.
+    CHECK("hist-p50-nearest-rank", s.Percentile(50.0, &v) && v == 50);
+    CHECK("hist-p95-nearest-rank", s.Percentile(95.0, &v) && v == 95);
+    CHECK("hist-p99-nearest-rank", s.Percentile(99.0, &v) && v == 99);
+    CHECK("hist-p100-max", s.Percentile(100.0, &v) && v == 100);
+    // Unsorted input must not matter.
+    xnc::StageHistogram u("u_us", 128);
+    for (const uint64_t x : {5ull, 1ull, 4ull, 2ull, 3ull}) u.Add(x);
+    // n=5: p50 -> ceil(2.5)=3rd (3); p95 -> ceil(4.75)=5th (5).
+    CHECK("hist-unsorted-p50", u.Percentile(50.0, &v) && v == 3);
+    CHECK("hist-unsorted-p95", u.Percentile(95.0, &v) && v == 5);
+    CHECK("hist-unsorted-monotone-summary",
+          [&] {
+            const auto p = u.Summary();
+            return p.has_samples && p.n == 5 && p.p50 <= p.p95 &&
+                   p.p95 <= p.p99 && p.p50 == 3 && p.p95 == 5 && p.p99 == 5;
+          }());
+    // Single sample: every percentile is that sample.
+    xnc::StageHistogram one("one_us", 4);
+    one.Add(7);
+    CHECK("hist-single", one.Percentile(50.0, &v) && v == 7 &&
+                             one.Percentile(99.0, &v) && v == 7);
+    // Capacity bound: the ring keeps the NEWEST samples (drop-oldest).
+    xnc::StageHistogram ring("ring_us", 4);
+    for (uint64_t i = 1; i <= 6; ++i) ring.Add(i);  // retains 3,4,5,6
+    CHECK("hist-ring-keeps-newest",
+          ring.Count() == 4 && ring.Percentile(50.0, &v) && v == 4 &&
+              ring.Percentile(95.0, &v) && v == 6);
+    ring.Reset();
+    CHECK("hist-reset", ring.Empty() && !ring.Percentile(50.0, &v));
+    // Rendering: log line + sidecar members; zero-sample stages ABSENT.
+    xnc::StageHistogram a("a_us", 8), b("b_us", 8), z("z_us", 8);
+    for (const uint64_t x : {10ull, 20ull, 30ull, 40ull}) a.Add(x);
+    b.Add(1);
+    b.Add(2);
+    const xnc::StageStat stats[] = {
+        {"a_us", a.Summary()}, {"z_us", z.Summary()}, {"b_us", b.Summary()}};
+    const std::string log_line = xnc::FormatStageLog(stats, 3);
+    CHECK("hist-log-omits-zero-sample",
+          log_line.find("z_us") == std::string::npos &&
+              log_line.find("a_us=20/40/40(n=4)") != std::string::npos &&
+              log_line.find("b_us=1/2/2(n=2)") != std::string::npos);
+    const std::string json = xnc::FormatStagesJson(stats, 3, 7);
+    CHECK("hist-json-absent-when-zero",
+          json.find("z_us") == std::string::npos);
+    CHECK("hist-json-members",
+          json.find("\"a_us\": { \"n\": 4, \"p50\": 20, \"p95\": 40, \"p99\": 40 }") !=
+              std::string::npos &&
+              json.find("\"b_us\": { \"n\": 2, \"p50\": 1, \"p95\": 2, \"p99\": 2 }") !=
+                  std::string::npos);
+    CHECK("hist-json-block-shape",
+          json.find("\"stages\": {") != std::string::npos &&
+              json.find("},") != std::string::npos);
+    CHECK("hist-json-readback-count",
+          json.find("\"cpu_readbacks\": 7") != std::string::npos);
+    // Sidecar splice: stages land BEFORE "ok"; an empty block keeps the
+    // M0 stats.json byte-identical (no "stages" key at all).
+    xnc::PipelineResult r2;
+    xnc::PipelineOpts o2;
+    r2.stages_json = xnc::FormatStagesJson(stats, 3, 0);
+    const std::string with = xnc::FormatStatsJson(r2, o2);
+    CHECK("statsjson-stages-spliced",
+          with.find("\"stages\": {") != std::string::npos &&
+              with.find("\"ok\"") > with.find("\"stages\""));
+    r2.stages_json.clear();
+    CHECK("statsjson-m0-unchanged",
+          xnc::FormatStatsJson(r2, o2).find("\"stages\"") ==
+              std::string::npos);
+  }
   { // Task 5:致命 Acquire 错误 → Run 立即失败(未初始化编码器也安全)
     struct FatalCapture final : xnc::ICapture {
       bool Acquire(xnc::FrameBlob&, std::string* err = nullptr,
@@ -8506,6 +8588,22 @@ int SelftestMain(bool desktop_pipeline_v2) {
                   return log.completes == log.submits &&
                          log.double_completes == 0;
                 }());
+          // Task 6: the run recorded every stage histogram into the final
+          // summary (sidecar block) - keys present, percentiles monotone -
+          // and the factory session performed no CPU readbacks (the
+          // readback counter only moves on the internal software rung).
+          CHECK("v2b-stages-json",
+                res.stages_json.find("gpu_copy_us") != std::string::npos &&
+                    res.stages_json.find("gpu_convert_us") !=
+                        std::string::npos &&
+                    res.stages_json.find("mft_submit_to_output_us") !=
+                        std::string::npos &&
+                    res.stages_json.find("inflight_slots") !=
+                        std::string::npos &&
+                    res.stages_json.find("queue_age_us") != std::string::npos &&
+                    res.stages_json.find("capture_to_au_us") !=
+                        std::string::npos);
+          CHECK("v2b-no-cpu-readback", res.cpu_readbacks == 0);
           std::printf("SELFTEST NOTE: v2b submits=%llu outputs=%llu aus=%llu\n",
                       (unsigned long long)log.submits,
                       (unsigned long long)log.outputs,

@@ -279,6 +279,63 @@ class Nv12Converter {
   uint32_t src_w_ = 0, src_h_ = 0, out_w_ = 0, out_h_ = 0;
 };
 
+// ---- M2 Task 6: stage histograms ----
+//
+// Each measured stage keeps TWO bounded rings (pipeline.h StageHistogram):
+// `total` (the whole run, keep-newest) and `win` (reset at every 10 s
+// emission). Add is one store + index bump per ring - no per-sample
+// allocation anywhere; percentiles sort a reused scratch once per emission.
+//
+// Semantics (all wall-clock as observed by the media loop thread; the D3D
+// commands below are ASYNC enqueues on the single immediate context, so on
+// hardware these are enqueue-cost upper bounds - on WARP they approximate
+// execution because WARP executes inline):
+//   gpu_copy_us            - the AcquireSurface call that returned kFrame:
+//                            the AcquireNextFrame compositor wait + the
+//                            CopyResource enqueue + ReleaseFrame.
+//   gpu_convert_us         - the VideoProcessorBlt BGRA->NV12 call
+//                            (Nv12Converter::Convert), successful calls only.
+//   mft_submit_to_output_us- per output: its submission stamp
+//                            (present_mono_us) -> the loop observing the
+//                            output via TakeOutput (encoder lookahead +
+//                            encode + poll cadence).
+//   inflight_slots         - pool live leases observed at each submission
+//                            attempt, AFTER Acquire's retire sweep (3 =
+//                            saturated: the coalescing path).
+//   queue_age_us           - the latest-content wait: the content's capture
+//                            stamp (source_mono_us) -> its submission stamp
+//                            (present_mono_us) through the depth-one mailbox.
+//   capture_to_au_us       - the plan's capture->AU gate observation: the
+//                            AU's source_mono_us -> publication (sink OnAu).
+// Zero-sample stages are omitted from every output, never fake-zero.
+struct StagePair {
+  StagePair(const char* name, size_t total_cap, size_t win_cap)
+      : total(name, total_cap), win(name, win_cap) {}
+  void Add(uint64_t v) {
+    total.Add(v);
+    win.Add(v);
+  }
+  StageHistogram total;
+  StageHistogram win;
+};
+
+// 60 s at 60 fps = 3600 samples: the totals cover the whole standard diag
+// run (longer runs keep the most recent kStageTotalCap); a 10 s window is
+// <= 600 samples at 60 fps, so kStageWinCap never wraps mid-window.
+constexpr size_t kStageTotalCap = 4096;
+constexpr size_t kStageWinCap = 1024;
+
+struct StageHists {
+  StagePair gpu_copy{"gpu_copy_us", kStageTotalCap, kStageWinCap};
+  StagePair gpu_convert{"gpu_convert_us", kStageTotalCap, kStageWinCap};
+  StagePair mft_submit_to_output{"mft_submit_to_output_us", kStageTotalCap,
+                                 kStageWinCap};
+  StagePair inflight_slots{"inflight_slots", kStageTotalCap, kStageWinCap};
+  StagePair queue_age_us{"queue_age_us", kStageTotalCap, kStageWinCap};
+  StagePair capture_to_au_us{"capture_to_au_us", kStageTotalCap,
+                             kStageWinCap};
+};
+
 }  // namespace
 
 // The process-wide fallback lock (Config::encoder_lock == null path).
@@ -378,6 +435,10 @@ struct MediaPipelineV2::Impl {
   uint32_t reinit_fail_streak = 0;
   uint32_t no_frame_resets = 0;
 
+  // ---- M2 Task 6: stage histograms + the 10 s emission cadence ----
+  StageHists stages;
+  uint32_t next_hist_beat_s = 10;
+
   Result res;
   std::atomic<bool> running{false};
   std::atomic<bool> stop_now{false};
@@ -467,9 +528,10 @@ class Loop {
     im_.res.backend_at_stop = im_.backend;
     im_.res.encoder_software_locked =
         im_.enc_lock != nullptr ? im_.enc_lock->SoftwareLocked() : false;
+    EmitStages(true);  // Task 6: final summary (log line + sidecar block)
     im_.sink().OnState("stream_end", im_.res.ok);
     const MediaPipelineV2::Result& r = im_.res;
-    XNC_LOG_INFO("media_v2_stop elapsed=%llums captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu resets=%u rebuilds=%u w=%u h=%u aus=%llu bytes=%llu reorder_gap_skips=%llu reorder_late_drops=%llu backend=%s ok=%d",
+    XNC_LOG_INFO("media_v2_stop elapsed=%llums captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu resets=%u rebuilds=%u w=%u h=%u aus=%llu bytes=%llu reorder_gap_skips=%llu reorder_late_drops=%llu backend=%s cpu_readbacks=%llu ok=%d",
                  static_cast<unsigned long long>(NowMs() - im_.t0),
                  static_cast<unsigned long long>(r.captured),
                  static_cast<unsigned long long>(r.encoded),
@@ -481,7 +543,9 @@ class Loop {
                  static_cast<unsigned long long>(r.bytes_written),
                  static_cast<unsigned long long>(r.reorder_gap_skips),
                  static_cast<unsigned long long>(r.reorder_late_drops),
-                 r.encoder_backend, r.ok ? 1 : 0);
+                 r.encoder_backend,
+                 static_cast<unsigned long long>(r.cpu_readbacks),
+                 r.ok ? 1 : 0);
     im_.running.store(false);
   }
 
@@ -502,6 +566,12 @@ class Loop {
     if (!im_.session) return;
     EncoderOutput out;
     while (im_.session->TakeOutput(&out, 0)) {
+      // Task 6: submit -> output-availability for THIS output (its
+      // submission stamp -> the moment the loop observes it here).
+      const uint64_t now_us = NowMonoUs();
+      if (out.id.present_mono_us != 0 && now_us > out.id.present_mono_us)
+        im_.stages.mft_submit_to_output.Add(now_us -
+                                            out.id.present_mono_us);
       if (!AcceptForPublication(std::move(out))) return;  // fatal
     }
     // A gap that stopped filling (static screen: no further outputs):
@@ -652,6 +722,13 @@ class Loop {
     eau.annexb = std::make_shared<const std::vector<uint8_t>>(im_.shaped);
     im_.res.aus_written++;
     im_.res.bytes_written += im_.shaped.size();
+    // Task 6: the capture->AU observation - the AU's pixel-capture stamp to
+    // the shaped AU being complete (one step short of the sink's own I/O).
+    {
+      const uint64_t now_us = NowMonoUs();
+      if (out.id.source_mono_us != 0 && now_us > out.id.source_mono_us)
+        im_.stages.capture_to_au_us.Add(now_us - out.id.source_mono_us);
+    }
     if (const char* err = im_.sink().OnAu(eau)) {
       im_.Fatal(err);
       XNC_LOG_ERROR("sink_onau_failed err=\"%s\"", err);
@@ -715,8 +792,13 @@ class Loop {
     spec.codec_epoch = im_.codec_epoch;
     spec.content_id = im_.next_content_id + 1;  // speculative (capture.h)
     std::string aerr;
+    // Task 6: the capture stage's wall cost, measured around the WHOLE
+    // AcquireSurface call (see StageHists: compositor wait + copy enqueue).
+    const uint64_t acq_t0 = NowMonoUs();
     const CaptureStatus st =
         im_.cfg.surf->AcquireSurface(im_.latest, im_.spf_ms, &spec, &aerr);
+    if (st == CaptureStatus::kFrame)
+      im_.stages.gpu_copy.Add(NowMonoUs() - acq_t0);
     switch (st) {
       case CaptureStatus::kFrame: {
         im_.next_content_id = spec.content_id;  // committed
@@ -875,6 +957,10 @@ class Loop {
     // guarantees a taken identity is always submitted (the coalescing
     // contract only drops content that was REPLACED, never taken content).
     SurfaceLease* lease = im_.pool.Acquire();
+    // Task 6: in-flight occupancy observed at the submission attempt
+    // (Acquire swept retired slots first; 3 = saturated = coalescing path).
+    im_.stages.inflight_slots.Add(
+        static_cast<uint64_t>(im_.pool.LiveLeases()));
     if (lease == nullptr) return;  // all three slots busy: mailbox keeps
                                    // the latest; nothing is lost
     FrameIdentity mid;
@@ -899,6 +985,10 @@ class Loop {
     FrameIdentity id = mid;
     id.encode_seq = ++im_.next_encode_seq;
     id.present_mono_us = NowMonoUs();  // stamped at submission (ruling 3)
+    // Task 6: queue age - the latest-content wait: this content's capture
+    // stamp to its submission stamp (depth-one mailbox + slot/FPS gates).
+    if (mid.source_mono_us != 0 && id.present_mono_us > mid.source_mono_us)
+      im_.stages.queue_age_us.Add(id.present_mono_us - mid.source_mono_us);
     // Ruling 3: the identity runs through the M1 FrameIdentityLedger at
     // the submission boundary - the M0 pipeline's exact site (pipeline.cpp
     // accepts at the input boundary). Every AU that can reach the wire was
@@ -918,8 +1008,12 @@ class Loop {
     char idr_reason[32];
     const bool force = im_.mbox.TakeIdr(idr_reason, sizeof(idr_reason));
     std::string cerr_;
+    // Task 6: the conversion stage's wall cost (VideoProcessorBlt).
+    const uint64_t conv_t0 = NowMonoUs();
     const bool conv_ok = im_.conv.Convert(tex, *lease, &cerr_);
+    const uint64_t conv_us = NowMonoUs() - conv_t0;
     tex->Release();
+    if (conv_ok) im_.stages.gpu_convert.Add(conv_us);
     if (!conv_ok) {
       lease->Release();
       if (LooksDeviceRemoved(cerr_)) {
@@ -950,6 +1044,12 @@ class Loop {
       return;
     }
     im_.res.encoded++;
+    // Task 6: the INTERNAL software rung's Submit performs exactly one
+    // staging Map (its designed fallback cost, mf_gpu_encoder.cpp); the
+    // hardware rung and the test factories perform none, and the
+    // capture/convert stages never do (read alongside encoder_backend).
+    if (!im_.session_is_hw && im_.cfg.session_factory == nullptr)
+      im_.res.cpu_readbacks++;
     im_.submit_count++;
     im_.last_submit_ms = NowMs();
     if (force)
@@ -1388,10 +1488,64 @@ class Loop {
     return false;
   }
 
+  // ---- M2 Task 6: stage-histogram emission ----
+  // Window lines every 10 s (per-window rings, reset right after each
+  // emission); the final summary renders the whole-run rings into
+  // Result::stages_json (for the stats.json sidecar) plus the
+  // media_v2_stages_final log line. Zero-sample stages are omitted from
+  // both outputs; an all-empty window emits nothing at all.
+  void EmitStages(bool final_summary) {
+    StageStat stats[6];
+    size_t n = 0;
+    const auto push = [&stats, &n](const StageHistogram& h) {
+      if (n >= sizeof(stats) / sizeof(stats[0])) return;
+      stats[n].key = h.name();
+      stats[n].p = h.Summary();
+      if (stats[n].p.has_samples) ++n;  // zero-sample: absent, not zero
+    };
+    if (final_summary) {
+      push(im_.stages.gpu_copy.total);
+      push(im_.stages.gpu_convert.total);
+      push(im_.stages.mft_submit_to_output.total);
+      push(im_.stages.inflight_slots.total);
+      push(im_.stages.queue_age_us.total);
+      push(im_.stages.capture_to_au_us.total);
+    } else {
+      push(im_.stages.gpu_copy.win);
+      push(im_.stages.gpu_convert.win);
+      push(im_.stages.mft_submit_to_output.win);
+      push(im_.stages.inflight_slots.win);
+      push(im_.stages.queue_age_us.win);
+      push(im_.stages.capture_to_au_us.win);
+    }
+    const std::string line = FormatStageLog(stats, n);
+    if (line.empty()) return;
+    const uint32_t elapsed_s =
+        static_cast<uint32_t>((NowMs() - im_.t0) / 1000);
+    XNC_LOG_INFO("media_v2_stages%s elapsed=%us %s",
+                 final_summary ? "_final" : "", elapsed_s, line.c_str());
+    if (final_summary) {
+      im_.res.stages_json =
+          FormatStagesJson(stats, n, im_.res.cpu_readbacks);
+      return;
+    }
+    im_.stages.gpu_copy.win.Reset();
+    im_.stages.gpu_convert.win.Reset();
+    im_.stages.mft_submit_to_output.win.Reset();
+    im_.stages.inflight_slots.win.Reset();
+    im_.stages.queue_age_us.win.Reset();
+    im_.stages.capture_to_au_us.win.Reset();
+  }
+
   void Beat() {
     const uint32_t elapsed_s = static_cast<uint32_t>((NowMs() - im_.t0) / 1000);
     if (elapsed_s < im_.next_beat_s) return;
     im_.next_beat_s = elapsed_s + 1;
+    // Task 6: the stage histograms ride the same beat, once per 10 s.
+    if (elapsed_s >= im_.next_hist_beat_s) {
+      im_.next_hist_beat_s = elapsed_s + 10;
+      EmitStages(false);
+    }
     const char* desktop = im_.cfg.desktop_name_fn != nullptr
                               ? im_.cfg.desktop_name_fn(im_.cfg.desktop_name_ctx)
                               : nullptr;

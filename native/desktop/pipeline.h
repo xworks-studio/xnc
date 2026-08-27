@@ -84,6 +84,11 @@ struct PipelineResult {
   uint32_t resets = 0;             // unified CaptureReset executions (M2-S1 T2)
   uint32_t storm_resets = 0;       // resets delayed by storm backoff (M2-S2 T1)
   char last_reset_reason[kResetReasonMax] = {0};  // reason of the last reset
+  // M2 Task 6: pre-rendered stage-histogram block for the stats.json
+  // sidecar (the "stages" members + the V2 cpu_readbacks line, produced by
+  // FormatStagesJson). EMPTY for M0 runs keeps the M0 sidecar byte-identical
+  // (FormatStatsJson splices it in only when non-empty).
+  std::string stages_json;
 };
 
 // Measured lookahead window of CMSH264EncoderMFT on the dev/target machines
@@ -208,6 +213,72 @@ class ResetStormTracker {
   uint32_t n_ = 0;
   uint32_t storm_count_ = 0;
 };
+
+// ---- bounded stage histogram (M2 Task 6: GPU media latency diag) ----
+//
+// One stage's latency/occupancy samples (uint64: microseconds or counts) in
+// a fixed-capacity ring buffer - drop-oldest keeps the NEWEST samples, so a
+// long run summarizes its most recent window with ZERO per-sample
+// allocation. Percentiles are NEAREST-RANK (the standard definition: rank =
+// ceil(p/100 * n), value = the rank-th smallest sample), computed on a
+// reused sort scratch - one sort per emission, never per sample.
+//
+// Zero-sample stages are never fake-zero: Percentile returns false and the
+// rendering helpers OMIT the stage entirely (stats.json sidecar + log
+// lines). Single-threaded by contract (the V2 media loop thread or the
+// selftest); hot-path cost is one store + index bump.
+class StageHistogram {
+ public:
+  struct Percentiles {
+    uint64_t n = 0;
+    uint64_t p50 = 0, p95 = 0, p99 = 0;
+    bool has_samples = false;  // false = zero samples (never fake-zero)
+  };
+
+  // `name` must have static storage duration (string literals in the
+  // caller); `capacity` is the ring size (0 = degenerate, Add is a no-op).
+  StageHistogram(const char* name, size_t capacity);
+  StageHistogram() = default;
+
+  void Add(uint64_t sample);
+  bool Empty() const { return count_ == 0; }
+  uint64_t Count() const { return static_cast<uint64_t>(count_); }
+  const char* name() const { return name_; }
+
+  // NEAREST-RANK percentile over the retained samples; p must be in
+  // (0, 100]. False (and *out untouched) when empty or p is invalid.
+  bool Percentile(double p, uint64_t* out) const;
+  // p50/p95/p99 in one sorted pass; has_samples=false when empty.
+  Percentiles Summary() const;
+  // Drops every sample (the per-10s window twin's reset).
+  void Reset();
+
+ private:
+  const char* name_ = "";
+  std::vector<uint64_t> ring_;
+  mutable std::vector<uint64_t> scratch_;  // reused sort buffer
+  size_t head_ = 0;  // next write index (wraps; overwrites the oldest)
+  size_t count_ = 0;
+};
+
+// One stage's rendered summary (key + percentiles) for the helpers below.
+struct StageStat {
+  const char* key;
+  StageHistogram::Percentiles p;
+};
+
+// Log line: every SAMPLED stage as "key=p50/p95/p99(n=N)" joined by single
+// spaces; zero-sample stages are omitted. Empty string when no stage has
+// samples (the caller skips the log line entirely).
+std::string FormatStageLog(const StageStat* stats, size_t n);
+
+// stats.json sidecar block (one line per SAMPLED stage, 4-space member
+// indent, zero-sample stages ABSENT - never fake-zero) plus the V2
+// cpu_readbacks accounting line. Trailing-comma terminated for splicing
+// before the "ok" member in FormatStatsJson. Empty string when no stage
+// has samples (keeps the M0 sidecar byte-identical).
+std::string FormatStagesJson(const StageStat* stats, size_t n,
+                             uint64_t cpu_readbacks);
 
 // Appends every NALU of `data` except parameter sets (7/8) and AUD (9),
 // each re-emitted with a 4-byte start code, trailing zero bytes before the

@@ -1,0 +1,26 @@
+{
+  "duration_s": 60,
+  "width": 3440,
+  "height": 1440,
+  "fps": 60,
+  "bitrate_bps": 4200000,
+  "captured": 1497,
+  "encoded": 1497,
+  "keyframes": 25,
+  "timeouts": 1,
+  "warmup_feeds": 0,
+  "rebuilds": 0,
+  "resets": 0,
+  "aus_written": 1480,
+  "bytes_written": 13609701,
+  "stages": {
+    "gpu_copy_us": { "n": 1497, "p50": 197, "p95": 337, "p99": 423 },
+    "gpu_convert_us": { "n": 1497, "p50": 624, "p95": 861, "p99": 969 },
+    "mft_submit_to_output_us": { "n": 1480, "p50": 685104, "p95": 768731, "p99": 773354 },
+    "inflight_slots": { "n": 1497, "p50": 1, "p95": 1, "p99": 1 },
+    "queue_age_us": { "n": 1497, "p50": 21528, "p95": 31013, "p99": 32051 },
+    "capture_to_au_us": { "n": 1480, "p50": 727891, "p95": 796376, "p99": 801316 },
+  },
+  "cpu_readbacks": 1497,
+  "ok": 1
+}

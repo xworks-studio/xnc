@@ -37,8 +37,10 @@
 #include <windows.h>  // Sleep, GetTickCount64
 #include <mmsystem.h>  // timeBeginPeriod/timeEndPeriod (1 ms timer resolution)
 
+#include <algorithm>  // std::sort (StageHistogram percentiles)
 #include <atomic>
 #include <cerrno>
+#include <cmath>      // std::ceil (nearest-rank percentiles)
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -1284,6 +1286,100 @@ PipelineResult Pipeline::Run(ICapture& cap, MfSoftEncoder& enc, FILE* out,
   return RunCore(cap, enc, tee, opt);
 }
 
+// ---- M2 Task 6: stage histogram (pipeline.h) ----
+
+StageHistogram::StageHistogram(const char* name, size_t capacity)
+    : name_(name != nullptr ? name : "") {
+  ring_.assign(capacity, 0);
+}
+
+void StageHistogram::Add(uint64_t sample) {
+  if (ring_.empty()) return;
+  ring_[head_] = sample;
+  head_ = (head_ + 1) % ring_.size();
+  if (count_ < ring_.size()) ++count_;
+}
+
+bool StageHistogram::Percentile(double p, uint64_t* out) const {
+  if (out == nullptr || count_ == 0 || !(p > 0.0) || p > 100.0) return false;
+  // Not full yet: the live samples are [0, count_). Full: every slot is a
+  // live sample (order does not matter - the buffer is sorted next).
+  if (count_ < ring_.size()) {
+    scratch_.assign(ring_.begin(), ring_.begin() + count_);
+  } else {
+    scratch_.assign(ring_.begin(), ring_.end());
+  }
+  std::sort(scratch_.begin(), scratch_.end());
+  // Nearest-rank: rank = ceil(p/100 * n), 1-based; value = rank-th smallest.
+  double rank = std::ceil(p / 100.0 * static_cast<double>(count_));
+  if (rank < 1.0) rank = 1.0;
+  size_t idx = static_cast<size_t>(rank) - 1;
+  if (idx >= count_) idx = count_ - 1;
+  *out = scratch_[idx];
+  return true;
+}
+
+StageHistogram::Percentiles StageHistogram::Summary() const {
+  Percentiles out;
+  uint64_t v = 0;
+  if (!Percentile(50.0, &v)) return out;
+  out.n = static_cast<uint64_t>(count_);
+  out.p50 = v;
+  if (!Percentile(95.0, &out.p95) || !Percentile(99.0, &out.p99)) {
+    out = Percentiles{};
+    return out;
+  }
+  out.has_samples = true;
+  return out;
+}
+
+void StageHistogram::Reset() {
+  count_ = 0;
+  head_ = 0;
+}
+
+std::string FormatStageLog(const StageStat* stats, size_t n) {
+  std::string out;
+  for (size_t i = 0; i < n; ++i) {
+    if (!stats[i].p.has_samples) continue;  // zero-sample: absent, not zero
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "%s%s=%llu/%llu/%llu(n=%llu)",
+                  out.empty() ? "" : " ", stats[i].key,
+                  static_cast<unsigned long long>(stats[i].p.p50),
+                  static_cast<unsigned long long>(stats[i].p.p95),
+                  static_cast<unsigned long long>(stats[i].p.p99),
+                  static_cast<unsigned long long>(stats[i].p.n));
+    out += buf;
+  }
+  return out;
+}
+
+std::string FormatStagesJson(const StageStat* stats, size_t n,
+                             uint64_t cpu_readbacks) {
+  std::string members;
+  for (size_t i = 0; i < n; ++i) {
+    if (!stats[i].p.has_samples) continue;  // zero-sample: absent, not zero
+    char buf[128];
+    std::snprintf(buf, sizeof(buf),
+                  "    \"%s\": { \"n\": %llu, \"p50\": %llu, \"p95\": %llu, "
+                  "\"p99\": %llu },\n",
+                  stats[i].key, static_cast<unsigned long long>(stats[i].p.n),
+                  static_cast<unsigned long long>(stats[i].p.p50),
+                  static_cast<unsigned long long>(stats[i].p.p95),
+                  static_cast<unsigned long long>(stats[i].p.p99));
+    members += buf;
+  }
+  if (members.empty()) return std::string();
+  std::string out = "  \"stages\": {\n";
+  out += members;
+  out += "  },\n";
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "  \"cpu_readbacks\": %llu,\n",
+                static_cast<unsigned long long>(cpu_readbacks));
+  out += buf;
+  return out;
+}
+
 std::string FormatStatsJson(const PipelineResult& r, const PipelineOpts& o) {
   char buf[640];
   std::snprintf(buf, sizeof(buf),
@@ -1301,18 +1397,22 @@ std::string FormatStatsJson(const PipelineResult& r, const PipelineOpts& o) {
                 "  \"rebuilds\": %u,\n"
                 "  \"resets\": %u,\n"
                 "  \"aus_written\": %llu,\n"
-                "  \"bytes_written\": %llu,\n"
-                "  \"ok\": %d\n"
-                "}\n",
+                "  \"bytes_written\": %llu,\n",
                 o.duration_s, r.width, r.height, o.fps, o.target_bitrate_bps,
                 static_cast<unsigned long long>(r.counters.captured),
                 static_cast<unsigned long long>(r.counters.encoded),
                 static_cast<unsigned long long>(r.counters.keyframes),
                 static_cast<unsigned long long>(r.counters.timeouts),
                 static_cast<unsigned long long>(r.counters.warmup_feeds),
-                r.counters.rebuilds, r.resets, static_cast<unsigned long long>(r.aus_written),
-                static_cast<unsigned long long>(r.bytes_written), r.ok ? 1 : 0);
-  return std::string(buf);
+                r.counters.rebuilds, r.resets,
+                static_cast<unsigned long long>(r.aus_written),
+                static_cast<unsigned long long>(r.bytes_written));
+  std::string out(buf);
+  out += r.stages_json;  // M2 Task 6: empty for M0 = byte-identical sidecar
+  char tail[32];
+  std::snprintf(tail, sizeof(tail), "  \"ok\": %d\n}\n", r.ok ? 1 : 0);
+  out += tail;
+  return out;
 }
 
 bool WriteStatsJson(const std::wstring& h264_out_path, const PipelineResult& r,

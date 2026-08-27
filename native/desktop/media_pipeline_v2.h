@@ -423,6 +423,16 @@ class MediaPipelineV2 {
     char last_reset_reason[kResetReasonMax] = {0};
     const char* encoder_backend = "(none)";  // which rung ran
     std::string encoder_friendly;
+    // M2 Task 6: pre-rendered stage-histogram block for the stats.json
+    // sidecar (FormatStagesJson: p50/p95/p99 per stage, zero-sample stages
+    // ABSENT). Empty when the run recorded no samples in any stage.
+    std::string stages_json;
+    // M2 Task 6: CPU readbacks observed INSIDE the serving encoder rung
+    // (the internal software rung's one staging Map per Submit - its
+    // designed fallback cost). The V2 capture/conversion stages have no
+    // readback site at all, so a GPU-rung run keeps this at 0; read it
+    // together with encoder_backend (which rung served).
+    uint64_t cpu_readbacks = 0;
   };
 
   MediaPipelineV2();

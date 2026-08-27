@@ -650,6 +650,10 @@ int RunConsoleDiagV2(const xnc::DiagOptions& opt, FILE* out, xnc::ICapture* cap,
   pr.aus_written = res.aus_written;
   pr.bytes_written = res.bytes_written;
   pr.resets = res.resets;
+  // M2 Task 6: the stage-histogram block (p50/p95/p99 per sampled stage,
+  // zero-sample stages absent) rides the same sidecar; empty for runs with
+  // no samples keeps the writer's shape unchanged.
+  pr.stages_json = res.stages_json;
   xnc::CopyReason(pr.last_reset_reason, sizeof(pr.last_reset_reason),
                   res.last_reset_reason);
   write_stats(pr);
