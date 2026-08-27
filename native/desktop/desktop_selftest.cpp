@@ -2287,6 +2287,80 @@ int SelftestMain() {
     CHECK("tracker-consume-after-rollback",
           t.Consume(true, 666667, &got) == xnc::OutputConsume::kTimeUnknown);
     CHECK("tracker-clear", (t.Clear(), t.PendingCount() == 0));
+    // Bounded memory (review fix): a healthy register->consume stream
+    // prunes the consumed FRONT, so retained stays tiny however many
+    // submissions flow; a consumed entry behind the oldest PENDING record
+    // is retained until that front resolves (reorder tolerance); and the
+    // retained cap is a HARD failure (>= kMaxTracked outputs owed).
+    {
+      xnc::OutputIdentityTracker big;
+      xnc::OutputIdentityRecord br{};
+      size_t max_retained = 0;
+      bool flow_ok = true;
+      for (int64_t i = 1; i <= 4000; ++i) {
+        br.id.encode_seq = static_cast<uint64_t>(i);
+        br.submit_id = static_cast<uint64_t>(i);
+        if (!big.Register(i * 33333, br)) {
+          flow_ok = false;
+          break;
+        }
+        xnc::OutputIdentityRecord got{};
+        if (big.Consume(true, i * 33333, &got) != xnc::OutputConsume::kOk ||
+            got.submit_id != static_cast<uint64_t>(i)) {
+          flow_ok = false;
+          break;
+        }
+        if (big.retained() > max_retained) max_retained = big.retained();
+      }
+      CHECK("tracker-bounded-pruning",
+            flow_ok && big.consumed_count() == 4000 && max_retained <= 2 &&
+                big.PendingCount() == 0);
+      // Reorder: consuming a NON-front entry retains it until the front
+      // resolves; then the whole consumed prefix prunes at once.
+      xnc::OutputIdentityTracker ro;
+      for (int64_t i = 1; i <= 3; ++i) {
+        br.id.encode_seq = static_cast<uint64_t>(i);
+        br.submit_id = static_cast<uint64_t>(i);
+        ro.Register(i * 33333, br);
+      }
+      xnc::OutputIdentityRecord got{};
+      CHECK("tracker-reorder-keeps-entries",
+            ro.Consume(true, 2 * 33333, &got) == xnc::OutputConsume::kOk &&
+                ro.retained() == 3 && ro.PendingCount() == 2);
+      CHECK("tracker-reorder-prunes-prefix",
+            ro.Consume(true, 33333, &got) == xnc::OutputConsume::kOk &&
+                ro.retained() == 1 && ro.PendingCount() == 1);
+      // Cap: kMaxTracked retained entries is the ceiling; the next
+      // Register is a hard failure and stays one until something is
+      // consumed (the cap follows RETAINED, not lifetime submissions).
+      xnc::OutputIdentityTracker capped;
+      bool failed_at_cap = false;
+      for (size_t i = 1; i <= xnc::OutputIdentityTracker::kMaxTracked + 2;
+           ++i) {
+        br.id.encode_seq = i;
+        br.submit_id = i;
+        if (!capped.Register(static_cast<int64_t>(i) * 33333, br)) {
+          failed_at_cap = true;
+          break;
+        }
+      }
+      CHECK("tracker-cap-hard-failure",
+            failed_at_cap &&
+                capped.retained() ==
+                    xnc::OutputIdentityTracker::kMaxTracked &&
+                capped.PendingCount() ==
+                    xnc::OutputIdentityTracker::kMaxTracked);
+      CHECK("tracker-cap-recovers",
+            capped.Consume(true, 33333, &got) == xnc::OutputConsume::kOk &&
+                capped.retained() ==
+                    xnc::OutputIdentityTracker::kMaxTracked - 1 &&
+                capped.Register(
+                    (static_cast<int64_t>(
+                         xnc::OutputIdentityTracker::kMaxTracked) +
+                     1) *
+                        33333,
+                    br));
+    }
     // §8.4 color rule: BT.709 limited at 720p+, BT.601 limited below.
     const xnc::Nv12ColorConfig c720 = xnc::Nv12ColorForSize(720);
     const xnc::Nv12ColorConfig c1080 = xnc::Nv12ColorForSize(1080);
@@ -2855,6 +2929,7 @@ int SelftestMain() {
                                               xnc::EncoderSessionError::
                                                   kNotReady);
         CHECK("gpu-skip-reconfigure", !gpu.Reconfigure(1, 30));
+        CHECK("gpu-skip-matrix-zero", gpu.negotiated_input_matrix() == 0);
         gpu.Shutdown(xnc::ShutdownMode::kImmediate);
         pool.FreeRetired();
         CHECK("gpu-skip-zero-live",
@@ -2885,9 +2960,14 @@ int SelftestMain() {
                 p1.first_output_inputs > 0 && p1.first_output_inputs <= 2 &&
                     p1.first_output_ms <= 100);
           CHECK("gpu-probe-discriminates", p1.hash_a != p1.hash_b);
-          // The SPS VUI must agree with the §8.4 rule on a rung that
-          // signals color metadata.
+          // §8.4 on hardware is a HARD check (review fix): the negotiated
+          // input type's matrix must equal the rule UNCONDITIONALLY
+          // (MfGpuEncoder::negotiated_input_matrix readback - there is no
+          // VUI-escape anymore), and a VUI that carries color metadata
+          // must agree with the same rule.
           const xnc::Nv12ColorConfig rule = xnc::Nv12ColorForSize(sh);
+          CHECK("gpu-input-matrix-agrees",
+                gpu.negotiated_input_matrix() == rule.matrix);
           bool vui_checked = false, vui_ok = false, saw_idr_vui = false;
           for (const auto& o : p1.outputs) {
             if (!o.key) continue;
@@ -2903,9 +2983,13 @@ int SelftestMain() {
           if (vui_checked) {
             CHECK("gpu-probe-vui-agrees", vui_ok);
           } else if (saw_idr_vui) {
+            // Loud NOTE, not an escape: for a backend that does not write
+            // VUI color, the unconditional negotiated-matrix assertion
+            // above IS the hard §8.4 check.
             std::printf("SELFTEST NOTE: gpu-probe VUI color unspecified "
-                        "(backend does not signal; VideoProcessor + input "
-                        "type carry the rule)\n");
+                        "(backend does not signal; the hard check is the "
+                        "negotiated input matrix=%u vs rule=%u above)\n",
+                        gpu.negotiated_input_matrix(), rule.matrix);
           }
         }
         gpu.Shutdown(xnc::ShutdownMode::kDrain);

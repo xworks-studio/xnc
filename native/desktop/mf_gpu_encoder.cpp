@@ -167,6 +167,7 @@ struct Unit {
   ComPtr<IMFMediaEventGenerator> gen;
   bool is_async = false;
   bool provides_samples = false;  // MFT_OUTPUT_STREAM_PROVIDES_SAMPLES
+  uint32_t in_matrix = 0;         // negotiated input MF_MT_YUV_MATRIX
   size_t out_buf_size = 0;
   int need_credits = 0;  // queued METransformNeedInput
   int have_credits = 0;  // queued METransformHaveOutput
@@ -396,6 +397,19 @@ bool ConfigureUnit(Unit& u, IMFDXGIDeviceManager* mgr, uint32_t w, uint32_t h,
     if (err) *err = HrStep("SetInputType(hw)", hr);
     return false;
   }
+  // Negotiated-matrix readback (the color-agreement surface; mirrors
+  // MfSoftEncoder::negotiated_input_matrix - 0 when the MFT dropped the
+  // attribute). Logged so the actually-in-force matrix is diagnosable.
+  u.in_matrix = 0;
+  {
+    ComPtr<IMFMediaType> cur;
+    UINT32 m = 0;
+    if (SUCCEEDED(u.mft->GetInputCurrentType(0, cur.GetAddressOf())) &&
+        SUCCEEDED(cur->GetUINT32(MF_MT_YUV_MATRIX, &m)))
+      u.in_matrix = m;
+    XNC_LOG_INFO("gpu_input_negotiated_matrix matrix=%u (rule=%u)", u.in_matrix,
+                 Nv12ColorForSize(h).matrix);
+  }
 
   // Low-latency shaping after types (accepted there; best-effort).
   if (u.codec_api.Get() != nullptr) {
@@ -430,16 +444,23 @@ bool ConfigureUnit(Unit& u, IMFDXGIDeviceManager* mgr, uint32_t w, uint32_t h,
   return true;
 }
 
-void ReleaseUnit(Unit& u) {
+// Releases the unit's streaming state and COM references. When
+// release_activate is false the IMFActivate reference is left untouched:
+// used by the ladder's live-activation failure path, where the enum
+// array's reference is still owned by the post-loop cleanup (single
+// owner - never released here AND there; the activated object is
+// ShutdownObject'd by that same cleanup).
+void ReleaseUnit(Unit& u, bool release_activate = true) {
   if (u.mft.Get() != nullptr)
     u.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
-  if (u.activate.Get() != nullptr) {
+  if (release_activate && u.activate.Get() != nullptr) {
     u.activate->ShutdownObject();
     u.activate.Reset();
   }
   u.gen.Reset();
   u.codec_api.Reset();
   u.mft.Reset();
+  u.in_matrix = 0;
   u.need_credits = u.have_credits = 0;
 }
 
@@ -866,9 +887,15 @@ bool MfGpuEncoder::Init(ID3D11Device* dev, Nv12SurfacePool* pool, uint32_t w,
 
   // Hardware ladder: first candidate that negotiates AND passes the §8.3
   // startup probe wins; a pristine instance of the winner is re-activated
-  // for the live stream. acts[i] references: the winner's is Attach'ed to
-  // the live unit (released at Shutdown); every other candidate's is
-  // ShutdownObject'd + released once, below.
+  // for the live stream. Reference OWNERSHIP (review fix: exactly one
+  // owner per IMFActivate reference - the historical attach-then-fail
+  // path double-released): the enum array's references are owned by the
+  // post-loop cleanup, which ShutdownObject's + Release()s every slot
+  // EXCEPT the winner's; the winner's reference is Attach'ed into the
+  // live unit ONLY after ConfigureUnit succeeds (and is released by that
+  // unit at Shutdown). A failed live re-activation therefore releases
+  // only the MFT-side references (ReleaseUnit with release_activate =
+  // false) and leaves acts[i] untouched for the cleanup loop.
   MFT_REGISTER_TYPE_INFO in_ri{MFMediaType_Video, MFVideoFormat_NV12};
   MFT_REGISTER_TYPE_INFO out_ri{MFMediaType_Video, MFVideoFormat_H264};
   IMFActivate** acts = nullptr;
@@ -899,20 +926,23 @@ bool MfGpuEncoder::Init(ID3D11Device* dev, Nv12SurfacePool* pool, uint32_t w,
       last_err = HrStep("ActivateObject(live)", hr);
       continue;
     }
-    live.activate.Attach(acts[i]);  // own the enum's reference from here
     std::string lerr;
     if (ConfigureUnit(live, impl_->mgr.Get(), w, h, fps, bitrate_bps, &lerr)) {
+      live.activate.Attach(acts[i]);  // success: the unit owns the ref now
       impl_->unit = std::move(live);
       winner = static_cast<long>(i);
       friendly_name_ = WideToNarrow(friendly);
       break;
     }
+    // Live re-activation failed: release ONLY the MFT-side references;
+    // acts[i]'s reference stays with the array for the cleanup loop
+    // (which also ShutdownObjects the still-activated object).
     last_err = "live re-init: " + lerr;
-    ReleaseUnit(live);  // releases the attached enum reference
+    ReleaseUnit(live, /*release_activate=*/false);
   }
   if (acts != nullptr) {
     for (UINT32 j = 0; j < nacts; ++j) {
-      if (static_cast<long>(j) == winner) continue;
+      if (static_cast<long>(j) == winner) continue;  // owned by impl_->unit
       acts[j]->ShutdownObject();
       acts[j]->Release();
     }
@@ -930,6 +960,10 @@ bool MfGpuEncoder::Init(ID3D11Device* dev, Nv12SurfacePool* pool, uint32_t w,
                w, h, fps, bitrate_bps, impl_->unit.is_async ? 1 : 0,
                impl_->unit.provides_samples ? 1 : 0, friendly_name_.c_str());
   return true;
+}
+
+uint32_t MfGpuEncoder::negotiated_input_matrix() const {
+  return impl_ != nullptr ? impl_->unit.in_matrix : 0;
 }
 
 SubmitResult MfGpuEncoder::Submit(const FrameIdentity& id, SurfaceLease&& lease,
@@ -974,6 +1008,12 @@ SubmitResult MfGpuEncoder::Submit(const FrameIdentity& id, SurfaceLease&& lease,
   rec.submit_id = id.encode_seq;
   rec.slot = slot;
   if (!impl_->tracker.Register(t, rec)) {
+    // The seq gate above rules out non-monotonic times, so this is the
+    // retained-entry cap: the encoder owes >= kMaxTracked outputs - hard
+    // failure per the tracker's bounded-memory contract.
+    XNC_LOG_ERROR("gpu_tracker_overflow retained=%zu cap=%zu",
+                  impl_->tracker.retained(),
+                  xnc::OutputIdentityTracker::kMaxTracked);
     pool_->Complete(id.encode_seq);
     impl_->identity_fault = true;
     last_error_ = EncoderSessionError::kEncoderIdentityMismatch;
@@ -1236,6 +1276,10 @@ SubmitResult MfCpuEncoder::Submit(const FrameIdentity& id, SurfaceLease&& lease,
   rec.submit_id = id.encode_seq;
   rec.slot = slot;
   if (!tracker_.Register(t, rec)) {
+    // Seq gate above rules out non-monotonic times: this is the
+    // retained-entry cap (>= kMaxTracked outputs owed) - hard failure.
+    XNC_LOG_ERROR("cpu_tracker_overflow retained=%zu cap=%zu",
+                  tracker_.retained(), OutputIdentityTracker::kMaxTracked);
     pool_->Complete(id.encode_seq);
     identity_fault_ = true;
     last_error_ = EncoderSessionError::kEncoderIdentityMismatch;

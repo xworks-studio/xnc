@@ -55,6 +55,7 @@
 #define XNC_NATIVE_DESKTOP_MF_GPU_ENCODER_H_
 
 #include <cstdint>
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -123,13 +124,29 @@ enum class OutputConsume : uint8_t {
 // the selftest share it). Register() enforces strictly increasing times
 // (the "100ns sample times keyed to encodeSeq" invariant); Consume() looks
 // an output up BY EXACT TIME among the live registrations.
+//
+// Bounded by construction (review fix): consumed entries are pruned from
+// the FRONT as soon as the prefix is fully consumed (outputs arrive in
+// roughly time order with a small reorder depth), and RETAINED entries
+// (pending + a consumed tail behind the oldest pending record) are hard-
+// capped at kMaxTracked. Hitting the cap means the encoder stopped
+// emitting outputs for >= kMaxTracked submissions - Register() then fails
+// and the sessions turn that into the identity fault (hard failure, lease
+// released), never into unbounded memory growth or O(n^2) scans.
 class OutputIdentityTracker {
  public:
+  // Retained-entry cap: far above every legitimate pipeline depth (the
+  // software MFT's ~17-frame lookahead, the 3-slot GPU pool, drain tails)
+  // and small enough to bound memory/work per session.
+  static constexpr size_t kMaxTracked = 512;
+
   // Records `sample_time` -> `rec`. False when the time is not strictly
   // greater than the last registered time (collisions/regressions would
-  // break the 1:1 mapping).
+  // break the 1:1 mapping) OR the retained-entry cap is exhausted (the
+  // encoder owes >= kMaxTracked unconsumed outputs - hard failure).
   bool Register(int64_t sample_time, const OutputIdentityRecord& rec) {
     if (sample_time <= last_time_ && has_any_) return false;
+    if (entries_.size() >= kMaxTracked) return false;
     Entry e{};
     e.time = sample_time;
     e.rec = rec;
@@ -175,6 +192,7 @@ class OutputIdentityTracker {
     entries_[found_live].consumed = true;
     if (out != nullptr) *out = entries_[found_live].rec;
     ++consumed_;
+    PruneConsumedFront();
     return OutputConsume::kOk;
   }
 
@@ -202,6 +220,9 @@ class OutputIdentityTracker {
 
   size_t consumed_count() const { return consumed_; }
   int64_t last_registered_time() const { return last_time_; }
+  // Entries currently retained (pending + consumed tail behind the oldest
+  // pending record); <= kMaxTracked always.
+  size_t retained() const { return entries_.size(); }
 
  private:
   static constexpr size_t kNpos = static_cast<size_t>(-1);
@@ -210,7 +231,13 @@ class OutputIdentityTracker {
     OutputIdentityRecord rec;
     bool consumed = false;
   };
-  std::vector<Entry> entries_;
+  // Deque: O(1) front pops keep the healthy path (register -> consume)
+  // constant-size; a vector's erase(begin) would re-shift per consume.
+  void PruneConsumedFront() {
+    while (!entries_.empty() && entries_.front().consumed)
+      entries_.pop_front();
+  }
+  std::deque<Entry> entries_;
   int64_t last_time_ = 0;
   bool has_any_ = false;
   size_t consumed_ = 0;
@@ -268,6 +295,12 @@ class MfGpuEncoder final : public IEncoderSession {
   EncoderSessionError last_error() const { return last_error_; }
   bool initialized() const { return impl_ != nullptr; }
   const std::string& FriendlyName() const { return friendly_name_; }
+  // The MF_MT_YUV_MATRIX the negotiated input type carries (1 = BT.709,
+  // 2 = BT.601, 0 = not negotiated / not initialized) - the color
+  // agreement surface on the hardware rung (mirrors
+  // MfSoftEncoder::negotiated_input_matrix). Defined in the .cpp (Impl
+  // is pimpl'd).
+  uint32_t negotiated_input_matrix() const;
   // "hardware" after a successful Init, "(none)" before/after failure.
   const char* BackendName() const {
     return impl_ != nullptr ? "hardware" : "(none)";
