@@ -35,6 +35,7 @@
 #include "../common/handshake.h"
 #include "../common/log.h"
 #include "cursor_manager.h"
+#include "gdi_capture.h"  // TryCreateGdiCapture (M2 T5 backend fallback)
 #include "input_manager.h"
 #include "media_pipeline_v2.h"  // M2 Task 4: ServeV2's engine
 
@@ -316,7 +317,7 @@ int RtServer::Serve(ICapture& cap, MfSoftEncoder& enc, const Opts& o) {
 // VideoProcessor and the HOST_HELLO carries the SCALED stream dims (the
 // M0 path's ScaledCapture equivalent lives inside MediaPipelineV2).
 int RtServer::ServeV2(ICapture& cap, ICaptureSurface& surf, const Opts& o,
-                      uint32_t max_width) {
+                      uint32_t max_width, MediaBackend initial_backend) {
   // Stream dims: the VideoProcessor output space (== the encoder, hello,
   // input and cursor spaces when the caller sizes them the same way).
   uint32_t w = cap.Width(), h = cap.Height();
@@ -351,6 +352,14 @@ int RtServer::ServeV2(ICapture& cap, ICaptureSurface& surf, const Opts& o,
   cfg.desktop_name_fn = o.desktop_name_fn;  // DesktopWatch beat (M2-S1 T1)
   cfg.desktop_name_ctx = o.desktop_name_ctx;
   cfg.reset = o.reset;  // unified CaptureReset (M2-S1 T2)
+  // M2 Task 5 (ruling 3): backend fallback through the unified reset -
+  // DXGI failure falls to GDI, a 30 s probe returns once DXGI works.
+  cfg.initial_backend = initial_backend;
+  cfg.make_backend = [](void*, MediaBackend kind, std::string* err) ->
+      std::unique_ptr<ICapture> {
+    return kind == MediaBackend::kGdi ? TryCreateGdiCapture(err)
+                                      : TryCreateDxgiCapture(err);
+  };
   MediaPipelineV2 pipe;
   MediaPipelineV2::Result res;
   if (pipe.Start(cfg)) {

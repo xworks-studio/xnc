@@ -608,6 +608,18 @@ int RunConsoleDiagV2(const xnc::DiagOptions& opt, FILE* out, xnc::ICapture* cap,
   cfg.desktop_name_fn = &DesktopNameThunk;
   cfg.desktop_name_ctx = watch;
   cfg.reset = reset;
+  // M2 Task 5: backend fallback through the unified reset - a DXGI rung
+  // that cannot be rebuilt falls to GDI, and a 30 s DXGI probe returns
+  // once DXGI works again (ruling 3; the direct backend stays the Task 4
+  // DXGI/GDI choice as the initial rung).
+  cfg.initial_backend = opt.backend == xnc::DiagBackend::kGdi
+                            ? xnc::MediaBackend::kGdi
+                            : xnc::MediaBackend::kDxgi;
+  cfg.make_backend = [](void*, xnc::MediaBackend kind, std::string* err) ->
+      std::unique_ptr<xnc::ICapture> {
+    return kind == xnc::MediaBackend::kGdi ? xnc::TryCreateGdiCapture(err)
+                                           : xnc::TryCreateDxgiCapture(err);
+  };
 
   xnc::MediaPipelineV2 pipe;
   xnc::MediaPipelineV2::Result res;
@@ -927,7 +939,11 @@ int RunConsoleRt(const xnc::DiagOptions& opt, bool desktop_pipeline_v2) {
       // Fix round 1 (finding 2): --max-w rides into the pipeline's
       // VideoProcessor; ServeV2 starts the HOST_HELLO at the same scaled
       // dims computed above (input/cursor/bitrate already use them).
-      const int rc = server.ServeV2(*v2_cap, *v2_surf, ro, opt.max_width);
+      // M2 Task 5: the initial rung's kind arms the DXGI<->GDI fallback.
+      const int rc = server.ServeV2(
+          *v2_cap, *v2_surf, ro, opt.max_width,
+          opt.backend == xnc::DiagBackend::kGdi ? xnc::MediaBackend::kGdi
+                                                : xnc::MediaBackend::kDxgi);
       watch.Stop();
       input.StopJanitor();  // ReleaseAll already ran in RtServer::Shutdown
       return rc;

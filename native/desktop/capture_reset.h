@@ -22,6 +22,11 @@
 // lives in pipeline.cpp; this header only owns request merging, debounce,
 // the desktop gate and the counters. Header-only + injectable clock on
 // purpose: desktop_selftest drives the merge table without any Win32.
+//
+// Epoch accounting (M1-deferred item, folded by M2 Task 5): epochs count
+// rebuild EVENTS, not reset sequences; capture_epoch may advance twice
+// across one reset sequence when err_rebuilt also fires (M1 observation);
+// monotonicity is the invariant everything downstream relies on.
 #ifndef XNC_NATIVE_DESKTOP_CAPTURE_RESET_H_
 #define XNC_NATIVE_DESKTOP_CAPTURE_RESET_H_
 
@@ -40,6 +45,14 @@ inline constexpr char kResetReasonChangeBackend[] = "change_backend";
 // M2-Slice3 Task 5: MSG_SWITCH_DISPLAY 0x0128 - the rebuild rebinds the
 // selected output (DxgiSelectDisplay) and DISPLAY_CHANGED carries this reason.
 inline constexpr char kResetReasonSwitch[] = "switch";
+// M2 Task 5 (MediaPipelineV2 vocabulary, additive - the M0 pipeline never
+// produces these): the device-removed reason carries the TOP severity in
+// the V2 reset coalescing order (device-removed > desktop/display change >
+// access-lost > encoder), and "encoder" marks encoder-rung recoveries that
+// ride the same unified reset sequence (hardware contract failures /
+// re-init retries).
+inline constexpr char kResetReasonDeviceRemoved[] = "device_removed";
+inline constexpr char kResetReasonEncoder[] = "encoder";
 
 // Width of the DISPLAY_CHANGED reason field (0x010A [char reason[24]]).
 inline constexpr size_t kResetReasonMax = 24;

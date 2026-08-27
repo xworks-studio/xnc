@@ -103,6 +103,7 @@
 #include "capture.h"       // ICapture
 #include "capture_reset.h"  // kResetReasonMax, CopyReason (0x010A reason field)
 #include "dxgi_capture.h"  // DisplayInfo (HOST_HELLO displays[]; M2-S3 Task 5)
+#include "media_pipeline_v2.h"  // MediaBackend (ServeV2's fallback rung, M2 T5)
 #include "mf_encoder.h"    // MfSoftEncoder
 #include "pipeline.h"      // AuSink, PipelineOpts
 #include "subscribers.h"
@@ -769,8 +770,13 @@ class RtServer : public AuSink {
   // instead) and the HOST_HELLO geometry is the SCALED stream dims
   // (GpuScaledDims of the capture) so the encoder, hello, input and cursor
   // spaces all agree.
+  // M2 Task 5: initial_backend names cap's rung and wires the DXGI<->GDI
+  // backend-fallback factories (a DXGI rung that cannot be rebuilt falls
+  // to GDI through the unified reset; a 30 s probe returns) - the default
+  // keeps the Task 4 single-direct-backend behavior for fakes.
   int ServeV2(ICapture& cap, ICaptureSurface& surf, const Opts& o,
-              uint32_t max_width = 0);
+              uint32_t max_width = 0,
+              MediaBackend initial_backend = MediaBackend::kDxgi);
 
   // Idempotent: stops the accept loop, broadcasts STATE{stream_end} to the
   // attached subscribers, cancels their IO, joins every connection thread.

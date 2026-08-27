@@ -135,6 +135,20 @@ inline bool GateStableFor(uint64_t since_ms, uint64_t now_ms,
          now_ms - since_ms >= min_stable_ms;
 }
 
+// Additive (M2 Task 5): the one-shot DXGI probe outcome rule, shared by
+// the ladder's probe loop below and MediaPipelineV2's GDI->DXGI return
+// probe (ruling 3: probe DXGI every 30 s while on GDI and return through
+// the same reset sequence). A create success plus ONE acquire whose
+// outcome is frame/err_timeout/err_rebuilt proves the duplication is
+// functional - timeout means a healthy static screen. Anything else
+// (access lost, a hard error) fails the probe.
+inline bool DxgiProbeOutcomeHealthy(bool acquire_ok, const char* err) {
+  if (acquire_ok) return true;
+  if (err == nullptr) return false;
+  return std::strcmp(err, "err_timeout") == 0 ||
+         std::strcmp(err, "err_rebuilt") == 0;
+}
+
 // Ladder decision (pure): DXGI downgrades when health < threshold; GDI
 // upgrades only after a successful DXGI probe.
 enum class LadderAction : uint8_t { kStay = 0, kDowngrade, kUpgrade };

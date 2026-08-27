@@ -385,8 +385,12 @@ void LadderCapture::ProbeLoop() {
     if (probe != nullptr) {
       FrameBlob blob;
       std::string aerr;
-      ok = probe->Acquire(blob, &aerr) || aerr == "err_timeout" ||
-           aerr == "err_rebuilt";
+      // M2 Task 5: the outcome rule is the shared DxgiProbeOutcomeHealthy
+      // (backend_ladder.h) - the identical inline expression this loop
+      // always evaluated, now single-sourced with MediaPipelineV2's
+      // GDI->DXGI return probe.
+      ok = DxgiProbeOutcomeHealthy(probe->Acquire(blob, &aerr),
+                                   aerr.c_str());
     }
     if (ok) {
       probe_ok_count_.fetch_add(1, std::memory_order_relaxed);

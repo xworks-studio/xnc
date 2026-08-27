@@ -42,7 +42,8 @@
 #include <wrl/client.h>  // ComPtr (device/context/video views)
 
 #include "../common/log.h"
-#include "dxgi_capture.h"  // GpuScaledDims, NowMonoUs
+#include "backend_ladder.h"  // DxgiProbeOutcomeHealthy (shared probe rule)
+#include "dxgi_capture.h"    // GpuScaledDims, NowMonoUs
 
 #include "media_pipeline_v2.h"
 
@@ -75,13 +76,21 @@ class TimePeriodGuard {
 constexpr DWORD kIdleSleepMs = 15;
 // Warm-up wall bound (spec 7.4; mirrors pipeline.cpp).
 constexpr uint64_t kWarmupWallBoundMs = 2000ull;
-// Reset retry cadence (M2-S1 T2 shape).
+// Reset retry cadence (M2-S1 T2 shape). The soft/hard rebuild backoff is
+// Config::reset_backoff_base_ms / 2x that (500/1000 ms production; M2
+// Task 5 made it injectable for the deterministic scenarios); the 500 here
+// is the fallback when a config passes 0 explicitly.
 constexpr uint32_t kResetPollMs = 100;
 constexpr uint32_t kResetBackoffMs = 500;
-constexpr uint32_t kResetHardBackoffMs = 1000;
 constexpr uint32_t kResetHardFailStreak = 3;
 // Pipeline-initiated IDR throttle (spec 7.5).
 constexpr uint64_t kIdrMinIntervalMs = 500;
+// M2 Task 5: the storm-backoff cap (base is Config::reset_backoff_base_ms,
+// default 500 ms - 0, 500, 1000, 2000, 4000, 4000...), and the
+// dead-end bound: resets that keep "completing" without a single captured
+// frame between them are a rebuild that cannot serve - fatal after
+// kResetHardFailStreak+1 of them (never an infinite loop).
+constexpr uint32_t kResetStormCapMs = 4000;
 // Reorder-before-publish window bounds (fix round 1): the software rung
 // emits AUs reordered relative to submissions, and the v2 wire's delivery
 // contract is strictly increasing encode_seq per epoch pair (the Go
@@ -98,6 +107,17 @@ std::string HrErr(const char* step, HRESULT hr) {
   _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%s: hr=0x%08lX", step,
               static_cast<unsigned long>(hr));
   return std::string(buf);
+}
+
+// Best-effort device-removed detection from the converter's HrErr strings
+// (DXGI_ERROR_DEVICE_REMOVED 0x887A0005 / DEVICE_HUNG 0x887A0001 /
+// DEVICE_RESET 0x887A0007): a dead device routes into the unified reset
+// with the TOP severity reason instead of a fatal - the rebuild recreates
+// the device (or falls to GDI when it cannot).
+bool LooksDeviceRemoved(const std::string& err) {
+  return err.find("hr=0x887A0005") != std::string::npos ||
+         err.find("hr=0x887A0001") != std::string::npos ||
+         err.find("hr=0x887A0007") != std::string::npos;
 }
 
 // ---- BGRA(LatestSurface) -> NV12(pool slot) converter ----
@@ -261,6 +281,13 @@ class Nv12Converter {
 
 }  // namespace
 
+// The process-wide fallback lock (Config::encoder_lock == null path).
+// Function-local static: process lifetime, thread-safe initialization.
+EncoderFallbackLock* ProcessEncoderLock() {
+  static EncoderFallbackLock lock;
+  return &lock;
+}
+
 // ---- MediaPipelineV2 ----
 
 struct MediaPipelineV2::Impl {
@@ -328,6 +355,29 @@ struct MediaPipelineV2::Impl {
   uint32_t stream_w = 0, stream_h = 0;
   uint32_t src_w = 0, src_h = 0;
 
+  // ---- M2 Task 5: unified reset + fallback state (media loop thread) ----
+  EncoderFallbackLock* enc_lock = nullptr;  // resolved at Start
+  bool session_is_hw = false;   // the live session is the hardware rung
+  bool hw_init_failed = false;  // the last CreateSession's hw rung failed
+  // Backend fallback (Config::make_backend): the pipeline-owned swap-in
+  // backend (cfg.cap/cfg.surf point into it after a swap) + which rung is
+  // serving + the DXGI re-probe schedule while on GDI.
+  std::unique_ptr<ICapture> owned_backend;
+  MediaBackend backend = MediaBackend::kDxgi;
+  uint64_t next_dxgi_probe_ms = 0;
+  bool dxgi_probe_ok = false;  // probe blessed DXGI; Rebuild swaps up
+  // Reset-storm accounting: consecutive executed resets carrying the
+  // IDENTICAL reason space out exponentially (ResetStormBackoffMs).
+  char last_exec_reason[32] = {0};
+  uint32_t storm_streak = 0;
+  // Recovery bounds: consecutive stream re-init failures (software/infra
+  // rung; hardware attempts are bounded by the 3-strike lock instead) and
+  // consecutive executed resets with no captured frame in between (a
+  // rebuild that "succeeds" but never yields frames is a dead end - loud
+  // fatal, never an infinite loop).
+  uint32_t reinit_fail_streak = 0;
+  uint32_t no_frame_resets = 0;
+
   Result res;
   std::atomic<bool> running{false};
   std::atomic<bool> stop_now{false};
@@ -373,16 +423,23 @@ class Loop {
       // 1. outputs first (frees slots, publishes AUs).
       CollectOutputs();
       if (!im_.res.ok) break;
-      // 2. external requests into the mailbox.
+      // 2. external requests into the mailbox + the DXGI re-probe while
+      // the fallback configuration serves on GDI (ruling 3).
       PollExternal();
+      MaybeProbeBackend();
       // 3. commands.
       char rr[32];
       if (im_.mbox.TakeReset(rr, sizeof(rr))) {
         if (RunReset(rr)) break;
         continue;
       }
+      // A reconfigure request is consumed only with a LIVE session, so it
+      // SURVIVES a reset and applies to the new session at re-init (the
+      // reset's config phase).
       uint32_t rb = 0, rf = 0;
-      if (im_.mbox.TakeReconfigure(&rb, &rf)) ApplyReconfigure(rb, rf);
+      if (im_.session != nullptr &&
+          im_.mbox.TakeReconfigure(&rb, &rf))
+        ApplyReconfigure(rb, rf);
       PollIdrRequest();
       // 4. capture.
       if (!AcquireOnce()) break;
@@ -407,6 +464,9 @@ class Loop {
     }
     im_.res.rebuilds =
         im_.cfg.cap != nullptr ? im_.cfg.cap->RebuildCount() : 0;
+    im_.res.backend_at_stop = im_.backend;
+    im_.res.encoder_software_locked =
+        im_.enc_lock != nullptr ? im_.enc_lock->SoftwareLocked() : false;
     im_.sink().OnState("stream_end", im_.res.ok);
     const MediaPipelineV2::Result& r = im_.res;
     XNC_LOG_INFO("media_v2_stop elapsed=%llums captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu resets=%u rebuilds=%u w=%u h=%u aus=%llu bytes=%llu reorder_gap_skips=%llu reorder_late_drops=%llu backend=%s ok=%d",
@@ -453,6 +513,19 @@ class Loop {
 
   // Routes one collected output through the reorder window. False = fatal.
   bool AcceptForPublication(EncoderOutput out) {
+    // M2 Task 5: outputs from RETIRED epochs are rejected here (counted,
+    // logged, never fatal): a reset's discontinuity phase retired the
+    // generation this output belonged to - publishing it would put an old
+    // generation on the wire behind the new one's 0x020B (and re-stamp it
+    // with the new generation's stream dims).
+    if (out.id.capture_epoch < im_.capture_epoch) {
+      im_.res.epoch_retired_drops++;
+      XNC_LOG_INFO("media_v2_epoch_retired_drop seq=%llu epoch=%llu cur=%llu",
+                   static_cast<unsigned long long>(out.id.encode_seq),
+                   static_cast<unsigned long long>(out.id.capture_epoch),
+                   static_cast<unsigned long long>(im_.capture_epoch));
+      return true;
+    }
     if (out.id.encode_seq == 0 || out.id.encode_seq > im_.next_encode_seq) {
       im_.Fatal("encoder_identity_mismatch");
       XNC_LOG_ERROR("encoder_identity_mismatch source=publish seq=%llu next=%llu",
@@ -648,11 +721,14 @@ class Loop {
       case CaptureStatus::kFrame: {
         im_.next_content_id = spec.content_id;  // committed
         im_.res.captured++;
+        im_.no_frame_resets = 0;  // a frame flowed: the last reset served
         if (!im_.stream_inited) {
           std::string ierr;
           if (!InitStream(&ierr)) {
-            im_.Fatal("media_v2_stream_init: " + ierr);
-            return false;
+            // M2 Task 5 (ruling 5): a failed re-init goes back through
+            // the reset sequence with backoff (bounded retries, then
+            // fatal) instead of the immediate fatal - and stays loud.
+            return HandleInitFailure(ierr);
           }
         } else {
           // Device/dims drift (backend re-Init'ed the surface on a new
@@ -693,6 +769,19 @@ class Loop {
       }
       case CaptureStatus::kFatal:
       default:
+        // M2 Task 5: with a backend-fallback configuration (ruling 3), a
+        // hard capture error routes into the unified reset under the TOP
+        // severity reason - the rebuild loop falls to GDI when DXGI
+        // cannot be rebuilt. Without fallback factories the Task 4
+        // contract stands: fatal, loud.
+        if (im_.cfg.make_backend != nullptr) {
+          im_.mbox.RequestReset(kResetReasonDeviceRemoved);
+          im_.sink().OnState("capture_failed", true);
+          XNC_LOG_ERROR("capture_fatal_reset err=\"%s\" (backend fallback armed)",
+                        aerr.c_str());
+          Sleep(kIdleSleepMs);  // debounce window (repeated errors merge)
+          return true;
+        }
         im_.Fatal(aerr.empty() ? "acquire failed" : aerr);
         im_.sink().OnState("capture_fatal", false);
         return false;
@@ -833,11 +922,30 @@ class Loop {
     tex->Release();
     if (!conv_ok) {
       lease->Release();
+      if (LooksDeviceRemoved(cerr_)) {
+        // Dead device: the unified reset rebuilds on a fresh device (or
+        // falls to GDI) under the top-severity reason - not a fatal.
+        im_.mbox.RequestReset(kResetReasonDeviceRemoved);
+        XNC_LOG_ERROR("convert_device_removed err=\"%s\" (reset)",
+                      cerr_.c_str());
+        return;
+      }
       im_.Fatal("convert: " + cerr_);
       return;
     }
     const SubmitResult r = im_.session->Submit(id, std::move(*lease), force);
     if (r != SubmitResult::kOk) {
+      // M2 Task 5 (rulings 3+5): a HARDWARE session that breaks its
+      // contract is one strike on the process-lifetime fallback lock, and
+      // the recovery rides the unified reset (bounded: <= 3 hardware
+      // attempts per process, then the software rung serves) - never an
+      // immediate fatal. The software rung breaking the contract is the
+      // M1 fatal guarantee, unchanged.
+      if (im_.session_is_hw) {
+        StrikeHw("submit");
+        im_.mbox.RequestReset(kResetReasonEncoder);
+        return;
+      }
       im_.Fatal("encoder submit rejected (result=" + std::to_string(static_cast<int>(r)) + ")");
       return;
     }
@@ -901,6 +1009,7 @@ class Loop {
     // A NEW session means a NEW SPS/PPS cache.
     im_.sps_pps.clear();
     im_.sps_pps_missing_logged = false;
+    im_.reinit_fail_streak = 0;  // re-init succeeded: the streak clears
     im_.stream_w = ow;
     im_.stream_h = oh;
     im_.res.width = ow;
@@ -917,6 +1026,54 @@ class Loop {
   }
 
   bool CreateSession(uint32_t w, uint32_t h, std::string* err) {
+    im_.session_is_hw = false;
+    im_.hw_init_failed = false;
+    // Hardware rung - skipped entirely once the process-lifetime lock
+    // tripped (three contract failures) or on --encoder software. The
+    // seam semantics: hw_session_factory IS the hardware rung (injected
+    // contract failures); a plain session_factory REPLACES THE WHOLE
+    // LADDER (the Task 4 shape - no hardware attempt, no strikes); with
+    // neither factory the real MfGpuEncoder runs (production).
+    const bool hw_allowed =
+        !im_.cfg.force_software_encoder && im_.enc_lock != nullptr &&
+        !im_.enc_lock->SoftwareLocked();
+    if (!hw_allowed) {
+      if (im_.enc_lock != nullptr && im_.enc_lock->SoftwareLocked())
+        XNC_LOG_INFO("media_v2_gpu_session_skipped (software locked: %u strikes)",
+                     im_.enc_lock->failures());
+    } else if (im_.cfg.hw_session_factory != nullptr) {
+      // The test seam for injected contract failures (ruling 3): a null
+      // return models the hardware encoder failing its Init contract.
+      IEncoderSession* s =
+          im_.cfg.hw_session_factory(im_.cfg.hw_session_ctx, &im_.pool);
+      if (s != nullptr) {
+        im_.session.reset(s);
+        im_.session_is_hw = true;
+        im_.res.encoder_backend = "factory-hw";
+        im_.res.encoder_friendly = "(test hardware session)";
+        return true;
+      }
+      im_.hw_init_failed = true;
+      StrikeHw("init");
+      if (err) *err = "hardware factory returned null";
+    } else if (im_.cfg.session_factory == nullptr) {
+      auto gpu = std::make_unique<MfGpuEncoder>();
+      std::string gerr;
+      if (gpu->Init(im_.dev.Get(), &im_.pool, w, h, im_.cfg.fps,
+                    im_.cfg.bitrate_bps, &gerr)) {
+        im_.res.encoder_backend = gpu->BackendName();
+        im_.res.encoder_friendly = gpu->FriendlyName();
+        im_.session = std::move(gpu);
+        im_.session_is_hw = true;
+        return true;
+      }
+      im_.hw_init_failed = true;
+      StrikeHw("init");
+      XNC_LOG_INFO("media_v2_gpu_session_unavailable err=\"%s\" (software rung)",
+                   gerr.c_str());
+      if (err) *err = gerr;
+    }
+    // Software rung: the test seam, else the internal CPU encoder.
     if (im_.cfg.session_factory != nullptr) {
       IEncoderSession* s =
           im_.cfg.session_factory(im_.cfg.session_ctx, &im_.pool);
@@ -929,19 +1086,6 @@ class Loop {
       im_.res.encoder_friendly = "(test factory session)";
       return true;
     }
-    if (!im_.cfg.force_software_encoder) {
-      auto gpu = std::make_unique<MfGpuEncoder>();
-      std::string gerr;
-      if (gpu->Init(im_.dev.Get(), &im_.pool, w, h, im_.cfg.fps,
-                    im_.cfg.bitrate_bps, &gerr)) {
-        im_.res.encoder_backend = gpu->BackendName();
-        im_.res.encoder_friendly = gpu->FriendlyName();
-        im_.session = std::move(gpu);
-        return true;
-      }
-      XNC_LOG_INFO("media_v2_gpu_session_unavailable err=\"%s\" (software rung)",
-                   gerr.c_str());
-    }
     auto cpu = std::make_unique<MfCpuEncoder>();
     if (!cpu->Init(im_.dev.Get(), &im_.pool, w, h, im_.cfg.fps,
                    im_.cfg.bitrate_bps, err)) {
@@ -953,47 +1097,249 @@ class Loop {
     return true;
   }
 
-  // ---- reset (the M2-S1 T2 sequence on the single loop thread) ----
+  // ---- M2 Task 5 helpers ----
+
+  // One hardware-encoder CONTRACT FAILURE (Init probe or a live session
+  // fault): strike the process-lifetime lock and surface it loudly.
+  void StrikeHw(const char* what) {
+    if (im_.enc_lock == nullptr) return;
+    const bool locked_now = im_.enc_lock->NoteHwFailure();
+    im_.res.hw_contract_failures = im_.enc_lock->failures();
+    XNC_LOG_ERROR("media_v2_hw_contract_failure what=%s strikes=%u%s",
+                  what, im_.res.hw_contract_failures,
+                  locked_now ? " (SOFTWARE LOCKED)" : "");
+    im_.sink().OnState("encoder_hw_strike", true);
+    if (locked_now) im_.sink().OnState("encoder_software_locked", true);
+  }
+
+  // InitStream failed (ruling 5): go back through the reset sequence with
+  // backoff - bounded retries, then fatal; loud throughout. Hardware-rung
+  // failures are bounded by the 3-strike lock instead (after three the
+  // software rung serves). Returns false only when the RUN must end.
+  bool HandleInitFailure(const std::string& err) {
+    const bool hw_rung = im_.hw_init_failed;
+    if (!hw_rung) {
+      ++im_.reinit_fail_streak;
+      if (im_.reinit_fail_streak >= kResetHardFailStreak) {
+        im_.sink().OnState("capture_fatal", false);
+        im_.Fatal("media_v2_stream_init: " + err);
+        return false;
+      }
+    }
+    im_.sink().OnState("capture_failed", true);  // still retrying: loud
+    XNC_LOG_ERROR("media_v2_stream_init_failed hw_rung=%d streak=%u err=\"%s\""
+                  " (reset sequence retries)",
+                  hw_rung ? 1 : 0, im_.reinit_fail_streak, err.c_str());
+    im_.mbox.RequestReset(hw_rung || err.rfind("session: ", 0) == 0
+                              ? kResetReasonEncoder
+                              : kResetReasonDeviceRemoved);
+    return true;
+  }
+
+  // Swaps the desktop backend during a reset (ruling 3). The pipeline
+  // OWNS factory-created backends; the caller-owned initial backend
+  // (cfg.cap at Start) is never freed here. False = the factory could not
+  // produce a usable rung (keep serving on the current one).
+  bool SwapBackend(MediaBackend kind, const char* reason) {
+    if (im_.cfg.make_backend == nullptr) return false;
+    std::string berr;
+    std::unique_ptr<ICapture> made =
+        im_.cfg.make_backend(im_.cfg.backend_ctx, kind, &berr);
+    if (made == nullptr) {
+      XNC_LOG_ERROR("backend_swap %s create failed err=\"%s\"",
+                    MediaBackendName(kind), berr.c_str());
+      return false;
+    }
+    ICaptureSurface* s = dynamic_cast<ICaptureSurface*>(made.get());
+    if (s == nullptr) {
+      XNC_LOG_ERROR("backend_swap %s not an ICaptureSurface",
+                    MediaBackendName(kind));
+      return false;
+    }
+    im_.owned_backend = std::move(made);  // frees the previous swap-in
+    im_.cfg.cap = im_.owned_backend.get();
+    im_.cfg.surf = s;
+    im_.backend = kind;
+    im_.res.backend_swaps++;
+    XNC_LOG_INFO("media_v2_backend_swap backend=%s reason=%s swaps=%u",
+                 MediaBackendName(kind), reason, im_.res.backend_swaps);
+    im_.sink().OnState("backend_changed", true);
+    return true;
+  }
+
+  // The DXGI re-probe while serving on GDI (ruling 3: every
+  // dxgi_reprobe_ms - 30 s in production). Runs on the media loop thread
+  // between iterations; a healthy probe arms the upgrade and requests a
+  // change_backend reset, so the RETURN rides the same reset sequence as
+  // every other rebuild. Throwaway probe: the probe capture is released
+  // and the swap creates a fresh backend (the ladder's pattern).
+  void MaybeProbeBackend() {
+    if (im_.cfg.make_backend == nullptr ||
+        im_.cfg.dxgi_reprobe_ms == 0 ||
+        im_.backend != MediaBackend::kGdi || !im_.stream_inited ||
+        im_.mbox.reset_pending())
+      return;
+    const uint64_t now = NowMs();
+    if (im_.next_dxgi_probe_ms == 0)
+      im_.next_dxgi_probe_ms = now + im_.cfg.dxgi_reprobe_ms;
+    if (now < im_.next_dxgi_probe_ms) return;
+    im_.next_dxgi_probe_ms = now + im_.cfg.dxgi_reprobe_ms;
+    std::string perr;
+    std::unique_ptr<ICapture> probe = im_.cfg.make_backend(
+        im_.cfg.backend_ctx, MediaBackend::kDxgi, &perr);
+    bool healthy = false;
+    if (probe != nullptr) {
+      FrameBlob blob;
+      std::string aerr;
+      healthy = DxgiProbeOutcomeHealthy(probe->Acquire(blob, &aerr),
+                                        aerr.c_str());
+    }
+    if (healthy) {
+      im_.res.dxgi_probes_ok++;
+      im_.dxgi_probe_ok = true;
+      XNC_LOG_INFO("media_v2_dxgi_probe ok=1 (change_backend reset)");
+      im_.mbox.RequestReset(kResetReasonChangeBackend);
+    } else {
+      im_.res.dxgi_probes_failed++;
+      XNC_LOG_INFO("media_v2_dxgi_probe ok=0 err=\"%s\"", perr.c_str());
+    }
+  }
+
+  // Records one reset phase (Result::reset_phases) + the compact log the
+  // field diagnosis reads. The phases of one executed reset are the spec
+  // sequence, in order.
+  void Phase(ResetPhase p) {
+    im_.res.reset_phases.push_back(p);
+    XNC_LOG_INFO("capture_reset_phase %s", ResetPhaseName(p));
+  }
+
+  // ---- reset (M2 Task 5: the unified, phased reset sequence on the
+  // single loop thread) ----
+  //
+  // discontinuity (0x020B - the retired generation's pending outputs are
+  // rejected from here; subscribers see the discontinuity with the new
+  // epoch's first AU) -> stop submissions -> retire leases -> rebuild
+  // (+ backend fallback swaps, ruling 3) -> base -> config -> IDR ->
+  // running. ONE epoch increment per executed reset; repeated identical
+  // reasons back off exponentially (ResetStormBackoffMs); every phase is
+  // recorded (Result::reset_phases) so the order is assertable.
   // Returns true when the RUN must end.
   bool RunReset(const char* reason) {
     const uint64_t ts = NowMs();
-    XNC_LOG_INFO("capture_reset_start reason=%s", reason);
+    // Storm backoff: repeated identical reasons space out exponentially
+    // (abortable, sliced - never an unbounded wait).
+    const bool same = std::strcmp(reason, im_.last_exec_reason) == 0;
+    im_.storm_streak = same ? im_.storm_streak + 1 : 1;
+    CopyReason(im_.last_exec_reason, sizeof(im_.last_exec_reason), reason);
+    const uint32_t storm_ms =
+        ResetStormBackoffMs(im_.cfg.reset_backoff_base_ms, kResetStormCapMs,
+                            im_.storm_streak);
+    im_.res.reset_storm_ms.push_back(storm_ms);
+    for (uint32_t slept = 0; slept < storm_ms; slept += kResetPollMs) {
+      if (im_.Abort()) return true;
+      Sleep(kResetPollMs);
+    }
+    // Dead-end bound: executed resets that never see a frame between them
+    // are a rebuild that cannot serve - loud fatal, never an infinite
+    // loop (kFrame clears the counter).
+    if (++im_.no_frame_resets > kResetHardFailStreak) {
+      im_.sink().OnState("capture_fatal", false);
+      im_.Fatal("capture_reset_no_recovery: rebuilds complete but no frame");
+      return true;
+    }
+    XNC_LOG_INFO("capture_reset_start reason=%s storm_streak=%u storm_ms=%u",
+                 reason, im_.storm_streak, storm_ms);
     im_.sink().OnState("recovering", true);
-    // Drop pending pre-reset content; tear the session (completes every
-    // outstanding lease); the surface content dies with the rebuild.
+
+    // Phase 1 - discontinuity: retire the current generation. Parked
+    // reorder-window outputs of the retiring epoch are dropped now
+    // (counted); AcceptForPublication additionally rejects any straggler
+    // from an earlier epoch, so no retired-generation AU can follow its
+    // successor on the wire.
+    Phase(ResetPhase::kDiscontinuity);
+    if (!im_.reorder_window_.empty()) {
+      size_t retired = 0;
+      for (auto it = im_.reorder_window_.begin();
+           it != im_.reorder_window_.end();) {
+        if (it->id.capture_epoch <= im_.capture_epoch) {
+          ++retired;
+          it = im_.reorder_window_.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      if (retired != 0) {
+        im_.res.epoch_retired_drops += retired;
+        if (im_.reorder_window_.empty()) im_.window_park_ms = 0;
+        XNC_LOG_INFO("capture_reset_retired_outputs dropped=%zu", retired);
+      }
+    }
+
+    // Phase 2 - stop submissions: drop pending pre-reset content and
+    // close the submission gate (stream_inited=false stops TrySubmit; it
+    // re-opens at the new base frame's InitStream).
+    Phase(ResetPhase::kStopSubmissions);
     FrameIdentity drop;
     while (im_.mbox.TakeContent(&drop)) {
     }
+    im_.stream_inited = false;
+
+    // Phase 3 - retire leases: tear the session (its Shutdown completes
+    // every outstanding lease), sweep the pool, invalidate the surface
+    // (its content dies with the rebuild).
+    Phase(ResetPhase::kRetireLeases);
     if (im_.session) {
       im_.session->Shutdown(ShutdownMode::kImmediate);
       im_.session.reset();
     }
+    im_.pool.RetireAll();
     im_.pool.FreeRetired();
     im_.latest.Invalidate();
-    // Wait out a secure desktop (immediate rebuilds are futile there).
+
+    // Phase 4 - rebuild. Wait out a secure desktop first (immediate
+    // rebuilds are futile there), then rebuild with retry/backoff; a DXGI
+    // rung that cannot be rebuilt falls to GDI THROUGH THIS RESET, and a
+    // probe-blessed DXGI returns from GDI here (ruling 3).
+    Phase(ResetPhase::kRebuild);
     while (im_.cfg.reset != nullptr &&
            im_.cfg.reset->Desktop() == ResetDesktop::kNonDefault) {
       if (im_.Abort()) return true;
       Sleep(kResetPollMs);
     }
-    // Rebuild with retry/backoff.
     uint32_t streak = 0;
     bool failed_state = false;
     uint32_t old_w = im_.cfg.cap != nullptr ? im_.cfg.cap->Width() : 0;
     uint32_t old_h = im_.cfg.cap != nullptr ? im_.cfg.cap->Height() : 0;
+    const uint32_t backoff_base = im_.cfg.reset_backoff_base_ms != 0
+                                       ? im_.cfg.reset_backoff_base_ms
+                                       : kResetBackoffMs;
+    const uint32_t backoff_hard = backoff_base * 2;
     for (;;) {
       if (im_.Abort()) return true;
+      // Upgrade first: GDI serving + a probe-blessed DXGI -> swap up. A
+      // fresh DXGI that breaks between probe and swap keeps GDI alive
+      // (never strand the reset loop; the next probe re-arms).
+      if (im_.backend == MediaBackend::kGdi && im_.dxgi_probe_ok) {
+        im_.dxgi_probe_ok = false;
+        if (SwapBackend(MediaBackend::kDxgi, "probe")) break;
+      }
       std::string rerr;
       if (im_.cfg.cap == nullptr || im_.cfg.cap->Rebuild(&rerr)) break;
       ++streak;
       XNC_LOG_ERROR("capture_reset_rebuild_failed streak=%u err=\"%s\"", streak,
                     rerr.c_str());
+      // DXGI failure falls to GDI through the same reset sequence (the
+      // swap IS the rebuild's success; the reset completes on GDI).
+      if (streak >= kResetHardFailStreak &&
+          im_.backend == MediaBackend::kDxgi &&
+          SwapBackend(MediaBackend::kGdi, "dxgi_rebuild_failed")) {
+        break;
+      }
       if (streak >= kResetHardFailStreak && !failed_state) {
         failed_state = true;
         im_.sink().OnState("capture_failed", true);  // still retrying
       }
-      const uint32_t backoff =
-          failed_state ? kResetHardBackoffMs : kResetBackoffMs;
+      const uint32_t backoff = failed_state ? backoff_hard : backoff_base;
       for (uint32_t slept = 0; slept < backoff; slept += kResetPollMs) {
         if (im_.Abort()) return true;
         Sleep(kResetPollMs);
@@ -1004,16 +1350,30 @@ class Loop {
         }
       }
     }
-    // New generation: epochs advance, the next kFrame re-inits the stream
-    // (new device/dims unknown until then) and the sticky rebuild IDR
-    // rides its first submission.
+
+    // Phase 5 - base: ONE epoch increment per executed reset (the rebuild
+    // EVENT); the next kFrame re-inits the stream (new device/dims are
+    // unknown until then) and becomes the new base frame (WAIT_BASE).
+    Phase(ResetPhase::kBase);
     im_.capture_epoch++;
     im_.codec_epoch++;
-    im_.stream_inited = false;
     im_.warmup_started_ms = 0;
     im_.warmup_gen_feeds = 0;
     im_.warmup_phase_logged = false;
+
+    // Phase 6 - config: a pending reconfigure request SURVIVES the reset
+    // (the loop consumes it only with a live session) and applies to the
+    // new session at re-init.
+    Phase(ResetPhase::kConfig);
+
+    // Phase 7 - IDR: the sticky rebuild IDR rides the new generation's
+    // first submission.
+    Phase(ResetPhase::kIdr);
     im_.mbox.ArmIdr("rebuild");
+
+    // Phase 8 - running: the reset is accounted, subscribers hear it, and
+    // a geometry change surfaces as DISPLAY_CHANGED.
+    Phase(ResetPhase::kRunning);
     im_.res.resets++;
     CopyReason(im_.res.last_reset_reason, sizeof(im_.res.last_reset_reason),
                reason);
@@ -1086,6 +1446,18 @@ bool MediaPipelineV2::Start(const Config& cfg) {
   }
   impl_->cfg = cfg;
   impl_->res = Result{};
+  impl_->enc_lock = cfg.encoder_lock != nullptr ? cfg.encoder_lock
+                                                : ProcessEncoderLock();
+  impl_->backend = cfg.initial_backend;
+  impl_->owned_backend.reset();
+  impl_->next_dxgi_probe_ms = 0;
+  impl_->dxgi_probe_ok = false;
+  impl_->last_exec_reason[0] = '\0';
+  impl_->storm_streak = 0;
+  impl_->reinit_fail_streak = 0;
+  impl_->no_frame_resets = 0;
+  impl_->session_is_hw = false;
+  impl_->hw_init_failed = false;
   impl_->stop_now.store(false);
   impl_->running.store(true);
   auto* im = impl_;

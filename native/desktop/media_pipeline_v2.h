@@ -69,7 +69,112 @@
 #include "mf_gpu_encoder.h"  // IEncoderSession (+ both rungs, in the .cpp)
 #include "pipeline.h"       // AuSink (publication seam, same as M0)
 
+#include <memory>
+
 namespace xnc {
+
+// ---- M2 Task 5: unified reset + backend fallback vocabulary (pure) ----
+//
+// The reset sequence every executed reset runs, in spec order. The phases
+// are recorded per executed reset (Result::reset_phases) so the wire
+// contract is assertable end to end:
+//   discontinuity (0x020B reaches subscribers with the new epoch's first
+//     AU; the old generation's pending outputs are REJECTED from here)
+//   -> stop submissions -> retire leases -> rebuild -> base -> config
+//   -> IDR -> running.
+enum class ResetPhase : uint8_t {
+  kDiscontinuity = 1,
+  kStopSubmissions,
+  kRetireLeases,
+  kRebuild,
+  kBase,
+  kConfig,
+  kIdr,
+  kRunning,
+};
+inline const char* ResetPhaseName(ResetPhase p) {
+  switch (p) {
+    case ResetPhase::kDiscontinuity: return "discontinuity";
+    case ResetPhase::kStopSubmissions: return "stop_submissions";
+    case ResetPhase::kRetireLeases: return "retire_leases";
+    case ResetPhase::kRebuild: return "rebuild";
+    case ResetPhase::kBase: return "base";
+    case ResetPhase::kConfig: return "config";
+    case ResetPhase::kIdr: return "idr";
+    case ResetPhase::kRunning: return "running";
+  }
+  return "?";
+}
+
+// Severity order for reason coalescing (ruling 2):
+//   device-removed > desktop/display change > access-lost > encoder
+// > unknown ("manual" etc.). A pending reset reason is superseded only by
+// a strictly higher severity (MediaMailbox::RequestReset).
+inline int ResetSeverity(const char* reason) {
+  if (reason == nullptr) return 0;
+  if (std::strcmp(reason, kResetReasonDeviceRemoved) == 0) return 5;
+  if (std::strcmp(reason, kResetReasonDesktopSwitch) == 0) return 4;
+  if (std::strcmp(reason, kResetReasonResolution) == 0) return 3;
+  if (std::strcmp(reason, kResetReasonSwitch) == 0) return 3;
+  if (std::strcmp(reason, kResetReasonAccessLost) == 0) return 2;
+  if (std::strcmp(reason, kResetReasonChangeBackend) == 0) return 2;
+  if (std::strcmp(reason, kResetReasonEncoder) == 0) return 1;
+  return 0;
+}
+
+// Exponential backoff for repeated IDENTICAL reset reasons (ruling 2):
+// `streak` is the consecutive-execution count of the same reason (1 = the
+// first). The first repeat is free, then base doubles per repeat, capped.
+// base=500/cap=4000 (production): 0, 0, 500, 1000, 2000, 4000, 4000...
+inline uint32_t ResetStormBackoffMs(uint32_t base_ms, uint32_t cap_ms,
+                                    uint32_t streak) {
+  if (streak <= 1 || base_ms == 0) return 0;
+  uint64_t v = base_ms;
+  for (uint32_t i = 2; i < streak; ++i) {
+    v <<= 1;
+    if (v >= cap_ms) return cap_ms;
+  }
+  return static_cast<uint32_t>(v < cap_ms ? v : cap_ms);
+}
+
+// The two desktop backends MediaPipelineV2 can fall between (ruling 3;
+// BackendKind in backend_ladder.h is the M0 ladder's own - this one keeps
+// the V2 path decoupled from the ladder).
+enum class MediaBackend : uint8_t { kDxgi = 0, kGdi = 1 };
+inline const char* MediaBackendName(MediaBackend b) {
+  return b == MediaBackend::kDxgi ? "dxgi" : "gdi";
+}
+
+// Process-lifetime hardware-encoder fallback lock (ruling 3): after
+// kMaxFailures hardware-encoder CONTRACT failures (the rung's Init probe
+// fails, or a live hardware session breaks the session contract - submit
+// rejected / 1:1 output mapping lost) the pipeline locks to the software
+// rung until process restart. Injectable so the selftest isolates
+// scenarios deterministically; production shares ONE instance per process
+// (ProcessEncoderLock, defined in media_pipeline_v2.cpp).
+struct EncoderFallbackLock {
+  static constexpr uint32_t kMaxFailures = 3;
+  std::atomic<uint32_t> hw_failures{0};
+  std::atomic<bool> software_locked{false};
+  // Records one contract failure. True when THIS failure tripped the lock.
+  bool NoteHwFailure() {
+    const uint32_t n = hw_failures.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n >= kMaxFailures) {
+      software_locked.store(true, std::memory_order_relaxed);
+      return true;
+    }
+    return false;
+  }
+  bool SoftwareLocked() const {
+    return software_locked.load(std::memory_order_relaxed);
+  }
+  uint32_t failures() const { return hw_failures.load(std::memory_order_relaxed); }
+};
+
+// The process-wide lock instance (function-local static: process lifetime,
+// thread-safe initialization). MediaPipelineV2 uses it when Config::
+// encoder_lock is null.
+EncoderFallbackLock* ProcessEncoderLock();
 
 // ---- the depth-one command mailbox (plan ruling 2) ----
 //
@@ -149,10 +254,17 @@ class MediaMailbox {
     return true;
   }
 
-  // ---- reset request (depth one, latest reason wins) ----
+  // ---- reset request (depth one; reasons COALESCE by severity, M2
+  // Task 5): a pending reason is superseded only by a strictly higher
+  // ResetSeverity (ties: the latest wins), so same-cycle reasons merge
+  // into ONE reset carrying the most severe cause. ----
   void RequestReset(const char* reason) {
     std::lock_guard<std::mutex> lk(mu_);
-    CopyPad(reset_reason_, reason);
+    char next[32];
+    CopyPad(next, reason);
+    if (reset_pending_ && ResetSeverity(next) < ResetSeverity(reset_reason_))
+      return;  // a lower-severity cause never displaces the pending one
+    CopyPad(reset_reason_, next);
     reset_pending_ = true;
   }
   bool TakeReset(char* out, size_t cap) {
@@ -233,6 +345,41 @@ class MediaPipelineV2 {
     // production ladder (MfGpuEncoder, MfCpuEncoder fallback).
     IEncoderSession* (*session_factory)(void* ctx, Nv12SurfacePool* pool) = nullptr;
     void* session_ctx = nullptr;
+    // M2 Task 5: the HARDWARE rung seam (injected contract failures - the
+    // lock is testable via fakes, never by waiting on real hardware).
+    // When non-null, CreateSession tries this FIRST and treats its session
+    // as the hardware rung: a null return = hardware Init failure (one
+    // strike on the process-lifetime fallback lock), and a live session's
+    // submit/contract fault routes through the unified reset (also a
+    // strike) instead of a fatal. Falls through to session_factory / the
+    // internal CPU rung exactly like a failing MfGpuEncoder would. With
+    // only session_factory set, behavior is exactly Task 4's (no lock
+    // interplay).
+    IEncoderSession* (*hw_session_factory)(void* ctx, Nv12SurfacePool* pool) = nullptr;
+    void* hw_session_ctx = nullptr;
+    // M2 Task 5 process-lifetime fallback lock. Null = the process-wide
+    // instance (ProcessEncoderLock). Tests inject a fresh one per
+    // scenario.
+    EncoderFallbackLock* encoder_lock = nullptr;
+    // M2 Task 5 backend fallback (ruling 3): when non-null, the pipeline
+    // may swap the desktop backend DURING a reset - a DXGI rung whose
+    // rebuild keeps failing falls to GDI, and a healthy DXGI probe (every
+    // dxgi_reprobe_ms while serving on GDI) returns through the same reset
+    // sequence. The factory returns an object implementing BOTH ICapture
+    // and ICaptureSurface; the pipeline OWNS factory-created backends.
+    // cfg.cap/cfg.surf remain the INITIAL backend (caller-owned, never
+    // freed by the pipeline). Null = the Task 4 single-backend shape.
+    std::unique_ptr<ICapture> (*make_backend)(void* ctx, MediaBackend kind,
+                                              std::string* err) = nullptr;
+    void* backend_ctx = nullptr;
+    MediaBackend initial_backend = MediaBackend::kDxgi;  // cfg.cap's kind
+    // DXGI re-probe cadence while on GDI (spec: 30 s; 0 = never return).
+    uint32_t dxgi_reprobe_ms = 30000;
+    // Exponential backoff base for repeated identical reset reasons AND
+    // the rebuild-failure retry cadence (500 ms production; small values
+    // keep the deterministic selftest scenarios fast). Hard backoff is
+    // 2x this. 0 = no backoff.
+    uint32_t reset_backoff_base_ms = 500;
   };
 
   struct Result {
@@ -253,6 +400,26 @@ class MediaPipelineV2 {
     // and outputs dropped for arriving below the already-published seq.
     uint64_t reorder_gap_skips = 0;
     uint64_t reorder_late_drops = 0;
+    // M2 Task 5 unified-reset accounting: the ordered phases of EVERY
+    // executed reset (8 per reset, ResetPhase order - assertable against
+    // the spec sequence), the storm backoff applied per executed reset
+    // (identical consecutive reasons), and the retired-generation outputs
+    // dropped so no AU of a retired epoch can follow its successor on the
+    // wire.
+    std::vector<ResetPhase> reset_phases;
+    std::vector<uint32_t> reset_storm_ms;
+    uint64_t epoch_retired_drops = 0;
+    // Hardware-encoder fallback lock state observed by this run (strikes
+    // noted + whether the process lock was tripped at stop).
+    uint32_t hw_contract_failures = 0;
+    bool encoder_software_locked = false;
+    // Backend fallback (Config::make_backend): swaps executed and the
+    // rung serving at stop, plus the DXGI re-probe accounting while on
+    // GDI (ruling 3).
+    uint32_t backend_swaps = 0;
+    uint32_t dxgi_probes_ok = 0;
+    uint32_t dxgi_probes_failed = 0;
+    MediaBackend backend_at_stop = MediaBackend::kDxgi;
     char last_reset_reason[kResetReasonMax] = {0};
     const char* encoder_backend = "(none)";  // which rung ran
     std::string encoder_friendly;

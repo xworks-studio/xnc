@@ -8018,13 +8018,20 @@ int SelftestMain(bool desktop_pipeline_v2) {
       bool Acquire(xnc::FrameBlob&, std::string* err = nullptr,
                    uint32_t = 0) override {
         if (err) *err = "err_timeout";  // CPU path unused under MediaPipelineV2
-        return false;
+        return false;  // (probe semantics: err_timeout = duplication healthy)
       }
       uint32_t Width() const override { return w_; }
       uint32_t Height() const override { return h_; }
       uint32_t RebuildCount() const override { return rebuilds_; }
-      bool Rebuild(std::string*) override {
+      bool Rebuild(std::string* err) override {
         ++rebuilds_;
+        // Task 5: the first rebuild_fail_first calls fail (a dead DXGI
+        // rung for the GDI-fallback scenarios); 0 = always succeed (the
+        // Task 4 default).
+        if (rebuild_fail_first != 0 && rebuilds_ <= rebuild_fail_first) {
+          if (err) *err = "err_rebuild_failed (scripted)";
+          return false;
+        }
         return true;
       }
 
@@ -8072,6 +8079,8 @@ int SelftestMain(bool desktop_pipeline_v2) {
 
       size_t frames() const { return frames_.load(); }
       uint32_t rebuilds() const { return rebuilds_; }
+      // Task 5 backend-fallback knob (see Rebuild).
+      uint32_t rebuild_fail_first = 0;
 
      private:
       ID3D11Device* dev_;
@@ -8116,6 +8125,7 @@ int SelftestMain(bool desktop_pipeline_v2) {
       uint32_t delay = 0;                 // v2g: emit after N more submits
       bool swap_pairs = false;            // v2g: emit pairs [k+1, k]
       uint64_t swallow_seq = 0;           // v2g: never emit this seq
+      std::atomic<size_t> hw_faults{0};   // v2m: HwFaultSession contract breaks
     };
     class LogSession final : public xnc::IEncoderSession {
      public:
@@ -8223,6 +8233,79 @@ int SelftestMain(bool desktop_pipeline_v2) {
       }
       SessionLog* log_;
       xnc::Nv12SurfacePool* pool_;
+    };
+
+    // Task 5 (v2m): the HARDWARE-rung fake for the injected-contract-
+    // failure tests. Honors the session contract for ok_submits
+    // submissions, then breaks it (kIdentityFault, lease released) - the
+    // shape of a hardware encoder MFT that stops pairing outputs 1:1. The
+    // pipeline must treat that as a hardware CONTRACT FAILURE: strike the
+    // process-lifetime fallback lock and route the recovery through the
+    // unified reset - never an immediate fatal.
+    class HwFaultSession final : public xnc::IEncoderSession {
+     public:
+      HwFaultSession(SessionLog* log, xnc::Nv12SurfacePool* pool,
+                     size_t ok_submits)
+          : log_(log), pool_(pool), ok_submits_(ok_submits) {}
+      xnc::SubmitResult Submit(const xnc::FrameIdentity& id,
+                               xnc::SurfaceLease&& lease,
+                               bool force_idr) override {
+        if (subs_ >= ok_submits_) {
+          lease.Release();
+          log_->hw_faults.fetch_add(1);
+          return xnc::SubmitResult::kIdentityFault;
+        }
+        ++subs_;
+        if (!lease.Submit(id.encode_seq)) {
+          lease.Release();
+          return xnc::SubmitResult::kRejected;
+        }
+        SessionLog::Rec r;
+        r.id = id;
+        r.force = force_idr;
+        bool fresh = false;
+        {
+          std::lock_guard<std::mutex> lk(log_->mu);
+          log_->subs.push_back(r);
+          ++log_->submits;
+          if (id.encode_seq != log_->swallow_seq) {
+            log_->ready.push_back(r);
+            fresh = true;
+          }
+        }
+        if (fresh) Complete(id.encode_seq);
+        return xnc::SubmitResult::kOk;
+      }
+      bool TakeOutput(xnc::EncoderOutput* out, uint32_t) override {
+        if (out == nullptr) return false;
+        SessionLog::Rec r;
+        {
+          std::lock_guard<std::mutex> lk(log_->mu);
+          if (log_->ready.empty()) return false;
+          r = log_->ready.front();
+          log_->ready.pop_front();
+          ++log_->outputs;
+        }
+        out->id = r.id;
+        out->submit_id = r.id.encode_seq;
+        out->key = true;
+        out->au = {0, 0, 0, 1, 0x65};
+        return true;
+      }
+      bool Reconfigure(uint32_t, uint32_t) override { return true; }
+      void Shutdown(xnc::ShutdownMode) override {}
+
+     private:
+      void Complete(uint64_t sid) {
+        if (pool_->Complete(sid)) {
+          std::lock_guard<std::mutex> lk(log_->mu);
+          ++log_->completes;
+        }
+      }
+      SessionLog* log_;
+      xnc::Nv12SurfacePool* pool_;
+      size_t ok_submits_;
+      size_t subs_ = 0;
     };
 
     // Recording AuSink: immutable AUs + state codes + display changes.
@@ -8840,6 +8923,636 @@ int SelftestMain(bool desktop_pipeline_v2) {
                     (unsigned long long)a.frames_,
                     (unsigned long long)a.v2_frames_,
                     (unsigned long long)a.keys_, rc);
+      }
+
+      // ---- (I) M2 Task 5 pure decision logic (device-free): the severity
+      // order, the mailbox's severity coalescing, the storm-backoff curve,
+      // the 3-strike hardware lock, the reset-phase vocabulary and the DXGI
+      // probe rule shared with the ladder. ----
+      {
+        // Ruling 2 severity: device-removed > desktop/display change >
+        // access-lost > encoder (unknown lowest).
+        CHECK("v2i-severity-order",
+              xnc::ResetSeverity(xnc::kResetReasonDeviceRemoved) >
+                  xnc::ResetSeverity(xnc::kResetReasonDesktopSwitch) &&
+              xnc::ResetSeverity(xnc::kResetReasonDesktopSwitch) >
+                  xnc::ResetSeverity(xnc::kResetReasonResolution) &&
+              xnc::ResetSeverity(xnc::kResetReasonSwitch) ==
+                  xnc::ResetSeverity(xnc::kResetReasonResolution) &&
+              xnc::ResetSeverity(xnc::kResetReasonResolution) >
+                  xnc::ResetSeverity(xnc::kResetReasonAccessLost) &&
+              xnc::ResetSeverity(xnc::kResetReasonAccessLost) >
+                  xnc::ResetSeverity(xnc::kResetReasonEncoder) &&
+              xnc::ResetSeverity("manual") == 0 &&
+              xnc::ResetSeverity(nullptr) == 0);
+        // Mailbox coalescing: a pending reason is superseded only by a
+        // HIGHER severity (ties: latest wins) - same-cycle reasons merge
+        // into ONE reset carrying the winner.
+        xnc::MediaMailbox mb;
+        char rr[32] = {0};
+        mb.RequestReset(xnc::kResetReasonAccessLost);
+        mb.RequestReset(xnc::kResetReasonEncoder);  // lower: displaced? no
+        CHECK("v2i-mailbox-keep-higher",
+              mb.TakeReset(rr, sizeof(rr)) &&
+                  std::strcmp(rr, xnc::kResetReasonAccessLost) == 0);
+        mb.RequestReset(xnc::kResetReasonAccessLost);
+        mb.RequestReset(xnc::kResetReasonDesktopSwitch);  // higher: wins
+        CHECK("v2i-mailbox-raise",
+              mb.TakeReset(rr, sizeof(rr)) &&
+                  std::strcmp(rr, xnc::kResetReasonDesktopSwitch) == 0);
+        mb.RequestReset(xnc::kResetReasonResolution);
+        mb.RequestReset(xnc::kResetReasonDeviceRemoved);  // top severity
+        mb.RequestReset(xnc::kResetReasonDesktopSwitch);  // lower: ignored
+        CHECK("v2i-mailbox-top",
+              mb.TakeReset(rr, sizeof(rr)) &&
+                  std::strcmp(rr, xnc::kResetReasonDeviceRemoved) == 0);
+        CHECK("v2i-mailbox-drained", !mb.TakeReset(rr, sizeof(rr)));
+        // Storm backoff (ruling 2): first reset for a reason is free,
+        // repeats space out base doubling, capped.
+        CHECK("v2i-storm-backoff",
+              xnc::ResetStormBackoffMs(500, 4000, 0) == 0 &&
+              xnc::ResetStormBackoffMs(500, 4000, 1) == 0 &&
+              xnc::ResetStormBackoffMs(500, 4000, 2) == 500 &&
+              xnc::ResetStormBackoffMs(500, 4000, 3) == 1000 &&
+              xnc::ResetStormBackoffMs(500, 4000, 4) == 2000 &&
+              xnc::ResetStormBackoffMs(500, 4000, 5) == 4000 &&
+              xnc::ResetStormBackoffMs(500, 4000, 9) == 4000);
+        // The 3-strike hardware lock (ruling 3): injectable, trips at
+        // three contract failures, stays tripped (process lifetime).
+        xnc::EncoderFallbackLock lock;
+        CHECK("v2i-lock-open", !lock.SoftwareLocked());
+        CHECK("v2i-lock-two-strikes",
+              !lock.NoteHwFailure() && !lock.NoteHwFailure() &&
+                  !lock.SoftwareLocked() && lock.failures() == 2);
+        CHECK("v2i-lock-trips-on-third",
+              lock.NoteHwFailure() && lock.SoftwareLocked());
+        CHECK("v2i-lock-stays",
+              lock.NoteHwFailure() && lock.SoftwareLocked());
+        // The reset-phase vocabulary: the spec's exact sequence order.
+        CHECK("v2i-phase-order",
+            xnc::ResetPhase::kDiscontinuity < xnc::ResetPhase::kStopSubmissions &&
+            xnc::ResetPhase::kStopSubmissions < xnc::ResetPhase::kRetireLeases &&
+            xnc::ResetPhase::kRetireLeases < xnc::ResetPhase::kRebuild &&
+            xnc::ResetPhase::kRebuild < xnc::ResetPhase::kBase &&
+            xnc::ResetPhase::kBase < xnc::ResetPhase::kConfig &&
+            xnc::ResetPhase::kConfig < xnc::ResetPhase::kIdr &&
+            xnc::ResetPhase::kIdr < xnc::ResetPhase::kRunning);
+        // The DXGI probe rule (backend_ladder.h, shared with the ladder's
+        // own probe loop): frame/timeout/rebuilt all prove the duplication
+        // is functional; anything else fails the probe.
+        CHECK("v2i-probe-rule",
+              xnc::DxgiProbeOutcomeHealthy(true, "") &&
+              xnc::DxgiProbeOutcomeHealthy(false, "err_timeout") &&
+              xnc::DxgiProbeOutcomeHealthy(false, "err_rebuilt") &&
+              !xnc::DxgiProbeOutcomeHealthy(false, "err_access_lost") &&
+              !xnc::DxgiProbeOutcomeHealthy(false, nullptr));
+      }
+
+      // ---- (J) the unified reset sequence at the real loop (ruling 2):
+      // phases in spec order discontinuity -> stop submissions -> retire
+      // leases -> rebuild -> base -> config -> IDR -> running, ONE epoch
+      // increment per executed reset. ----
+      {
+        const uint32_t w = 320, h = 240;
+        std::vector<ScriptedDeviceCapture::Step> script;
+        for (int i = 0; i < 8; ++i)
+          script.push_back(ScriptedDeviceCapture::Step::kFrame);
+        script.push_back(ScriptedDeviceCapture::Step::kAccessLost);
+        for (int i = 0; i < 8; ++i)
+          script.push_back(ScriptedDeviceCapture::Step::kFrame);
+        ScriptedDeviceCapture cap(v2_dev.Get(), v2_ctx.Get(), script, w, h);
+        SessionLog log;
+        V2RecordingSink sink;
+        xnc::EncoderFallbackLock lock;
+        xnc::MediaPipelineV2::Config cfg;
+        cfg.cap = &cap;
+        cfg.surf = &cap;
+        cfg.sink = &sink;
+        cfg.fps = 60;
+        cfg.duration_s = 30;
+        cfg.reset_backoff_base_ms = 20;
+        cfg.encoder_lock = &lock;
+        cfg.session_factory = [](void* ctx, xnc::Nv12SurfacePool* pool) ->
+            xnc::IEncoderSession* {
+              return new LogSession(static_cast<SessionLog*>(ctx), pool);
+            };
+        cfg.session_ctx = &log;
+        xnc::MediaPipelineV2 pipe;
+        CHECK("v2j-start", pipe.Start(cfg));
+        if (pipe.running()) {
+          CHECK("v2j-epoch2-published",
+                wait_for([&] {
+                  for (const auto& a : sink.CopyAus())
+                    if (a.id.capture_epoch == 2) return true;
+                  return false;
+                }, 8000));
+          const xnc::MediaPipelineV2::Result res = pipe.Stop();
+          CHECK("v2j-ok", res.ok);
+          CHECK("v2j-one-executed-reset", res.resets == 1);
+          // The binding sequence assertion: the eight phases, in order.
+          const std::vector<xnc::ResetPhase> want = {
+              xnc::ResetPhase::kDiscontinuity, xnc::ResetPhase::kStopSubmissions,
+              xnc::ResetPhase::kRetireLeases, xnc::ResetPhase::kRebuild,
+              xnc::ResetPhase::kBase, xnc::ResetPhase::kConfig,
+              xnc::ResetPhase::kIdr, xnc::ResetPhase::kRunning};
+          CHECK("v2j-phase-sequence", res.reset_phases == want);
+          // One epoch increment per executed reset: exactly epochs 1->2.
+          bool saw_e1 = false, saw_e2 = false, epoch_violation = false;
+          for (const auto& id : sink.CopyIds()) {
+            if (id.capture_epoch == 1) saw_e1 = true;
+            if (id.capture_epoch == 2) saw_e2 = true;
+            if (id.capture_epoch < 1 || id.capture_epoch > 2)
+              epoch_violation = true;
+          }
+          CHECK("v2j-one-epoch-per-reset",
+                saw_e1 && saw_e2 && !epoch_violation);
+          // The first reset for a reason carries no storm backoff.
+          CHECK("v2j-storm-first-free",
+                res.reset_storm_ms.size() == 1 && res.reset_storm_ms[0] == 0);
+          CHECK("v2j-identity-monotonic",
+                DeliveredIdentitiesValid(sink.CopyIds()));
+          // No hardware rung ran (the sw-only factory shape): no strikes.
+          CHECK("v2j-no-hw-strikes",
+                res.hw_contract_failures == 0 && !res.encoder_software_locked);
+        }
+      }
+
+      // ---- (K) rejection of outputs from retired epochs: outputs parked
+      // in the reorder window when a reset fires belong to the RETIRED
+      // generation - dropped (counted), never published after the reset. ----
+      {
+        const uint32_t w = 320, h = 240;
+        std::vector<ScriptedDeviceCapture::Step> script;
+        for (int i = 0; i < 12; ++i)
+          script.push_back(ScriptedDeviceCapture::Step::kFrame);
+        script.push_back(ScriptedDeviceCapture::Step::kAccessLost);
+        for (int i = 0; i < 12; ++i)
+          script.push_back(ScriptedDeviceCapture::Step::kFrame);
+        ScriptedDeviceCapture cap(v2_dev.Get(), v2_ctx.Get(), script, w, h);
+        SessionLog log;
+        log.swallow_seq = 3;  // seq 3 never emitted: 4+ park in the window
+        V2RecordingSink sink;
+        xnc::MediaPipelineV2::Config cfg;
+        cfg.cap = &cap;
+        cfg.surf = &cap;
+        cfg.sink = &sink;
+        cfg.fps = 60;
+        cfg.duration_s = 30;
+        cfg.reset_backoff_base_ms = 20;
+        cfg.session_factory = [](void* ctx, xnc::Nv12SurfacePool* pool) ->
+            xnc::IEncoderSession* {
+              return new LogSession(static_cast<SessionLog*>(ctx), pool);
+            };
+        cfg.session_ctx = &log;
+        xnc::MediaPipelineV2 pipe;
+        CHECK("v2k-start", pipe.Start(cfg));
+        if (pipe.running()) {
+          CHECK("v2k-epoch2-published",
+                wait_for([&] {
+                  for (const auto& a : sink.CopyAus())
+                    if (a.id.capture_epoch == 2) return true;
+                  return false;
+                }, 8000));
+          const xnc::MediaPipelineV2::Result res = pipe.Stop();
+          CHECK("v2k-ok", res.ok);
+          CHECK("v2k-one-reset", res.resets == 1);
+          // The parked epoch-1 outputs (seq 4+, parked behind the
+          // swallowed 3) were DROPPED at the discontinuity phase.
+          CHECK("v2k-retired-dropped", res.epoch_retired_drops >= 1);
+          // Wire contract: no epoch-1 AU at seq >= 3, and no epoch-1 AU
+          // delivered after the first epoch-2 AU.
+          bool saw_e2 = false, violation = false;
+          for (const auto& id : sink.CopyIds()) {
+            if (id.capture_epoch == 2) saw_e2 = true;
+            if (id.capture_epoch == 1 && saw_e2) violation = true;
+            if (id.capture_epoch == 1 && id.encode_seq >= 3) violation = true;
+          }
+          CHECK("v2k-no-retired-on-wire", saw_e2 && !violation);
+          CHECK("v2k-identity-monotonic",
+                DeliveredIdentitiesValid(sink.CopyIds()));
+          std::printf("SELFTEST NOTE: v2k retired_drops=%llu aus=%llu "
+                      "gap_skips=%llu late_drops=%llu\n",
+                      (unsigned long long)res.epoch_retired_drops,
+                      (unsigned long long)res.aus_written,
+                      (unsigned long long)res.reorder_gap_skips,
+                      (unsigned long long)res.reorder_late_drops);
+        }
+      }
+
+      // ---- (L) exponential backoff for repeated IDENTICAL reasons: three
+      // sequential access_lost resets record backoffs 0, base, 2*base. ----
+      {
+        const uint32_t w = 320, h = 240;
+        std::vector<ScriptedDeviceCapture::Step> script;
+        for (int r = 0; r < 3; ++r) {
+          for (int i = 0; i < 6; ++i)
+            script.push_back(ScriptedDeviceCapture::Step::kFrame);
+          script.push_back(ScriptedDeviceCapture::Step::kAccessLost);
+        }
+        for (int i = 0; i < 8; ++i)
+          script.push_back(ScriptedDeviceCapture::Step::kFrame);
+        ScriptedDeviceCapture cap(v2_dev.Get(), v2_ctx.Get(), script, w, h);
+        SessionLog log;
+        V2RecordingSink sink;
+        xnc::MediaPipelineV2::Config cfg;
+        cfg.cap = &cap;
+        cfg.surf = &cap;
+        cfg.sink = &sink;
+        cfg.fps = 60;
+        cfg.duration_s = 30;
+        cfg.reset_backoff_base_ms = 25;  // storm: 0, 25, 50 ms
+        cfg.session_factory = [](void* ctx, xnc::Nv12SurfacePool* pool) ->
+            xnc::IEncoderSession* {
+              return new LogSession(static_cast<SessionLog*>(ctx), pool);
+            };
+        cfg.session_ctx = &log;
+        xnc::MediaPipelineV2 pipe;
+        CHECK("v2l-start", pipe.Start(cfg));
+        if (pipe.running()) {
+          CHECK("v2l-epoch4-published",
+                wait_for([&] {
+                  for (const auto& a : sink.CopyAus())
+                    if (a.id.capture_epoch == 4) return true;
+                  return false;
+                }, 8000));
+          const xnc::MediaPipelineV2::Result res = pipe.Stop();
+          CHECK("v2l-ok", res.ok);
+          CHECK("v2l-three-resets", res.resets == 3);
+          CHECK("v2l-storm-backoffs",
+                res.reset_storm_ms.size() == 3 &&
+                    res.reset_storm_ms[0] == 0 &&
+                    res.reset_storm_ms[1] == 25 &&
+                    res.reset_storm_ms[2] == 50);
+          // One epoch per executed reset: three resets -> epoch 4 on top.
+          CHECK("v2l-phase-count", res.reset_phases.size() == 24);
+          uint64_t max_epoch = 0;
+          for (const auto& id : sink.CopyIds())
+            if (id.capture_epoch > max_epoch) max_epoch = id.capture_epoch;
+          CHECK("v2l-epoch-per-reset", max_epoch == 4);
+          CHECK("v2l-identity-monotonic",
+                DeliveredIdentitiesValid(sink.CopyIds()));
+          std::printf("SELFTEST NOTE: v2l resets=%u storm=%u/%u/%u\n",
+                      res.resets, res.reset_storm_ms.size() > 0
+                          ? res.reset_storm_ms[0] : 0,
+                      res.reset_storm_ms.size() > 1
+                          ? res.reset_storm_ms[1] : 0,
+                      res.reset_storm_ms.size() > 2
+                          ? res.reset_storm_ms[2] : 0);
+        }
+      }
+
+      // ---- (M) mid-run hardware-encoder CONTRACT failures (ruling 3 +
+      // ruling 5): each fault strikes the lock and routes recovery through
+      // the unified reset (never an immediate fatal); after THREE strikes
+      // the process locks to software and the stream survives on it. ----
+      {
+        const uint32_t w = 320, h = 240, frames = 90;
+        std::vector<ScriptedDeviceCapture::Step> script(
+            frames, ScriptedDeviceCapture::Step::kFrame);
+        ScriptedDeviceCapture cap(v2_dev.Get(), v2_ctx.Get(), script, w, h);
+        SessionLog log;
+        V2RecordingSink sink;
+        xnc::EncoderFallbackLock lock;
+        struct HwFake {
+          SessionLog* log;
+          std::atomic<int> creates{0};
+        } hw{&log};
+        xnc::MediaPipelineV2::Config cfg;
+        cfg.cap = &cap;
+        cfg.surf = &cap;
+        cfg.sink = &sink;
+        cfg.fps = 60;
+        cfg.duration_s = 30;
+        cfg.reset_backoff_base_ms = 20;
+        cfg.encoder_lock = &lock;
+        cfg.hw_session_factory = [](void* ctx, xnc::Nv12SurfacePool* pool) ->
+            xnc::IEncoderSession* {
+              auto* f = static_cast<HwFake*>(ctx);
+              f->creates.fetch_add(1);
+              return new HwFaultSession(f->log, pool, 2);  // 2 ok, then fault
+            };
+        cfg.hw_session_ctx = &hw;
+        cfg.session_factory = [](void* ctx, xnc::Nv12SurfacePool* pool) ->
+            xnc::IEncoderSession* {
+              return new LogSession(static_cast<SessionLog*>(ctx), pool);
+            };
+        cfg.session_ctx = &log;
+        xnc::MediaPipelineV2 pipe;
+        CHECK("v2m-start", pipe.Start(cfg));
+        if (pipe.running()) {
+          // fault(1) -> reset -> hw(2) -> fault(2) -> reset -> hw(3) ->
+          // fault(3) LOCKS -> reset -> software rung -> epoch 4 serves.
+          CHECK("v2m-epoch4-published",
+                wait_for([&] {
+                  for (const auto& a : sink.CopyAus())
+                    if (a.id.capture_epoch == 4) return true;
+                  return false;
+                }, 8000));
+          const xnc::MediaPipelineV2::Result res = pipe.Stop();
+          CHECK("v2m-ok-not-fatal", res.ok);
+          CHECK("v2m-three-resets", res.resets == 3);
+          CHECK("v2m-three-hw-attempts",
+                hw.creates.load() == 3 && log.hw_faults.load() == 3);
+          CHECK("v2m-locked",
+                lock.SoftwareLocked() && res.encoder_software_locked &&
+                    res.hw_contract_failures == 3);
+          CHECK("v2m-states-loud",
+                sink.HasState("encoder_hw_strike") &&
+                    sink.HasState("encoder_software_locked") &&
+                    sink.HasState("capture_rebuilt"));
+          // Ruling 5's backoff: the three encoder resets spaced 0/20/40.
+          CHECK("v2m-reinit-backoff",
+                res.reset_storm_ms.size() == 3 && res.reset_storm_ms[0] == 0 &&
+                    res.reset_storm_ms[1] == 20 && res.reset_storm_ms[2] == 40);
+          // The new (software) generation starts from an IDR.
+          bool e4_first_key = false, e4_seen = false;
+          for (const auto& a : sink.CopyAus()) {
+            if (a.id.capture_epoch == 4) {
+              if (!e4_seen)
+                e4_first_key = (a.flags & xnc::AuFlags::kAuFlagKey) != 0;
+              e4_seen = true;
+            }
+          }
+          CHECK("v2m-epoch4-idr-first", e4_seen && e4_first_key);
+          CHECK("v2m-identity-monotonic",
+                DeliveredIdentitiesValid(sink.CopyIds()));
+          std::printf("SELFTEST NOTE: v2m hw_faults=%llu creates=%d "
+                      "resets=%u strikes=%u\n",
+                      (unsigned long long)log.hw_faults.load(),
+                      hw.creates.load(), res.resets,
+                      res.hw_contract_failures);
+        }
+      }
+
+      // ---- (N) hardware INIT failures strike the same lock (the RDP
+      // shape: the hardware rung never completes its probe), and the lock
+      // is PROCESS-lifetime: a second pipeline never re-attempts hardware. ----
+      {
+        const uint32_t w = 320, h = 240;
+        std::vector<ScriptedDeviceCapture::Step> script;
+        for (int i = 0; i < 6; ++i)
+          script.push_back(ScriptedDeviceCapture::Step::kFrame);
+        script.push_back(ScriptedDeviceCapture::Step::kAccessLost);
+        for (int i = 0; i < 6; ++i)
+          script.push_back(ScriptedDeviceCapture::Step::kFrame);
+        script.push_back(ScriptedDeviceCapture::Step::kAccessLost);
+        for (int i = 0; i < 10; ++i)
+          script.push_back(ScriptedDeviceCapture::Step::kFrame);
+        ScriptedDeviceCapture cap(v2_dev.Get(), v2_ctx.Get(), script, w, h);
+        SessionLog log;
+        V2RecordingSink sink;
+        xnc::EncoderFallbackLock lock;
+        struct HwInitFake {
+          std::atomic<int> creates{0};
+        } hw;
+        auto hw_factory = [](void* ctx, xnc::Nv12SurfacePool*) ->
+            xnc::IEncoderSession* {
+          static_cast<HwInitFake*>(ctx)->creates.fetch_add(1);
+          return nullptr;  // hardware init always fails (injected)
+        };
+        xnc::MediaPipelineV2::Config cfg;
+        cfg.cap = &cap;
+        cfg.surf = &cap;
+        cfg.sink = &sink;
+        cfg.fps = 60;
+        cfg.duration_s = 30;
+        cfg.reset_backoff_base_ms = 20;
+        cfg.encoder_lock = &lock;
+        cfg.hw_session_factory = hw_factory;
+        cfg.hw_session_ctx = &hw;
+        cfg.session_factory = [](void* ctx, xnc::Nv12SurfacePool* pool) ->
+            xnc::IEncoderSession* {
+              return new LogSession(static_cast<SessionLog*>(ctx), pool);
+            };
+        cfg.session_ctx = &log;
+        xnc::MediaPipelineV2 pipe;
+        CHECK("v2n-start", pipe.Start(cfg));
+        if (pipe.running()) {
+          // init strike(1) at the first InitStream; the two injected
+          // access-lost resets re-init twice more: strikes 2 and 3 LOCK.
+          CHECK("v2n-epoch3-published",
+                wait_for([&] {
+                  for (const auto& a : sink.CopyAus())
+                    if (a.id.capture_epoch == 3) return true;
+                  return false;
+                }, 8000));
+          const xnc::MediaPipelineV2::Result res = pipe.Stop();
+          CHECK("v2n-ok", res.ok);
+          CHECK("v2n-three-hw-attempts-then-locked",
+                hw.creates.load() == 3 && lock.SoftwareLocked());
+          CHECK("v2n-states-loud",
+                sink.HasState("encoder_hw_strike") &&
+                    sink.HasState("encoder_software_locked"));
+          // PROCESS-lifetime: a second pipeline sharing the lock never
+          // touches the hardware factory again.
+          std::vector<ScriptedDeviceCapture::Step> script2(
+              12, ScriptedDeviceCapture::Step::kFrame);
+          ScriptedDeviceCapture cap2(v2_dev.Get(), v2_ctx.Get(), script2, w,
+                                     h);
+          SessionLog log2;
+          V2RecordingSink sink2;
+          xnc::MediaPipelineV2::Config cfg2 = cfg;
+          cfg2.cap = &cap2;
+          cfg2.surf = &cap2;
+          cfg2.sink = &sink2;
+          cfg2.session_ctx = &log2;
+          xnc::MediaPipelineV2 pipe2;
+          CHECK("v2n-pipe2-start", pipe2.Start(cfg2));
+          if (pipe2.running()) {
+            CHECK("v2n-pipe2-published",
+                  wait_for([&] { return sink2.CopyAus().size() >= 2; }, 8000));
+            const xnc::MediaPipelineV2::Result res2 = pipe2.Stop();
+            CHECK("v2n-pipe2-ok", res2.ok);
+            CHECK("v2n-pipe2-no-hw-retry", hw.creates.load() == 3);
+            CHECK("v2n-pipe2-locked-snapshot",
+                  res2.encoder_software_locked &&
+                      res2.hw_contract_failures == 0);
+          }
+          std::printf("SELFTEST NOTE: v2n hw_creates=%d resets=%u "
+                      "locked=%d\n",
+                      hw.creates.load(), res.resets,
+                      lock.SoftwareLocked() ? 1 : 0);
+        }
+      }
+
+      // ---- (O) DXGI failure falls to GDI THROUGH the reset sequence
+      // (ruling 3): a DXGI rung whose rebuild keeps failing is swapped for
+      // GDI inside the same executed reset; the stream resumes on GDI. ----
+      {
+        const uint32_t w = 320, h = 240;
+        // The initial (caller-owned) DXGI fake: frames, one access-lost,
+        // frames; its Rebuild always fails (dead duplication).
+        std::vector<ScriptedDeviceCapture::Step> dxgi_script;
+        for (int i = 0; i < 6; ++i)
+          dxgi_script.push_back(ScriptedDeviceCapture::Step::kFrame);
+        dxgi_script.push_back(ScriptedDeviceCapture::Step::kAccessLost);
+        for (int i = 0; i < 6; ++i)
+          dxgi_script.push_back(ScriptedDeviceCapture::Step::kFrame);
+        ScriptedDeviceCapture cap(v2_dev.Get(), v2_ctx.Get(), dxgi_script, w,
+                                  h);
+        cap.rebuild_fail_first = 1000;  // DXGI can never be rebuilt
+        SessionLog log;
+        V2RecordingSink sink;
+        // The factory context: everything a capture-less factory lambda
+        // needs (spec + create counters for both rungs).
+        struct BackendSpec {
+          ID3D11Device* dev;
+          ID3D11DeviceContext* ctx;
+          std::vector<ScriptedDeviceCapture::Step> gdi;
+          uint32_t w, h;
+          uint32_t dxgi_rebuild_fail_first;
+          std::atomic<int> dxgi_creates{0}, gdi_creates{0};
+        } spec{v2_dev.Get(), v2_ctx.Get(),
+               std::vector<ScriptedDeviceCapture::Step>(
+                   24, ScriptedDeviceCapture::Step::kFrame),
+               w, h, 1000, {}, {}};
+        xnc::MediaPipelineV2::Config cfg;
+        cfg.cap = &cap;
+        cfg.surf = &cap;
+        cfg.sink = &sink;
+        cfg.fps = 60;
+        cfg.duration_s = 30;
+        cfg.reset_backoff_base_ms = 20;
+        cfg.initial_backend = xnc::MediaBackend::kDxgi;
+        cfg.make_backend = [](void* c, xnc::MediaBackend kind,
+                              std::string*) ->
+            std::unique_ptr<xnc::ICapture> {
+          auto* s = static_cast<BackendSpec*>(c);
+          if (kind == xnc::MediaBackend::kGdi) {
+            s->gdi_creates.fetch_add(1);
+            return std::make_unique<ScriptedDeviceCapture>(s->dev, s->ctx,
+                                                           s->gdi, s->w, s->h);
+          }
+          s->dxgi_creates.fetch_add(1);
+          auto made = std::make_unique<ScriptedDeviceCapture>(s->dev, s->ctx,
+              std::vector<ScriptedDeviceCapture::Step>(
+                  8, ScriptedDeviceCapture::Step::kFrame), s->w, s->h);
+          made->rebuild_fail_first = s->dxgi_rebuild_fail_first;
+          return made;
+        };
+        cfg.backend_ctx = &spec;
+        cfg.session_factory = [](void* ctx, xnc::Nv12SurfacePool* pool) ->
+            xnc::IEncoderSession* {
+              return new LogSession(static_cast<SessionLog*>(ctx), pool);
+            };
+        cfg.session_ctx = &log;
+        xnc::MediaPipelineV2 pipe;
+        CHECK("v2o-start", pipe.Start(cfg));
+        if (pipe.running()) {
+          // access_lost -> reset: DXGI rebuild fails the hard-fail streak
+          // -> the SAME reset swaps to GDI and completes there.
+          CHECK("v2o-epoch2-published",
+                wait_for([&] {
+                  for (const auto& a : sink.CopyAus())
+                    if (a.id.capture_epoch == 2) return true;
+                  return false;
+                }, 8000));
+          const xnc::MediaPipelineV2::Result res = pipe.Stop();
+          CHECK("v2o-ok", res.ok);
+          CHECK("v2o-one-reset", res.resets == 1);
+          CHECK("v2o-swapped-to-gdi",
+                res.backend_swaps == 1 &&
+                    res.backend_at_stop == xnc::MediaBackend::kGdi &&
+                    spec.gdi_creates.load() == 1);
+          // No DXGI probe ran during the short scenario (30 s cadence), so
+          // the factory never created a DXGI rung.
+          CHECK("v2o-no-dxgi-factory", spec.dxgi_creates.load() == 0);
+          CHECK("v2o-backend-state", sink.HasState("backend_changed"));
+          CHECK("v2o-phase-sequence", res.reset_phases.size() == 8);
+          CHECK("v2o-identity-monotonic",
+                DeliveredIdentitiesValid(sink.CopyIds()));
+          std::printf("SELFTEST NOTE: v2o gdi_creates=%d resets=%u "
+                      "retired_drops=%llu\n",
+                      spec.gdi_creates.load(), res.resets,
+                      (unsigned long long)res.epoch_retired_drops);
+        }
+      }
+
+      // ---- (P) the return path (ruling 3): while serving on GDI, a DXGI
+      // probe every dxgi_reprobe_ms (30 s in production) re-tries DXGI and
+      // RETURNS through the same reset sequence (backend_changed). ----
+      {
+        const uint32_t w = 320, h = 240;
+        // The initial (caller-owned) GDI fake: a few frames, then a
+        // static screen (script exhausted -> kNoChange forever).
+        std::vector<ScriptedDeviceCapture::Step> gdi_script(
+            6, ScriptedDeviceCapture::Step::kFrame);
+        ScriptedDeviceCapture cap(v2_dev.Get(), v2_ctx.Get(), gdi_script, w,
+                                  h);
+        SessionLog log;
+        V2RecordingSink sink;
+        struct BackendSpec {
+          ID3D11Device* dev;
+          ID3D11DeviceContext* ctx;
+          std::vector<ScriptedDeviceCapture::Step> dxgi;
+          uint32_t w, h;
+          std::atomic<int> dxgi_creates{0}, gdi_creates{0};
+        } spec{v2_dev.Get(), v2_ctx.Get(),
+               std::vector<ScriptedDeviceCapture::Step>(
+                   24, ScriptedDeviceCapture::Step::kFrame),
+               w, h, {}, {}};
+        xnc::MediaPipelineV2::Config cfg;
+        cfg.cap = &cap;
+        cfg.surf = &cap;
+        cfg.sink = &sink;
+        cfg.fps = 60;
+        cfg.duration_s = 30;
+        cfg.reset_backoff_base_ms = 20;
+        cfg.initial_backend = xnc::MediaBackend::kGdi;
+        cfg.dxgi_reprobe_ms = 250;  // fast re-probe for the scenario
+        cfg.make_backend = [](void* c, xnc::MediaBackend kind,
+                              std::string*) ->
+            std::unique_ptr<xnc::ICapture> {
+          auto* s = static_cast<BackendSpec*>(c);
+          if (kind == xnc::MediaBackend::kGdi) {
+            s->gdi_creates.fetch_add(1);
+            return std::make_unique<ScriptedDeviceCapture>(s->dev, s->ctx,
+                std::vector<ScriptedDeviceCapture::Step>(
+                    6, ScriptedDeviceCapture::Step::kFrame), s->w, s->h);
+          }
+          s->dxgi_creates.fetch_add(1);
+          return std::make_unique<ScriptedDeviceCapture>(s->dev, s->ctx,
+                                                         s->dxgi, s->w, s->h);
+        };
+        cfg.backend_ctx = &spec;
+        cfg.session_factory = [](void* ctx, xnc::Nv12SurfacePool* pool) ->
+            xnc::IEncoderSession* {
+              return new LogSession(static_cast<SessionLog*>(ctx), pool);
+            };
+        cfg.session_ctx = &log;
+        xnc::MediaPipelineV2 pipe;
+        CHECK("v2p-start", pipe.Start(cfg));
+        if (pipe.running()) {
+          // ~250 ms: probe -> healthy -> change_backend reset -> swap to
+          // DXGI -> the DXGI fake's frames publish as epoch 2.
+          CHECK("v2p-epoch2-published",
+                wait_for([&] {
+                  for (const auto& a : sink.CopyAus())
+                    if (a.id.capture_epoch == 2) return true;
+                  return false;
+                }, 8000));
+          const xnc::MediaPipelineV2::Result res = pipe.Stop();
+          CHECK("v2p-ok", res.ok);
+          CHECK("v2p-returned-to-dxgi",
+                res.backend_at_stop == xnc::MediaBackend::kDxgi &&
+                    res.backend_swaps == 1 &&
+                    res.dxgi_probes_ok >= 1);
+          // Probe (throwaway) + swap (fresh) both asked the factory for a
+          // DXGI rung; the GDI rung was never factory-created.
+          CHECK("v2p-probe-plus-swap",
+                spec.dxgi_creates.load() == 2 && spec.gdi_creates.load() == 0);
+          CHECK("v2p-backend-state", sink.HasState("backend_changed"));
+          CHECK("v2p-reset-reason-change-backend",
+                std::strcmp(res.last_reset_reason,
+                            xnc::kResetReasonChangeBackend) == 0);
+          CHECK("v2p-phase-sequence", res.reset_phases.size() == 8);
+          CHECK("v2p-identity-monotonic",
+                DeliveredIdentitiesValid(sink.CopyIds()));
+          std::printf("SELFTEST NOTE: v2p probes_ok=%u creates_dxgi=%d "
+                      "resets=%u\n",
+                      res.dxgi_probes_ok, spec.dxgi_creates.load(),
+                      res.resets);
+        }
       }
     }
   }
