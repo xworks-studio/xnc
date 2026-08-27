@@ -120,6 +120,45 @@ inline void NalExtractTypes(const uint8_t* data, size_t len, const uint8_t* type
 // the encoder's outward contract is identical for both.
 enum class EncoderBackend : uint8_t { kHardware = 0, kSoftware = 1 };
 
+// NV12 color rule (spec §8.4, M2 Task 3): BT.709 limited range at 720p
+// and above, BT.601 limited range below. ONE rule shared by the encoder
+// input types (both rungs), the D3D11 VideoProcessor conversion, and the
+// selftest's SPS/VUI agreement check. The numeric values are the MF enum
+// constants (mfobjects.h), kept as plain uint32 so this header needs no
+// MF include:
+//   MFVideoTransferMatrix_BT709 = 1 / _BT601 = 2
+//   MFVideoPrimaries_BT709 = 2 / _SMPTE170M = 5
+//   MFVideoTransFunc_709 = 5 (the BT.709/SMPTE170M gamma - one function)
+//   MFNominalRange_16_235 = 1 (limited)
+// The input types carry matrix/primaries/transfer; nominal_range is the
+// VideoProcessor-side carrier only (the MS software encoder rejects
+// MF_MT_VIDEO_NOMINAL_RANGE on its input type with MF_E_INVALIDMEDIATYPE,
+// measured) and is implied by the matrix on the type side.
+struct Nv12ColorConfig {
+  bool bt709 = true;
+  uint32_t matrix = 1;      // MFVideoTransferMatrix_*
+  uint32_t primaries = 2;   // MFVideoPrimaries_*
+  uint32_t transfer = 5;    // MFVideoTransFunc_*
+  uint32_t nominal_range = 1;  // MFNominalRange_16_235 (limited)
+};
+
+inline Nv12ColorConfig Nv12ColorForSize(uint32_t height) {
+  Nv12ColorConfig c{};
+  if (height >= 720) {
+    c.bt709 = true;
+    c.matrix = 1;    // MFVideoTransferMatrix_BT709
+    c.primaries = 2; // MFVideoPrimaries_BT709
+    c.transfer = 5;  // MFVideoTransFunc_709
+  } else {
+    c.bt709 = false;
+    c.matrix = 2;    // MFVideoTransferMatrix_BT601
+    c.primaries = 5; // MFVideoPrimaries_SMPTE170M
+    c.transfer = 5;  // MFVideoTransFunc_709 (170M shares the 709 curve)
+  }
+  c.nominal_range = 1;  // MFNominalRange_16_235 - limited, both families
+  return c;
+}
+
 // One Encode/EncodeNV12 operation has two independently meaningful results:
 // ProcessInput may reject the input, or it may accept it and a later
 // ProcessOutput collection may fail after appending complete AUs.
@@ -207,9 +246,20 @@ class MfSoftEncoder {
   // w*h*3/2, tight stride = width) - NO BGRA->NV12 conversion (the DXGI GPU
   // path already produced NV12 in the VideoProcessor). Same submit/output
   // contract as Encode. Invalid dims/len are rejected like Encode.
+  //
+  // M2 Task 3 additive optional hooks (session adapters only; every M0/M1
+  // call site passes nothing and keeps the pinned wall-clock behavior):
+  //   out_times - when non-null, receives the 100ns sample time of every
+  //     returned AU (the MFT echoes the input PTS; the software MFT emits
+  //     AUs REORDERED, so identity pairing must key on these, not order);
+  //   in_time - when non-null, overrides the wall-clock PTS for THIS
+  //     submission (the caller owns a strictly increasing 100ns sequence
+  //     keyed to encode_seq - spec §5.3/§8.3.3).
   EncoderSubmitResult EncodeNV12(const uint8_t* nv12, size_t len,
                                  std::vector<std::vector<uint8_t>>& aus,
-                                 std::string* err);
+                                 std::string* err,
+                                 std::vector<int64_t>* out_times = nullptr,
+                                 const int64_t* in_time = nullptr);
 
   // Arms the one-shot IDR request (see header comment). Pure bookkeeping -
   // the ICodecAPI property is applied at the next Encode submission.
@@ -227,7 +277,10 @@ class MfSoftEncoder {
   // MF_E_TRANSFORM_NEED_MORE_INPUT, appending any AUs to aus (NOT cleared).
   // Never applies or re-arms a force-key request - that is the E2 contract.
   // false surfaces collection failure; complete AUs appended first remain.
-  bool Drain(std::vector<std::vector<uint8_t>>& aus, std::string* err = nullptr);
+  // out_times (M2 Task 3, optional): per-AU 100ns sample times, like
+  // EncodeNV12's.
+  bool Drain(std::vector<std::vector<uint8_t>>& aus, std::string* err = nullptr,
+             std::vector<int64_t>* out_times = nullptr);
 
   // End-of-stream flush (Task 5; the Task 4 review's deferred minor):
   // sends MFT_MESSAGE_NOTIFY_END_OF_STREAM + MFT_MESSAGE_COMMAND_DRAIN,
@@ -238,8 +291,24 @@ class MfSoftEncoder {
   // Never touches the force-key state. After FlushTail the encoder is
   // drained - do not feed it again; call Init to reuse the object.
   // false surfaces message/collection failure; complete partial AUs remain.
+  // out_times (M2 Task 3, optional): per-AU 100ns sample times, like
+  // EncodeNV12's.
   bool FlushTail(std::vector<std::vector<uint8_t>>& aus,
-                 std::string* err = nullptr);
+                 std::string* err = nullptr,
+                 std::vector<int64_t>* out_times = nullptr);
+
+  // Hot rate update (M2 Task 3, spec §8.2 "码率和 FPS 可以热更新" - no
+  // re-Init, no codec-epoch rebuild): sets CODECAPI_AVEncCommonMeanBitRate
+  // live on the negotiated MFT. False when no ICodecAPI/the set failed
+  // (logged); the encoder keeps its previous rate either way. Resolution
+  // changes still require a full Init.
+  bool ReconfigureRate(uint32_t bitrate_bps);
+
+  // The MF_MT_YUV_MATRIX the negotiated input type carries (1 = BT.709,
+  // 2 = BT.601, 0 = not negotiated). M2 Task 3: the color-agreement
+  // surface (the input type must advertise the same matrix the
+  // VideoProcessor converted with - Nv12ColorForSize).
+  uint32_t negotiated_input_matrix() const { return in_matrix_; }
 
  private:
   // Full media-type negotiation + streaming start on an existing MFT (no
@@ -256,19 +325,23 @@ class MfSoftEncoder {
   // at submission (E2 contract).
   EncoderSubmitResult SubmitNv12(const uint8_t* nv12, size_t len,
                                  std::vector<std::vector<uint8_t>>& aus,
-                                 std::string* err);
+                                 std::string* err,
+                                 std::vector<int64_t>* out_times = nullptr,
+                                 const int64_t* in_time = nullptr);
   // Drops the current MFT/session (END_STREAMING + release + activate
   // ShutdownObject) WITHOUT tearing down impl_/w_/h_ - used to discard
   // hardware ladder candidates and to reset between probe/live instances.
   // Clears stream-derived state (sps_pps_, last_was_key_, force_pending_).
   void ReleaseMft();
   bool CollectOutputs(std::vector<std::vector<uint8_t>>& aus, std::string* err,
-                      EncoderOutputStage stage);
+                      EncoderOutputStage stage,
+                      std::vector<int64_t>* out_times = nullptr);
   void Shutdown();
 
   struct Impl;  // COM pointers + streaming state (mf_encoder.cpp)
   Impl* impl_ = nullptr;
   uint32_t w_ = 0, h_ = 0, fps_ = 0, bitrate_ = 0;
+  uint32_t in_matrix_ = 0;      // negotiated input MF_MT_YUV_MATRIX (0 none)
   bool last_was_key_ = false;
   bool force_pending_ = false;  // one-shot, consumed at input SUBMISSION
   bool force_software_ = false; // --encoder software diagnostic pin

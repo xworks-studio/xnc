@@ -51,6 +51,7 @@
 #include "media_types.h"  // M1 Task 1: FrameIdentity/EncodedAU/AuFlags ledger
 #include "mf_decoder_probe.h"  // Task 5 m0: test-only decode-to-luma-hash probe
 #include "mf_encoder.h"
+#include "mf_gpu_encoder.h"  // M2 Task 3: IEncoderSession + both rungs
 #include "nv12.h"
 #include "pipeline.h"
 #include "rt_pipe_server.h"
@@ -180,6 +181,157 @@ size_t CountAusWithNal(const std::vector<std::vector<uint8_t>>& aus, uint8_t typ
     if (xnc::NalHasType(au.data(), au.size(), type)) ++n;
   return n;
 };
+
+// ---- M2 Task 3: minimal SPS/VUI parser (selftest-only) ----
+//
+// Parses the first SPS (NAL type 7) of an Annex-B AU far enough to read
+// the VUI's video_signal_type: video_format / video_full_range_flag /
+// colour_primaries / transfer_characteristics / matrix_coefficients.
+// That is the §8.4 agreement surface: the encoded metadata must match the
+// Nv12ColorForSize rule the VideoProcessor + encoder input type carry.
+struct SpsVui {
+  bool sps_found = false;
+  bool vui_present = false;
+  bool video_signal_present = false;
+  int video_format = -1;
+  int full_range = -1;
+  int colour_description = -1;
+  int cp = -1;  // colour_primaries
+  int tc = -1;  // transfer_characteristics
+  int mc = -1;  // matrix_coefficients
+};
+
+struct SpsBitReader {
+  const uint8_t* d;
+  size_t n;
+  size_t bit = 0;
+  SpsBitReader(const uint8_t* p, size_t sz) : d(p), n(sz) {}
+  int U(int bits) {
+    int v = 0;
+    for (int i = 0; i < bits; ++i) {
+      if (bit >= n * 8) return -1;
+      v = (v << 1) | ((d[bit >> 3] >> (7 - (bit & 7))) & 1);
+      ++bit;
+    }
+    return v;
+  }
+  int UE() {  // exp-Golomb
+    int zeros = 0;
+    for (;;) {
+      if (bit >= n * 8) return -1;
+      if (((d[bit >> 3] >> (7 - (bit & 7))) & 1) != 0) break;
+      ++zeros;
+      ++bit;
+      if (zeros > 31) return -1;
+    }
+    ++bit;  // the terminating 1
+    int info = 1 << zeros;
+    for (int i = 0; i < zeros; ++i) info |= U(1) << (zeros - 1 - i);
+    return info - 1;
+  }
+};
+
+SpsVui ParseSpsVui(const uint8_t* au, size_t len) {
+  SpsVui v;
+  const size_t hdr = xnc::nal_detail::FindTypeFrom(au, len, 0, 7);
+  if (hdr == xnc::nal_detail::kNpos) return v;
+  v.sps_found = true;
+  size_t end = len;
+  for (size_t j = hdr + 1; j + 3 <= len; ++j) {
+    if (au[j] == 0 && au[j + 1] == 0 &&
+        (au[j + 2] == 1 ||
+         (au[j + 2] == 0 && j + 4 <= len && au[j + 3] == 1))) {
+      end = j;
+      break;
+    }
+  }
+  // Strip emulation prevention (00 00 03 -> 00 00).
+  std::vector<uint8_t> rbsp;
+  for (size_t i = hdr; i < end; ++i) {
+    if (i + 2 < end && au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 3) {
+      rbsp.push_back(0);
+      rbsp.push_back(0);
+      i += 2;
+    } else {
+      rbsp.push_back(au[i]);
+    }
+  }
+  SpsBitReader br(rbsp.data(), rbsp.size());
+  const int profile = br.U(8);
+  br.U(8);  // constraint flags + reserved
+  br.U(8);  // level_idc
+  br.UE();  // seq_parameter_set_id
+  if (profile == 100 || profile == 110 || profile == 122 || profile == 244 ||
+      profile == 44 || profile == 83 || profile == 86 || profile == 118 ||
+      profile == 128 || profile == 138 || profile == 139 || profile == 134 ||
+      profile == 135) {
+    const int chroma = br.UE();
+    if (chroma == 3) br.U(1);  // separate_colour_plane_flag
+    br.UE();                   // bit_depth_luma_minus8
+    br.UE();                   // bit_depth_chroma_minus8
+    br.U(1);                   // qpprime_y_zero_transform_bypass_flag
+    if (br.U(1) != 0) return v;  // scaling lists: out of scope
+  }
+  br.UE();  // log2_max_frame_num_minus4
+  const int poc = br.UE();
+  if (poc == 0) {
+    br.UE();
+  } else if (poc == 1) {
+    br.U(1);
+    br.UE();
+    br.UE();
+    const int cyc = br.UE();
+    for (int i = 0; i < cyc; ++i) br.UE();
+  }
+  br.UE();  // max_num_ref_frames
+  br.U(1);  // gaps_in_frame_num_value_allowed_flag
+  br.UE();  // pic_width_in_mbs_minus1
+  br.UE();  // pic_height_in_map_units_minus1
+  br.U(1);  // frame_mbs_only_flag
+  br.U(1);  // direct_8x8_inference_flag
+  if (br.U(1) != 0) {  // frame_cropping
+    br.UE();
+    br.UE();
+    br.UE();
+    br.UE();
+  }
+  if (br.U(1) == 0) return v;  // vui_parameters_present_flag
+  v.vui_present = true;
+  if (br.U(1) != 0) {  // aspect_ratio_info_present
+    if (br.U(8) == 255) {
+      br.U(16);
+      br.U(16);
+    }
+  }
+  if (br.U(1) != 0) br.U(1);  // overscan
+  if (br.U(1) != 0) {         // video_signal_type_present_flag
+    v.video_signal_present = true;
+    v.video_format = br.U(3);
+    v.full_range = br.U(1);
+    v.colour_description = br.U(1);
+    if (v.colour_description == 1) {
+      v.cp = br.U(8);
+      v.tc = br.U(8);
+      v.mc = br.U(8);
+    }
+  }
+  return v;
+}
+
+// True when the parsed VUI color fields agree with the §8.4 rule
+// (BT.709 {1,1,1} or BT.601/170M family {5,6}x{5,6}x{5,6}, limited range).
+bool VuiMatchesColorRule(const SpsVui& vui, const xnc::Nv12ColorConfig& rule) {
+  if (!vui.vui_present || !vui.video_signal_present ||
+      vui.colour_description != 1)
+    return false;
+  if (vui.full_range != 0) return false;  // limited range
+  if (rule.bt709)
+    return vui.cp == 1 && vui.tc == 1 && vui.mc == 1;
+  return (vui.cp == 5 || vui.cp == 6) && (vui.tc == 5 || vui.tc == 6) &&
+         (vui.mc == 5 || vui.mc == 6);
+}
+
+
 
 // Task 5 (2026-08-26 desktop-media-m0 correctness): encodes ONE cold-start
 // reference IDR for `bgra` through a freshly-Init'ed encoder (same
@@ -2075,6 +2227,692 @@ int SelftestMain() {
           }
         }
         CHECK("gpu-surface-no-d3d-errors", !bad);
+      }
+    }
+  }
+  { // M2 Task 3: the PURE session vocabulary - SubmitResult/ShutdownMode/
+    // EncoderOutput field round-trip, the OutputIdentityTracker's 1:1
+    // output<->input mapping rules (the three encoder_identity_mismatch
+    // failure modes), and the §8.4 color rule Nv12ColorForSize.
+    xnc::SubmitResult ok = xnc::SubmitResult::kOk;
+    CHECK("submit-result-enum", ok == xnc::SubmitResult::kOk &&
+                                    xnc::SubmitResult::kRejected !=
+                                        xnc::SubmitResult::kIdentityFault);
+    xnc::ShutdownMode drain = xnc::ShutdownMode::kDrain;
+    CHECK("shutdown-mode-enum",
+          drain == xnc::ShutdownMode::kDrain &&
+              xnc::ShutdownMode::kImmediate != xnc::ShutdownMode::kDrain);
+    xnc::EncoderOutput eo;
+    eo.id = xnc::FrameIdentity{9, 8, 7, 6, 5, 4};
+    eo.submit_id = 6;
+    eo.slot = 2;
+    eo.sample_time = 333333;
+    eo.key = true;
+    eo.au = {0, 0, 0, 1, 0x65};
+    CHECK("encoder-output-fields",
+          eo.id.encode_seq == 6 && eo.submit_id == 6 && eo.slot == 2 &&
+              eo.sample_time == 333333 && eo.key &&
+              xnc::NalHasType(eo.au.data(), eo.au.size(), 5));
+    // Tracker: register strictly increasing times, consume by EXACT time.
+    xnc::OutputIdentityTracker t;
+    xnc::OutputIdentityRecord r1{};
+    r1.id = xnc::FrameIdentity{1, 1, 10, 1, 0, 0};
+    r1.submit_id = 1;
+    r1.slot = 0;
+    xnc::OutputIdentityRecord r2 = r1;
+    r2.id.encode_seq = 2;
+    r2.submit_id = 2;
+    r2.slot = 1;
+    CHECK("tracker-register", t.Register(333333, r1) && t.Register(666666, r2));
+    CHECK("tracker-register-not-increasing",
+          !t.Register(666666, r1) && !t.Register(100000, r1));
+    CHECK("tracker-register-increasing-ok", t.Register(666667, r1));
+    xnc::OutputIdentityRecord got{};
+    CHECK("tracker-consume-ok",
+          t.Consume(true, 666666, &got) == xnc::OutputConsume::kOk &&
+              got.id.encode_seq == 2 && got.submit_id == 2 && got.slot == 1);
+    CHECK("tracker-consume-duplicated",
+          t.Consume(true, 666666, &got) ==
+          xnc::OutputConsume::kTimeDuplicated);
+    CHECK("tracker-consume-unknown",
+          t.Consume(true, 999999, &got) == xnc::OutputConsume::kTimeUnknown);
+    CHECK("tracker-consume-missing-time",
+          t.Consume(false, 333333, &got) == xnc::OutputConsume::kTimeMissing);
+    CHECK("tracker-pending-accounting",
+          t.PendingCount() == 2 && t.consumed_count() == 1 &&
+              t.last_registered_time() == 666667);
+    CHECK("tracker-rollback-newest",
+          (t.RollbackNewest(), t.last_registered_time() == 666666 &&
+                                   t.PendingCount() == 1));
+    CHECK("tracker-consume-after-rollback",
+          t.Consume(true, 666667, &got) == xnc::OutputConsume::kTimeUnknown);
+    CHECK("tracker-clear", (t.Clear(), t.PendingCount() == 0));
+    // §8.4 color rule: BT.709 limited at 720p+, BT.601 limited below.
+    const xnc::Nv12ColorConfig c720 = xnc::Nv12ColorForSize(720);
+    const xnc::Nv12ColorConfig c1080 = xnc::Nv12ColorForSize(1080);
+    const xnc::Nv12ColorConfig c480 = xnc::Nv12ColorForSize(480);
+    const xnc::Nv12ColorConfig c719 = xnc::Nv12ColorForSize(719);
+    CHECK("color-rule-709-at-720p",
+          c720.bt709 && c720.matrix == 1 && c720.primaries == 2 &&
+              c720.transfer == 5 && c720.nominal_range == 1);
+    CHECK("color-rule-709-at-1080p",
+          c1080.bt709 && c1080.matrix == 1 && c1080.primaries == 2);
+    CHECK("color-rule-601-below-720p",
+          !c480.bt709 && c480.matrix == 2 && c480.primaries == 5 &&
+              c480.transfer == 5 && c480.nominal_range == 1);
+    CHECK("color-rule-boundary-719", !c719.bt709 && c719.matrix == 2);
+  }
+  { // M2 Task 3: D3D11 color agreement on the ENCODER side (spec §8.4):
+    // the negotiated input type must carry Nv12ColorForSize's matrix, and
+    // the encoded SPS VUI - when the backend writes color metadata - must
+    // agree with the same rule. Measured on this machine: the MS software
+    // H.264 encoder ACCEPTS the color attributes on its input type (the
+    // matrix reads back exactly) but leaves VUI color UNSPECIFIED (its
+    // AVEncVideo*Color* codec APIs are E_NOTIMPL), so on the software
+    // rung the input-type agreement is the proof and the VUI absence is
+    // reported with a loud NOTE (unspecified color in SPS + our
+    // resolution-follows-standard-practice matrix selection is the
+    // coherent combination; a hardware rung writing VUI must match).
+    for (uint32_t rep = 0; rep < 2; ++rep) {
+      const uint32_t w = rep == 0 ? 1280 : 640;
+      const uint32_t h = rep == 0 ? 720 : 480;
+      const xnc::Nv12ColorConfig rule = xnc::Nv12ColorForSize(h);
+      xnc::MfSoftEncoder enc;
+      std::string err;
+      const bool init_ok = enc.Init(w, h, 30, 2000000, &err);
+      if (!init_ok)
+        std::printf("SELFTEST NOTE: color-init(%u) err=%s\n", h, err.c_str());
+      CHECK(rep == 0 ? "color-encoder-init-720" : "color-encoder-init-480",
+            init_ok);
+      if (!init_ok) continue;
+      char name_matrix[48], name_vui[48];
+      std::snprintf(name_matrix, sizeof(name_matrix), "color-input-matrix-%u",
+                    h);
+      std::snprintf(name_vui, sizeof(name_vui), "color-sps-vui-%u", h);
+      CHECK(name_matrix, enc.negotiated_input_matrix() == rule.matrix);
+      // Feed synthetic bars until the cold-start IDR surfaces, then parse
+      // its SPS VUI (EncodeReferenceIdr's feed shape, inlined so the
+      // negotiated matrix above comes from THIS Init).
+      SyntheticBars bars(w, h);
+      enc.ForceNextIdr("color-selftest");
+      SpsVui vui;
+      bool saw_idr = false;
+      std::vector<std::vector<uint8_t>> aus;
+      for (uint32_t i = 0;
+           i < xnc::kEncoderLookaheadFrames * 2 + 4 && !saw_idr; ++i) {
+        aus.clear();
+        if (!enc.Encode(bars.Frame(i % 3), bars.Bytes(), aus, &err)) break;
+        for (const auto& au : aus) {
+          if (xnc::NalHasType(au.data(), au.size(), 5)) {
+            vui = ParseSpsVui(au.data(), au.size());
+            saw_idr = true;
+            break;
+          }
+        }
+      }
+      CHECK(rep == 0 ? "color-idr-encoded-720" : "color-idr-encoded-480",
+            saw_idr && vui.sps_found);
+      if (saw_idr) {
+        if (vui.vui_present && vui.video_signal_present &&
+            vui.colour_description == 1) {
+          CHECK(name_vui, VuiMatchesColorRule(vui, rule));
+          std::printf("SELFTEST NOTE: color-sps-vui-%u cp=%d tc=%d mc=%d "
+                      "range=%d (matches rule bt709=%d)\n",
+                      h, vui.cp, vui.tc, vui.mc, vui.full_range,
+                      rule.bt709 ? 1 : 0);
+        } else {
+          // Loud NOTE, never a silent pass: this backend leaves color
+          // unspecified in the bitstream; agreement is proven at the
+          // input-type level above.
+          std::printf("SELFTEST NOTE: color-sps-vui-%u ABSENT (backend does "
+                      "not signal color metadata; agreement proven via the "
+                      "negotiated input matrix=%u)\n",
+                      h, enc.negotiated_input_matrix());
+          CHECK(name_vui, enc.negotiated_input_matrix() == rule.matrix);
+        }
+      }
+    }
+  }
+  { // M2 Task 3: the encoder SESSION interface + both real rungs over the
+    // Task 1 NV12 pool. Device hardware->WARP (the gpu-surface pattern).
+    //   (a) fake-session contract: a 17-submission output delay (the CPU
+    //       MFT's lookahead shape) must return every output paired to ITS
+    //       input - identity AND lease token (submit-id/slot) - with no
+    //       cross-wiring, leases completed exactly once;
+    //   (b) the GPU-shape fake: leases held until output bound the pool at
+    //       3 in-flight (spec §9) and Shutdown completes them all;
+    //   (c) the REAL CPU session (MfCpuEncoder over MfSoftEncoder): the
+    //       eight-frame pixel probe - distinct content ids, forced IDRs at
+    //       inputs 0 and 7, 1:1 time-keyed mapping, decoded luma
+    //       signatures vs per-input references computed through the SAME
+    //       session type, input discrimination;
+    //   (d) the REAL GPU session (MfGpuEncoder): D3D11-aware hardware
+    //       ladder + startup probe; skip-clean with a loud NOTE when this
+    //       machine's RDP session cannot complete hardware encode work
+    //       (measured: QSV negotiates after MF_TRANSFORM_ASYNC_UNLOCK but
+    //       never emits under RDP).
+    UINT create_flags =
+        D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    Microsoft::WRL::ComPtr<ID3D11Device> dev;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> dev_ctx;
+    D3D_FEATURE_LEVEL fl{};
+    const char* via = "hardware";
+    auto try_create = [&dev, &dev_ctx, &fl](UINT f, D3D_DRIVER_TYPE dt) {
+      dev.Reset();
+      dev_ctx.Reset();
+      return D3D11CreateDevice(nullptr, dt, nullptr, f, nullptr, 0,
+                               D3D11_SDK_VERSION, &dev, &fl, &dev_ctx);
+    };
+    HRESULT hr = try_create(create_flags, D3D_DRIVER_TYPE_HARDWARE);
+    if (FAILED(hr)) {
+      via = "warp";
+      hr = try_create(create_flags, D3D_DRIVER_TYPE_WARP);
+    }
+    CHECK("gpu-session-device", SUCCEEDED(hr));
+    if (SUCCEEDED(hr)) {
+      std::printf("SELFTEST NOTE: gpu-session device driver=%s\n", via);
+      const uint32_t sw = 640, sh = 480;  // even; §8.4 BT.601 regime
+      // Two deterministic NV12 contents (A/B) for the pixel probe: luma
+      // gradients that differ everywhere (discriminating inputs).
+      std::vector<uint8_t> nv12_a(static_cast<size_t>(sw) * sh * 3 / 2);
+      std::vector<uint8_t> nv12_b(static_cast<size_t>(sw) * sh * 3 / 2);
+      for (uint32_t y = 0; y < sh; ++y)
+        for (uint32_t x = 0; x < sw; ++x) {
+          const size_t i = static_cast<size_t>(y) * sw + x;
+          nv12_a[i] = static_cast<uint8_t>((x + y) & 0xFF);
+          nv12_b[i] = static_cast<uint8_t>((255 - x + y) & 0xFF);
+        }
+      for (size_t i = static_cast<size_t>(sw) * sh;
+           i < nv12_a.size(); i += 2) {
+        nv12_a[i] = 128; nv12_a[i + 1] = 128;
+        nv12_b[i] = 96; nv12_b[i + 1] = 160;
+      }
+      auto upload = [&](ID3D11Texture2D* tex, const std::vector<uint8_t>& nv12) {
+        dev_ctx->UpdateSubresource(tex, 0, nullptr, nv12.data(), sw, 0);
+      };
+      // ---- (a) FakeDelaySession: outputs lag submissions by 17 ----
+      class FakeDelaySession final : public xnc::IEncoderSession {
+       public:
+        explicit FakeDelaySession(xnc::Nv12SurfacePool* pool, size_t delay)
+            : pool_(pool), delay_(delay) {}
+        xnc::SubmitResult Submit(const xnc::FrameIdentity& id,
+                                 xnc::SurfaceLease&& lease,
+                                 bool force_idr) override {
+          (void)force_idr;
+          ++submits_;
+          const uint64_t sid = id.encode_seq;
+          const size_t slot = lease.index();
+          if (!lease.Submit(sid)) {
+            lease.Release();
+            return xnc::SubmitResult::kRejected;
+          }
+          // CPU shape: the input is consumed at Submit (bytes secured) -
+          // the lease completes now; only the OUTPUT identity lags.
+          if (!pool_->Complete(sid)) ++double_completes_;
+          ++completes_;
+          Rec p{};
+          p.id = id;
+          p.sid = sid;
+          p.slot = slot;
+          fifo_.push_back(p);
+          if (fifo_.size() > delay_) {
+            ready_.push_back(fifo_.front());
+            fifo_.erase(fifo_.begin());
+          }
+          return xnc::SubmitResult::kOk;
+        }
+        bool TakeOutput(xnc::EncoderOutput* out, uint32_t) override {
+          if (out == nullptr || ready_.empty()) return false;
+          const Rec& p = ready_.front();
+          out->id = p.id;
+          out->submit_id = p.sid;
+          out->slot = p.slot;
+          out->sample_time = static_cast<int64_t>(p.sid) * 33333;
+          out->key = true;
+          out->au = {0, 0, 0, 1, 0x65};
+          ready_.erase(ready_.begin());
+          ++returned_;
+          return true;
+        }
+        bool Reconfigure(uint32_t bitrate, uint32_t fps) override {
+          reconf_bitrate_ = bitrate;
+          reconf_fps_ = fps;
+          return true;
+        }
+        void Shutdown(xnc::ShutdownMode) override {
+          // CPU shape completed every lease at consumption already.
+          shutdown_pending_ = fifo_.size();
+          fifo_.clear();
+          ready_.clear();
+        }
+        size_t submits_ = 0, completes_ = 0, double_completes_ = 0;
+        size_t returned_ = 0, shutdown_pending_ = 0;
+        uint32_t reconf_bitrate_ = 0, reconf_fps_ = 0;
+
+       private:
+        struct Rec {
+          xnc::FrameIdentity id{};
+          uint64_t sid = 0;
+          size_t slot = 0;
+        };
+        xnc::Nv12SurfacePool* pool_;
+        size_t delay_;
+        std::vector<Rec> fifo_, ready_;
+      };
+      xnc::Nv12SurfacePool pool;
+      std::string err;
+      CHECK("session-pool-init", pool.Init(dev.Get(), sw, sh, &err));
+      constexpr size_t kFakeDelay = 17;
+      constexpr size_t kFakeSubmits = 24;
+      FakeDelaySession fake(&pool, kFakeDelay);
+      std::vector<size_t> slots(kFakeSubmits, 999);
+      bool pre_delay_true = true;  // TakeOutput must fail before input #18
+      for (size_t i = 0; i < kFakeSubmits; ++i) {
+        xnc::SurfaceLease* lease = pool.Acquire();
+        CHECK("fake-lease-available", lease != nullptr);
+        if (lease == nullptr) break;
+        upload(lease->texture(), (i % 2) ? nv12_b : nv12_a);
+        slots[i] = lease->index();
+        const xnc::FrameIdentity id{1, 1, 100 + i, i + 1, 0, 0};
+        const xnc::SubmitResult r =
+            fake.Submit(id, std::move(*lease), i == 0);
+        CHECK("fake-submit-ok", r == xnc::SubmitResult::kOk);
+        xnc::EncoderOutput out;
+        if (i + 1 <= kFakeDelay && fake.TakeOutput(&out, 1))
+          pre_delay_true = false;
+      }
+      CHECK("fake-no-output-before-delay",
+            pre_delay_true && fake.submits_ == kFakeSubmits);
+      CHECK("fake-completes-exactly-once",
+            fake.completes_ == kFakeSubmits && fake.double_completes_ == 0);
+      // Every returned output pairs to ITS input: identity + lease token.
+      bool pairing_ok = true;
+      size_t expect = kFakeSubmits - kFakeDelay;  // 7 by now
+      xnc::EncoderOutput out;
+      while (fake.TakeOutput(&out, 1)) {
+        const size_t i = fake.returned_ - 1;  // FIFO: output j <-> input j
+        if (out.id.encode_seq != i + 1 || out.id.content_id != 100 + i ||
+            out.submit_id != i + 1 || out.slot != slots[i] || !out.key)
+          pairing_ok = false;
+      }
+      CHECK("fake-identity-lease-pairing", pairing_ok);
+      CHECK("fake-output-count", fake.returned_ == expect);
+      CHECK("fake-reconfigure",
+            fake.Reconfigure(1500000, 24) && fake.reconf_bitrate_ == 1500000 &&
+                fake.reconf_fps_ == 24);
+      fake.Shutdown(xnc::ShutdownMode::kDrain);
+      pool.FreeRetired();  // sweep any last consumption-retired slot
+      CHECK("fake-shutdown-zero-live",
+            pool.LiveLeases() == 0 &&
+                pool.FreeCount() == xnc::Nv12SurfacePool::kSlotCount);
+      // ---- (b) FakeHoldSession: GPU shape (leases held until output) ----
+      class FakeHoldSession final : public xnc::IEncoderSession {
+       public:
+        explicit FakeHoldSession(xnc::Nv12SurfacePool* pool,
+                                 size_t delay)
+            : pool_(pool), delay_(delay) {}
+        xnc::SubmitResult Submit(const xnc::FrameIdentity& id,
+                                 xnc::SurfaceLease&& lease,
+                                 bool force_idr) override {
+          (void)force_idr;
+          if (!lease.Submit(id.encode_seq)) {
+            lease.Release();
+            return xnc::SubmitResult::kRejected;
+          }
+          Rec p{};
+          p.id = id;
+          p.sid = id.encode_seq;
+          p.slot = lease.index();
+          fifo_.push_back(p);
+          ++submits_;
+          return xnc::SubmitResult::kOk;
+        }
+        bool TakeOutput(xnc::EncoderOutput* out, uint32_t) override {
+          if (out == nullptr || fifo_.size() <= delay_) return false;
+          const Rec p = fifo_.front();
+          fifo_.erase(fifo_.begin());
+          if (!pool_->Complete(p.sid)) ++double_completes_;
+          ++completes_;
+          out->id = p.id;
+          out->submit_id = p.sid;
+          out->slot = p.slot;
+          return true;
+        }
+        bool Reconfigure(uint32_t, uint32_t) override { return true; }
+        void Shutdown(xnc::ShutdownMode) override {
+          for (const auto& p : fifo_) {
+            if (!pool_->Complete(p.sid)) ++double_completes_;
+            ++completes_;
+          }
+          fifo_.clear();
+        }
+        size_t submits_ = 0, completes_ = 0, double_completes_ = 0;
+
+       private:
+        struct Rec {
+          xnc::FrameIdentity id{};
+          uint64_t sid = 0;
+          size_t slot = 0;
+        };
+        xnc::Nv12SurfacePool* pool_;
+        size_t delay_;
+        std::vector<Rec> fifo_;
+      };
+      FakeHoldSession hold(&pool, kFakeDelay);
+      size_t held = 0;
+      for (; held < 6; ++held) {  // try 6; only 3 slots may be in flight
+        xnc::SurfaceLease* lease = pool.Acquire();
+        if (lease == nullptr) break;
+        upload(lease->texture(), nv12_a);
+        const xnc::FrameIdentity id{1, 1, 200 + held, 50 + held, 0, 0};
+        CHECK("hold-submit-ok",
+              hold.Submit(id, std::move(*lease), false) ==
+              xnc::SubmitResult::kOk);
+      }
+      CHECK("hold-pool-bounded-at-three",
+            held == 3 && pool.Acquire() == nullptr &&
+                pool.LiveLeases() == 3);
+      xnc::EncoderOutput hout;
+      CHECK("hold-no-output", !hold.TakeOutput(&hout, 1));
+      hold.Shutdown(xnc::ShutdownMode::kImmediate);
+      CHECK("hold-shutdown-completes-all",
+            hold.completes_ == 3 && hold.double_completes_ == 0);
+      CHECK("hold-zero-live-after-shutdown",
+            pool.FreeRetired() == 3 && pool.LiveLeases() == 0 &&
+                pool.FreeCount() == xnc::Nv12SurfacePool::kSlotCount);
+      CHECK("hold-complete-unknown-after",
+            !pool.Complete(50));  // already retired: exactly-once evidence
+      // ---- (c) the REAL eight-frame pixel probe over a session ----
+      // Fixed 30-input sequence (deterministic; identical across the probe
+      // and the reference run): inputs 0..7 alternate A/B with distinct
+      // content ids and forced IDRs at 0 and 7; 9..30 continue the
+      // alternation so the software rung's ~17-input warm-up surfaces the
+      // first outputs (its lookahead is structural - see the NOTE below).
+      struct ProbeOutcome {
+        bool ok = false;
+        int first_output_inputs = -1;
+        uint32_t first_output_ms = 0;
+        std::vector<xnc::EncoderOutput> outputs;
+        uint64_t hash_a = 0, hash_b = 0;
+        bool decoded_a = false, decoded_b = false;
+        std::string err;
+      };
+      auto run_probe = [&](xnc::IEncoderSession& sess) {
+        ProbeOutcome po;
+        const ULONGLONG t0 = GetTickCount64();
+        for (uint32_t i = 0; i < 30; ++i) {
+          xnc::SurfaceLease* lease = pool.Acquire();
+          if (lease == nullptr) {
+            po.err = "probe: pool exhausted (lease leak?)";
+            return po;
+          }
+          upload(lease->texture(), (i % 2) ? nv12_b : nv12_a);
+          const xnc::FrameIdentity id{1, 1, 300 + i, i + 1, 0, 0};
+          const bool force = (i == 0 || i == 7);
+          const xnc::SubmitResult r = sess.Submit(id, std::move(*lease), force);
+          if (r != xnc::SubmitResult::kOk) {
+            po.err = "probe: submit rejected at input " + std::to_string(i);
+            return po;
+          }
+          xnc::EncoderOutput out;
+          while (sess.TakeOutput(&out, 4)) {
+            if (po.first_output_inputs < 0) {
+              po.first_output_inputs = static_cast<int>(i) + 1;
+              po.first_output_ms =
+                  static_cast<uint32_t>(GetTickCount64() - t0);
+            }
+            po.outputs.push_back(std::move(out));
+          }
+        }
+        xnc::EncoderOutput out;
+        while (sess.TakeOutput(&out, 4)) po.outputs.push_back(std::move(out));
+        // Decode the two forced-IDR outputs (input 0 = content A,
+        // input 7 = content B) through the MF decoder probe.
+        std::string derr;
+        for (const auto& o : po.outputs) {
+          if (!(o.key && (o.id.encode_seq == 1 || o.id.encode_seq == 8)))
+            continue;
+          uint64_t hash = 0;
+          if (!xnc::DecodeAnnexBToLumaHash(o.au, &hash, &derr)) continue;
+          if (o.id.encode_seq == 1) {
+            po.hash_a = hash;
+            po.decoded_a = true;
+          } else {
+            po.hash_b = hash;
+            po.decoded_b = true;
+          }
+        }
+        if (!po.decoded_a)
+          po.err = "probe: no decodable IDR for input 0" +
+                   (derr.empty() ? std::string() : " (" + derr + ")");
+        else if (!po.decoded_b)
+          po.err = "probe: no decodable IDR for input 7";
+        po.ok = po.err.empty();
+        return po;
+      };
+      xnc::MfCpuEncoder cpu;
+      bool cpu_ok = cpu.Init(dev.Get(), &pool, sw, sh, 30, 2000000, &err);
+      if (!cpu_ok)
+        std::printf("SELFTEST NOTE: cpu-session-init err=%s\n", err.c_str());
+      CHECK("cpu-session-init", cpu_ok);
+      if (cpu_ok) {
+        std::printf("SELFTEST NOTE: cpu-session backend=%s friendly=\"%s\"\n",
+                    cpu.BackendName(), cpu.FriendlyName().c_str());
+        ProbeOutcome p1 = run_probe(cpu);
+        if (!p1.ok)
+          std::printf("SELFTEST NOTE: cpu-probe err=%s\n", p1.err.c_str());
+        CHECK("cpu-probe-ok", p1.ok);
+        if (p1.ok) {
+          // 1:1 mapping: inputs 1..8 each produced exactly one output,
+          // paired by identity + lease token; reordering is allowed (the
+          // software MFT emits AUs out of input order - time-keyed
+          // mapping, not FIFO position).
+          bool map_ok = p1.outputs.size() >= 8;
+          for (uint64_t seq = 1; seq <= 8 && map_ok; ++seq) {
+            size_t n = 0;
+            for (const auto& o : p1.outputs) {
+              if (o.id.encode_seq == seq) {
+                ++n;
+                map_ok = map_ok && o.submit_id == seq && o.slot < 3;
+              }
+            }
+            map_ok = map_ok && n == 1;
+          }
+          CHECK("cpu-probe-1to1-mapping", map_ok);
+          // First-output bound: the STRICT §8.3 bound (two inputs or
+          // 100 ms) is a HARDWARE gate; the software rung's structural
+          // ~17-input lookahead (measured; CBR/low-latency does not
+          // remove it) gets the loud-NOTE treatment here.
+          std::printf("SELFTEST NOTE: cpu-probe first_output_inputs=%d "
+                      "first_output_ms=%u outputs=%zu (software rung: the "
+                      "strict 2-input/100ms bound is hardware-only; "
+                      "spec 8.3 items 1/3/4/5 all asserted)\n",
+                      p1.first_output_inputs, p1.first_output_ms,
+                      p1.outputs.size());
+          CHECK("cpu-probe-first-output-bounded",
+                p1.first_output_inputs > 0 &&
+                    p1.first_output_inputs <= 30);
+          CHECK("cpu-probe-discriminates",
+                p1.hash_a != 0 && p1.hash_b != 0 && p1.hash_a != p1.hash_b);
+          // Hot reconfigure (spec §8.2): rate change keeps the session
+          // encoding with intact identity mapping.
+          CHECK("cpu-reconfigure", cpu.Reconfigure(1200000, 30));
+          {
+            xnc::SurfaceLease* lease = pool.Acquire();
+            CHECK("cpu-post-reconf-lease", lease != nullptr);
+            if (lease != nullptr) {
+              upload(lease->texture(), nv12_b);
+              const xnc::FrameIdentity id{1, 1, 400, 31, 0, 0};
+              CHECK("cpu-post-reconf-submit",
+                    cpu.Submit(id, std::move(*lease), false) ==
+                        xnc::SubmitResult::kOk);
+              bool got31 = false;
+              xnc::EncoderOutput out;
+              uint64_t fill_seq = 31;
+              const ULONGLONG dl = GetTickCount64() + 3000;
+              while (GetTickCount64() < dl) {
+                if (cpu.TakeOutput(&out, 4) && out.id.encode_seq == 31) {
+                  got31 = true;
+                  break;
+                }
+                xnc::SurfaceLease* fill = pool.Acquire();
+                if (fill == nullptr) {
+                  Sleep(4);
+                  continue;
+                }
+                upload(fill->texture(), nv12_a);
+                const xnc::FrameIdentity fid{1, 1, 401, ++fill_seq, 0, 0};
+                cpu.Submit(fid, std::move(*fill), false);
+              }
+              CHECK("cpu-post-reconf-output-maps", got31);
+            }
+          }
+          // Reference regime: a PRISTINE session of the SAME type, fed the
+          // IDENTICAL 30-input sequence, must decode to the same per-input
+          // signatures (decode-side determinism via the same backend -
+          // the abc-scenario reference discipline).
+          xnc::MfCpuEncoder cpu2;
+          const bool cpu2_ok =
+              cpu2.Init(dev.Get(), &pool, sw, sh, 30, 2000000, &err);
+          CHECK("cpu-ref-session-init", cpu2_ok);
+          if (cpu2_ok) {
+            ProbeOutcome p2 = run_probe(cpu2);
+            CHECK("cpu-ref-probe-ok", p2.ok);
+            if (p2.ok) {
+              CHECK("cpu-ref-signature-a", p2.hash_a == p1.hash_a);
+              CHECK("cpu-ref-signature-b", p2.hash_b == p1.hash_b);
+            }
+            cpu2.Shutdown(xnc::ShutdownMode::kDrain);
+            pool.FreeRetired();  // sweep consumption-retired slots
+            CHECK("cpu-ref-zero-live",
+                  pool.LiveLeases() == 0 &&
+                      pool.FreeCount() == xnc::Nv12SurfacePool::kSlotCount);
+          }
+        }
+        cpu.Shutdown(xnc::ShutdownMode::kDrain);
+        pool.FreeRetired();
+        CHECK("cpu-shutdown-zero-live",
+              pool.LiveLeases() == 0 &&
+                  pool.FreeCount() == xnc::Nv12SurfacePool::kSlotCount);
+        CHECK("cpu-shutdown-takeoutput-notready",
+              [&] {
+                xnc::EncoderOutput out;
+                return !cpu.TakeOutput(&out, 1) &&
+                       cpu.last_error() ==
+                           xnc::EncoderSessionError::kNotReady;
+              }());
+        {
+          xnc::SurfaceLease* lease = pool.Acquire();
+          CHECK("cpu-shutdown-submit-lease", lease != nullptr);
+          if (lease != nullptr) {
+            const size_t idx = lease->index();
+            xnc::FrameIdentity id{};
+            id.capture_epoch = 1;
+            id.codec_epoch = 1;
+            id.content_id = 500;
+            id.encode_seq = 60;
+            const xnc::SubmitResult r =
+                cpu.Submit(id, std::move(*lease), false);
+            CHECK("cpu-shutdown-submit-releases-lease",
+                  r == xnc::SubmitResult::kNotReady &&
+                      pool.State(idx) == xnc::SurfaceLeaseState::kFree);
+          }
+        }
+      }
+      // ---- (d) the REAL GPU session (D3D11-aware hardware ladder) ----
+      xnc::MfGpuEncoder gpu;
+      const bool gpu_ok = gpu.Init(dev.Get(), &pool, sw, sh, 30, 2000000, &err);
+      if (!gpu_ok) {
+        // Skip-clean (plan ruling 5): no fail, no silent pass. The error
+        // carries the measured machine shape (async-unlockable QSV that
+        // never completes encode work under RDP, or no hardware encoder).
+        std::printf("SELFTEST NOTE: gpu-session hardware path UNAVAILABLE "
+                    "on this machine - err=\"%s\" - hardware session "
+                    "scenarios SKIPPED (the software path above is the "
+                    "exercised rung)\n",
+                    err.c_str());
+        CHECK("gpu-session-skip-reason",
+              err.find("startup probe") != std::string::npos ||
+                  err.find("hardware H.264 encoder") != std::string::npos ||
+                  err.find("D3D11-aware") != std::string::npos ||
+                  err.find("MFTEnumEx") != std::string::npos ||
+                  err.find("MFCreateDXGIDeviceManager") != std::string::npos);
+        CHECK("gpu-session-skip-not-initialized", !gpu.initialized());
+        xnc::SurfaceLease* lease = pool.Acquire();
+        CHECK("gpu-skip-lease", lease != nullptr);
+        if (lease != nullptr) {
+          const size_t idx = lease->index();
+          const xnc::FrameIdentity id{1, 1, 600, 70, 0, 0};
+          CHECK("gpu-skip-submit-notready",
+                gpu.Submit(id, std::move(*lease), false) ==
+                    xnc::SubmitResult::kNotReady);
+          CHECK("gpu-skip-lease-returned",
+                pool.State(idx) == xnc::SurfaceLeaseState::kFree);
+        }
+        xnc::EncoderOutput out;
+        CHECK("gpu-skip-takeoutput-notready",
+              !gpu.TakeOutput(&out, 1) && gpu.last_error() ==
+                                              xnc::EncoderSessionError::
+                                                  kNotReady);
+        CHECK("gpu-skip-reconfigure", !gpu.Reconfigure(1, 30));
+        gpu.Shutdown(xnc::ShutdownMode::kImmediate);
+        pool.FreeRetired();
+        CHECK("gpu-skip-zero-live",
+              pool.LiveLeases() == 0 &&
+                  pool.FreeCount() == xnc::Nv12SurfacePool::kSlotCount);
+      } else {
+        // Hardware initialized (console session / capable RDP): run the
+        // same probe with the STRICT §8.3 bounds.
+        std::printf("SELFTEST NOTE: gpu-session hardware INITIALIZED "
+                    "friendly=\"%s\" - running the strict probe\n",
+                    gpu.FriendlyName().c_str());
+        ProbeOutcome p1 = run_probe(gpu);
+        CHECK("gpu-probe-ok", p1.ok);
+        if (p1.ok) {
+          bool map_ok = p1.outputs.size() >= 8;
+          for (uint64_t seq = 1; seq <= 8 && map_ok; ++seq) {
+            size_t n = 0;
+            for (const auto& o : p1.outputs) {
+              if (o.id.encode_seq == seq) {
+                ++n;
+                map_ok = map_ok && o.submit_id == seq && o.slot < 3;
+              }
+            }
+            map_ok = map_ok && n == 1;
+          }
+          CHECK("gpu-probe-1to1-mapping", map_ok);
+          CHECK("gpu-probe-first-output-strict",
+                p1.first_output_inputs > 0 && p1.first_output_inputs <= 2 &&
+                    p1.first_output_ms <= 100);
+          CHECK("gpu-probe-discriminates", p1.hash_a != p1.hash_b);
+          // The SPS VUI must agree with the §8.4 rule on a rung that
+          // signals color metadata.
+          const xnc::Nv12ColorConfig rule = xnc::Nv12ColorForSize(sh);
+          bool vui_checked = false, vui_ok = false, saw_idr_vui = false;
+          for (const auto& o : p1.outputs) {
+            if (!o.key) continue;
+            const SpsVui vui = ParseSpsVui(o.au.data(), o.au.size());
+            if (!vui.sps_found) continue;
+            saw_idr_vui = true;
+            if (vui.vui_present && vui.video_signal_present &&
+                vui.colour_description == 1) {
+              vui_checked = true;
+              vui_ok = VuiMatchesColorRule(vui, rule);
+            }
+          }
+          if (vui_checked) {
+            CHECK("gpu-probe-vui-agrees", vui_ok);
+          } else if (saw_idr_vui) {
+            std::printf("SELFTEST NOTE: gpu-probe VUI color unspecified "
+                        "(backend does not signal; VideoProcessor + input "
+                        "type carry the rule)\n");
+          }
+        }
+        gpu.Shutdown(xnc::ShutdownMode::kDrain);
+        pool.FreeRetired();
+        CHECK("gpu-shutdown-zero-live",
+              pool.LiveLeases() == 0 &&
+                  pool.FreeCount() == xnc::Nv12SurfacePool::kSlotCount);
       }
     }
   }

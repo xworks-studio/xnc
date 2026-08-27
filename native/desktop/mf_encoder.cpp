@@ -105,10 +105,19 @@ HRESULT MakeH264OutputType(uint32_t w, uint32_t h, uint32_t fps, uint32_t bitrat
 // The caller's NV12 input type (tight stride = width) — the ONE standard
 // input attempt for both rungs. Hardware MFTs that reject CPU NV12 (QSV
 // needs D3D11 textures, M4) log the failure and the ladder falls back to
-// the next candidate / the software rung.
+// the next candidate / the software rung. M2 Task 3: the type carries the
+// §8.4 color rule (BT.709 limited >=720p, BT.601 limited below -
+// Nv12ColorForSize) so the encoded stream's advertised input matrix always
+// matches the VideoProcessor conversion; measured accepted by both the
+// software rung and the (unlocked) QSV rung. MF_MT_VIDEO_NOMINAL_RANGE is
+// deliberately NOT set: the MS software encoder rejects the attribute
+// outright (0xC00D36B4, measured) - limited range is implied by the YUV
+// matrix and carried explicitly by the VideoProcessor side
+// (D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235).
 HRESULT MakeNv12InputType(uint32_t w, uint32_t h, uint32_t fps, IMFMediaType** out) {
   const uint64_t frame_size = (static_cast<uint64_t>(w) << 32) | h;
   const uint64_t frame_rate = (static_cast<uint64_t>(fps) << 32) | 1;
+  const Nv12ColorConfig color = Nv12ColorForSize(h);
   ComPtr<IMFMediaType> mt;
   HRESULT hr = MFCreateMediaType(mt.GetAddressOf());
   if (SUCCEEDED(hr)) hr = mt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
@@ -117,6 +126,12 @@ HRESULT MakeNv12InputType(uint32_t w, uint32_t h, uint32_t fps, IMFMediaType** o
   if (SUCCEEDED(hr)) hr = mt->SetUINT64(MF_MT_FRAME_SIZE, frame_size);
   if (SUCCEEDED(hr)) hr = mt->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
   if (SUCCEEDED(hr)) hr = mt->SetUINT64(MF_MT_FRAME_RATE, frame_rate);
+  if (SUCCEEDED(hr))
+    hr = mt->SetUINT32(MF_MT_YUV_MATRIX, color.matrix);
+  if (SUCCEEDED(hr))
+    hr = mt->SetUINT32(MF_MT_VIDEO_PRIMARIES, color.primaries);
+  if (SUCCEEDED(hr))
+    hr = mt->SetUINT32(MF_MT_TRANSFER_FUNCTION, color.transfer);
   if (SUCCEEDED(hr)) *out = mt.Detach();
   return hr;
 }
@@ -209,6 +224,7 @@ void MfSoftEncoder::ReleaseMft() {
   impl_->rt_last = 0;
   impl_->in_stride = 0;
   impl_->in_padded_.clear();
+  in_matrix_ = 0;
   sps_pps_.clear();
   last_was_key_ = false;
   force_pending_ = false;
@@ -225,6 +241,7 @@ void MfSoftEncoder::Shutdown() {
     impl_ = nullptr;
   }
   w_ = h_ = fps_ = bitrate_ = 0;
+  in_matrix_ = 0;
   nv12_.clear();
   backend_ = EncoderBackend::kSoftware;
   friendly_name_.clear();
@@ -312,15 +329,21 @@ bool MfSoftEncoder::InitWithMft(IMFTransform* mft, const std::wstring& friendly,
   // Negotiated input stride: honor a wider aligned stride (pad input rows);
   // 0/absent/odd/<w means tight is in effect. Log the readback so the
   // MFT's chosen stride is diagnosable after every successful negotiation.
+  // M2 Task 3: also read back the negotiated YUV matrix - the color
+  // agreement surface (must match Nv12ColorForSize; the MFT may normalize
+  // or drop the attribute, so record what is actually in force).
   impl_->in_stride = 0;
+  in_matrix_ = 0;
   {
     ComPtr<IMFMediaType> cur;
     UINT32 s = 0;
     if (SUCCEEDED(mft->GetInputCurrentType(0, cur.GetAddressOf()))) {
       if (SUCCEEDED(cur->GetUINT32(MF_MT_DEFAULT_STRIDE, &s))) impl_->in_stride = s;
+      UINT32 m = 0;
+      if (SUCCEEDED(cur->GetUINT32(MF_MT_YUV_MATRIX, &m))) in_matrix_ = m;
     }
-    XNC_LOG_INFO("encoder_input_negotiated_stride backend=%s stride=%u w=%u",
-                 hardware ? "hardware" : "software", s, w_);
+    XNC_LOG_INFO("encoder_input_negotiated_stride backend=%s stride=%u w=%u matrix=%u",
+                 hardware ? "hardware" : "software", s, w_, in_matrix_);
     if (impl_->in_stride < w_ || (impl_->in_stride % 2) != 0) impl_->in_stride = 0;
   }
   if (impl_->in_stride != 0 && impl_->in_stride != w_) {
@@ -531,7 +554,7 @@ bool MfSoftEncoder::Init(uint32_t w, uint32_t h, uint32_t fps, uint32_t bitrate_
 
 EncoderSubmitResult MfSoftEncoder::SubmitNv12(
     const uint8_t* nv12, size_t len, std::vector<std::vector<uint8_t>>& aus,
-    std::string* err) {
+    std::string* err, std::vector<int64_t>* out_times, const int64_t* in_time) {
   const uint8_t* src = nv12;
   size_t src_len = len;
   if (impl_->in_stride != 0 && impl_->in_stride != w_) {
@@ -573,7 +596,10 @@ EncoderSubmitResult MfSoftEncoder::SubmitNv12(
   // PTS = wall clock since Init in 100ns units (the media-type frame rate is
   // only the rate-control reference; fixed-step timestamps drift under
   // variable capture cadence). Monotonic, duration = gap to previous frame.
-  int64_t now = impl_->Now100ns();
+  // M2 Task 3: in_time (session adapters only) overrides the wall clock
+  // with the caller's strictly increasing 100ns sequence; the wall-clock
+  // default keeps the M0-pinned behavior for every existing caller.
+  int64_t now = in_time != nullptr ? *in_time : impl_->Now100ns();
   if (now <= impl_->rt_last) now = impl_->rt_last + 1;
   int64_t dur = impl_->rt_last == 0 ? static_cast<int64_t>(10000000 / fps_) : now - impl_->rt_last;
   if (dur <= 0) dur = 1;
@@ -606,7 +632,8 @@ EncoderSubmitResult MfSoftEncoder::SubmitNv12(
     if (!accepted && err != nullptr) *err = HrStep("ProcessInput", hr);
   }
   if (!accepted) return {};
-  const bool outputs_ok = CollectOutputs(aus, err, EncoderOutputStage::kSubmit);
+  const bool outputs_ok =
+      CollectOutputs(aus, err, EncoderOutputStage::kSubmit, out_times);
   return {true, outputs_ok};
 }
 
@@ -633,8 +660,9 @@ EncoderSubmitResult MfSoftEncoder::Encode(
 
 EncoderSubmitResult MfSoftEncoder::EncodeNV12(
     const uint8_t* nv12, size_t len, std::vector<std::vector<uint8_t>>& aus,
-    std::string* err) {
+    std::string* err, std::vector<int64_t>* out_times, const int64_t* in_time) {
   aus.clear();
+  if (out_times != nullptr) out_times->clear();
   if (!impl_ || impl_->mft.Get() == nullptr) {
     if (err) *err = "encoder not initialized";
     return {};
@@ -645,7 +673,7 @@ EncoderSubmitResult MfSoftEncoder::EncodeNV12(
       *err = "short nv12 frame: " + std::to_string(len) + " < " + std::to_string(need);
     return {};
   }
-  return SubmitNv12(nv12, len, aus, err);
+  return SubmitNv12(nv12, len, aus, err, out_times, in_time);
 }
 
 void MfSoftEncoder::ForceNextIdr(const char* reason) {
@@ -654,13 +682,33 @@ void MfSoftEncoder::ForceNextIdr(const char* reason) {
 }
 
 bool MfSoftEncoder::Drain(std::vector<std::vector<uint8_t>>& aus,
-                          std::string* err) {
+                          std::string* err,
+                          std::vector<int64_t>* out_times) {
   if (!impl_ || impl_->mft.Get() == nullptr) return true;
-  return CollectOutputs(aus, err, EncoderOutputStage::kDrain);
+  return CollectOutputs(aus, err, EncoderOutputStage::kDrain, out_times);
+}
+
+bool MfSoftEncoder::ReconfigureRate(uint32_t bitrate_bps) {
+  if (!impl_ || impl_->mft.Get() == nullptr || impl_->codec_api.Get() == nullptr)
+    return false;
+  if (bitrate_bps == 0) return false;
+  VARIANT v{};
+  v.vt = VT_UI4;
+  v.ulVal = bitrate_bps;
+  const HRESULT hr = impl_->codec_api->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &v);
+  if (FAILED(hr)) {
+    XNC_LOG_INFO("reconfigure_rate_rejected hr=0x%08x (previous rate kept)",
+                 static_cast<unsigned int>(hr));
+    return false;
+  }
+  bitrate_ = bitrate_bps;
+  XNC_LOG_INFO("reconfigure_rate bitrate=%u", bitrate_bps);
+  return true;
 }
 
 bool MfSoftEncoder::FlushTail(std::vector<std::vector<uint8_t>>& aus,
-                              std::string* err) {
+                              std::string* err,
+                              std::vector<int64_t>* out_times) {
   if (!impl_ || impl_->mft.Get() == nullptr) return true;
   // Canonical MFT flush: no more input (END_OF_STREAM), then COMMAND_DRAIN =
   // produce all pending output; CollectOutputs stops at
@@ -695,7 +743,7 @@ bool MfSoftEncoder::FlushTail(std::vector<std::vector<uint8_t>>& aus,
                   "flush_tail drain");
   std::string collect_err;
   const bool outputs_ok =
-      CollectOutputs(aus, &collect_err, EncoderOutputStage::kFlushTail);
+      CollectOutputs(aus, &collect_err, EncoderOutputStage::kFlushTail, out_times);
   if (!outputs_ok) {
     if (err != nullptr) *err = collect_err;
     return false;
@@ -706,9 +754,18 @@ bool MfSoftEncoder::FlushTail(std::vector<std::vector<uint8_t>>& aus,
 
 bool MfSoftEncoder::CollectOutputs(std::vector<std::vector<uint8_t>>& aus,
                                    std::string* err,
-                                   EncoderOutputStage stage) {
-  if (fault_seam_ != nullptr && fault_seam_->collect_outputs != nullptr)
-    return fault_seam_->collect_outputs(fault_seam_->ctx, stage, &aus, err);
+                                   EncoderOutputStage stage,
+                                   std::vector<int64_t>* out_times) {
+  if (fault_seam_ != nullptr && fault_seam_->collect_outputs != nullptr) {
+    // Fault-seam path (M0-pinned tests): synthesized AUs carry no sample
+    // times; session adapters never run with a seam attached, so out_times
+    // (when passed) simply records 0 per AU to stay index-aligned.
+    const size_t before = aus.size();
+    const bool ok = fault_seam_->collect_outputs(fault_seam_->ctx, stage, &aus, err);
+    if (out_times != nullptr)
+      out_times->insert(out_times->end(), aus.size() - before, 0);
+    return ok;
+  }
   bool any_au = false;
   bool has_idr = false;
   for (;;) {
@@ -744,6 +801,16 @@ bool MfSoftEncoder::CollectOutputs(std::vector<std::vector<uint8_t>>& aus,
     }
     if (!ob.pSample) continue;
 
+    // M2 Task 3: the AU's own 100ns sample time (the MFT echoes the input
+    // PTS; software-MFT AUs surface reordered, so identity pairing must
+    // key on these). Collected before the buffer is detached/copied.
+    if (out_times != nullptr) {
+      LONGLONG t = 0;
+      if (SUCCEEDED(ob.pSample->GetSampleTime(&t)))
+        out_times->push_back(static_cast<int64_t>(t));
+      else
+        out_times->push_back(0);
+    }
     ComPtr<IMFMediaBuffer> buf;
     hr = ob.pSample->ConvertToContiguousBuffer(buf.GetAddressOf());
     if (SUCCEEDED(hr)) {
