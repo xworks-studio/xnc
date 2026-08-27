@@ -774,9 +774,14 @@ class RtServer : public AuSink {
   // backend-fallback factories (a DXGI rung that cannot be rebuilt falls
   // to GDI through the unified reset; a 30 s probe returns) - the default
   // keeps the Task 4 single-direct-backend behavior for fakes.
+  // Final-review fix 2026-08: force_software threads the --encoder software
+  // pin into cfg.force_software_encoder (the M0 rt path and the v2 diag
+  // path already honor it) so the degraded-restart contract reaches the V2
+  // session selection in rt mode too - no hardware rung attempt at all.
   int ServeV2(ICapture& cap, ICaptureSurface& surf, const Opts& o,
               uint32_t max_width = 0,
-              MediaBackend initial_backend = MediaBackend::kDxgi);
+              MediaBackend initial_backend = MediaBackend::kDxgi,
+              bool force_software = false);
 
   // Idempotent: stops the accept loop, broadcasts STATE{stream_end} to the
   // attached subscribers, cancels their IO, joins every connection thread.

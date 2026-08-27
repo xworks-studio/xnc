@@ -1240,7 +1240,11 @@ class Loop {
   // Swaps the desktop backend during a reset (ruling 3). The pipeline
   // OWNS factory-created backends; the caller-owned initial backend
   // (cfg.cap at Start) is never freed here. False = the factory could not
-  // produce a usable rung (keep serving on the current one).
+  // produce a usable rung (keep serving on the current one). The shared
+  // LatestSurface was already fully Reset by the reset's phase 3 (runs
+  // before any swap): the new rung's first AcquireSurface re-Inits it on
+  // the new backend's device - the swap never inherits the old device's
+  // texture (final-review fix 2026-08).
   bool SwapBackend(MediaBackend kind, const char* reason) {
     if (im_.cfg.make_backend == nullptr) return false;
     std::string berr;
@@ -1386,8 +1390,12 @@ class Loop {
     im_.stream_inited = false;
 
     // Phase 3 - retire leases: tear the session (its Shutdown completes
-    // every outstanding lease), sweep the pool, invalidate the surface
-    // (its content dies with the rebuild).
+    // every outstanding lease), sweep the pool, RESET the surface - not
+    // merely Invalidate (final-review fix 2026-08): the texture AND its
+    // device pairing die with the rebuild. The next backend's first
+    // AcquireSurface re-Inits the surface on ITS device, so a swap to GDI
+    // at identical dims (a duplicated primary) can never keep serving the
+    // dead DXGI device's frozen pixels through a cross-device CopyFrom.
     Phase(ResetPhase::kRetireLeases);
     if (im_.session) {
       im_.session->Shutdown(ShutdownMode::kImmediate);
@@ -1395,7 +1403,7 @@ class Loop {
     }
     im_.pool.RetireAll();
     im_.pool.FreeRetired();
-    im_.latest.Invalidate();
+    im_.latest.Reset();
 
     // Phase 4 - rebuild. Wait out a secure desktop first (immediate
     // rebuilds are futile there), then rebuild with retry/backoff; a DXGI

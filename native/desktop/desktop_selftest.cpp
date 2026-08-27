@@ -8079,6 +8079,32 @@ int SelftestMain(bool desktop_pipeline_v2) {
 
     // ---- shared fakes (the DeviceSurfaceCapture shape + a script) ----
 
+    // v2q content discriminator: solid white with a moving 4px black
+    // stripe (content still changes every frame). After the BGRA->NV12
+    // studio-range conversion its luma is ~235 almost everywhere, vs ~16
+    // in the bars pattern's BLACK bar ([w/2, 5w/8)) - a margin no driver
+    // rounding can bridge, so a readback of a converted slot tells the
+    // GDI rung's live pixels from frozen DXGI pixels apart.
+    class BrightSolid {
+     public:
+      BrightSolid(uint32_t w, uint32_t h)
+          : bgra_((size_t)w * h * 4, 0xFF), w_(w), h_(h) {}
+      const uint8_t* Frame(uint32_t i) {
+        std::fill(bgra_.begin(), bgra_.end(), 0xFF);
+        static const uint8_t kBlack[4] = {0, 0, 0, 0xFF};
+        const uint32_t sw = 4;
+        const uint32_t x0 = (i * 9) % (w_ - sw);
+        for (uint32_t y = 0; y < h_; ++y)
+          for (uint32_t x = x0; x < x0 + sw; ++x)
+            std::memcpy(bgra_.data() + ((size_t)y * w_ + x) * 4, kBlack, 4);
+        return bgra_.data();
+      }
+
+     private:
+      std::vector<uint8_t> bgra_;
+      uint32_t w_, h_;
+    };
+
     // Device-backed scripted ICaptureSurface: per-scripted-frame draws the
     // synthetic bars frame i into a DEFAULT BGRA texture via
     // UpdateSubresource (the GDI upload shape) and CopyFrom's it into the
@@ -8091,9 +8117,10 @@ int SelftestMain(bool desktop_pipeline_v2) {
      public:
       enum class Step : uint8_t { kFrame, kAccessLost };
       ScriptedDeviceCapture(ID3D11Device* dev, ID3D11DeviceContext* ctx,
-                            std::vector<Step> script, uint32_t w, uint32_t h)
+                            std::vector<Step> script, uint32_t w, uint32_t h,
+                            bool use_bright = false)
           : dev_(dev), ctx_(ctx), script_(std::move(script)), w_(w), h_(h),
-            bars_(w, h) {
+            bars_(w, h), bright_(w, h), use_bright_(use_bright) {
         D3D11_TEXTURE2D_DESC td{};
         td.Width = w;
         td.Height = h;
@@ -8145,8 +8172,11 @@ int SelftestMain(bool desktop_pipeline_v2) {
             return xnc::CaptureStatus::kAccessLost;
           }
           // Distinct content per script index (stripe moves).
-          const uint8_t* px = bars_.Frame(next_ - 1);
+          const uint32_t fi = static_cast<uint32_t>(next_ - 1);
+          const uint8_t* px = use_bright_ ? bright_.Frame(fi)
+                                          : bars_.Frame(fi);
           ctx_->UpdateSubresource(tex_, 0, nullptr, px, w_ * 4, 0);
+          if (use_bright_) SyncTexture(tex_);  // upload resident (v2q)
           if (latest.width() != w_ || latest.height() != h_) {
             std::string ierr;
             if (!latest.Init(dev_, w_, h_, &ierr)) {
@@ -8163,6 +8193,14 @@ int SelftestMain(bool desktop_pipeline_v2) {
             if (err) *err = "latest copy: " + cerr_;
             return xnc::CaptureStatus::kFatal;
           }
+          if (use_bright_) {  // the surface copy EXECUTED before kFrame
+            xnc::FrameIdentity dsid;
+            ID3D11Texture2D* dtex = nullptr;
+            if (latest.Snapshot(&dsid, &dtex) && dtex != nullptr) {
+              SyncTexture(dtex);
+              dtex->Release();
+            }
+          }
           last_id_ = stamp;
           ++frames_;
           if (id) *id = stamp;
@@ -8178,6 +8216,33 @@ int SelftestMain(bool desktop_pipeline_v2) {
       // Task 5 backend-fallback knob (see Rebuild).
       uint32_t rebuild_fail_first = 0;
 
+      // v2q determinism: staging-Map a texture so its most recent write on
+      // this device's context has EXECUTED (Map drains the queue). The
+      // two-device swap scenario needs the fake's writes visible before
+      // AcquireSurface returns: the converter's video-engine
+      // VideoProcessorBlt on a BRAND-NEW device otherwise races the first
+      // read of the surface (measured: the first post-swap conversion read
+      // the zero-initialized surface; frame 2 onward is correct). The
+      // production backends keep their adjacent copy chains (the M2 gate
+      // validated real output end to end); the fake owns making its OWN
+      // timing deterministic.
+      void SyncTexture(ID3D11Texture2D* t) {
+        if (t == nullptr) return;
+        D3D11_TEXTURE2D_DESC ud{};
+        t->GetDesc(&ud);
+        D3D11_TEXTURE2D_DESC sd = ud;
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.BindFlags = 0;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        sd.MiscFlags = 0;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> stage;
+        if (FAILED(dev_->CreateTexture2D(&sd, nullptr, &stage))) return;
+        ctx_->CopyResource(stage.Get(), t);
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (SUCCEEDED(ctx_->Map(stage.Get(), 0, D3D11_MAP_READ, 0, &m)))
+          ctx_->Unmap(stage.Get(), 0);
+      }
+
      private:
       ID3D11Device* dev_;
       ID3D11DeviceContext* ctx_;
@@ -8185,6 +8250,8 @@ int SelftestMain(bool desktop_pipeline_v2) {
       std::vector<Step> script_;
       uint32_t w_, h_;
       SyntheticBars bars_;
+      BrightSolid bright_;      // v2q: the GDI rung's bright content
+      bool use_bright_ = false;
       size_t next_ = 0;
       std::atomic<size_t> frames_{0};
       uint32_t rebuilds_ = 0;
@@ -8402,6 +8469,134 @@ int SelftestMain(bool desktop_pipeline_v2) {
       xnc::Nv12SurfacePool* pool_;
       size_t ok_submits_;
       size_t subs_ = 0;
+    };
+
+    // v2q (final-review fix 2026-08): the two-device swap probe session.
+    // Records, per submission, WHICH D3D device the leased NV12 slot lives
+    // on (the pool/converter device the pipeline adopted from the surface
+    // snapshot) plus the max luma over a fixed sample grid of the
+    // CONVERTED slot - a test-only staging readback proving the submitted
+    // pixels are the live GDI content, not the stale device's frozen frame.
+    // (The readback lives in this FACTORY session only; the production
+    // pipeline's no-readback contract is untouched - res.cpu_readbacks
+    // stays 0 for factory rungs.)
+    class SwapProbeSession final : public xnc::IEncoderSession {
+     public:
+      struct Rec {
+        uint64_t encode_seq = 0;
+        uint64_t content_id = 0;
+        ID3D11Device* dev = nullptr;  // raw identity; scenario-owned devices
+                                      // outlive pipe.Stop()
+        uint32_t bright_pts = 0;      // sampled NV12 points with luma >= 200
+        bool sampled = false;         // the staging readback actually ran
+        uint8_t row_profile[8] = {0}; // middle-row luma samples (the NOTE)
+      };
+      SwapProbeSession(std::vector<Rec>* recs, std::mutex* mu,
+                       xnc::Nv12SurfacePool* pool)
+          : recs_(recs), mu_(mu), pool_(pool) {}
+      xnc::SubmitResult Submit(const xnc::FrameIdentity& id,
+                               xnc::SurfaceLease&& lease,
+                               bool /*force_idr*/) override {
+        Rec r;
+        r.encode_seq = id.encode_seq;
+        r.content_id = id.content_id;
+        ID3D11Texture2D* tex = lease.texture();
+        if (tex != nullptr) {
+          Microsoft::WRL::ComPtr<ID3D11Device> d;
+          tex->GetDevice(d.GetAddressOf());
+          r.dev = d.Get();
+          r.sampled = SampleBrightPoints(tex, d.Get(), &r.bright_pts,
+                                         r.row_profile);
+        }
+        if (!lease.Submit(id.encode_seq)) {
+          lease.Release();
+          return xnc::SubmitResult::kRejected;
+        }
+        {
+          std::lock_guard<std::mutex> lk(*mu_);
+          recs_->push_back(r);
+          ready_.push_back(id);
+        }
+        return xnc::SubmitResult::kOk;
+      }
+      bool TakeOutput(xnc::EncoderOutput* out, uint32_t) override {
+        xnc::FrameIdentity id{};
+        {
+          std::lock_guard<std::mutex> lk(*mu_);
+          if (ready_.empty()) return false;
+          id = ready_.front();
+          ready_.pop_front();
+        }
+        pool_->Complete(id.encode_seq);
+        if (out == nullptr) return true;
+        out->id = id;
+        out->submit_id = id.encode_seq;
+        out->key = true;  // single IDR NALU, the LogSession shape
+        out->au = {0, 0, 0, 1, 0x65};
+        return true;
+      }
+      bool Reconfigure(uint32_t, uint32_t) override { return true; }
+      void Shutdown(xnc::ShutdownMode) override {}
+
+     private:
+      // Staging-readback luma probe: 12 sample points (4 x positions in the
+      // bars pattern's BLACK bar [w/2, 5w/8) x 3 heights), counting points
+      // with NV12 luma >= 200 (studio bright). BrightSolid content -> >= 11
+      // of 12 (the 4px moving stripe can cover at most ONE point - the
+      // points are 13 px apart at 320 wide); bars content -> <= 1 (only a
+      // stripe-covered point can be bright; the black bar itself is ~16).
+      // Frozen DXGI pixels on the GDI device would read <= 1 forever.
+      // Returns false when any D3D step failed (a skipped sample, never a
+      // "dark" verdict - a transient staging failure must not read as
+      // frozen content).
+      static bool SampleBrightPoints(ID3D11Texture2D* tex, ID3D11Device* dev,
+                                     uint32_t* out,
+                                     uint8_t* row_profile = nullptr) {
+        *out = 0;
+        D3D11_TEXTURE2D_DESC td{};
+        tex->GetDesc(&td);
+        if (td.Format != DXGI_FORMAT_NV12) return false;
+        D3D11_TEXTURE2D_DESC sd = td;
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.BindFlags = 0;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        sd.MiscFlags = 0;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> stage;
+        if (FAILED(dev->CreateTexture2D(&sd, nullptr, &stage))) return false;
+        Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx;
+        dev->GetImmediateContext(ctx.GetAddressOf());
+        ctx->CopyResource(stage.Get(), tex);
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (FAILED(ctx->Map(stage.Get(), 0, D3D11_MAP_READ, 0, &m)))
+          return false;
+        static const double kXs[4] = {0.52, 0.56, 0.60, 0.615};
+        static const double kYs[3] = {0.35, 0.50, 0.65};
+        uint32_t bright = 0;
+        const uint8_t* y_plane = static_cast<const uint8_t*>(m.pData);
+        for (double fy : kYs)
+          for (double fx : kXs) {
+            const UINT x = static_cast<UINT>(fx * td.Width) % td.Width;
+            const UINT y = static_cast<UINT>(fy * td.Height) % td.Height;
+            if (y_plane[(size_t)y * m.RowPitch + x] >= 200) ++bright;
+          }
+        // Middle-row luma samples (8 evenly spread x positions) for the
+        // scenario NOTE - the human-readable content fingerprint (bars
+        // [81 145 41 235 16 ...] vs bright [235 ...]).
+        if (row_profile != nullptr && td.Width >= 8) {
+          const UINT y0 = td.Height / 2;
+          for (UINT i = 0; i < 8; ++i) {
+            const UINT xx = (td.Width / 8) * i + td.Width / 16;
+            row_profile[i] = y_plane[(size_t)y0 * m.RowPitch + xx];
+          }
+        }
+        ctx->Unmap(stage.Get(), 0);
+        *out = bright;
+        return true;
+      }
+      std::vector<Rec>* recs_;
+      std::mutex* mu_;
+      xnc::Nv12SurfacePool* pool_;
+      std::deque<xnc::FrameIdentity> ready_;  // guarded by *mu_
     };
 
     // Recording AuSink: immutable AUs + state codes + display changes.
@@ -9673,6 +9868,299 @@ int SelftestMain(bool desktop_pipeline_v2) {
                       res.dxgi_probes_ok, spec.dxgi_creates.load(),
                       res.resets);
         }
+      }
+
+      // ---- (Q) final-review fix 2026-08 (CRITICAL): the DXGI->GDI backend
+      // swap on TWO DISTINCT D3D devices at EQUAL dims. The production bug:
+      // the shared LatestSurface kept the dead DXGI device's texture, the
+      // GDI rung's CopyFrom paired two devices (API-invalid, silently
+      // undefined in retail), the pipeline adopted the STALE device from
+      // the surface snapshot and served frozen DXGI pixels with healthy,
+      // ever-advancing identities. Every earlier swap scenario shared the
+      // suite's single device, so the fakes could not see the failure.
+      // The fix (LatestSurface::Reset at reset phase 3) must hand the
+      // surface, pool, converter and session to the GDI device and serve
+      // ITS live content. ----
+      {
+        const uint32_t w = 320, h = 240;
+        // Device B: a SECOND D3D instance - WARP first (fully detached from
+        // the suite device), else a second HARDWARE instance (some machines
+        // refuse WARP with the video flag, 0x887A0004). Either way it is a
+        // DISTINCT ID3D11Device with its own immediate context, which is
+        // what makes the cross-device pairing of the bug observable at all.
+        Microsoft::WRL::ComPtr<ID3D11Device> gdi_dev;
+        Microsoft::WRL::ComPtr<ID3D11DeviceContext> gdi_ctx;
+        D3D_FEATURE_LEVEL gdi_fl{};
+        auto gdi_try = [&gdi_dev, &gdi_ctx, &gdi_fl](D3D_DRIVER_TYPE dt,
+                                                     UINT f) {
+          gdi_dev.Reset();
+          gdi_ctx.Reset();
+          return D3D11CreateDevice(nullptr, dt, nullptr, f, nullptr, 0,
+                                   D3D11_SDK_VERSION, &gdi_dev, &gdi_fl,
+                                   &gdi_ctx);
+        };
+        HRESULT gdi_hr = gdi_try(D3D_DRIVER_TYPE_WARP, v2_flags);
+        const char* gdi_via = "warp";
+        if (FAILED(gdi_hr)) {
+          gdi_via = "hardware";
+          gdi_hr = gdi_try(D3D_DRIVER_TYPE_HARDWARE, v2_flags);
+        }
+        CHECK("v2q-second-device", SUCCEEDED(gdi_hr));
+        if (gdi_dev) {
+          // DXGI rung (device A): frames, one access-lost, frames; its
+          // Rebuild never succeeds (a dead duplication).
+          std::vector<ScriptedDeviceCapture::Step> dxgi_script;
+          for (int i = 0; i < 6; ++i)
+            dxgi_script.push_back(ScriptedDeviceCapture::Step::kFrame);
+          dxgi_script.push_back(ScriptedDeviceCapture::Step::kAccessLost);
+          for (int i = 0; i < 6; ++i)
+            dxgi_script.push_back(ScriptedDeviceCapture::Step::kFrame);
+          ScriptedDeviceCapture cap(v2_dev.Get(), v2_ctx.Get(), dxgi_script,
+                                    w, h);
+          cap.rebuild_fail_first = 1000;
+          // The factory context: the GDI rung is created on DEVICE B at the
+          // SAME dims with BRIGHT content (luma ~235 where the DXGI bars
+          // stay black ~16).
+          struct BackendSpec {
+            ID3D11Device* dev;
+            ID3D11DeviceContext* ctx;
+            uint32_t w, h;
+            std::atomic<int> gdi_creates{0};
+          } spec{gdi_dev.Get(), gdi_ctx.Get(), w, h, {}};
+          std::vector<SwapProbeSession::Rec> recs;
+          std::mutex recs_mu;
+          struct ProbeCtx {
+            std::vector<SwapProbeSession::Rec>* recs;
+            std::mutex* mu;
+          } probe_ctx{&recs, &recs_mu};
+          V2RecordingSink sink;
+          xnc::MediaPipelineV2::Config cfg;
+          cfg.cap = &cap;
+          cfg.surf = &cap;
+          cfg.sink = &sink;
+          cfg.fps = 60;
+          cfg.duration_s = 30;
+          cfg.reset_backoff_base_ms = 20;
+          cfg.initial_backend = xnc::MediaBackend::kDxgi;
+          cfg.make_backend = [](void* c, xnc::MediaBackend kind,
+                                std::string*) ->
+              std::unique_ptr<xnc::ICapture> {
+            auto* s = static_cast<BackendSpec*>(c);
+            if (kind != xnc::MediaBackend::kGdi) return nullptr;
+            s->gdi_creates.fetch_add(1);
+            return std::make_unique<ScriptedDeviceCapture>(
+                s->dev, s->ctx,
+                std::vector<ScriptedDeviceCapture::Step>(
+                    60, ScriptedDeviceCapture::Step::kFrame),
+                s->w, s->h, /*use_bright=*/true);
+          };
+          cfg.backend_ctx = &spec;
+          cfg.session_factory = [](void* c, xnc::Nv12SurfacePool* pool) ->
+              xnc::IEncoderSession* {
+            auto* p = static_cast<ProbeCtx*>(c);
+            return new SwapProbeSession(p->recs, p->mu, pool);
+          };
+          cfg.session_ctx = &probe_ctx;
+          xnc::MediaPipelineV2 pipe;
+          CHECK("v2q-start", pipe.Start(cfg));
+          if (pipe.running()) {
+            // access_lost -> reset: the dead DXGI rebuild trips the swap in
+            // the SAME reset; wait until the GDI rung drove >= 8 BRIGHT,
+            // sampled, on-device-B submissions - i.e. the stream is
+            // provably serving the GDI device's live content (not frozen
+            // DXGI pixels) before the scenario stops anything.
+            CHECK("v2q-gdi-submissions",
+                  wait_for([&] {
+                    std::lock_guard<std::mutex> lk(recs_mu);
+                    size_t bright_b = 0;
+                    for (const auto& r : recs)
+                      if (r.dev == gdi_dev.Get() && r.sampled &&
+                          r.bright_pts >= 8)
+                        ++bright_b;
+                    return bright_b >= 8;
+                  }, 8000));
+            const xnc::MediaPipelineV2::Result res = pipe.Stop();
+            CHECK("v2q-ok", res.ok);
+            CHECK("v2q-swapped-to-gdi",
+                  res.backend_swaps == 1 &&
+                      res.backend_at_stop == xnc::MediaBackend::kGdi &&
+                      spec.gdi_creates.load() == 1);
+            std::vector<SwapProbeSession::Rec> snap;
+            {
+              std::lock_guard<std::mutex> lk(recs_mu);
+              snap = recs;
+            }
+            CHECK("v2q-submissions-flowed", snap.size() >= 10);
+            // THE device handoff: submissions before the swap ran on the
+            // DXGI device, every submission after it on the GDI device -
+            // the pool/converter/session followed the surface's device,
+            // never the stale DXGI one (under the bug the post-swap
+            // submissions kept coming from device A).
+            bool saw_gdi = false, clean = true;
+            size_t on_a = 0, on_b = 0;
+            for (const auto& r : snap) {
+              if (r.dev == gdi_dev.Get()) {
+                saw_gdi = true;
+                ++on_b;
+              } else {
+                if (saw_gdi) clean = false;
+                ++on_a;
+              }
+            }
+            CHECK("v2q-device-handoff", saw_gdi && clean && on_a >= 4);
+            // THE content proof: every SAMPLED post-swap converted slot
+            // carries the GDI rung's BRIGHT pixels (>= 8 of 12 points) in
+            // the region the DXGI bars keep black - frozen DXGI pixels
+            // would read <= 1 bright point forever while the identities
+            // kept advancing (the P0 "not recovered, frozen" class this
+            // scenario exists to kill). A staging sample that failed to
+            // run is excluded, never counted dark.
+            size_t bright = 0, dark_after_swap = 0;
+            for (const auto& r : snap) {
+              if (r.dev != gdi_dev.Get() || !r.sampled) continue;
+              if (r.bright_pts >= 8) ++bright; else ++dark_after_swap;
+            }
+            CHECK("v2q-serves-gdi-content", bright >= 8 && dark_after_swap == 0);
+            // Discriminator sanity: the DXGI-era submissions really were
+            // the bars (<= 1 bright point; the bright/dark split
+            // discriminates on THIS converter, not vacuously).
+            size_t dark_before = 0;
+            for (const auto& r : snap)
+              if (r.dev == v2_dev.Get() && r.sampled && r.bright_pts <= 1)
+                ++dark_before;
+            CHECK("v2q-dxgi-content-was-bars", dark_before >= 4);
+            // Identities advanced with the real GDI content changes:
+            // strictly increasing content_ids across the post-swap
+            // submissions (each a distinct moving-stripe frame).
+            uint64_t last_cid = 0;
+            bool cids_advance = true;
+            for (const auto& r : snap)
+              if (r.dev == gdi_dev.Get()) {
+                if (last_cid != 0 && r.content_id <= last_cid)
+                  cids_advance = false;
+                last_cid = r.content_id;
+              }
+            CHECK("v2q-content-ids-advance", cids_advance && last_cid > 6);
+            CHECK("v2q-identity-monotonic",
+                  DeliveredIdentitiesValid(sink.CopyIds()));
+            std::printf("SELFTEST NOTE: v2q dev_b=%s on_a=%zu on_b=%zu "
+                        "bright=%zu dark_after=%zu dark_before=%zu "
+                        "last_cid=%llu pts=[",
+                        gdi_via, on_a, on_b, bright, dark_after_swap,
+                        dark_before,
+                        static_cast<unsigned long long>(last_cid));
+            for (size_t i = 0; i < snap.size(); ++i)
+              std::printf("%s%u:%u[%u %u %u %u %u %u %u %u]", i ? " " : "",
+                          snap[i].dev == gdi_dev.Get() ? 1 : 0,
+                          snap[i].bright_pts, snap[i].row_profile[0],
+                          snap[i].row_profile[1], snap[i].row_profile[2],
+                          snap[i].row_profile[3], snap[i].row_profile[4],
+                          snap[i].row_profile[5], snap[i].row_profile[6],
+                          snap[i].row_profile[7]);
+            std::printf("] resets=%u captured=%llu encoded=%llu\n",
+                        res.resets,
+                        static_cast<unsigned long long>(res.captured),
+                        static_cast<unsigned long long>(res.encoded));
+          }
+        }
+      }
+
+      // ---- (R) final-review fix 2026-08 (IMPORTANT): --encoder software
+      // must reach the V2 session selection in rt mode. Pipeline half: the
+      // pin keeps CreateSession off the hardware rung ENTIRELY (no probe,
+      // no strikes) while the software rung serves (the unpinned hardware
+      // attempts are v2m/v2n's creates>=1 assertions). ----
+      {
+        const uint32_t w = 320, h = 240;
+        std::vector<ScriptedDeviceCapture::Step> script(
+            12, ScriptedDeviceCapture::Step::kFrame);
+        ScriptedDeviceCapture cap(v2_dev.Get(), v2_ctx.Get(), script, w, h);
+        SessionLog log;
+        V2RecordingSink sink;
+        xnc::EncoderFallbackLock lock;
+        struct HwProbe {
+          std::atomic<int> creates{0};
+        } hw;
+        xnc::MediaPipelineV2::Config cfg;
+        cfg.cap = &cap;
+        cfg.surf = &cap;
+        cfg.sink = &sink;
+        cfg.fps = 60;
+        cfg.duration_s = 30;
+        cfg.encoder_lock = &lock;
+        cfg.force_software_encoder = true;  // THE PIN (ServeV2 threads it)
+        cfg.hw_session_factory = [](void* c, xnc::Nv12SurfacePool*) ->
+            xnc::IEncoderSession* {
+          static_cast<HwProbe*>(c)->creates.fetch_add(1);
+          return nullptr;  // a would-be hardware rung
+        };
+        cfg.hw_session_ctx = &hw;
+        cfg.session_factory = [](void* ctx, xnc::Nv12SurfacePool* pool) ->
+            xnc::IEncoderSession* {
+          return new LogSession(static_cast<SessionLog*>(ctx), pool);
+        };
+        cfg.session_ctx = &log;
+        xnc::MediaPipelineV2 pipe;
+        CHECK("v2r-start", pipe.Start(cfg));
+        if (pipe.running()) {
+          CHECK("v2r-published",
+                wait_for([&] { return sink.CopyAus().size() >= 2; }, 8000));
+          const xnc::MediaPipelineV2::Result res = pipe.Stop();
+          CHECK("v2r-ok", res.ok);
+          CHECK("v2r-hw-never-probed", hw.creates.load() == 0);
+          CHECK("v2r-no-strikes",
+                !lock.SoftwareLocked() && res.hw_contract_failures == 0);
+          CHECK("v2r-software-rung-served",
+                std::strcmp(res.encoder_backend, "factory") == 0 &&
+                    res.aus_written >= 2);
+          CHECK("v2r-no-cpu-readback", res.cpu_readbacks == 0);
+          CHECK("v2r-identity-monotonic",
+                DeliveredIdentitiesValid(sink.CopyIds()));
+          std::printf("SELFTEST NOTE: v2r hw_creates=%d backend=%s aus=%llu\n",
+                      hw.creates.load(), res.encoder_backend,
+                      static_cast<unsigned long long>(res.aus_written));
+        }
+      }
+
+      // ---- (R, rt half) ServeV2 with the pin through the REAL production
+      // ladder in rt mode: the hardware rung is suppressed (no
+      // encoder_hw_strike reaches the subscriber on a box where it would
+      // fail), the software rung serves, exit 0. ----
+      {
+        const uint32_t w = 320, h = 240;
+        std::vector<ScriptedDeviceCapture::Step> script(
+            30, ScriptedDeviceCapture::Step::kFrame);
+        ScriptedDeviceCapture cap(v2_dev.Get(), v2_ctx.Get(), script, w, h);
+        xnc::RtServer server;
+        xnc::RtServer::Opts ro;
+        ro.pipe_name = RtPipeNameOf(13);
+        ro.secret = kRtSecret;
+        ro.secret_len = sizeof(kRtSecret);
+        ro.max_subs = 4;
+        ro.fps = 15;
+        ro.bitrate_bps = 500000;
+        ro.sddl_override = L"D:P(A;;GA;;;WD)";  // TEST-ONLY permissive DACL
+        ro.pipeline_v2 = true;
+        int rc = 1;
+        std::thread serve_th([&] {
+          rc = server.ServeV2(cap, cap, ro, 0, xnc::MediaBackend::kDxgi,
+                              /*force_software=*/true);
+        });
+        RtTestClient a;
+        CHECK("v2r-rt-connect",
+              a.Connect(ro.pipe_name.c_str(), kRtSecret, sizeof(kRtSecret)));
+        CHECK("v2r-rt-attach", a.Attach(13));
+        a.Pump(6000, [&a] { return a.keys_ >= 1 && a.v2_frames_ >= 4; });
+        server.RequestStop();
+        serve_th.join();
+        a.Pump(1500);  // drain + stream_end
+        server.Shutdown();
+        CHECK("v2r-rt-frames", a.v2_frames_ >= 1 && a.keys_ >= 1);
+        CHECK("v2r-rt-no-hw-strike", !a.SawState("encoder_hw_strike"));
+        CHECK("v2r-rt-serve-ok", rc == 0);
+        std::printf("SELFTEST NOTE: v2r-rt frames=%llu keys=%llu rc=%d\n",
+                    static_cast<unsigned long long>(a.v2_frames_),
+                    static_cast<unsigned long long>(a.keys_), rc);
       }
     }
   }

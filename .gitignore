@@ -29,3 +29,6 @@ server/web/dist/*
 *.exe
 __pycache__/
 *.obj
+
+# 测量产物（M4 才有意入库精选 gate 记录；日常记录见 SDD 任务报告）
+artifacts/

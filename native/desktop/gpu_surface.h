@@ -175,15 +175,28 @@ class LatestSurface {
                 const FrameIdentity& id, std::string* err);
 
   // AddRef'd pointer to the owned texture + the FrameIdentity stamped by the
-  // most recent CopyFrom. False after Invalidate()/Init() until a CopyFrom
-  // completes (or for a null out pointer). Caller owns one reference and
-  // must Release() it; the surface keeps its own.
+  // most recent CopyFrom. False after Invalidate()/Reset()/Init() until a
+  // CopyFrom completes (or for a null out pointer). Caller owns one
+  // reference and must Release() it; the surface keeps its own.
   bool Snapshot(FrameIdentity* id_out, ID3D11Texture2D** tex_out);
 
   // Marks the content unusable (capture access lost / unified reset): the
   // texture stays allocated (persistent) but Snapshot fails until the next
   // CopyFrom. Also clears the stale identity.
   void Invalidate();
+
+  // FULL teardown of the surface's device pairing (backend swap / unified
+  // reset - final-review fix 2026-08): drops the owned texture AND the
+  // recorded dims, not just the validity; width()/height() report 0 until
+  // the next Init, so the FIRST AcquireSurface of whatever backend now
+  // serves re-Inits the surface on ITS device. Invalidate cannot express
+  // that: with EQUAL dims (the DXGI->GDI fall on a duplicated primary) the
+  // next backend would keep the old device's texture and its CopyFrom
+  // would pair two D3D devices - API-invalid, silently undefined in retail
+  // (the ever-"healthy" frozen-desktop failure class). Object identity is
+  // preserved: the pipeline's single LatestSurface instance survives every
+  // reset; only its texture/dims/identity die.
+  void Reset();
 
   bool valid() const { return valid_; }
   uint32_t width() const { return w_; }

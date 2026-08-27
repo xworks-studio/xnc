@@ -944,10 +944,13 @@ int RunConsoleRt(const xnc::DiagOptions& opt, bool desktop_pipeline_v2) {
       // VideoProcessor; ServeV2 starts the HOST_HELLO at the same scaled
       // dims computed above (input/cursor/bitrate already use them).
       // M2 Task 5: the initial rung's kind arms the DXGI<->GDI fallback.
+      // Fix 2026-08: --encoder software reaches the V2 session selection
+      // (the M0 rt path and the v2 diag path already honored the pin).
       const int rc = server.ServeV2(
           *v2_cap, *v2_surf, ro, opt.max_width,
           opt.backend == xnc::DiagBackend::kGdi ? xnc::MediaBackend::kGdi
-                                                : xnc::MediaBackend::kDxgi);
+                                                : xnc::MediaBackend::kDxgi,
+          opt.encoder == xnc::DiagEncoder::kSoftware);
       watch.Stop();
       input.StopJanitor();  // ReleaseAll already ran in RtServer::Shutdown
       return rc;

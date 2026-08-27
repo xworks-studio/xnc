@@ -53,9 +53,13 @@ struct GdiCapture::Impl {
   // fills it from the compact GetDIBits buffer, then the desc-identical
   // LatestSurface::CopyFrom stamps it into the caller-owned surface. The
   // device is created lazily (hardware -> WARP) and deliberately NOT
-  // touched by Teardown: Init/Rebuild only recycle the GDI objects, and a
-  // LatestSurface already Init'ed on this device must stay valid. The
-  // ComPtrs release when Impl is deleted (~GdiCapture).
+  // touched by Teardown: Init/Rebuild only recycle the GDI objects. It IS
+  // dropped when the caller's LatestSurface needs a full (re)Init (a
+  // Reset()-dropped surface reports width 0 - see AcquireSurface), so the
+  // surface and the upload texture always share one LIVE device: a
+  // TDR-killed device passes every dims check, and re-creating it there is
+  // the only signal that reaches it. The ComPtrs release when Impl is
+  // deleted (~GdiCapture).
   Microsoft::WRL::ComPtr<ID3D11Device> dev;
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx;
   Microsoft::WRL::ComPtr<ID3D11Texture2D> upload;
@@ -301,14 +305,26 @@ CaptureStatus GdiCapture::AcquireSurface(LatestSurface& latest,
     return CaptureStatusFromErr(aerr);
   }
   std::string uerr;
+  // Caller-owned surface on THIS backend's device at the current metrics:
+  // a fresh surface reports width 0, a metrics change re-Inits, and so does
+  // a surface dropped by LatestSurface::Reset (a backend swap or a unified
+  // reset - final-review fix 2026-08; this is the DXGI->GDI fall that
+  // otherwise keeps the dead device's texture at EQUAL dims). A forced
+  // re-Init also drops the INTERNAL upload device + texture: the previous
+  // device pairing is gone (or the device is TDR-dead, which no dims check
+  // can see), so EnsureGpuUpload re-creates both below and the CopyFrom can
+  // never pair two D3D devices.
+  const bool reinit_latest = latest.width() != w_ || latest.height() != h_;
+  if (reinit_latest) {
+    impl_->dev.Reset();
+    impl_->ctx.Reset();
+    impl_->upload.Reset();
+  }
   if (!EnsureGpuUpload(&uerr)) {
     if (err) *err = "gdi surface: " + uerr;
     return CaptureStatus::kFatal;
   }
-  // Caller-owned surface on THIS backend's device at the current metrics
-  // (a fresh surface reports width 0; a metrics change re-Inits - which
-  // drops its content + the identity mirror, matching LatestSurface::Init).
-  if (latest.width() != w_ || latest.height() != h_) {
+  if (reinit_latest) {
     if (!latest.Init(impl_->dev.Get(), w_, h_, &uerr)) {
       if (err) *err = "gdi latest init: " + uerr;
       return CaptureStatus::kFatal;

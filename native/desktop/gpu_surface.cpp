@@ -229,6 +229,17 @@ void LatestSurface::Invalidate() {
   last_id_ = FrameIdentity{};
 }
 
+// Final-review fix 2026-08: the full-drop counterpart of Invalidate (see
+// gpu_surface.h) - Init's teardown half, so the next backend Init re-binds
+// the surface to ITS device even at identical dims.
+void LatestSurface::Reset() {
+  impl_->tex.Reset();
+  valid_ = false;
+  last_id_ = FrameIdentity{};
+  w_ = 0;
+  h_ = 0;
+}
+
 // ---- Nv12SurfacePool / SurfaceLease ----
 
 Nv12SurfacePool::Nv12SurfacePool()

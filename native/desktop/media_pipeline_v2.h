@@ -124,8 +124,9 @@ inline int ResetSeverity(const char* reason) {
 
 // Exponential backoff for repeated IDENTICAL reset reasons (ruling 2):
 // `streak` is the consecutive-execution count of the same reason (1 = the
-// first). The first repeat is free, then base doubles per repeat, capped.
-// base=500/cap=4000 (production): 0, 0, 500, 1000, 2000, 4000, 4000...
+// first). The first execution is free, the second waits base, then base
+// doubles per repeat, capped. base=500/cap=4000 (production): 0, 500,
+// 1000, 2000, 4000, 4000...
 inline uint32_t ResetStormBackoffMs(uint32_t base_ms, uint32_t cap_ms,
                                     uint32_t streak) {
   if (streak <= 1 || base_ms == 0) return 0;

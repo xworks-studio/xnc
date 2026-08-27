@@ -109,10 +109,12 @@ class ICapture {
 // CopyResource, before the method returns - the duplication is never held
 // into encoder work. The LatestSurface OBJECT is caller-owned; the backend
 // (re)Inits it (backend device, backend dims) whenever its device is
-// recreated or the mode changed, so the caller passes the SAME LatestSurface
-// to every call of one backend. After kRetry/kAccessLost a previously
-// Snapshot()-leased texture may belong to a dead device - the unified
-// CaptureReset (M2-S1) owns the retry that re-Inits it.
+// recreated, the mode changed, or the surface was fully Reset() (backend
+// swap / unified reset - a Reset surface reports width 0 and MUST be
+// re-Init'ed before any CopyFrom), so the caller passes the SAME
+// LatestSurface to every call of one backend. After kRetry/kAccessLost a
+// previously Snapshot()-leased texture may belong to a dead device - the
+// unified CaptureReset (M2-S1) owns the retry that re-Inits it.
 //
 // Threading (M2 Task 4 ruling 4): under MediaPipelineV2 the MEDIA GPU
 // thread drives AcquireSurface - its single loop owns capture, the
