@@ -17,12 +17,10 @@ import (
 	"github.com/pion/rtcp"
 )
 
-// pubStats 是 publisher 的原子计数器集(透传统计)。
+// pubStats 是 publisher 的原子计数器集(透传统计)。帧/字节/抑制计数
+// 已随发包状态下沉到 ViewerSender(viewer_sender.go 的 ViewerStats)。
 type pubStats struct {
-	frames         atomic.Uint64 // WriteSample 成功帧数
-	bytes          atomic.Uint64 // 写入 AU 字节数
 	preConnDropped atomic.Uint64 // 连接就绪前丢弃帧数(sender 未启动,写了也丢)
-	preKeyDropped  atomic.Uint64 // 连接后、首个 key 帧前丢弃的 delta 数
 	pli            atomic.Uint64 // 收到 RTCP PLI
 	fir            atomic.Uint64 // 收到 RTCP FIR
 	nack           atomic.Uint64 // 收到 RTCP NACK(拦截器已本地重发)

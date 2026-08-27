@@ -72,11 +72,9 @@ func TestPublisherRejectsUnpacketizableAnnexB(t *testing.T) {
 		}
 	}()
 	p.connReady.Store(true)
-	p.stateMu.Lock()
-	p.started = true
-	p.stateMu.Unlock()
-
-	err = p.WriteFrame(Frame{PresentMonoUs: 1, AU: []byte{0, 0, 0, 1}})
+	// Key 帧直达发送器的 WAIT_IDR 门(旧测试以 p.started 内部字段预置,
+	// M3 Task 1 起该状态归 ViewerSender)。
+	err = p.WriteFrame(Frame{Key: true, PresentMonoUs: 1, AU: []byte{0, 0, 0, 1}})
 	if err == nil {
 		t.Fatal("WriteFrame accepted Annex-B data that produced no RTP packets")
 	}

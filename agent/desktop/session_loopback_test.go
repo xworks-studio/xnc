@@ -205,7 +205,14 @@ func (s *fakeSource) run(t *testing.T) {
 				}
 				i++
 				key := force || i%60 == 1
-				f := Frame{Key: key, PresentMonoUs: mono, AU: synthAU(key, mono)}
+				// v2 身份透传(M3 Task 1):epoch 恒定(重挂 fake 不镜像
+				// capture 重建——epoch 恢复路径由 viewer_sender_test 确定性
+				// 覆盖),EncodeSeq 逐帧递增。
+				f := Frame{
+					Key: key, PresentMonoUs: mono, AU: synthAU(key, mono),
+					CaptureEpoch: 1, CodecEpoch: 1, ContentID: 1,
+					EncodeSeq: uint64(i), SourceMonoUs: mono - 1_000,
+				}
 				select {
 				case s.frameCh <- f:
 				case <-s.done:

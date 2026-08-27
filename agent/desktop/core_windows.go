@@ -291,7 +291,16 @@ func (p *pipeSource) RecvFrame(ctx context.Context) (Frame, bool) {
 		if !ok {
 			return Frame{}, false
 		}
-		return Frame{Key: f.Key, PresentMonoUs: f.PresentMonoUs, AU: f.AU}, true
+		return Frame{
+			Key:           f.Key,
+			PresentMonoUs: f.PresentMonoUs,
+			CaptureEpoch:  f.CaptureEpoch,
+			CodecEpoch:    f.CodecEpoch,
+			ContentID:     f.ContentID,
+			EncodeSeq:     f.EncodeSeq,
+			SourceMonoUs:  f.SourceMonoUs,
+			AU:            f.AU,
+		}, true
 	case <-ctx.Done():
 		return Frame{}, false
 	case <-p.sub.Done():

@@ -1,8 +1,13 @@
-// transport.go — Pion publisher(M1-Slice2 Task 4)。
+// transport.go — Pion publisher(M1-Slice2 Task 4;M3 Task 1 起拆分)。
+//
+// Publisher 只保留传输面:PeerConnection、视频轨、信令(offer/answer/
+// trickle)、RTCP 泵与连接就绪门。发包状态(RTP 时钟、分包、单帧队列、
+// 令牌桶 pacing、WAIT_IDR 状态机)归每 viewer 一个的 ViewerSender
+// (viewer_sender.go);WriteFrame 委派 Enqueue,session.go 零改动。
 //
 // API 选择:TrackLocalStaticRTP + Pion H264Payloader。Annex-B AU 由 Pion
-// 完成 STAP-A/FU-A 分包，每帧的所有 RTP 包都直接使用该 AU 的
-// PresentMonoUs@90kHz 时戳；不再用 sample.Duration 隐式推进时间轴。
+// 完成 STAP-A/FU-A 分包,每帧的所有 RTP 包都直接使用该 AU 的
+// PresentMonoUs@90kHz 时戳;不再用 sample.Duration 隐式推进时间轴。
 package desktop
 
 import (
@@ -10,15 +15,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand/v2"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/pion/interceptor"
-	"github.com/pion/rtp"
-	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -35,30 +37,30 @@ type PublisherConfig struct {
 	RelayOnly bool
 	// DefaultDuration 仅为旧调用方的源码兼容字段；RTP 时间轴不使用它。
 	DefaultDuration time.Duration
+	// PacingBudgetBps 是 viewer 发送器的 pacing 预算(bits/s;0 →
+	// defaultPacingBudgetBps)。令牌桶按其 85% 铺开帧内突发。
+	PacingBudgetBps int
 	Log             *slog.Logger
 }
 
-// Publisher 承载一个 viewer 会话的发送侧 PeerConnection + H264 视频轨。
+// Publisher 承载一个 viewer 会话的发送侧 PeerConnection + H264 视频轨,
+// 并拥有该 viewer 的 ViewerSender(发包/队列/状态机)。
 type Publisher struct {
-	log        *slog.Logger
-	pc         *webrtc.PeerConnection
-	sender     *webrtc.RTPSender
-	track      *webrtc.TrackLocalStaticRTP
-	packetizer rtp.Packetizer
-	rtpClock   *rtpClock
-	writeMu    sync.Mutex
+	log    *slog.Logger
+	pc     *webrtc.PeerConnection
+	sender *webrtc.RTPSender
+	track  *webrtc.TrackLocalStaticRTP
+	vs     *ViewerSender
 	// defDur/lastMono 只保留给旧 frameDuration 单测，不在发送热路径上。
-	defDur        time.Duration
-	stats         pubStats
-	wg            sync.WaitGroup
-	closeO        sync.Once
-	connReady     atomic.Bool // ICE+DTLS 已通(到达即向 host 请求 fresh IDR)
-	keyFn         func(reason string)
-	iceFn         func(webrtc.ICECandidateInit)
-	stateMu       sync.Mutex
-	lastMono      uint64
-	started       bool // 连接后首个 key 帧已写出(viewer 可解码起点)
-	intervalStats frameIntervalStats
+	defDur    time.Duration
+	stats     pubStats
+	wg        sync.WaitGroup
+	closeO    sync.Once
+	connReady atomic.Bool // ICE+DTLS 已通(到达即向 host 请求 fresh IDR)
+	keyFn     func(reason string)
+	iceFn     func(webrtc.ICECandidateInit)
+	stateMu   sync.Mutex
+	lastMono  uint64
 }
 
 // RegisterDesktopCodecs 在 MediaEngine 上注册管线唯一的视频编解码
@@ -143,12 +145,22 @@ func NewPublisher(cfg PublisherConfig) (*Publisher, error) {
 		pc:     pc,
 		sender: sender,
 		track:  track,
-		// The packetizer's payload type (102) and SSRC (0) literals are inert:
-		// both are per-binding values overwritten by TrackLocalStaticRTP.writeRTP
-		// for each binding before the packet hits the wire.
-		packetizer: rtp.NewPacketizer(1200, 102, 0, &codecs.H264Payloader{}, rtp.NewRandomSequencer(), 90000),
-		rtpClock:   newRTPClock(rand.Uint32()),
 	}
+	// 每 viewer 一个发送器:发包/单帧队列/令牌桶 pacing/WAIT_IDR 状态机
+	// 全部私有(与其它 viewer 完全隔离)。合并关键帧回调与 Publisher 的
+	// OnKeyRequest 同一 seam(connect/pli/fir 也经它汇出)。
+	vs, err := newViewerSender(ViewerSenderConfig{
+		WritePacket: track.WriteRTP,
+		KeyRequest:  p.fireKeyRequest,
+		BudgetBps:   cfg.PacingBudgetBps,
+		Log:         log,
+	})
+	if err != nil {
+		_ = pc.Close()
+		return nil, fmt.Errorf("desktop: viewer sender: %w", err)
+	}
+	p.vs = vs
+	p.vs.start()
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		fn := p.iceFn
 		if fn == nil {
@@ -204,13 +216,14 @@ func (p *Publisher) AddCandidate(c webrtc.ICECandidateInit) error {
 	return p.pc.AddICECandidate(c)
 }
 
-// WriteFrame 将一帧 Annex-B AU 分包后写入视频轨。同一 AU 的所有
-// 包使用同一个 PresentMonoUs@90kHz 时戳，仅最后一包置 Marker。
+// WriteFrame 将一帧 Annex-B AU 交给本 viewer 的发送器(分包/队列/pacing/
+// 状态机见 viewer_sender.go)。同一 AU 的所有包使用同一个
+// PresentMonoUs@90kHz 时戳,仅最后一包置 Marker。
 //
 // 首帧语义(双保险,见 NewPublisher 的 Connected 钩子):连接就绪前的帧
-// 一律丢弃(RTPSender 未启动,写了也静默蒸发);连接后丢弃 delta 直到
-// 首个 key 帧成功写出——viewer 收到的第一帧永远是 IDR,静止桌面/慢启动
-// 场景无画面黑洞。
+// 一律丢弃(RTPSender 未启动,写了也静默蒸发);连接后由发送器的
+// WAIT_IDR 状态机丢弃 delta 直到首个 key 帧——viewer 收到的第一帧永远是
+// IDR,静止桌面/慢启动场景无画面黑洞。
 func (p *Publisher) WriteFrame(f Frame) error {
 	if len(f.AU) == 0 {
 		return nil
@@ -219,51 +232,7 @@ func (p *Publisher) WriteFrame(f Frame) error {
 		p.stats.preConnDropped.Add(1)
 		return nil
 	}
-	p.writeMu.Lock()
-	defer p.writeMu.Unlock()
-	p.stateMu.Lock()
-	started := p.started
-	p.stateMu.Unlock()
-	if !started && !f.Key {
-		p.stats.preKeyDropped.Add(1)
-		return nil
-	}
-	hadPreviousTimestamp := p.rtpClock.started
-	previousMonoUs := p.rtpClock.last
-	timestamp, err := p.rtpClock.Timestamp(f.PresentMonoUs)
-	if err != nil {
-		return err
-	}
-	packets := p.packetizer.Packetize(f.AU, 0)
-	if len(packets) == 0 {
-		return errors.New("desktop: H264 payloader produced no RTP packets")
-	}
-	for i, packet := range packets {
-		packet.Timestamp = timestamp
-		packet.Marker = i == len(packets)-1
-	}
-	ws := time.Now()
-	for i, packet := range packets {
-		if err := p.track.WriteRTP(packet); err != nil {
-			return fmt.Errorf("desktop: write RTP packet %d/%d: %w", i+1, len(packets), err)
-		}
-	}
-	if ms := time.Since(ws).Milliseconds(); ms > 20 {
-		p.log.Info("desktop write_rtp slow", "ms", ms, "auBytes", len(f.AU), "rtpPackets", len(packets))
-	}
-	if hadPreviousTimestamp {
-		if deltaUs := f.PresentMonoUs - previousMonoUs; deltaUs <= 1_000_000 {
-			p.intervalStats.add(time.Duration(deltaUs)*time.Microsecond, p.log)
-		}
-	}
-	if !started {
-		p.stateMu.Lock()
-		p.started = true
-		p.stateMu.Unlock()
-	}
-	p.stats.frames.Add(1)
-	p.stats.bytes.Add(uint64(len(f.AU)))
-	return nil
+	return p.vs.Enqueue(f)
 }
 
 // frameIntervalStats 帧间隔分布诊断:播放节奏 = RTP 时间戳间隔 = mono 差,
@@ -320,13 +289,15 @@ func (p *Publisher) frameDuration(monoUs uint64) time.Duration {
 	return p.defDur
 }
 
-// Stats 返回透传统计快照(计数器均为累计值)。
+// Stats 返回透传统计快照(计数器均为累计值):帧/字节/抑制计数来自
+// viewer 发送器,RTCP 计数来自本 Publisher 的 RTCP 泵。
 func (p *Publisher) Stats() PubStats {
+	vs := p.vs.Stats()
 	return PubStats{
-		FramesWritten:  p.stats.frames.Load(),
-		BytesWritten:   p.stats.bytes.Load(),
+		FramesWritten:  vs.FramesSent,
+		BytesWritten:   vs.BytesSent,
 		PreConnDropped: p.stats.preConnDropped.Load(),
-		PreKeyDropped:  p.stats.preKeyDropped.Load(),
+		PreKeyDropped:  vs.PreKeyDropped,
 		PLI:            p.stats.pli.Load(),
 		FIR:            p.stats.fir.Load(),
 		NACK:           p.stats.nack.Load(),
@@ -334,11 +305,12 @@ func (p *Publisher) Stats() PubStats {
 	}
 }
 
-// Close 关闭 PeerConnection 并等 RTCP 泵退出;幂等。关闭时打一条统计摘要
-// 日志(不含任何凭据)。
+// Close 关闭发送器(停 pace 泵)与 PeerConnection,等 RTCP 泵退出;幂等。
+// 关闭时打一条统计摘要日志(不含任何凭据)。
 func (p *Publisher) Close() error {
 	var err error
 	p.closeO.Do(func() {
+		p.vs.Close()
 		err = p.pc.Close()
 		p.wg.Wait()
 		st := p.Stats()

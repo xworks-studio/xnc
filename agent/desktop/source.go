@@ -13,11 +13,20 @@ package desktop
 import "context"
 
 // Frame 是一帧已编码视频 AU(Annex-B,4 字节起始码),与 desktoppipe.Frame
-// 字段一一对应(core_windows.go 负责转换)。
+// 字段一一对应(core_windows.go 负责转换)。v2(0x0205)身份字段是
+// desktoppipe.FrameIdentity 的透传:M3 起 ViewerSender 用其做 epoch 感知的
+// WAIT_IDR(0x020B 不连续的 wire 侧镜像);v1 帧身份全零 = 退化为纯关键帧
+// 门控。W/H 不为发送侧消费,不透传。
 type Frame struct {
 	Key           bool
 	PresentMonoUs uint64 // host 单调钟微秒——RTP 时戳的真相来源
-	AU            []byte
+	// CaptureEpoch/CodecEpoch:capture 重建 / 编码器重置的代际(v2 身份)。
+	CaptureEpoch, CodecEpoch uint64
+	// ContentID:一帧采集内容的稳定 id;EncodeSeq:编码序号(v2 身份)。
+	ContentID, EncodeSeq uint64
+	// SourceMonoUs:采集(而非呈现)时刻(v2 身份;发送侧仅诊断用)。
+	SourceMonoUs uint64
+	AU           []byte
 }
 
 // HelloInfo 是 HOST_HELLO 内容镜像;gen 递增代表 capture 重建。
