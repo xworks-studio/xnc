@@ -38,6 +38,7 @@
 #include "gdi_capture.h"
 #include "input_manager.h"
 #include "jpeg_wic.h"
+#include "media_types.h"  // M1 Task 1: FrameIdentity/EncodedAU/AuFlags ledger
 #include "mf_decoder_probe.h"  // Task 5 m0: test-only decode-to-luma-hash probe
 #include "mf_encoder.h"
 #include "nv12.h"
@@ -1006,11 +1007,11 @@ class ResetCapture final : public xnc::ICapture {
 // Thread-safe: with the capture/encode threads decoupled, OnAu runs on the
 // encode thread while OnState/OnDisplayChanged run on the capture thread.
 struct RecordingSink final : xnc::AuSink {
-  const char* OnAu(bool is_idr, uint64_t mono_us, const uint8_t*, size_t) override {
+  const char* OnAu(const xnc::EncodedAU& au) override {
     std::lock_guard<std::mutex> lk(mu);
     aus++;
-    if (is_idr) keys++;
-    timestamps.push_back(mono_us);
+    if ((au.flags & xnc::AuFlags::kAuFlagKey) != 0) keys++;
+    timestamps.push_back(au.id.present_mono_us);
     return nullptr;
   }
   void OnState(const char* code, bool recoverable) override {
@@ -1291,8 +1292,8 @@ xnc::PipelineResult RunLedgerLifecycleScenario(EncoderFaultPlan* plan,
 }
 
 struct FailingAuSink final : xnc::AuSink {
-  const char* OnAu(bool, uint64_t mono_us, const uint8_t*, size_t) override {
-    timestamps.push_back(mono_us);
+  const char* OnAu(const xnc::EncodedAU& au) override {
+    timestamps.push_back(au.id.present_mono_us);
     return timestamps.size() == fail_on ? "fault_sink_mid_vector" : nullptr;
   }
   size_t fail_on = 1;
@@ -1454,6 +1455,50 @@ std::unique_ptr<xnc::ICapture> LdMakeGdi(uint32_t max_w, std::string* err) {
 }  // namespace
 
 int SelftestMain() {
+  { // M1 Task 1: immutable frame identity - compile-time field order plus
+    // the monotonicity ledger's accept/reject rules (spec §5.1/§5.3).
+    // The first three checks are the plan's binding test vector.
+    xnc::FrameIdentity id{1, 2, 3, 4, 500, 600};
+    CHECK("identity-fields", id.capture_epoch == 1 && id.encode_seq == 4);
+    xnc::FrameIdentityLedger l;
+    CHECK("identity-accept", l.Accept(id));
+    CHECK("identity-reject-repeat", !l.Accept(id));
+    // Same epochs: new content accepted; same-content re-encode needs a
+    // strictly new encode_seq; content/seq regressions and repeats rejected.
+    xnc::FrameIdentity next = id;
+    next.content_id = 4;
+    next.encode_seq = 5;
+    CHECK("identity-accept-new-content", l.Accept(next));
+    xnc::FrameIdentity reencode = next;
+    reencode.encode_seq = 6;
+    CHECK("identity-accept-reencode-new-seq", l.Accept(reencode));
+    CHECK("identity-reject-seq-repeat", !l.Accept(reencode));
+    xnc::FrameIdentity regress = reencode;
+    regress.content_id = 3;
+    regress.encode_seq = 7;
+    CHECK("identity-reject-content-regress", !l.Accept(regress));
+    CHECK("identity-last-tracked",
+          l.Last().content_id == 4 && l.Last().encode_seq == 6);
+    // Epoch advance re-baselines (capture/codec generation change);
+    // epoch regression is rejected.
+    const xnc::FrameIdentity gen2{2, 1, 1, 8, 700, 800};
+    CHECK("identity-accept-epoch-advance", l.Accept(gen2));
+    CHECK("identity-reject-epoch-regress", !l.Accept(id));
+    CHECK("identity-reset-forgets", (l.Reset(), l.Accept(id)));
+    // EncodedAU: AuFlags key bit and the immutable shared Annex-B payload.
+    CHECK("au-flag-none-zero", xnc::AuFlags::kAuFlagNone == 0);
+    xnc::EncodedAU au;
+    au.id = id;
+    au.width = 1920;
+    au.height = 1080;
+    au.flags = xnc::AuFlags::kAuFlagKey;
+    au.annexb = std::make_shared<const std::vector<uint8_t>>(
+        std::vector<uint8_t>{0, 0, 0, 1, 0x65});
+    CHECK("au-key-flag", (au.flags & xnc::AuFlags::kAuFlagKey) != 0);
+    CHECK("au-payload-immutable-shared",
+          au.annexb != nullptr && au.annexb->size() == 5 &&
+              au.annexb->data()[4] == 0x65);
+  }
   { // Delayed encoder output must retain submission order, not call order.
     xnc::SubmissionLedger ledger;
     for (uint64_t t : {100, 200, 300})
@@ -1739,22 +1784,34 @@ int SelftestMain() {
   }
   { // FrameBlob 布局(MSVC x64 ABI):bgra(vector 24B)+w(4)+h(4)+pixfmt(1)+
     // 对齐填充(3)+mono_us(8)+gpu_scale_us(8) 紧凑 56B(gpu-readback 任务
-    // 新增 pixfmt 布局字段与 gpu_scale_us 计时段)
-    CHECK("frameblob-sizeof", sizeof(xnc::FrameBlob) == 56);
+    // 新增 pixfmt 布局字段与 gpu_scale_us 计时段)。M1 Task 1 在末尾追加四个
+    // uint64 内容身份字段(总 88B):capture_epoch/codec_epoch/content_id/
+    // source_mono_us - 身份随帧穿过 handoff 队列(见 capture.h)。
+    CHECK("frameblob-sizeof", sizeof(xnc::FrameBlob) == 88);
     CHECK("frameblob-off-bgra", offsetof(xnc::FrameBlob, bgra) == 0);
     CHECK("frameblob-off-w", offsetof(xnc::FrameBlob, w) == 24);
     CHECK("frameblob-off-h", offsetof(xnc::FrameBlob, h) == 28);
     CHECK("frameblob-off-pixfmt", offsetof(xnc::FrameBlob, pixfmt) == 32);
     CHECK("frameblob-off-mono", offsetof(xnc::FrameBlob, mono_us) == 40);
     CHECK("frameblob-off-gpu-scale", offsetof(xnc::FrameBlob, gpu_scale_us) == 48);
+    CHECK("frameblob-off-capture-epoch", offsetof(xnc::FrameBlob, capture_epoch) == 56);
+    CHECK("frameblob-off-codec-epoch", offsetof(xnc::FrameBlob, codec_epoch) == 64);
+    CHECK("frameblob-off-content-id", offsetof(xnc::FrameBlob, content_id) == 72);
+    CHECK("frameblob-off-source-mono", offsetof(xnc::FrameBlob, source_mono_us) == 80);
     CHECK("frameblob-field-sizes", sizeof(xnc::FrameBlob::w) == 4 && sizeof(xnc::FrameBlob::h) == 4 &&
                                   sizeof(xnc::FrameBlob::mono_us) == 8 &&
                                   sizeof(xnc::FrameBlob::gpu_scale_us) == 8 &&
+                                  sizeof(xnc::FrameBlob::capture_epoch) == 8 &&
+                                  sizeof(xnc::FrameBlob::codec_epoch) == 8 &&
+                                  sizeof(xnc::FrameBlob::content_id) == 8 &&
+                                  sizeof(xnc::FrameBlob::source_mono_us) == 8 &&
                                   sizeof(xnc::FrameBlob::pixfmt) == 1);
     xnc::FrameBlob fb;
     CHECK("frameblob-default", fb.bgra.empty() && fb.w == 0 && fb.h == 0 &&
                                fb.mono_us == 0 && fb.gpu_scale_us == 0 &&
-                               fb.pixfmt == xnc::Pixfmt::kBgra);
+                               fb.pixfmt == xnc::Pixfmt::kBgra &&
+                               fb.capture_epoch == 0 && fb.codec_epoch == 0 &&
+                               fb.content_id == 0 && fb.source_mono_us == 0);
   }
   { // ICapture 形状:抽象基类(Acquire/Width/Height 纯虚),虚析构可 delete
     static_assert(std::is_abstract<xnc::ICapture>::value, "ICapture must stay abstract");
@@ -2947,7 +3004,7 @@ int SelftestMain() {
   {
     // defaults: a sink implementing only OnAu inherits no-op IDR/state hooks
     struct MinimalSink final : xnc::AuSink {
-      const char* OnAu(bool, uint64_t, const uint8_t*, size_t) override { return nullptr; }
+      const char* OnAu(const xnc::EncodedAU&) override { return nullptr; }
     };
     MinimalSink m;
     CHECK("sink-default-no-pending", m.PendingIdrReason() == nullptr);
@@ -2955,9 +3012,9 @@ int SelftestMain() {
     m.OnState("capture_rebuilt", true);
     CHECK("sink-default-noop-ok", true);
     struct CounterSink final : xnc::AuSink {
-      const char* OnAu(bool is_idr, uint64_t, const uint8_t*, size_t) override {
+      const char* OnAu(const xnc::EncodedAU& au) override {
         aus++;
-        if (is_idr) keys++;
+        if ((au.flags & xnc::AuFlags::kAuFlagKey) != 0) keys++;
         return nullptr;
       }
       const char* PendingIdrReason() override { return want_idr ? "sub_join" : nullptr; }
@@ -2969,7 +3026,10 @@ int SelftestMain() {
     };
     CounterSink a, b;
     xnc::TeeAuSink tee(&a, &b);
-    const char* e = tee.OnAu(true, 42, nullptr, 0);
+    xnc::EncodedAU tee_au;  // key AU, present_mono_us = 42 (M1 Task 1 shape)
+    tee_au.id.present_mono_us = 42;
+    tee_au.flags = xnc::AuFlags::kAuFlagKey;
+    const char* e = tee.OnAu(tee_au);
     CHECK("tee-onau-both", e == nullptr && a.aus == 1 && b.aus == 1 && a.keys == 1);
     CHECK("tee-pending-none", tee.PendingIdrReason() == nullptr);
     b.want_idr = true;
@@ -2981,13 +3041,13 @@ int SelftestMain() {
     CHECK("tee-state-both", a.states.size() == 1 && b.states.size() == 1);
     // fatal error short-circuit: a fails -> b gets nothing
     struct FailingSink final : xnc::AuSink {
-      const char* OnAu(bool, uint64_t, const uint8_t*, size_t) override { return "boom"; }
+      const char* OnAu(const xnc::EncodedAU&) override { return "boom"; }
     };
     FailingSink f;
     CounterSink c2;
     xnc::TeeAuSink tee2(&f, &c2);
     CHECK("tee-fatal-first-wins",
-          std::strcmp(tee2.OnAu(false, 1, nullptr, 0), "boom") == 0 && c2.aus == 0);
+          std::strcmp(tee2.OnAu(tee_au), "boom") == 0 && c2.aus == 0);
   }
   // ---- M1-Slice2 Task 2:RtServer 端到端(真 pipe + 真 MF 编码器 + 合成采集)----
   // 管线跑在子线程(有界 duration),fake 订阅者在主线程轮询读;每个场景

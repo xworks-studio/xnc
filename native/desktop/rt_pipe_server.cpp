@@ -683,9 +683,10 @@ void RtServer::SenderLoop(std::shared_ptr<SubConn> c) {
 
 // ---- AuSink (encode thread; OnState/OnDisplayChanged from the capture thread) ----
 
-const char* RtServer::OnAu(bool is_idr, uint64_t mono_us, const uint8_t* au,
-                           size_t len) {
-  if (len == 0) return nullptr;
+const char* RtServer::OnAu(const EncodedAU& au) {
+  if (au.annexb == nullptr || au.annexb->empty()) return nullptr;
+  const uint8_t* p = au.annexb->data();
+  const size_t len = au.annexb->size();
   if (len > kMaxAuBytes) {  // 8MiB AU bound (proto.MaxSessionFrameBytes)
     XNC_LOG_ERROR("rt_au_oversize len=%llu (dropped)",
                   static_cast<unsigned long long>(len));
@@ -693,7 +694,11 @@ const char* RtServer::OnAu(bool is_idr, uint64_t mono_us, const uint8_t* au,
     stats_.frames_oversize++;
     return nullptr;
   }
-  std::vector<uint8_t> payload = EncodeFrameEvent(mono_us, is_idr, au, len);
+  // M1 Task 1: the v1 0x0105 wire event is unchanged - the key bit and the
+  // timeline timestamp come out of the immutable AU's flags/identity.
+  const bool is_idr = (au.flags & AuFlags::kAuFlagKey) != 0;
+  const uint64_t mono_us = au.id.present_mono_us;
+  std::vector<uint8_t> payload = EncodeFrameEvent(mono_us, is_idr, p, len);
   if (payload.empty()) {  // > XNIP frame cap safety net
     XNC_LOG_ERROR("rt_au_frame_cap len=%llu (dropped)",
                   static_cast<unsigned long long>(len));

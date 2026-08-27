@@ -176,8 +176,11 @@ struct OnDemandIdr {
 class FileAuSink final : public AuSink {
  public:
   explicit FileAuSink(FILE* f) : f_(f) {}
-  const char* OnAu(bool, uint64_t, const uint8_t* au, size_t len) override {
-    if (std::fwrite(au, 1, len, f_) != len) {
+  const char* OnAu(const EncodedAU& au) override {
+    if (au.annexb == nullptr || au.annexb->empty()) return nullptr;
+    const uint8_t* p = au.annexb->data();
+    const size_t len = au.annexb->size();
+    if (std::fwrite(p, 1, len, f_) != len) {
       XNC_LOG_ERROR("write_out_failed");
       return "fwrite out failed";
     }
@@ -213,6 +216,20 @@ struct PipelineShared {
                                    // thread) - gates re-feeds on the encode
                                    // thread so they only happen on a static
                                    // screen (old timeout-path semantics)
+  // M1 Task 1: frame-identity generation counters + the submission-identity
+  // FIFO paired 1:1 with `submissions` (same push/pop/rollback/clear points,
+  // so the M0 SubmissionLedger timestamp pairing stays exact - ruling 2).
+  // capture_epoch++ on every capture rebuild/reset, codec_epoch++ on every
+  // encoder re-init, next_content_id++ per accepted captured content,
+  // next_encode_seq++ per successful encoder submission (spec §5.1).
+  // identity_ledger is the separate monotonicity accept/reject gate
+  // (media_types.h), never merged into SubmissionLedger (ruling 1).
+  uint64_t capture_epoch = 1;
+  uint64_t codec_epoch = 1;
+  uint64_t next_content_id = 0;
+  uint64_t next_encode_seq = 0;
+  FrameIdentityLedger identity_ledger;
+  std::deque<FrameIdentity> pending_ids;  // pairs 1:1 with submissions
 };
 
 // Per-frame pipeline latency window (pipeline-decouple): capture mono_us ->
@@ -373,6 +390,7 @@ bool RunResetSequence(ResetSequence& s) {
     std::lock_guard<std::mutex> lk(s.sh->mu);
     s.sh->cache.OnRebuild();  // WAIT_BASE_FRAME + one-shot "rebuild" IDR
     s.sh->latest.Invalidate();
+    s.sh->capture_epoch++;  // M1 Task 1: one real rebuild = one epoch (spec §11)
     s.sh->warmup_started_ms = 0;
     s.sh->warmup_gen_feeds = 0;
     s.sh->warmup_phase_logged = false;
@@ -412,8 +430,11 @@ bool RunResetSequence(ResetSequence& s) {
         // Shutdown first discards every delayed output from the old MFT.
         std::lock_guard<std::mutex> lk(s.sh->mu);
         s.sh->submissions.Clear();
-        if (ok)
+        s.sh->pending_ids.clear();  // M1: the paired identity FIFO clears too
+        if (ok) {
+          s.sh->codec_epoch++;  // M1 Task 1: re-init = new codec generation
           XNC_LOG_INFO("capture_reset encoder re-init w=%u h=%u", new_w, new_h);
+        }
       }
     }
     if (ok) break;
@@ -480,8 +501,29 @@ void ProcessFrameLocked(EncodeCtx& ctx, const FrameBlob& f, bool warmup) {
 
   // Register at the input boundary, not at capture time: dropped handoff
   // frames never enter the MFT and therefore never enter this ledger.
+  // M1 Task 1: assign encode_seq + present_mono_us at successful submission
+  // (spec §5.1/§5.2); the identity FIFO pairs 1:1 with SubmissionLedger so
+  // the M0 timestamp pairing stays exact (ruling 2).
+  FrameIdentity id;
+  id.capture_epoch = f.capture_epoch;
+  id.codec_epoch = f.codec_epoch;
+  id.content_id = f.content_id;
+  id.source_mono_us = f.source_mono_us;
   {
     std::lock_guard<std::mutex> lk(ctx.sh.mu);
+    id.encode_seq = ++ctx.sh.next_encode_seq;
+    id.present_mono_us = f.mono_us;
+    if (!ctx.sh.identity_ledger.Accept(id)) {
+      ctx.sh.res->ok = false;
+      ctx.sh.res->err = "encoder_identity_monotonicity";
+      XNC_LOG_ERROR("encoder_identity_monotonicity cap_epoch=%llu codec_epoch=%llu content=%llu seq=%llu",
+                    static_cast<unsigned long long>(id.capture_epoch),
+                    static_cast<unsigned long long>(id.codec_epoch),
+                    static_cast<unsigned long long>(id.content_id),
+                    static_cast<unsigned long long>(id.encode_seq));
+      ctx.fatal.store(true, std::memory_order_relaxed);
+      return;
+    }
     if (!ctx.sh.submissions.Submit(f.mono_us)) {
       ctx.sh.res->ok = false;
       ctx.sh.res->err = "encoder_submission_overflow";
@@ -490,6 +532,7 @@ void ProcessFrameLocked(EncodeCtx& ctx, const FrameBlob& f, bool warmup) {
       ctx.fatal.store(true, std::memory_order_relaxed);
       return;
     }
+    ctx.sh.pending_ids.push_back(id);
   }
   std::string eerr;
   // gpu-readback: route on the blob's layout - NV12 (DXGI GPU path) skips
@@ -509,6 +552,7 @@ void ProcessFrameLocked(EncodeCtx& ctx, const FrameBlob& f, bool warmup) {
         ctx.sh.res->ok = false;
         ctx.sh.res->err = "encoder_identity_mismatch";
       } else {
+        ctx.sh.pending_ids.pop_back();  // M1: the paired identity rolls back
         ctx.sh.res->ok = false;
         ctx.sh.res->err = msg;
       }
@@ -529,26 +573,50 @@ void ProcessFrameLocked(EncodeCtx& ctx, const FrameBlob& f, bool warmup) {
   }
   for (const auto& au : ctx.aus) {
     uint64_t au_mono_us = 0;
+    uint32_t au_w = 0, au_h = 0;
+    FrameIdentity au_id;
     {
       std::lock_guard<std::mutex> lk(ctx.sh.mu);
-      if (!ctx.sh.submissions.Take(&au_mono_us)) {
+      if (!ctx.sh.submissions.Take(&au_mono_us) || ctx.sh.pending_ids.empty()) {
         ctx.sh.res->ok = false;
         ctx.sh.res->err = "encoder_identity_mismatch";
         XNC_LOG_ERROR("encoder_identity_mismatch source=encode");
         ctx.fatal.store(true, std::memory_order_relaxed);
         return;
       }
+      au_id = ctx.sh.pending_ids.front();
+      ctx.sh.pending_ids.pop_front();
+      if (au_id.present_mono_us != au_mono_us) {
+        // M1 Task 1 ruling 2: the identity FIFO must pair exactly with the
+        // SubmissionLedger timestamp. A drift is a pairing break, never a
+        // silent success.
+        ctx.sh.res->ok = false;
+        ctx.sh.res->err = "encoder_identity_mismatch";
+        XNC_LOG_ERROR("encoder_identity_mismatch source=encode_pairing");
+        ctx.fatal.store(true, std::memory_order_relaxed);
+        return;
+      }
+      au_w = ctx.sh.enc_w;
+      au_h = ctx.sh.enc_h;
     }
     const bool is_idr = NalHasType(au.data(), au.size(), 5);
     ShapeAu(au.data(), au.size(), is_idr, ctx.enc.SpsPps(), &ctx.shaped);
     if (!ctx.shaped.empty()) {
+      // M1 Task 1: the sink receives one IMMUTABLE AU - the payload is
+      // copied out of the reused shaped scratch into a shared const vector
+      // so the AU outlives the call and can never be mutated in place.
+      EncodedAU eau;
+      eau.id = au_id;
+      eau.width = au_w;
+      eau.height = au_h;
+      eau.flags = is_idr ? AuFlags::kAuFlagKey : AuFlags::kAuFlagNone;
+      eau.annexb = std::make_shared<const std::vector<uint8_t>>(ctx.shaped);
       {
         std::lock_guard<std::mutex> lk(ctx.sh.mu);
         ctx.sh.res->aus_written++;
         ctx.sh.res->bytes_written += ctx.shaped.size();
       }
-      if (const char* err =
-              ctx.sink.OnAu(is_idr, au_mono_us, ctx.shaped.data(), ctx.shaped.size())) {
+      if (const char* err = ctx.sink.OnAu(eau)) {
         {
           std::lock_guard<std::mutex> lk(ctx.sh.mu);
           ctx.sh.res->ok = false;
@@ -867,6 +935,14 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
       {
         std::lock_guard<std::mutex> lk(sh.mu);
         const bool is_base = sh.cache.OnCapturedFrame();  // captured++ inside
+        // M1 Task 1: content identity assigned at capture (spec §5.1/§5.2):
+        // the current generations, a fresh content_id per accepted content
+        // and this capture's timestamp as source time. encode_seq and
+        // present_mono_us are added at successful submission (encode thread).
+        blob.capture_epoch = sh.capture_epoch;
+        blob.codec_epoch = sh.codec_epoch;
+        blob.content_id = ++sh.next_content_id;
+        blob.source_mono_us = blob.mono_us;
         sh.latest.Update(blob);
         if (is_base) {
           res.width = blob.w;
@@ -904,6 +980,12 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
       handoff.w = blob.w;
       handoff.h = blob.h;
       handoff.pixfmt = blob.pixfmt;
+      // M1 Task 1: the content identity rides with the handoff frame so the
+      // encode thread pairs every AU back to its captured content.
+      handoff.capture_epoch = blob.capture_epoch;
+      handoff.codec_epoch = blob.codec_epoch;
+      handoff.content_id = blob.content_id;
+      handoff.source_mono_us = blob.source_mono_us;
       // Capture-side pacing: frame-index-aligned absolute deadline, sleep
       // BEFORE the push. The acquire waits for the compositor (0..16.7ms at
       // 60Hz) and this sleep tops the interval up to exactly spf - without
@@ -945,6 +1027,7 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
         std::lock_guard<std::mutex> lk(sh.mu);
         sh.cache.OnRebuild();
         sh.latest.Invalidate();
+        sh.capture_epoch++;  // M1 Task 1: in-place rebuild = new capture generation
         sh.warmup_started_ms = 0;
         sh.warmup_gen_feeds = 0;
         sh.warmup_phase_logged = false;
@@ -1035,22 +1118,40 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
     const auto deliver = [&](const char* source, bool flushing) {
       for (const auto& au : aus) {
         uint64_t au_mono_us = 0;
+        uint32_t au_w = 0, au_h = 0;
+        FrameIdentity au_id;
         {
           std::lock_guard<std::mutex> lk(sh.mu);
-          if (!sh.submissions.Take(&au_mono_us)) {
+          if (!sh.submissions.Take(&au_mono_us) || sh.pending_ids.empty()) {
             res.ok = false;
             res.err = "encoder_identity_mismatch";
             XNC_LOG_ERROR("encoder_identity_mismatch source=%s", source);
             return false;
           }
+          au_id = sh.pending_ids.front();
+          sh.pending_ids.pop_front();
+          if (au_id.present_mono_us != au_mono_us) {
+            // M1 Task 1 ruling 2: identity FIFO must pair with SubmissionLedger.
+            res.ok = false;
+            res.err = "encoder_identity_mismatch";
+            XNC_LOG_ERROR("encoder_identity_mismatch source=%s_pairing", source);
+            return false;
+          }
+          au_w = sh.enc_w;
+          au_h = sh.enc_h;
         }
         const bool is_idr = NalHasType(au.data(), au.size(), 5);
         ShapeAu(au.data(), au.size(), is_idr, enc.SpsPps(), &shaped);
         if (!shaped.empty()) {
+          EncodedAU eau;
+          eau.id = au_id;
+          eau.width = au_w;
+          eau.height = au_h;
+          eau.flags = is_idr ? AuFlags::kAuFlagKey : AuFlags::kAuFlagNone;
+          eau.annexb = std::make_shared<const std::vector<uint8_t>>(shaped);
           res.aus_written++;
           res.bytes_written += shaped.size();
-          const char* err =
-              sink.OnAu(is_idr, au_mono_us, shaped.data(), shaped.size());
+          const char* err = sink.OnAu(eau);
           if (err != nullptr) {
             res.ok = false;
             res.err = flushing && std::strcmp(err, "fwrite out failed") == 0
@@ -1100,16 +1201,29 @@ PipelineResult RunCore(ICapture& cap, MfSoftEncoder& enc, AuSink& sink,
     // path. A nominally successful drain must account for every accepted
     // input; unresolved identities are a fatal mismatch, never success.
     size_t discarded = 0;
+    size_t id_discarded = 0;
     {
       std::lock_guard<std::mutex> lk(sh.mu);
       discarded = sh.submissions.Pending();
+      id_discarded = sh.pending_ids.size();
       if (res.ok && discarded != 0) {
         res.ok = false;
         res.err = "encoder_identity_mismatch";
         XNC_LOG_ERROR("encoder_identity_mismatch source=stream_end pending=%zu",
                       discarded);
       }
+      if (id_discarded != discarded) {
+        // M1 Task 1 ruling 2: the paired FIFOs must agree at stream end; a
+        // drift is a pairing break, never a silent success.
+        if (res.ok) {
+          res.ok = false;
+          res.err = "encoder_identity_mismatch";
+        }
+        XNC_LOG_ERROR("encoder_identity_mismatch source=stream_end_pairing submissions=%zu ids=%zu",
+                      discarded, id_discarded);
+      }
       sh.submissions.Clear();
+      sh.pending_ids.clear();
     }
     if (discarded != 0) {
       XNC_LOG_INFO("encoder_submission_clear pending=%zu reason=%s", discarded,

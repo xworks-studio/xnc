@@ -48,6 +48,7 @@
 #include "capture.h"       // ICapture, FrameBlob
 #include "capture_reset.h"  // CaptureReset (M2-S1 Task 2)
 #include "frame_cache.h"   // FrameCache, FrameCacheCounters
+#include "media_types.h"   // FrameIdentity, EncodedAU, AuFlags (M1 Task 1)
 #include "mf_encoder.h"    // MfSoftEncoder
 
 namespace xnc {
@@ -106,6 +107,9 @@ inline constexpr uint64_t kIdrMinIntervalMs = 500;
 // emit an input's AU many calls later, so output timestamps cannot come from
 // the current Encode call. The cap exceeds both the measured 17-frame
 // lookahead and the 34-feed warm-up bound; overflow is a fatal encoder error.
+// M0-pinned interface: M1 Task 1 keeps this FIFO pairing unchanged and adds
+// the SEPARATE FrameIdentityLedger (media_types.h) as the monotonicity
+// accept/reject gate; the pipeline runs a 1:1 identity FIFO alongside it.
 class SubmissionLedger {
  public:
   bool Submit(uint64_t mono_us);
@@ -273,12 +277,14 @@ class AuSink {
  public:
   virtual ~AuSink() = default;
 
-  // One shaped AU (SPS/PPS-prefixed on IDR, 4-byte start codes, no AUD);
-  // mono_us = capture timestamp of the submission that produced it.
-  // Returns nullptr on success; a non-null fatal message aborts the run
+  // One immutable shaped AU (M1 Task 1): SPS/PPS-prefixed on IDR (the key
+  // bit in au.flags), 4-byte start codes, no AUD; au.id.present_mono_us =
+  // the capture timestamp of the submission that produced it and
+  // au.id.source_mono_us = the desktop-capture time of its pixels. The
+  // payload is shared const and must not be mutated. Returns nullptr on
+  // success; a non-null fatal message aborts the run
   // (PipelineResult::err = message).
-  virtual const char* OnAu(bool is_idr, uint64_t mono_us, const uint8_t* au,
-                           size_t len) = 0;
+  virtual const char* OnAu(const EncodedAU& au) = 0;
 
   // Merged IDR request (spec §7.5): non-null when the sink wants a
   // pipeline-initiated IDR (e.g. "sub_join"/"queue_overflow"/"explicit").
@@ -317,11 +323,10 @@ class AuSink {
 class TeeAuSink final : public AuSink {
  public:
   TeeAuSink(AuSink* a, AuSink* b) : a_(a), b_(b) {}
-  const char* OnAu(bool is_idr, uint64_t mono_us, const uint8_t* au,
-                   size_t len) override {
-    const char* e = a_ ? a_->OnAu(is_idr, mono_us, au, len) : nullptr;
+  const char* OnAu(const EncodedAU& au) override {
+    const char* e = a_ ? a_->OnAu(au) : nullptr;
     if (e != nullptr) return e;
-    return b_ ? b_->OnAu(is_idr, mono_us, au, len) : nullptr;
+    return b_ ? b_->OnAu(au) : nullptr;
   }
   const char* PendingIdrReason() override {
     if (a_ != nullptr) {

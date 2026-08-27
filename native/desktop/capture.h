@@ -24,7 +24,7 @@ enum class Pixfmt : uint8_t { kBgra = 0, kNv12 = 1 };
 // monotonic-clock microseconds. pixfmt says which layout bgra holds. Fields
 // are default-initialized so a default-constructed blob is {empty, 0, 0, 0,
 // BGRA, 0} (value semantics matter: diag/pipeline code reuses FrameBlob
-// locals).
+// locals); the M1 Task 1 identity fields below default to 0 likewise.
 struct FrameBlob {
   std::vector<uint8_t> bgra;
   uint32_t w = 0, h = 0;
@@ -34,6 +34,16 @@ struct FrameBlob {
   // scale/NV12 + readback portion of this frame (0 = not measured / not the
   // GPU path). Pipeline windows it into the gpu_scale_ms log line.
   uint64_t gpu_scale_us = 0;
+  // M1 Task 1: content identity assigned at capture (pipeline.cpp) and
+  // carried through the handoff queue to the encode thread. capture_epoch/
+  // codec_epoch are the generation values at capture time; content_id
+  // identifies this pixel content; source_mono_us is the desktop-capture
+  // time of these pixels (spec §5.1/§5.2). encode_seq and present_mono_us
+  // are assigned later, at successful encoder submission.
+  uint64_t capture_epoch = 0;
+  uint64_t codec_epoch = 0;
+  uint64_t content_id = 0;
+  uint64_t source_mono_us = 0;
 };
 
 // Capture backend. Acquire semantics (pinned for Task 3/5, M2-S1 T2 adds
