@@ -9,6 +9,7 @@ import type {
 } from "react";
 import { api } from "../api";
 import type { NodeDTO } from "../types";
+import { FrameCorrelator, decodeFrameMeta } from "../lib/desktopFrameMeta";
 import { lookupScan } from "./desktop/keymap";
 import { cursorDotStyle, decodeCursor, streamMapping } from "./desktop/cursor";
 import {
@@ -87,14 +88,47 @@ function toWsUrl(url: string): string {
 }
 
 /** requestVideoFrameCallback feature probe (Chrome/Edge have it; the
- * Firefox fallback polls getStats().framesDecoded). */
+ * Firefox fallback polls getStats().framesDecoded).
+ * M3 Task 5: Chrome's rVFC metadata also carries the RTP correlation
+ * fields — rtpTimestamp links a presented frame to its frame-meta
+ * record; capture/receive/processing expose the pipeline latency. All
+ * optional (Firefox/older Chrome omit them). */
 interface VideoFrameCallbackMetadataLike {
   mediaTime: number;
+  rtpTimestamp?: number;
+  captureTime?: number;
+  receiveTime?: number;
+  processingDuration?: number;
 }
 type Rvfc = (
   cb: (now: number, meta: VideoFrameCallbackMetadataLike) => void,
 ) => number;
 type VideoElementWithRvfc = HTMLVideoElement & { requestVideoFrameCallback?: Rvfc };
+
+/** M3 Task 5: viewer_feedback uplink frame (agent events.go
+ * onViewerFeedback parses exactly type/visible/estimatedBps/queueMs/
+ * decodeQueue/rttMs — TestViewerFeedbackJSONShape pins the shape; the
+ * extra diagnostic fields below are ignored by the agent but ride along
+ * for the e2e tooling). Session routing needs NO sessionID field here:
+ * the agent fills ViewerFeedback.SessionID from the per-session WS
+ * connection itself (the dial URL carries the session id). */
+interface ViewerFeedbackFrame {
+  type: string;
+  visible: boolean;
+  /** Downlink goodput estimate (bps). */
+  estimatedBps: number;
+  /** Avg jitter-buffer delay per emitted frame this window (ms). */
+  queueMs: number;
+  /** Decoded-but-not-presented surplus this window (frames). */
+  decodeQueue: number;
+  /** Candidate-pair RTT (ms). */
+  rttMs: number;
+  framesDecoded?: number;
+  framesDropped?: number;
+  freezeCount?: number;
+  freezes?: number;
+  presentedFps?: number;
+}
 
 /** Module-scoped live-WebSocket handle so the PLI/lease buttons can reach
  * the effect-owned socket (set right after connect, cleared on teardown). */
@@ -471,6 +505,20 @@ export default function DesktopLive() {
     let ws: WebSocket | null = null;
     let pc: RTCPeerConnection | null = null;
     let statsTimer = 0;
+    let feedbackTimer = 0;
+    const onVisibilityChange = () => {
+      // One visible:false report on the hide transition (cheap: the
+      // periodic loop below skips hidden tabs, so without this the agent
+      // would only learn via stale-viewer pruning). The agent hides the
+      // viewer from QoS decisions but never pauses on it.
+      if (!disposed && document.visibilityState === "hidden") void sendFeedback(false);
+    };
+
+    // M3 Task 5: frame-meta correlation — the "frame-meta" DataChannel
+    // feeds onMeta, each rVFC-presented frame calls onPresented, and the
+    // 1s feedback report reads the snapshot. Effect-owned (dies with the
+    // session; bounded internals, no teardown state of its own).
+    const correlator = new FrameCorrelator();
 
     // Frame accounting shared by the rvfc loop and the stats poller.
     let frameCount = 0;
@@ -547,6 +595,118 @@ export default function DesktopLive() {
       return decoded;
     };
 
+    // ---- M3 Task 5: 1s viewer_feedback uplink ----
+    // Metric derivations (all downlink-side; documented per plan ruling 4):
+    //  - estimatedBps: inbound-rtp bytesReceived delta × 8 / elapsed —
+    //    the viewer's downlink goodput (never the outbound direction).
+    //    Fallback when the delta is 0: candidate-pair
+    //    availableIncomingBitrate. With no estimate at all the report
+    //    is skipped — a 0 would read as deep congestion to the agent's
+    //    QoS controller.
+    //  - queueMs: (jitterBufferDelay delta / jitterBufferEmittedCount
+    //    delta) × 1000 — average jitter-buffer sojourn per emitted
+    //    frame over the window (both stats are cumulative seconds /
+    //    frames, hence the deltas).
+    //  - decodeQueue: max(0, framesDecoded delta − rVFC presented
+    //    delta) — decoded-but-not-yet-presented surplus; Chrome exposes
+    //    no direct decode-queue stat, so this is the proxy.
+    //  - rttMs: selected candidate-pair currentRoundTripTime × 1000.
+    type FeedbackSample = {
+      at: number;
+      bytes: number;
+      framesDecoded: number;
+      framesDropped: number;
+      freezeCount: number;
+      jitterDelay: number;
+      jitterEmitted: number;
+      presented: number;
+      freezes: number;
+    };
+    let fbBase: FeedbackSample | null = null;
+    const readFeedbackStats = async (): Promise<{
+      sample: FeedbackSample | null;
+      rttMs: number;
+      availBps: number;
+    }> => {
+      if (!pc) return { sample: null, rttMs: 0, availBps: 0 };
+      let sample: FeedbackSample | null = null;
+      let rttMs = 0;
+      let availBps = 0;
+      try {
+        const report = await pc.getStats();
+        const corr = correlator.snapshot();
+        report.forEach((st) => {
+          if (st.type === "inbound-rtp" && st.kind === "video") {
+            const r = st as RTCInboundRtpStreamStats & {
+              bytesReceived?: number;
+              framesDecoded?: number;
+              framesDropped?: number;
+              freezeCount?: number;
+              jitterBufferDelay?: number;
+              jitterBufferEmittedCount?: number;
+            };
+            sample = {
+              at: performance.now(),
+              bytes: r.bytesReceived ?? 0,
+              framesDecoded: r.framesDecoded ?? 0,
+              framesDropped: r.framesDropped ?? 0,
+              freezeCount: r.freezeCount ?? 0,
+              jitterDelay: r.jitterBufferDelay ?? 0,
+              jitterEmitted: r.jitterBufferEmittedCount ?? 0,
+              presented: corr.presented,
+              freezes: corr.plausibleFreezes,
+            };
+          } else if (st.type === "candidate-pair") {
+            const p = st as RTCIceCandidatePairStats;
+            if (typeof p.currentRoundTripTime === "number") {
+              // Prefer the nominated (in-use) pair; Chrome reports
+              // several pairs, only the selected one is meaningful.
+              if (p.nominated || rttMs === 0) rttMs = p.currentRoundTripTime * 1000;
+            }
+            if (typeof p.availableIncomingBitrate === "number" && p.availableIncomingBitrate > 0) {
+              availBps = p.availableIncomingBitrate;
+            }
+          }
+        });
+      } catch {
+        /* pc closing */
+      }
+      return { sample, rttMs, availBps };
+    };
+    const sendFeedback = async (visible: boolean) => {
+      if (!pc || disposed) return;
+      const { sample, rttMs, availBps } = await readFeedbackStats();
+      if (!sample || disposed) return;
+      if (sample.framesDecoded <= 0 || !fbBase) {
+        fbBase = sample; // no media yet / first sample only primes deltas
+        return;
+      }
+      const elapsedS = Math.max((sample.at - fbBase.at) / 1000, 0.001);
+      const goodput = Math.round(((sample.bytes - fbBase.bytes) * 8) / elapsedS);
+      const estimatedBps = goodput > 0 ? goodput : Math.round(availBps);
+      const base = fbBase;
+      fbBase = sample; // advance the window even when we skip below
+      if (estimatedBps <= 0) return; // nothing measurable — 0 would look like congestion
+      const emitted = sample.jitterEmitted - base.jitterEmitted;
+      const queueMs = emitted > 0 ? ((sample.jitterDelay - base.jitterDelay) / emitted) * 1000 : 0;
+      const decodedDelta = sample.framesDecoded - base.framesDecoded;
+      const presentedDelta = sample.presented - base.presented;
+      const fb: ViewerFeedbackFrame = {
+        type: "viewer_feedback",
+        visible,
+        estimatedBps,
+        queueMs: Math.round(queueMs * 10) / 10,
+        decodeQueue: Math.max(0, decodedDelta - presentedDelta),
+        rttMs: Math.round(rttMs * 10) / 10,
+        framesDecoded: decodedDelta,
+        framesDropped: sample.framesDropped - base.framesDropped,
+        freezeCount: sample.freezeCount - base.freezeCount,
+        freezes: sample.freezes - base.freezes,
+        presentedFps: Math.round((presentedDelta / elapsedS) * 10) / 10,
+      };
+      send(fb);
+    };
+
     /** rvfc loop: per-second fps + first-frame latency (preferred
      * source of truth in Chrome/Edge — counts presented frames). */
     const startFrameLoop = (video: HTMLVideoElement) => {
@@ -557,14 +717,33 @@ export default function DesktopLive() {
         frameCount++;
         const first = frameCount === 1;
         const now = performance.now();
+        // M3 Task 5: correlate this presented frame against the bounded
+        // frame-meta map via Chrome's metadata.rtpTimestamp (when the
+        // browser exposes it). A hit whose codecEpoch/contentId/
+        // encodeSeq regressed vs the last presented hit is a
+        // presentation-order anomaly: warn + count, never throw.
+        const corr = correlator.onPresented(meta.rtpTimestamp, _now);
+        if (corr.regressed) {
+          console.warn(
+            "[frame-meta] presented frame identity regressed",
+            corr.meta && {
+              rtpTimestamp: corr.meta.rtpTimestamp,
+              codecEpoch: corr.meta.codecEpoch.toString(),
+              contentId: corr.meta.contentId.toString(),
+              encodeSeq: corr.meta.encodeSeq.toString(),
+            },
+          );
+        }
         // 逐帧诊断:每呈现一帧记录 帧号:mediaTime(秒,3位):呈现间隔(ms)。
-        // mediaTime 倒退 = 回退帧;间隔 0/巨大 = 重复/卡顿。
+        // mediaTime 倒退 = 回退帧;间隔 0/巨大 = 重复/卡顿。M3 Task 5:
+        // 命中 frame-meta 时追加身份列 :E<codecEpoch>:S<encodeSeq>。
         const di = diagRef.current;
         if (framediag && di) {
           const mt = typeof meta.mediaTime === "number" ? meta.mediaTime : NaN;
           const dt = di.lastPresent ? Math.round((_now - di.lastPresent) * 1000) / 1000 : 0;
           di.lastPresent = _now;
-          di.frames.push(`${frameCount}:${mt.toFixed(3)}:${dt.toFixed(1)}`);
+          const id = corr.meta ? `:E${corr.meta.codecEpoch}:S${corr.meta.encodeSeq}` : "";
+          di.frames.push(`${frameCount}:${mt.toFixed(3)}:${dt.toFixed(1)}${id}`);
           if (di.frames.length > 240) di.frames.splice(0, di.frames.length - 240);
           // 每 ~1s 快照一次 DOM(避免每帧 setState 拖累渲染)。
           if (frameCount % 30 === 0) setDiag({ frames: di.frames.slice(-120), stats: di.stats });
@@ -596,6 +775,8 @@ export default function DesktopLive() {
     const teardown = () => {
       disposed = true;
       window.clearInterval(statsTimer);
+      window.clearInterval(feedbackTimer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
       try {
         pc?.close();
       } catch {
@@ -680,6 +861,18 @@ export default function DesktopLive() {
                     if (!upd) return;
                     const map = streamMapping(videoRef.current, dimsRef.current);
                     setCursorDot(map && upd.visible ? cursorDotStyle(map, upd.x, upd.y) : null);
+                  };
+                } else if (ch.label === "frame-meta") {
+                  // M3 Task 5: per-frame telemetry (agent M3 Task 4 —
+                  // unordered, no retransmit, so records may drop).
+                  // 56-byte FrameMetaV1 records keyed by rtpTimestamp
+                  // for the rVFC correlation; decode failures (wrong
+                  // version/length/garbage) are counted inside the
+                  // correlator and NEVER thrown from this handler.
+                  ch.binaryType = "arraybuffer";
+                  ch.onmessage = (m: MessageEvent) => {
+                    if (disposed || !(m.data instanceof ArrayBuffer)) return;
+                    correlator.onMeta(decodeFrameMeta(m.data));
                   };
                 }
               };
@@ -819,6 +1012,16 @@ export default function DesktopLive() {
           if (disposed) return;
           const decoded = await pollStats();
           if (decoded > 0 && !disposed) setState((s) => (s === "streaming" ? s : "streaming"));
+        }, 1000);
+        // M3 Task 5: 1s viewer_feedback uplink over this session WS (the
+        // agent's QoS loop consumes it; the frame shape is the flat JSON
+        // vocabulary — routing is the connection itself). Hidden tabs
+        // skip the periodic report; the hide transition sends exactly
+        // one visible:false report via onVisibilityChange above.
+        document.addEventListener("visibilitychange", onVisibilityChange);
+        feedbackTimer = window.setInterval(() => {
+          if (disposed || document.hidden) return;
+          void sendFeedback(document.visibilityState === "visible");
         }, 1000);
       })
       .catch((err) => {
