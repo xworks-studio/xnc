@@ -320,7 +320,8 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 
 // setupPublisher 建 PeerConnection、接好回调和帧泵,并返回 answer。
 // ictl 在 offer 应答前 attach 三条输入/光标 DataChannel(必须先于
-// HandleOffer 建立),并在 answer 后启动 cursor 泵(0x0109 → cursor 通道)。
+// HandleOffer 建立),frame-meta 遥测通道(M3 Task 4)随后同一约束建立,
+// 并在 answer 后启动 cursor 泵(0x0109 → cursor 通道)。
 // M3 Task 2:关键帧请求协调器在此组建——本会话全部请求源(RTCP PLI/FIR、
 // 连接就绪、viewer 发送器 overflow/pacer/resume)经 OnKeyRequest seam 汇入
 // (connect=新订阅 urgent),帧泵的 IDR 观测经 idrObservingSource 喂
@@ -377,6 +378,13 @@ func (h *Handler) setupPublisher(ctx context.Context, w *wsWriter, src Source,
 	if err := ictl.attach(pub); err != nil {
 		_ = pub.Close()
 		return nil, fmt.Errorf("input channels: %w", err)
+	}
+	// frame-meta 通道(M3 Task 4):unordered + 不重传的轻量遥测,随输入
+	// 通道同一约束在 HandleOffer 之前创建;发送点在本帧最后一包 RTP 写出
+	// 之后(transport.go writePacketWithMeta),失败只计数不阻塞媒体。
+	if err := pub.attachFrameMeta(); err != nil {
+		_ = pub.Close()
+		return nil, fmt.Errorf("frame meta channel: %w", err)
 	}
 	answerSDP, err := pub.HandleOffer(offerSDP)
 	if err != nil {
