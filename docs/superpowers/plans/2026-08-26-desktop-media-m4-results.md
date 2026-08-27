@@ -1,0 +1,166 @@
+# M4 Task 2 (rerun) — correctness and recovery gates on REAL console hardware
+
+**Overall: BLOCKED — the bounded-soak gate FAILED on a P0 counter and the suite stopped per the
+STOP rule.** The run executed on labs-xiaoxin console session 5 (the designated validation node,
+interactive desktop attached). The harness pipe bug from the first attempt is confirmed fixed by
+commit `6f61605` (full `\\.\pipe\...` path: the rt server appeared, all viewer events dialed,
+`from-diag` produced real verdicts). A second, previously-unknown harness-side defect was found and
+fixed DURING this rerun (uncommitted in the worktree — see §7): `FormatStagesJson` emitted a
+trailing comma in the `stages` object, so every v2 `stats.json` was invalid JSON and `from-diag`
+rejected it. The binary validated here includes that fix.
+
+Worktree: `C:\Users\LABS\Desktop\XNC\.worktrees\desktop-media-m4`, branch `codex/desktop-media-m4`,
+HEAD `6f61605`. Validated binary SHA256
+`4C2615CF6104B4A1DD8F4C577BD1E8E1AA9F5586C64EF1C75AE6BA48FFD5DB1B` (bin\xnc-desktop.exe, built by
+`cmd /c native\desktop\build.bat` with the uncommitted pipeline.cpp fix; local v1 selftest of this
+exact binary: exit 0).
+
+---
+
+## 1. Environment (labs-xiaoxin — all runtime evidence)
+
+| Row | Value |
+|---|---|
+| Host / user | LABS-XIAOXIN, `labs-xiaoxin\labs` (WinRM user `labs`, Negotiate, empty password) |
+| Session | **console session 5, ACTIVE** — proof: `query session` in-suite shows `> console LABS 5 Active` (the `>` marks the driver's own session) and `ProcessIdToSessionId` of the driver pid (7124 main suite, 20216 diag run) = 5; artifacts `logs\env-proof.txt`, `logs\env2.txt` |
+| Desktop | \\.\DISPLAY11 primary, logical 1440x900 @32bpp (200% scaling); DXGI duplication native **2880x1800**; `--jpeg-single` smoke of the live desktop exit=0 (300,419 B jpg) |
+| GPU | Intel(R) Arc(TM) 130T GPU (12GB), driver **32.0.101.8801** (2026-05-11), Win32_VideoController |
+| OS | Microsoft Windows 11 Pro 10.0.26200 (build 26200) |
+| Power | Balanced scheme; battery status=2 (on AC), 94% |
+| Deploy | `C:\xnc-m4\` — repo payload incl. `bin\`, `scripts\desktop-media\`, `tools\`, `drivers\`, portable Go 1.26 at `C:\xnc-m4\go` (offline `GOPROXY=off` — run-soak builds its viewer/report tools in-run); binary hashes verified identical local↔remote (SHA256 above; accesslost.exe `B9A45018…49A4BF`, resetloop.exe `7ADD7EAB…CA759C1`) |
+
+Execution vehicle: `Register-ScheduledTask -TaskName xnc-m4-soak` with
+`New-ScheduledTaskPrincipal -UserId LABS -LogonType Interactive` and action
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\xnc-m4\drivers\drive-all2.ps1`
+(then `diag.ps1`, `alprobe-only.ps1` for the post-abort diagnostics), `Start-ScheduledTask`,
+marker-file polling via `Invoke-Command` (≥45 s intervals, per-phase wall-clock budgets). The task
+was DELETED after each run; final state verified clean (no `xnc-m4*` tasks, no processes from
+`C:\xnc-m4\bin`, console session 5 still Active, no desktop settings ever changed — the injector
+only held a duplication).
+
+## 2. Exact commands
+
+Build (local worktree):
+```
+cmd /c native\desktop\build.bat
+cd tools\e2eviewer && go build -o ..\..\bin\e2eviewer.exe .
+cd tools\desktopreport && go build -o ..\..\bin\desktopreport.exe .
+cd artifacts\desktop-media\resetloop-tool && GOWORK=off go build -o ..\..\..\bin\resetloop.exe .
+cmd /c artifacts\desktop-media\accesslost-tool\build.bat        (ACCESS_LOST injector)
+```
+Deploy (WinRM, `Copy-Item -ToSession`, overwrite): `bin\{xnc-desktop,resetloop,accesslost,e2eviewer,desktopreport}.exe`,
+`scripts\desktop-media\*.ps1`, driver scripts → `C:\xnc-m4\`.
+
+On the console session (driver phases; artifacts under `C:\xnc-m4\artifacts\desktop-media\`):
+```
+# pilot (2 min v2; chain integrity incl. the stats.json JSON fix)
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\xnc-m4\scripts\desktop-media\run-soak.ps1 -DurationSec 120 -Pipeline v2 -Fps 30 -RunDir <art>\soak-pilot-20260827-151030
+# mandated 60-min soak (NOT executed - suite stopped on the pilot P0):
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\xnc-m4\scripts\desktop-media\run-soak.ps1 -DurationSec 3600 -Pipeline v2 -Fps 30
+# mandated 10-min v1 rollback soak (NOT executed):
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\xnc-m4\scripts\desktop-media\run-soak.ps1 -DurationSec 600 -Pipeline v1 -Fps 30
+# selftests (deployed exe, console hardware)
+C:\xnc-m4\bin\xnc-desktop.exe --selftest
+C:\xnc-m4\bin\xnc-desktop.exe --selftest --desktop-pipeline-v2
+# 100 reset cycles (NOT executed; mechanism probe only):
+C:\xnc-m4\bin\resetloop.exe -exe C:\xnc-m4\bin\xnc-desktop.exe -out <art>\resetloop-100 -cycles 100 -variants auto -injector C:\xnc-m4\bin\accesslost.exe -max-total-sec 3300
+```
+
+## 3. Gate status
+
+| Gate | Status | Evidence |
+|---|---|---|
+| Bounded soak (2-min pilot, mandated config): zero unrecovered freezes | **FAIL — P0** | `soak-pilot-20260827-151030\runresult.json`: `UnrecoveredFreezes=4`, Verdict FAIL. Reproduced: `soak-pilot2-20260827-151844\runresult.json`: `UnrecoveredFreezes=49`, Verdict FAIL |
+| Bounded soak: zero contentId/hash regressions | **PASS (within the failed runs)** | both pilots: `OldFrameRegressions=0`, `EpochRegressions=0`; standing viewer `contentIdRegressions=0`, `rtpTsRegressions=0`, `encodeSeqRegressions=0`, `codecEpochRegressions=0` |
+| Bounded soak: latency/memory gates | **FAIL** | pilot/pilot2: `CaptureToAUP95Ms` 8266/8285 (gate 15), `QueueP95Ms` 6966/6919 (gate 50), `QueueMaxMs` 7512/7468 (gate 100), `WorkingSetMB` 1190/1207 (gate 350); `CPUPercent` 2.3/2.7 |
+| 60-min v2 soak | **NOT RUN — stopped on P0** (STOP rule) | suite marker `logs\suite.abort` "pilot broken: exit=1" |
+| 8 h soak completion | **PENDING** (not started; blocked by the P0 above) | — |
+| 100 reset cycles: one epoch per reset / recovery ≤2 s ≥99 / no stale frame | **NO EVIDENCE — 0 of 100 ran** (suite stopped on P0) | `resetloop-100` absent; mechanisms probed separately (§5) |
+| 10-min v1 rollback soak (CaptureToAUP95 NO-EVIDENCE expected fail-closed) | **NOT RUN** | aborted before phase 6; expectation stands unexercised |
+| Selftest v1 (`--selftest`) on console hardware | **PASS** | exit 0, 143 s, zero `SELFTEST FAIL` lines (`logs\selftest-v1.log`) |
+| Selftest v2 (`--selftest --desktop-pipeline-v2`) on console hardware | **PASS** | exit 0, 179 s, zero FAIL lines; **v2e (real GDI capture of the live 2880x1800 desktop) PASSED** — the scenario that starved in the first attempt's disconnected RDP session |
+| Encoder contract: fault matrix (delayed/missing/unknown-timestamp outputs; no invalid AU reaches pipe) | **PASS** (selftest both modes; checks are silent on pass — zero FAIL lines) | `logs\selftest-v{1,2}.log`; corroborating NOTEs: `mf-flush first-au-nal=6 types: 9 7 8 6 6 5`, `v2c delivery strictly monotonic n=33`, `v2k retired_drops=9`, `rsD rebuilds=6` |
+| Encoder contract: 3-strike hw lock + software failover, no oscillation | **PASS** | NOTEs: `v2m hw_faults=3 creates=3 resets=3 strikes=3`, `v2n hw_creates=3 resets=2 locked=1`, `v2r hw_creates=0 backend=factory`, `v2r-rt frames=4 keys=1 rc=0` |
+| Encoder contract: one epoch increment per executed reset | **PASS** | NOTEs: `v2l resets=3 storm=0/25/50`, `v2d aus=9 resets=1 rebuilds=1`, `rsA … resets=1 requests=7 merged=6`, `rsC … resets=1 w=96 h=64` |
+| Lock/unlock + UAC transitions | **PENDING (manual, interactive console)** | not automatable unattended; desktop state deliberately untouched |
+
+## 4. The P0: what failed and why (all numbers from artifacts)
+
+Two independent 120 s soaks with the mandated config (`-Pipeline v2 -Fps 30`, no `-max-w` → native
+2880x1800) failed identically:
+
+- **Hardware encoder rung does not serve on this node.** The D3D11-aware Intel QSV MFT IS
+  enumerated (`gpu_probe friendly="Intel? Quick Sync Video H.264 Encoder MFT"`, `gpu_mft_async=1
+  d3d11_aware=1`), but its startup probe fails: `"probe: no METransformNeedInput within budget
+  (input #1)"` (twice per run) → `media_v2_hw_contract_failure what=init strikes=1` →
+  `media_v2_gpu_session_unavailable … (software rung)` → `encoder_backend=software` (stats.json),
+  friendly `"CMSH264EncoderMFT (Microsoft H.264 Software Encoder)"`. The M0-ladder path likewise:
+  `encoder_input_attempt backend=hardware hr=0xc00d6d77 (rejected, falling back)`. Contract
+  behavior itself was correct (one loud strike, clean failover, no oscillation).
+- **The software rung cannot sustain 2880x1800@30**: `mft_submit_to_output_us` p50/p95 =
+  5,739,422/8,831,091 (pilot, n=320) → `capture_to_au_us` p95 8,266,477 → viewer
+  `QueueP95Ms` ≈ 6.97 s. With AUs arriving in bursts seconds apart, `recoveryViolations` (post-gap
+  recovery AU not starting with an IDR) accumulated: **4** in the pilot (all in the PLI event
+  viewer — the requested IDR sits behind seconds of queued P-frames) and **49** in pilot2 (standing
+  viewer) → `UnrecoveredFreezes` P0. Working set 1.19–1.21 GB (gate 350 MB). Secondary churn:
+  `reorder_gap_skips=71 reorder_late_drops=71` (pilot). Content integrity was NOT implicated
+  (all regression counters 0; `recoveryGapMs` 1164 ms with `recoveryViolations=0` on the standing
+  viewer in the pilot).
+- Verdict chain: `from-diag` → `verify` → `run-soak: FAIL (exit 1)`; suite aborted per the STOP
+  rule (`logs\suite.abort`).
+
+Plausibly causal environment factors (recorded, not excusing): Win11 build 26200 + Arc driver
+.8801 QSV async-MFT probe timeout, 200%-scaled 2880x1800 console, Balanced power on AC. The
+production shape (`--max-w` clamp / hardware rung) was NOT substituted — that would be forcing a
+pass.
+
+## 5. Reset-mechanism probes (bounded diagnostics after the STOP)
+
+- **switch_display (0x0128)** and **set_video_config (0x0129 max_w 1280→1024)** remain the two
+  scriptable unified-reset triggers against the real binary (reasons `switch` / `resolution`;
+  single-display `switch_display idx=0` is accepted — `DxgiSelectDisplay` only bounds-checks the
+  table). They were wired into `resetloop.exe` (`-variants`) but the 100-cycle gate never ran.
+- **ACCESS_LOST by second duplication (the task's preferred mechanism) is NOT implementable on
+  this OS/driver** — three probe iterations (`alprobe…`, artifacts §6):
+  1. injector device-creation bug fixed (ComPtr `Reset()` nulling the kept adapter →
+     `D3D11CreateDevice hr=0x80070057`);
+  2. `DuplicateOutput1` with NV12 / R16G16B16A16_FLOAT / BGRA all return
+     **`DXGI_ERROR_UNSUPPORTED (0x887A0004)`** while another duplication session holds the output;
+  3. legacy `IDXGIOutput1::DuplicateOutput` **succeeds (hr=0x0)** and the sessions COEXIST — the
+     victim kept capturing through a 300 ms hold (zero `capture_reset*` lines, epoch unchanged).
+     I.e. no eviction → no ACCESS_LOST. Real-hardware ACCESS_LOST remains covered by the selftest's
+     injected-backend scenario rsD (`rsD rebuilds=6` PASS).
+- Desktop state was never modified (no resolution/display changes on the user's console).
+
+## 6. Artifacts
+
+Local copies (git-ignored) — `artifacts\desktop-media\rerun2-remote\` (remote origin
+`C:\xnc-m4\artifacts\desktop-media\`):
+- `soak-pilot-20260827-151030\` — runresult.json (FAIL, freezes 4), stats.json (backend=software,
+  stage histograms), native.log (QSV probe chain), 5 viewer reports, metrics.jsonl, table.md
+- `soak-pilot2-20260827-151844\` — confirmation FAIL (freezes 49), same shape
+- `logs-final\` (= remote `logs\`): env-proof.txt, env2.txt, phase0/pilot/selftest-v1/selftest-v2/
+  pilot2/env2/diag markers, suite.abort, selftest-v1.log, selftest-v2.log, pilot/pilot2 console
+  logs, diag transcript, alprobe2.txt (+ `logs\`, `logs2\` same content at pull time)
+- `alprobe\cycle-001\` (+`alprobe2\`,`alprobe4\`) — injector HRESULT logs (§5), cycle.json
+- `prior-rerun-drive-all.ps1` — the interrupted prior rerun's driver (for provenance; its pilot
+  found the stats.json JSON bug: remote `soak-20260827-144809`)
+
+## 7. Uncommitted harness-source fix carried by this run
+
+`native/desktop/pipeline.cpp` (worktree, NOT committed — the task mandates committing only this
+doc): `FormatStagesJson` left a trailing `,\n` after the last stage member, so every v2 stats.json
+was invalid JSON; `desktopreport from-diag` rejected it (found on labs-xiaoxin console session 5
+by the prior interrupted rerun; the selftest's stage checks are substring matches, only a real
+parse catches it). The 4-line trim fix is required for ANY v2 soak verdict to exist. Landing it as
+a fix commit is a follow-up.
+
+## 8. Follow-ups for adjudication
+
+1. P0 driver question: QSV MFT async probe budget vs driver .8801 (probe: "no METransformNeedInput
+   within budget") — hardware rung unusable on the canary node as-is.
+2. Software rung at unclamped 2880x1800 is seconds-per-AU: the soak config (no `-max-w`) fails by
+   construction on this node while the hardware rung is down.
+3. Land the `pipeline.cpp` JSON fix (§7).
+4. Reset cycles need either the two scriptable mechanisms only, or a real ACCESS_LOST trigger
+   (mode change / secure-desktop) — second-duplication eviction does not exist on Win11 26200.
