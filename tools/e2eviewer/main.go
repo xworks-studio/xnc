@@ -887,7 +887,7 @@ func runDirect(c *config) (*summary, error) {
 	go func() {
 		defer close(pumpDone)
 		for f := range sub.FrameCh() {
-			if err := pub.WriteFrame(desktop.Frame{Key: f.Key, MonoUs: f.MonoUs, AU: f.AU}); err != nil {
+			if err := pub.WriteFrame(desktop.Frame{Key: f.Key, PresentMonoUs: f.PresentMonoUs, AU: f.AU}); err != nil {
 				log.Warn("frame pump stopped", "err", err)
 				return
 			}

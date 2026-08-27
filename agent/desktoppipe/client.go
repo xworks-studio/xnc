@@ -11,7 +11,13 @@
 //	MSG_KEYFRAME_REQ 0x0104 req   [u32 sub_id][char reason[32]](NUL 填充)
 //	MSG_FRAME        0x0105 event [u32 sub_id_target=0 广播][u64 mono_us]
 //	                            [u8 key][u32 len][au bytes]
+//	MSG_FRAME_V2     0x0205 event (M1 Task 2/3;host 以 XNC_DESKTOP_PIPELINE_V2
+//	                            门控):72 字节 LE 固定头(header_bytes + 六个
+//	                            身份 u64 + w/h + flags + payload_len + crc32c)
+//	                            + Annex-B 载荷;仅 hello media_protocol=2 时
+//	                            使用,v1 连接收到即拒(反之亦然)
 //	MSG_HOST_HELLO   0x0106 event [u32 gen][u32 w][u32 h][u32 fps][u32 max_subs]
+//	                            (M1 Task 2:管道 v2 时尾随 [u32 media_protocol=2])
 //	MSG_STATE        0x0107 event [char code[32]][u8 recoverable]
 //	MSG_INPUT        0x0108 req   [u32 sub_id][u64 seq][u8 type][payload']
 //	                            (M1-Slice3 出站;payload' 布局见 InputMsg)
@@ -35,6 +41,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"net"
 	"os"
 	"sync"
@@ -44,7 +51,7 @@ import (
 	"xnc/proto/ipc"
 )
 
-// 消息类型(0x0102-0x010A;native/desktop/rt_pipe_server.h 镜像)。
+// 消息类型(0x0102-0x010A, 0x0205;native/desktop/rt_pipe_server.h 镜像)。
 const (
 	msgAttach      uint16 = 0x0102
 	msgDetach      uint16 = 0x0103
@@ -56,6 +63,7 @@ const (
 	msgCursor      uint16 = 0x0109
 	msgDisplayChg  uint16 = 0x010A
 	msgSwitchDisp  uint16 = 0x0128
+	msgFrameV2     uint16 = 0x0205 // M1 Task 2/3:v2 已验证媒体帧
 )
 
 // 0x0108 type 值(C++ kInput* 镜像)。
@@ -96,7 +104,28 @@ const (
 	// displayEntryLen 是 HOST_HELLO displays[] 每项字节数(M2-S3 Task 5):
 	// [u32 idx][s32 ox][s32 oy][u32 w][u32 h][u8 primary]。
 	displayEntryLen = 21
+
+	// v2HeaderBytes 是 0x0205 载荷的固定头长度(M1 Task 2;镜像 native
+	// kV2HeaderBytes):[u32 header_bytes][u64 capture_epoch][u64 codec_epoch]
+	// [u64 content_id][u64 encode_seq][u64 source_mono_us]
+	// [u64 present_mono_us][u32 width][u32 height][u32 flags]
+	// [u32 payload_len][u32 crc32c]。
+	v2HeaderBytes = 72
+	// maxAuBytes 是 v2 载荷上限(镜像 native kMaxAuBytes =
+	// proto.MaxSessionFrameBytes)。
+	maxAuBytes = 8 << 20
+	// mediaProtocolV2 是扩展 HOST_HELLO 尾随的媒体协议版本号。
+	mediaProtocolV2 uint32 = 2
+	// flagKey 是 v2 flags 的 key 位(镜像 native AuFlags::kAuFlagKey)。
+	flagKey uint32 = 1 << 0
 )
+
+// crc32cTable 是 v2 帧 CRC32C(Castagnoli,反射多项式 0x82F63B78,
+// init/xorout 0xFFFFFFFF)查找表(镜像 native crc32c.h)。
+var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
+
+// zero4 是 v2 CRC 覆盖中 crc 字段原位为零的 4 字节段。
+var zero4 = [4]byte{}
 
 // SubOpts 是 ATTACH 携带的整形参数(0 = 未指定,由 host 用默认)。
 type SubOpts struct {
@@ -105,22 +134,29 @@ type SubOpts struct {
 	Bitrate uint32
 }
 
-// Frame 是一条解码后的视频 AU(Annex-B,统一 4 字节起始码)。
+// Frame 是一条解码后的视频 AU(Annex-B,统一 4 字节起始码)。v2(0x0205)
+// 帧携带完整媒体身份(镜像 native FrameIdentity);v1(0x0105)帧仅
+// Key/PresentMonoUs/AU 有效,身份字段为 0。
 type Frame struct {
-	Key    bool
-	MonoUs uint64
-	AU     []byte
+	Key                         bool
+	CaptureEpoch, CodecEpoch    uint64
+	ContentID, EncodeSeq        uint64
+	SourceMonoUs, PresentMonoUs uint64
+	W, H                        uint32
+	AU                          []byte
 }
 
 // HelloInfo 是 HOST_HELLO 内容;gen 递增代表 capture 重建(T2 语义)。
 // Displays 是 M2-S3 Task 5 的 displays[] 块(旧 server 不携带 = nil);
 // W/H 恒为「当前活动显示器」几何(与 displays[] 中某一项一致)。
+// MediaProtocol 是 v2 扩展的尾随 u32(0 = 旧 host / 无字段,M1 Task 2)。
 type HelloInfo struct {
-	Gen      uint32
-	W, H     uint32
-	Fps      uint32
-	MaxSubs  uint32
-	Displays []Display
+	Gen           uint32
+	W, H          uint32
+	Fps           uint32
+	MaxSubs       uint32
+	Displays      []Display
+	MediaProtocol uint32
 }
 
 // Display 是 HOST_HELLO displays[] 的一项(M2-S3 Task 5;与 native
@@ -180,13 +216,15 @@ type Sub struct {
 
 	writeMu sync.Mutex // 串行化 DETACH/KEYFRAME_REQ 写
 
-	mu       sync.Mutex // 守护 hello/needKey/closed/pumpErr
-	hello    *HelloInfo
-	needKey  bool // 消费侧丢 delta 后合并的 keyframe 请求标志
-	closed   bool
-	pumpErr  error
-	closeOne sync.Once
-	closeErr error
+	mu           sync.Mutex // 守护 hello/mediaProto/needKey/closed/pumpErr
+	hello        *HelloInfo
+	mediaProto   uint32 // 协商媒体协议(hello 尾随字段;0 = v1)
+	needKey      bool   // 消费侧丢 delta 后合并的 keyframe 请求标志
+	closed       bool
+	pumpErr      error
+	closeOne     sync.Once
+	closeErr     error
+	ledger       frameLedger // v2 帧身份单调性(pump 独占)
 
 	frameCh   chan Frame
 	stateCh   chan StateEvent
@@ -195,6 +233,50 @@ type Sub struct {
 	displayCh chan DisplayChanged
 	done      chan struct{}
 	doneOnce  sync.Once
+}
+
+// frameIdentity 是 v2 帧身份中参与单调性校验的字段(镜像 native
+// FrameIdentity 的子集)。
+type frameIdentity struct {
+	captureEpoch, codecEpoch uint64
+	contentID, encodeSeq     uint64
+}
+
+// frameLedger 镜像 native FrameIdentityLedger.Accept 的单调性规则:
+// epoch 前进重基线;epoch/content 回退、seq 重复(<=)拒绝。
+type frameLedger struct {
+	hasLast bool
+	last    frameIdentity
+}
+
+func (l *frameLedger) accept(id frameIdentity) bool {
+	if !l.hasLast {
+		l.hasLast = true
+		l.last = id
+		return true
+	}
+	if id.captureEpoch < l.last.captureEpoch {
+		return false
+	}
+	if id.captureEpoch > l.last.captureEpoch {
+		l.last = id
+		return true
+	}
+	if id.codecEpoch < l.last.codecEpoch {
+		return false
+	}
+	if id.codecEpoch > l.last.codecEpoch {
+		l.last = id
+		return true
+	}
+	if id.contentID < l.last.contentID {
+		return false
+	}
+	if id.encodeSeq <= l.last.encodeSeq {
+		return false
+	}
+	l.last = id
+	return true
 }
 
 // Dial 连接 xnc-desktop 实时 pipe,完成握手与 ATTACH,等待 HOST_HELLO
@@ -249,6 +331,7 @@ func Dial(pipe, secret string, subID uint32, opts SubOpts) (*Sub, error) {
 				return nil, err
 			}
 			s.hello = h
+			s.mediaProto = h.MediaProtocol
 			_ = conn.SetDeadline(time.Time{})
 			go s.pump()
 			return s, nil
@@ -430,37 +513,41 @@ func (s *Sub) pump() {
 		}
 		switch f.MessageType {
 		case msgFrame:
+			if s.mediaProto == mediaProtocolV2 {
+				s.teardown(fmt.Errorf("desktoppipe: v1 frame on v2 media connection"))
+				return
+			}
 			frm, err := decodeFrame(f.Payload)
 			if err != nil {
 				s.teardown(err)
 				return
 			}
-			if frm.Key {
-				select {
-				case s.frameCh <- frm:
-				case <-s.done:
-					s.teardown(nil)
-					return
-				}
-				s.mu.Lock()
-				s.needKey = false // key 已送达,合并请求清位
-				s.mu.Unlock()
-				continue
-			}
-			select {
-			case s.frameCh <- frm:
-			case <-s.done:
-				s.teardown(nil)
+			if !s.deliverFrame(frm) {
 				return
-			default:
-				// 消费侧落后:丢 delta,合并请求一次 keyframe(§7.9 客户端镜像)。
-				s.mu.Lock()
-				need := s.needKey
-				s.needKey = true
-				s.mu.Unlock()
-				if !need {
-					go func() { _ = s.RequestKeyframe("client_overflow") }() //nolint:errcheck // 记账请求,失败随连接终结
-				}
+			}
+		case msgFrameV2:
+			if s.mediaProto != mediaProtocolV2 {
+				s.teardown(fmt.Errorf("desktoppipe: v2 frame on v1 media connection"))
+				return
+			}
+			frm, err := decodeFrameV2(f.Payload)
+			if err != nil {
+				s.teardown(err)
+				return
+			}
+			// 身份单调性在进 FrameCh 前校验:回归帧直接拒收并下线。
+			if !s.ledger.accept(frameIdentity{
+				captureEpoch: frm.CaptureEpoch,
+				codecEpoch:   frm.CodecEpoch,
+				contentID:    frm.ContentID,
+				encodeSeq:    frm.EncodeSeq,
+			}) {
+				s.teardown(fmt.Errorf("desktoppipe: v2 frame identity regression: capture_epoch=%d codec_epoch=%d content_id=%d encode_seq=%d",
+					frm.CaptureEpoch, frm.CodecEpoch, frm.ContentID, frm.EncodeSeq))
+				return
+			}
+			if !s.deliverFrame(frm) {
+				return
 			}
 		case msgHostHello:
 			h, err := decodeHostHello(f.Payload)
@@ -470,6 +557,7 @@ func (s *Sub) pump() {
 			}
 			s.mu.Lock()
 			s.hello = h
+			s.mediaProto = h.MediaProtocol
 			s.mu.Unlock()
 			select {
 			case s.helloCh <- *h:
@@ -529,6 +617,40 @@ func (s *Sub) pump() {
 			// PONG / 迟到的 ATTACH 应答等:忽略。
 		}
 	}
+}
+
+// deliverFrame 交付一帧到 FrameCh:key 帧阻塞送达(可被 Close 解除)并
+// 清合并位;delta 满时丢弃并合并请求一次 keyframe。返回 false 表示泵
+// 已 teardown(调用方须退出)。
+func (s *Sub) deliverFrame(frm Frame) bool {
+	if frm.Key {
+		select {
+		case s.frameCh <- frm:
+		case <-s.done:
+			s.teardown(nil)
+			return false
+		}
+		s.mu.Lock()
+		s.needKey = false // key 已送达,合并请求清位
+		s.mu.Unlock()
+		return true
+	}
+	select {
+	case s.frameCh <- frm:
+	case <-s.done:
+		s.teardown(nil)
+		return false
+	default:
+		// 消费侧落后:丢 delta,合并请求一次 keyframe(§7.9 客户端镜像)。
+		s.mu.Lock()
+		need := s.needKey
+		s.needKey = true
+		s.mu.Unlock()
+		if !need {
+			go func() { _ = s.RequestKeyframe("client_overflow") }() //nolint:errcheck // 记账请求,失败随连接终结
+		}
+	}
+	return true
 }
 
 // teardown 是泵的唯一下线路径:记录终结原因(主动 Close 后为 nil)、
@@ -617,14 +739,76 @@ func decodeFrame(p []byte) (Frame, error) {
 		return Frame{}, fmt.Errorf("desktoppipe: frame length mismatch: len field %d, payload %d", ln, len(p))
 	}
 	return Frame{
-		Key:    p[12] != 0,
-		MonoUs: binary.LittleEndian.Uint64(p[4:12]),
-		AU:     append([]byte(nil), p[17:]...),
+		Key:           p[12] != 0,
+		PresentMonoUs: binary.LittleEndian.Uint64(p[4:12]),
+		AU:            append([]byte(nil), p[17:]...),
 	}, nil
 }
 
+// decodeFrameV2 解码并校验 0x0205 v2 媒体帧。校验顺序镜像 native
+// DecodeFrameEventV2:完整头 → header_bytes == 72 → payload_len <= 8 MiB
+// → 精确总长(无尾随字节)→ CRC32C——全部通过才分配载荷。
+func decodeFrameV2(p []byte) (Frame, error) {
+	if len(p) < v2HeaderBytes {
+		return Frame{}, fmt.Errorf("desktoppipe: v2 frame payload %d bytes, want >= %d", len(p), v2HeaderBytes)
+	}
+	if hb := binary.LittleEndian.Uint32(p); hb != v2HeaderBytes {
+		return Frame{}, fmt.Errorf("desktoppipe: v2 frame header_bytes %d, want %d", hb, v2HeaderBytes)
+	}
+	payloadLen := binary.LittleEndian.Uint32(p[64:])
+	if payloadLen > maxAuBytes {
+		return Frame{}, fmt.Errorf("desktoppipe: v2 frame payload_len %d exceeds 8 MiB", payloadLen)
+	}
+	if uint64(len(p)) != uint64(v2HeaderBytes)+uint64(payloadLen) {
+		return Frame{}, fmt.Errorf("desktoppipe: v2 frame length mismatch: header %d + payload_len %d, got %d",
+			v2HeaderBytes, payloadLen, len(p))
+	}
+	// CRC32C 覆盖 zero-crc 头 + 载荷:hash [0,68) + 4 个零字节 + 载荷
+	// (镜像 native 的链式 Crc32c)。
+	crc := crc32.Update(0, crc32cTable, p[:68])
+	crc = crc32.Update(crc, crc32cTable, zero4[:])
+	crc = crc32.Update(crc, crc32cTable, p[72:])
+	if stored := binary.LittleEndian.Uint32(p[68:]); crc != stored {
+		return Frame{}, fmt.Errorf("desktoppipe: v2 frame crc32c mismatch: got %#08x, want %#08x", crc, stored)
+	}
+	flags := binary.LittleEndian.Uint32(p[60:])
+	return Frame{
+		Key:           flags&flagKey != 0,
+		CaptureEpoch:  binary.LittleEndian.Uint64(p[4:]),
+		CodecEpoch:    binary.LittleEndian.Uint64(p[12:]),
+		ContentID:     binary.LittleEndian.Uint64(p[20:]),
+		EncodeSeq:     binary.LittleEndian.Uint64(p[28:]),
+		SourceMonoUs:  binary.LittleEndian.Uint64(p[36:]),
+		PresentMonoUs: binary.LittleEndian.Uint64(p[44:]),
+		W:             binary.LittleEndian.Uint32(p[52:]),
+		H:             binary.LittleEndian.Uint32(p[56:]),
+		AU:            append([]byte(nil), p[72:]...),
+	}, nil
+}
+
+// decodeHostHello 解码 HOST_HELLO:先按 legacy 形态(20B 或 24+21n)解;
+// 失败再尝试 v2 扩展(尾随 u32 media_protocol=2;镜像 native 的先
+// DecodeHostHello 后 DecodeHostHelloV2 顺序,避免 displays 尾 4 字节
+// 巧合 == 2 的歧义)。两者皆失败 = 未知版本,拒绝。
 func decodeHostHello(p []byte) (*HelloInfo, error) {
-	// M2-S3 Task 5:legacy 20B(无 displays)或 24B + 21B*n 扩展载荷。
+	if h, err := decodeHostHelloLegacy(p); err == nil {
+		return h, nil
+	}
+	if len(p) >= 28 {
+		mp := binary.LittleEndian.Uint32(p[len(p)-4:])
+		if mp == mediaProtocolV2 {
+			if h, err := decodeHostHelloLegacy(p[:len(p)-4]); err == nil {
+				h.MediaProtocol = mp
+				return h, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("desktoppipe: host_hello payload %d bytes, want 20, 24+21n or v2-extended", len(p))
+}
+
+// decodeHostHelloLegacy 解码 legacy HOST_HELLO(M2-S3 Task 5:20B 无
+// displays,或 24B + 21B*n 扩展载荷)。
+func decodeHostHelloLegacy(p []byte) (*HelloInfo, error) {
 	if len(p) != 20 && (len(p) < 24 || (len(p)-24)%displayEntryLen != 0) {
 		return nil, fmt.Errorf("desktoppipe: host_hello payload %d bytes, want 20 or 24+21n", len(p))
 	}
@@ -700,13 +884,14 @@ func decodeDisplayChanged(p []byte) (DisplayChanged, error) {
 }
 
 // displayAsHello 把一条 0x010A 合成 hello 视图(gen/w/h;事件不携带
-// fps/max_subs,从 prev 继承,prev 为 nil 时留 0)。
+// fps/max_subs/displays/media_protocol,从 prev 继承,prev 为 nil 时留 0)。
 func displayAsHello(ev DisplayChanged, prev *HelloInfo) *HelloInfo {
 	h := &HelloInfo{Gen: ev.Gen, W: ev.W, H: ev.H}
 	if prev != nil {
 		h.Fps = prev.Fps
 		h.MaxSubs = prev.MaxSubs
-		h.Displays = prev.Displays // 0x010A 不携带 displays;沿用旧表
+		h.Displays = prev.Displays     // 0x010A 不携带 displays;沿用旧表
+		h.MediaProtocol = prev.MediaProtocol
 	}
 	return h
 }

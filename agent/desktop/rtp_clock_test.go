@@ -76,7 +76,7 @@ func TestPublisherRejectsUnpacketizableAnnexB(t *testing.T) {
 	p.started = true
 	p.stateMu.Unlock()
 
-	err = p.WriteFrame(Frame{MonoUs: 1, AU: []byte{0, 0, 0, 1}})
+	err = p.WriteFrame(Frame{PresentMonoUs: 1, AU: []byte{0, 0, 0, 1}})
 	if err == nil {
 		t.Fatal("WriteFrame accepted Annex-B data that produced no RTP packets")
 	}

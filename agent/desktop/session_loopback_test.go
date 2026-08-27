@@ -205,7 +205,7 @@ func (s *fakeSource) run(t *testing.T) {
 				}
 				i++
 				key := force || i%60 == 1
-				f := Frame{Key: key, MonoUs: mono, AU: synthAU(key, mono)}
+				f := Frame{Key: key, PresentMonoUs: mono, AU: synthAU(key, mono)}
 				select {
 				case s.frameCh <- f:
 				case <-s.done:

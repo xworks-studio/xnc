@@ -144,7 +144,7 @@ func TestIntentReattachAfterDeath(t *testing.T) {
 	dyn := it.source()
 
 	// 消费者视角:死亡前正常收帧。
-	first.frameCh <- Frame{Key: true, MonoUs: 1, AU: synthAU(true, 1)}
+	first.frameCh <- Frame{Key: true, PresentMonoUs: 1, AU: synthAU(true, 1)}
 	if f, ok := dyn.RecvFrame(ctx); !ok || !f.Key {
 		t.Fatalf("RecvFrame before death = %v %v", f, ok)
 	}
@@ -158,10 +158,10 @@ func TestIntentReattachAfterDeath(t *testing.T) {
 		}
 	}()
 	waitStarts(t, core, 2, 5*time.Second)
-	second.frameCh <- Frame{Key: true, MonoUs: 2, AU: synthAU(true, 2)}
+	second.frameCh <- Frame{Key: true, PresentMonoUs: 2, AU: synthAU(true, 2)}
 	select {
 	case f := <-got:
-		if !f.Key || f.MonoUs != 2 {
+		if !f.Key || f.PresentMonoUs != 2 {
 			t.Fatalf("post-reattach frame = %+v", f)
 		}
 	case <-time.After(5 * time.Second):

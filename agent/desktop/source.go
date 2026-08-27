@@ -15,9 +15,9 @@ import "context"
 // Frame 是一帧已编码视频 AU(Annex-B,4 字节起始码),与 desktoppipe.Frame
 // 字段一一对应(core_windows.go 负责转换)。
 type Frame struct {
-	Key    bool
-	MonoUs uint64 // host 单调钟微秒——RTP 时戳的真相来源
-	AU     []byte
+	Key           bool
+	PresentMonoUs uint64 // host 单调钟微秒——RTP 时戳的真相来源
+	AU            []byte
 }
 
 // HelloInfo 是 HOST_HELLO 内容镜像;gen 递增代表 capture 重建。

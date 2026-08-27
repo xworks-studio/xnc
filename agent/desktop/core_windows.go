@@ -291,7 +291,7 @@ func (p *pipeSource) RecvFrame(ctx context.Context) (Frame, bool) {
 		if !ok {
 			return Frame{}, false
 		}
-		return Frame{Key: f.Key, MonoUs: f.MonoUs, AU: f.AU}, true
+		return Frame{Key: f.Key, PresentMonoUs: f.PresentMonoUs, AU: f.AU}, true
 	case <-ctx.Done():
 		return Frame{}, false
 	case <-p.sub.Done():

@@ -2,7 +2,7 @@
 //
 // API 选择:TrackLocalStaticRTP + Pion H264Payloader。Annex-B AU 由 Pion
 // 完成 STAP-A/FU-A 分包，每帧的所有 RTP 包都直接使用该 AU 的
-// MonoUs@90kHz 时戳；不再用 sample.Duration 隐式推进时间轴。
+// PresentMonoUs@90kHz 时戳；不再用 sample.Duration 隐式推进时间轴。
 package desktop
 
 import (
@@ -205,7 +205,7 @@ func (p *Publisher) AddCandidate(c webrtc.ICECandidateInit) error {
 }
 
 // WriteFrame 将一帧 Annex-B AU 分包后写入视频轨。同一 AU 的所有
-// 包使用同一个 MonoUs@90kHz 时戳，仅最后一包置 Marker。
+// 包使用同一个 PresentMonoUs@90kHz 时戳，仅最后一包置 Marker。
 //
 // 首帧语义(双保险,见 NewPublisher 的 Connected 钩子):连接就绪前的帧
 // 一律丢弃(RTPSender 未启动,写了也静默蒸发);连接后丢弃 delta 直到
@@ -230,7 +230,7 @@ func (p *Publisher) WriteFrame(f Frame) error {
 	}
 	hadPreviousTimestamp := p.rtpClock.started
 	previousMonoUs := p.rtpClock.last
-	timestamp, err := p.rtpClock.Timestamp(f.MonoUs)
+	timestamp, err := p.rtpClock.Timestamp(f.PresentMonoUs)
 	if err != nil {
 		return err
 	}
@@ -252,7 +252,7 @@ func (p *Publisher) WriteFrame(f Frame) error {
 		p.log.Info("desktop write_rtp slow", "ms", ms, "auBytes", len(f.AU), "rtpPackets", len(packets))
 	}
 	if hadPreviousTimestamp {
-		if deltaUs := f.MonoUs - previousMonoUs; deltaUs <= 1_000_000 {
+		if deltaUs := f.PresentMonoUs - previousMonoUs; deltaUs <= 1_000_000 {
 			p.intervalStats.add(time.Duration(deltaUs)*time.Microsecond, p.log)
 		}
 	}
