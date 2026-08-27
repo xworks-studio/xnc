@@ -17,6 +17,11 @@
 // correctness Task 5 adds the decoded A/B/C end-to-end regression: A/B/C
 // then timeouts then sub_join + pli - the recovery IDR must DECODE to C's
 // luma hash (mf_decoder_probe.h), not A's (stale-pixel acceptance test).
+// 2026-08-26 desktop-media-m2 Task 1 adds the pure lease state machine
+// (FREE -> CONVERTING -> SUBMITTED -> RETIRED -> FREE) plus the D3D11
+// LatestSurface/Nv12SurfacePool wrappers over a self-created device
+// (hardware -> WARP; XNC_D3D_DEBUG=1 gates the debug-layer assertions:
+// no ERROR/CORRUPTION D3D messages + zero live leases after teardown).
 // Pure-logic cases need no desktop;
 // the encoder/pipeline scenarios feed synthetic color bars straight into the
 // MF software H.264 MFT, so no capture is involved and they run on any
@@ -36,6 +41,7 @@
 #include "frame_cache.h"
 #include "frame_queue.h"
 #include "gdi_capture.h"
+#include "gpu_surface.h"  // M2 Task 1: lease model + LatestSurface/NV12 pool
 #include "input_manager.h"
 #include "jpeg_wic.h"
 #include "media_types.h"  // M1 Task 1: FrameIdentity/EncodedAU/AuFlags ledger
@@ -60,6 +66,8 @@ bool ParsePipelineV2Env(const char* v);
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>  // GetTempPathW, GetCurrentProcessId, DeleteFileW, pipes
+#include <d3d11.h>    // M2 Task 1: device + textures for the surface tests
+#include <wrl/client.h>  // ComPtr RAII in the surface tests
 
 #include <cstddef>  // offsetof
 #include <cstdio>
@@ -1610,6 +1618,271 @@ int SelftestMain() {
     CHECK("au-payload-immutable-shared",
           au.annexb != nullptr && au.annexb->size() == 5 &&
               au.annexb->data()[4] == 0x65);
+  }
+  { // M2 Task 1: the PURE lease state machine (FREE -> CONVERTING ->
+    // SUBMITTED -> RETIRED -> FREE, plan ruling 1 - constructible without
+    // any D3D type). The first three checks are the plan's binding test
+    // vector; the rest pin the remaining transitions.
+    xnc::SurfaceLeaseModel m(3);
+    auto a = m.Acquire(); auto b = m.Acquire(); auto c = m.Acquire();
+    CHECK("pool-bounded", a && b && c && !m.Acquire());
+    a->Submit(10);
+    CHECK("submitted-not-reusable", !m.ReleaseFree(a->index()));
+    CHECK("output-releases", m.Complete(10) && m.Acquire());
+    // Complete parks the slot in RETIRED (observable); the NEXT Acquire
+    // sweeps retired slots back to FREE before allocating (that sweep is
+    // what makes output-releases hold).
+    xnc::SurfaceLeaseModel m2(3);
+    CHECK("lease-slot-count", m2.slot_count() == 3);
+    auto l0 = m2.Acquire();
+    CHECK("lease-acquire-converting",
+          l0 && m2.State(l0->index()) == xnc::SurfaceLeaseState::kConverting);
+    CHECK("lease-submit", l0->Submit(77));
+    CHECK("lease-submitted-state",
+          m2.State(l0->index()) == xnc::SurfaceLeaseState::kSubmitted);
+    CHECK("lease-complete-retires",
+          m2.Complete(77) &&
+              m2.State(l0->index()) == xnc::SurfaceLeaseState::kRetired);
+    CHECK("lease-retired-counted-live",
+          m2.LiveLeases() == 1 && m2.RetiredCount() == 1 && m2.FreeCount() == 2);
+    CHECK("lease-explicit-sweep", m2.FreeRetired() == 1);
+    CHECK("lease-swept-free",
+          m2.LiveLeases() == 0 && m2.FreeCount() == 3);
+    CHECK("lease-complete-unknown-id", !m2.Complete(9999));
+    // ReleaseFree: the CONVERTING abandon path; every other state rejects.
+    xnc::SurfaceLeaseModel m3(3);
+    auto r0 = m3.Acquire();
+    CHECK("lease-release-free", m3.ReleaseFree(r0->index()) && m3.FreeCount() == 3);
+    CHECK("lease-release-free-rejected", !m3.ReleaseFree(r0->index()));
+    auto r1 = m3.Acquire();
+    CHECK("lease-submit-ok", r1->Submit(1));
+    CHECK("lease-release-submitted-rejected", !m3.ReleaseFree(r1->index()));
+    CHECK("lease-double-submit-rejected", !r1->Submit(2));
+    // Submit ids stay unique among SUBMITTED slots (Complete is by id).
+    auto r2 = m3.Acquire();
+    CHECK("lease-duplicate-submit-id-rejected", !r2->Submit(1));
+    // RetireAll: bulk CONVERTING/SUBMITTED -> RETIRED (flush/teardown), then
+    // the sweep frees them; exhaustion stays bounded at slot_count.
+    CHECK("lease-retireall-count", m3.RetireAll() == 2);
+    CHECK("lease-retireall-states",
+          m3.RetiredCount() == 2 && m3.LiveLeases() == 2);
+    CHECK("lease-retireall-idempotent", m3.RetireAll() == 0);
+    CHECK("lease-retireall-sweep-frees",
+          m3.FreeRetired() == 2 && m3.LiveLeases() == 0 && m3.FreeCount() == 3 &&
+              m3.Acquire() != nullptr);
+  }
+  { // M2 Task 1: the D3D wrappers - LatestSurface (owned persistent BGRA
+    // "latest complete desktop") + the 3-slot NV12 Nv12SurfacePool over the
+    // same lease model. Device: hardware -> WARP fallback with BGRA+VIDEO
+    // flags (RDP/WARP-safe, the dxgi_capture.cpp pattern). XNC_D3D_DEBUG=1
+    // adds D3D11_CREATE_DEVICE_DEBUG and FAILS on any ERROR/CORRUPTION D3D
+    // message observed during these surface tests (ruling 3); when the debug
+    // layer is not installed those assertions are loudly SKIPPED (SELFTEST
+    // NOTE), never silently passed. Zero live leases after teardown is
+    // asserted either way. No Map()/readback: GPU stays GPU.
+    bool want_debug = false;
+    {
+      char dbuf[8];
+      const DWORD dlen =
+          GetEnvironmentVariableA("XNC_D3D_DEBUG", dbuf, sizeof(dbuf));
+      want_debug = dlen > 0 && dlen < sizeof(dbuf) && dbuf[0] != '0';
+    }
+    UINT create_flags =
+        D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    if (want_debug) create_flags |= D3D11_CREATE_DEVICE_DEBUG;
+    Microsoft::WRL::ComPtr<ID3D11Device> dev;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> dev_ctx;
+    D3D_FEATURE_LEVEL fl{};
+    const char* via = "hardware";
+    auto try_create = [&dev, &dev_ctx, &fl](UINT f, D3D_DRIVER_TYPE dt) {
+      dev.Reset();
+      dev_ctx.Reset();
+      return D3D11CreateDevice(nullptr, dt, nullptr, f, nullptr, 0,
+                               D3D11_SDK_VERSION, &dev, &fl, &dev_ctx);
+    };
+    HRESULT hr = try_create(create_flags, D3D_DRIVER_TYPE_HARDWARE);
+    if (FAILED(hr)) {
+      via = "warp";
+      hr = try_create(create_flags, D3D_DRIVER_TYPE_WARP);
+    }
+    bool debug_layer = want_debug && SUCCEEDED(hr);
+    if (want_debug && !debug_layer) {
+      std::printf(
+          "SELFTEST NOTE: XNC_D3D_DEBUG=1 but the D3D11 debug layer is not "
+          "installed (debug device creation failed) - D3D debug assertions "
+          "SKIPPED\n");
+      create_flags &= ~D3D11_CREATE_DEVICE_DEBUG;
+      via = "hardware";
+      hr = try_create(create_flags, D3D_DRIVER_TYPE_HARDWARE);
+      if (FAILED(hr)) {
+        via = "warp";
+        hr = try_create(create_flags, D3D_DRIVER_TYPE_WARP);
+      }
+    }
+    CHECK("gpu-surface-device", SUCCEEDED(hr));
+    if (SUCCEEDED(hr)) {
+      std::printf("SELFTEST NOTE: gpu-surface device driver=%s debug_layer=%d\n",
+                  via, debug_layer ? 1 : 0);
+      Microsoft::WRL::ComPtr<ID3D11InfoQueue> iq;
+      if (debug_layer && SUCCEEDED(dev.As(&iq)))
+        iq->ClearStoredMessages();  // only surface-test messages count
+      // ---- LatestSurface ----
+      xnc::LatestSurface latest;
+      std::string err;
+      const uint32_t lw = 64, lh = 48;
+      CHECK("latest-init", latest.Init(dev.Get(), lw, lh, &err));
+      CHECK("latest-dims", latest.width() == lw && latest.height() == lh);
+      CHECK("latest-invalid-before-copy", !latest.valid());
+      xnc::FrameIdentity sid{};
+      ID3D11Texture2D* snap = nullptr;
+      CHECK("latest-snapshot-before-copy-fails", !latest.Snapshot(&sid, &snap));
+      // Source BGRA texture with known content (DEFAULT usage, like the
+      // duplication textures CopyFrom will see in production).
+      D3D11_TEXTURE2D_DESC sd{};
+      sd.Width = lw;
+      sd.Height = lh;
+      sd.MipLevels = 1;
+      sd.ArraySize = 1;
+      sd.SampleDesc.Count = 1;
+      sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+      sd.Usage = D3D11_USAGE_DEFAULT;
+      std::vector<uint8_t> px(static_cast<size_t>(lw) * lh * 4);
+      for (size_t i = 0; i + 3 < px.size(); i += 4) {
+        px[i] = 0x11;
+        px[i + 1] = 0x22;
+        px[i + 2] = 0x33;
+        px[i + 3] = 0xFF;
+      }
+      D3D11_SUBRESOURCE_DATA srd{px.data(), lw * 4, 0};
+      Microsoft::WRL::ComPtr<ID3D11Texture2D> src;
+      CHECK("latest-src-create",
+            SUCCEEDED(dev->CreateTexture2D(&sd, &srd, &src)));
+      const xnc::FrameIdentity id1{2, 1, 30, 1, 1000, 1100};
+      CHECK("latest-copy", latest.CopyFrom(dev_ctx.Get(), src.Get(), id1, &err));
+      CHECK("latest-valid-after-copy", latest.valid());
+      ID3D11Texture2D* snap_a = nullptr;
+      CHECK("latest-snapshot-ok",
+            latest.Snapshot(&sid, &snap_a) && snap_a != nullptr);
+      CHECK("latest-snapshot-identity",
+            sid.capture_epoch == 2 && sid.content_id == 30 &&
+                sid.encode_seq == 1 && sid.source_mono_us == 1000 &&
+                sid.present_mono_us == 1100);
+      D3D11_TEXTURE2D_DESC gd{};
+      if (snap_a) snap_a->GetDesc(&gd);
+      CHECK("latest-snapshot-desc",
+            snap_a && gd.Width == lw && gd.Height == lh &&
+                gd.Format == DXGI_FORMAT_B8G8R8A8_UNORM);
+      // Snapshot is AddRef'd: two live snapshots of the same image.
+      xnc::FrameIdentity sid_b{};
+      ID3D11Texture2D* snap_b = nullptr;
+      CHECK("latest-snapshot-stable",
+            latest.Snapshot(&sid_b, &snap_b) && snap_b == snap_a &&
+                sid_b.encode_seq == 1);
+      if (snap_a) snap_a->Release();
+      if (snap_b) snap_b->Release();
+      // Desc mismatches are rejected before CopyResource (the debug layer
+      // would flag an invalid copy).
+      D3D11_TEXTURE2D_DESC sd2 = sd;
+      sd2.Width = 32;
+      sd2.Height = 24;
+      Microsoft::WRL::ComPtr<ID3D11Texture2D> src_small;
+      if (SUCCEEDED(dev->CreateTexture2D(&sd2, nullptr, &src_small)))
+        CHECK("latest-copy-dims-mismatch",
+              !latest.CopyFrom(dev_ctx.Get(), src_small.Get(), id1, &err));
+      // Invalidate -> Snapshot fails until a new CopyFrom completes (ruling 2).
+      latest.Invalidate();
+      ID3D11Texture2D* snap_c = nullptr;
+      CHECK("latest-invalidated-snapshot-fails",
+            !latest.valid() && !latest.Snapshot(&sid, &snap_c));
+      const xnc::FrameIdentity id2{2, 1, 31, 2, 2000, 2100};
+      CHECK("latest-recopy-after-invalidate",
+            latest.CopyFrom(dev_ctx.Get(), src.Get(), id2, &err));
+      CHECK("latest-new-identity",
+            latest.Snapshot(&sid, &snap_c) && snap_c != nullptr &&
+                sid.encode_seq == 2 && sid.content_id == 31);
+      if (snap_c) snap_c->Release();
+      // ---- Nv12SurfacePool ----
+      xnc::Nv12SurfacePool pool;
+      CHECK("pool-init", pool.Init(dev.Get(), lw, lh, &err));
+      CHECK("pool-dims", pool.width() == lw && pool.height() == lh);
+      CHECK("pool-starts-free",
+            pool.FreeCount() == xnc::Nv12SurfacePool::kSlotCount &&
+                pool.LiveLeases() == 0);
+      CHECK("pool-odd-dims-rejected", [&] {
+        xnc::Nv12SurfacePool odd;
+        return !odd.Init(dev.Get(), 33, lh, &err);
+      }());
+      auto* p0 = pool.Acquire();
+      auto* p1 = pool.Acquire();
+      auto* p2 = pool.Acquire();
+      CHECK("pool-three-leases", p0 && p1 && p2 && pool.LiveLeases() == 3);
+      CHECK("pool-fourth-rejected", pool.Acquire() == nullptr);
+      ID3D11Texture2D* t0 = p0 ? p0->texture() : nullptr;
+      ID3D11Texture2D* t1 = p1 ? p1->texture() : nullptr;
+      ID3D11Texture2D* t2 = p2 ? p2->texture() : nullptr;
+      D3D11_TEXTURE2D_DESC pd{};
+      if (t0) t0->GetDesc(&pd);
+      CHECK("pool-slot-textures",
+            t0 != nullptr && t1 != nullptr && t2 != nullptr && t0 != t1 &&
+                t0 != t2 && t1 != t2 && pd.Width == lw && pd.Height == lh &&
+                pd.Format == DXGI_FORMAT_NV12);
+      CHECK("pool-lease-converting",
+            p0->state() == xnc::SurfaceLeaseState::kConverting &&
+                pool.State(p0->index()) == xnc::SurfaceLeaseState::kConverting);
+      // Submit -> only Complete/RetireAll may move the slot on.
+      CHECK("pool-submit", p0->Submit(1000));
+      CHECK("pool-submit-state",
+            p0->state() == xnc::SurfaceLeaseState::kSubmitted);
+      CHECK("pool-release-submitted-rejected", !p0->Release());
+      CHECK("pool-double-submit-rejected", !p0->Submit(1001));
+      CHECK("pool-duplicate-id-rejected", !p1->Submit(1000));
+      CHECK("pool-submit-second", p1->Submit(1001));
+      // Abandon: a CONVERTING slot releases without ever being submitted.
+      CHECK("pool-abandon-release",
+            p2->Release() && pool.FreeCount() == 1);
+      auto* p3 = pool.Acquire();
+      CHECK("pool-reacquire-after-abandon",
+            p3 != nullptr && p3->index() == p2->index() &&
+                pool.Acquire() == nullptr);
+      // Output completion: Complete retires; the next Acquire sweeps to FREE.
+      CHECK("pool-complete",
+            pool.Complete(1000) &&
+                pool.State(p0->index()) == xnc::SurfaceLeaseState::kRetired);
+      auto* p4 = pool.Acquire();
+      CHECK("pool-reacquire-after-complete",
+            p4 != nullptr &&
+                pool.State(p0->index()) == xnc::SurfaceLeaseState::kConverting);
+      CHECK("pool-complete-unknown-id", !pool.Complete(4242));
+      // Teardown (ruling 3): retire everything outstanding, sweep, and the
+      // pool must report zero live leases.
+      CHECK("pool-retireall", pool.RetireAll() == 3 && pool.LiveLeases() == 3);
+      CHECK("pool-retireall-sweep", pool.FreeRetired() == 3);
+      CHECK("pool-zero-live-after-teardown",
+            pool.LiveLeases() == 0 &&
+                pool.FreeCount() == xnc::Nv12SurfacePool::kSlotCount);
+      // Ruling 3 verdict: no ERROR/CORRUPTION D3D debug messages during the
+      // surface tests (only when the debug layer actually came up).
+      if (debug_layer && iq) {
+        bool bad = false;
+        const UINT64 nmsgs = iq->GetNumStoredMessages();
+        for (UINT64 i = 0; i < nmsgs; ++i) {
+          SIZE_T len = 0;
+          if (FAILED(iq->GetMessage(i, nullptr, &len)) || len == 0) continue;
+          std::vector<char> mbuf(len);
+          D3D11_MESSAGE* msg = reinterpret_cast<D3D11_MESSAGE*>(mbuf.data());
+          if (FAILED(iq->GetMessage(i, msg, &len))) continue;
+          if (msg->Severity == D3D11_MESSAGE_SEVERITY_ERROR ||
+              msg->Severity == D3D11_MESSAGE_SEVERITY_CORRUPTION) {
+            bad = true;
+            std::printf("SELFTEST NOTE: d3d sev=%u id=%u desc=%s\n",
+                        static_cast<unsigned>(msg->Severity),
+                        static_cast<unsigned>(msg->ID),
+                        msg->pDescription ? msg->pDescription : "");
+          }
+        }
+        CHECK("gpu-surface-no-d3d-errors", !bad);
+      }
+    }
   }
   { // Delayed encoder output must retain submission order, not call order.
     xnc::SubmissionLedger ledger;
