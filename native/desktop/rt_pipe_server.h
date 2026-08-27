@@ -764,7 +764,13 @@ class RtServer : public AuSink {
   // seam (the real backends implement both on one object). Both pipelines
   // publish the same shaped EncodedAU through OnAu - the wire flavor is
   // still Opts.pipeline_v2.
-  int ServeV2(ICapture& cap, ICaptureSurface& surf, const Opts& o);
+  // Fix round 1 (finding 2): max_width > 0 threads the --max-w clamp into
+  // the pipeline's VideoProcessor (the M0 path scales via ScaledCapture
+  // instead) and the HOST_HELLO geometry is the SCALED stream dims
+  // (GpuScaledDims of the capture) so the encoder, hello, input and cursor
+  // spaces all agree.
+  int ServeV2(ICapture& cap, ICaptureSurface& surf, const Opts& o,
+              uint32_t max_width = 0);
 
   // Idempotent: stops the accept loop, broadcasts STATE{stream_end} to the
   // attached subscribers, cancels their IO, joins every connection thread.

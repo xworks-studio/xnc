@@ -24,8 +24,16 @@
 // identity that can reach the wire runs through the M1 FrameIdentityLedger
 // at the submission boundary - the M0 pipeline's exact policy site (the
 // software rung's AUs surface REORDERED, measured in M1 Task 3, so
-// publication order cannot be the gate) - and publication additionally
+// emission order cannot be the gate) - and publication additionally
 // rejects unknown or duplicated encode_seqs. Any regression is fatal.
+// DELIVERY-order monotonicity (the v2 wire contract: strictly increasing
+// encode_seq per epoch pair as delivered - the Go client's frameLedger
+// tears down on the first regression) is restored by a bounded
+// reorder-before-publish window in CollectOutputs: in-order outputs
+// publish immediately with their true (time-keyed) identities, an output
+// whose seq skips parks until the gap fills, and a gap that exceeds 2x
+// the lookahead window or outlives a hold timeout is skipped + recovered
+// by a sticky "reorder_gap" IDR.
 //
 // AU shaping is the SAME stream contract as the M0 pipeline (pipeline.h:
 // SPS/PPS prefixed on IDR, 4-byte start codes, parameter sets/AUD dropped).
@@ -240,6 +248,11 @@ class MediaPipelineV2 {
     uint64_t bytes_written = 0;
     uint32_t resets = 0;            // executed capture resets
     uint32_t rebuilds = 0;          // backend RebuildCount() at stop
+    // Reorder-window accounting (fix round 1): never-emitted encode_seqs
+    // skipped to keep delivery monotonic (each skip arms a sticky IDR),
+    // and outputs dropped for arriving below the already-published seq.
+    uint64_t reorder_gap_skips = 0;
+    uint64_t reorder_late_drops = 0;
     char last_reset_reason[kResetReasonMax] = {0};
     const char* encoder_backend = "(none)";  // which rung ran
     std::string encoder_friendly;

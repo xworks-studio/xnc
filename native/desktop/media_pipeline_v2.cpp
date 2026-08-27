@@ -82,6 +82,16 @@ constexpr uint32_t kResetHardBackoffMs = 1000;
 constexpr uint32_t kResetHardFailStreak = 3;
 // Pipeline-initiated IDR throttle (spec 7.5).
 constexpr uint64_t kIdrMinIntervalMs = 500;
+// Reorder-before-publish window bounds (fix round 1): the software rung
+// emits AUs reordered relative to submissions, and the v2 wire's delivery
+// contract is strictly increasing encode_seq per epoch pair (the Go
+// client's frameLedger tears down on the first regression). Out-of-order
+// outputs are PARKED until the gap fills; a gap that exceeds 2x the
+// ~17-frame lookahead (the WarmupFeedBound convention) or outlives
+// kReorderHoldMs (static screen: no further outputs to fill it) is
+// skipped and a sticky IDR resynchronizes decoders.
+constexpr size_t kReorderWindowMax = 34;
+constexpr uint64_t kReorderHoldMs = 500;
 
 std::string HrErr(const char* step, HRESULT hr) {
   char buf[128];
@@ -273,7 +283,9 @@ struct MediaPipelineV2::Impl {
                                // type; see the TrySubmit note - outputs
                                // surface REORDERED on the software rung,
                                // so the M0-exact submission site is the
-                               // only order-fair gate)
+                               // only order-fair gate). DELIVERY-order
+                               // monotonicity is restored downstream by
+                               // the reorder-before-publish window.
   std::deque<uint64_t> published_seqs;  // bounded duplicate guard at
                                         // publication (belt to the
                                         // session's 1:1 mapping)
@@ -287,6 +299,14 @@ struct MediaPipelineV2::Impl {
     if (published_seqs.size() > OutputIdentityTracker::kMaxTracked)
       published_seqs.pop_front();
   }
+  // Reorder-before-publish window (fix round 1): emission order becomes
+  // delivery order ONLY through here. publish_next_seq is the next
+  // encode_seq that may go on the wire; everything above it parks until
+  // the gap fills (or is skipped, counted, and IDR-recovered).
+  std::vector<EncoderOutput> reorder_window_;  // kept sorted by encode_seq
+  uint64_t publish_next_seq = 1;
+  uint64_t window_park_ms = 0;      // first park time (0 = window empty)
+  bool reorder_gap_idr_armed = false;  // one sticky IDR per gap incident
   std::vector<uint8_t> sps_pps;  // harvested from the session's key AUs
   bool sps_pps_missing_logged = false;
   bool have_key = false;
@@ -371,10 +391,13 @@ class Loop {
       // 6. beat.
       Beat();
     }
-    // Drain: collect whatever is ready, then tear the session down (its
-    // own drain validates the tail identity mapping and completes leases).
+    // Drain: collect whatever is ready, flush the reorder window in seq
+    // order (skipping any never-emitted tail gap), then tear the session
+    // down (its own drain validates the tail identity mapping and
+    // completes leases).
     if (im_.stream_inited) {
       CollectOutputs();
+      FlushReorderWindow(true);
       if (im_.session) im_.session->Shutdown(ShutdownMode::kDrain);
       im_.session.reset();
       im_.pool.FreeRetired();
@@ -386,7 +409,7 @@ class Loop {
         im_.cfg.cap != nullptr ? im_.cfg.cap->RebuildCount() : 0;
     im_.sink().OnState("stream_end", im_.res.ok);
     const MediaPipelineV2::Result& r = im_.res;
-    XNC_LOG_INFO("media_v2_stop elapsed=%llums captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu resets=%u rebuilds=%u w=%u h=%u aus=%llu bytes=%llu backend=%s ok=%d",
+    XNC_LOG_INFO("media_v2_stop elapsed=%llums captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu resets=%u rebuilds=%u w=%u h=%u aus=%llu bytes=%llu reorder_gap_skips=%llu reorder_late_drops=%llu backend=%s ok=%d",
                  static_cast<unsigned long long>(NowMs() - im_.t0),
                  static_cast<unsigned long long>(r.captured),
                  static_cast<unsigned long long>(r.encoded),
@@ -396,72 +419,182 @@ class Loop {
                  r.rebuilds, r.width, r.height,
                  static_cast<unsigned long long>(r.aus_written),
                  static_cast<unsigned long long>(r.bytes_written),
+                 static_cast<unsigned long long>(r.reorder_gap_skips),
+                 static_cast<unsigned long long>(r.reorder_late_drops),
                  r.encoder_backend, r.ok ? 1 : 0);
     im_.running.store(false);
   }
 
  private:
   // ---- output collection + publication ----
+  //
+  // Delivery-order monotonicity (fix round 1): the v2 wire contract is a
+  // strictly increasing encode_seq per epoch pair in DELIVERY order (the
+  // Go client's frameLedger tears down on the first same-epoch
+  // seq <= last). The software rung emits AUs reordered relative to
+  // submissions (measured, M1 Task 3 + v2c), so CollectOutputs runs a
+  // bounded reorder-before-publish window: in-order outputs publish
+  // immediately (true pairing preserved for the common case); an output
+  // whose seq skips parks until the gap fills; a gap that exceeds the
+  // window cap or outlives kReorderHoldMs is skipped (counted) and a
+  // sticky IDR ("reorder_gap") resynchronizes decoders.
   void CollectOutputs() {
     if (!im_.session) return;
     EncoderOutput out;
     while (im_.session->TakeOutput(&out, 0)) {
-      const bool is_idr = NalHasType(out.au.data(), out.au.size(), 5);
-      if (is_idr && im_.sps_pps.empty()) {
-        // Harvest the session's own parameter sets for the IDR prefix
-        // (the sessions do not expose MfSoftEncoder::SpsPps()).
-        const uint8_t types[2] = {7, 8};
-        NalExtractTypes(out.au.data(), out.au.size(), types, 2, &im_.sps_pps);
+      if (!AcceptForPublication(std::move(out))) return;  // fatal
+    }
+    // A gap that stopped filling (static screen: no further outputs):
+    // bound the hold, then skip the gap and continue in order.
+    if (!im_.reorder_window_.empty() && im_.window_park_ms != 0 &&
+        NowMs() - im_.window_park_ms > kReorderHoldMs)
+      FlushReorderWindow(true);
+  }
+
+  // Routes one collected output through the reorder window. False = fatal.
+  bool AcceptForPublication(EncoderOutput out) {
+    if (out.id.encode_seq == 0 || out.id.encode_seq > im_.next_encode_seq) {
+      im_.Fatal("encoder_identity_mismatch");
+      XNC_LOG_ERROR("encoder_identity_mismatch source=publish seq=%llu next=%llu",
+                    static_cast<unsigned long long>(out.id.encode_seq),
+                    static_cast<unsigned long long>(im_.next_encode_seq));
+      return false;
+    }
+    if (out.id.encode_seq < im_.publish_next_seq) {
+      // Straggler of an already-published or gap-skipped seq: publishing
+      // it would regress the wire - drop it, count it.
+      im_.res.reorder_late_drops++;
+      XNC_LOG_INFO("media_v2_reorder_late_drop seq=%llu",
+                   static_cast<unsigned long long>(out.id.encode_seq));
+      return true;
+    }
+    if (out.id.encode_seq == im_.publish_next_seq) {
+      if (!PublishNow(out)) return false;
+      ++im_.publish_next_seq;
+      // Drain the contiguous run that the arrival just unblocked.
+      while (!im_.reorder_window_.empty() &&
+             im_.reorder_window_.front().id.encode_seq ==
+                 im_.publish_next_seq) {
+        EncoderOutput next = std::move(im_.reorder_window_.front());
+        im_.reorder_window_.erase(im_.reorder_window_.begin());
+        if (!PublishNow(next)) return false;
+        ++im_.publish_next_seq;
       }
-      ShapeAu(out.au.data(), out.au.size(), is_idr, im_.sps_pps, &im_.shaped);
-      if (im_.shaped.empty()) {
-        XNC_LOG_INFO("media_v2_empty_au seq=%llu",
-                     static_cast<unsigned long long>(out.id.encode_seq));
-        continue;
+      if (im_.reorder_window_.empty()) im_.window_park_ms = 0;
+      return true;
+    }
+    ParkInWindow(std::move(out));
+    if (im_.reorder_window_.size() >= kReorderWindowMax)
+      FlushReorderWindow(true);
+    return true;
+  }
+
+  void ParkInWindow(EncoderOutput out) {
+    if (im_.window_park_ms == 0) im_.window_park_ms = NowMs();
+    size_t at = 0;
+    while (at < im_.reorder_window_.size() &&
+           im_.reorder_window_[at].id.encode_seq < out.id.encode_seq)
+      ++at;
+    im_.reorder_window_.insert(im_.reorder_window_.begin() + at,
+                               std::move(out));
+  }
+
+  // Publishes everything parked, in seq order. gap_skip=true (window cap
+  // or hold timeout hit): the never-emitted seqs are counted as skipped
+  // and one sticky IDR is armed so decoders resynchronize on the next
+  // submission. Publication stays strictly increasing either way.
+  void FlushReorderWindow(bool gap_skip) {
+    if (im_.reorder_window_.empty()) {
+      im_.window_park_ms = 0;
+      return;
+    }
+    if (gap_skip) {
+      uint64_t expect = im_.publish_next_seq;
+      uint64_t skipped = 0;
+      for (const auto& held : im_.reorder_window_) {
+        if (held.id.encode_seq > expect)
+          skipped += held.id.encode_seq - expect;
+        expect = held.id.encode_seq + 1;
       }
-      if (is_idr && im_.sps_pps.empty() && !im_.sps_pps_missing_logged) {
-        im_.sps_pps_missing_logged = true;
-        XNC_LOG_INFO("media_v2_spspps_absent (backend IDR carries none)");
-      }
-      // Publication guard (ruling 3's never-a-regression-on-the-wire): the
-      // AU's identity must be one of OUR submissions and must never
-      // publish twice. (The M1 FrameIdentityLedger itself runs at the
-      // SUBMISSION boundary in M0's exact spot - see TrySubmit - because
-      // the software rung's AUs surface reordered; a publication-order
-      // ledger would false-fatal on that documented MFT shape.)
-      if (out.id.encode_seq == 0 ||
-          out.id.encode_seq > im_.next_encode_seq ||
-          im_.AlreadyPublished(out.id.encode_seq)) {
-        im_.Fatal("encoder_identity_mismatch");
-        XNC_LOG_ERROR("encoder_identity_mismatch source=publish seq=%llu next=%llu",
-                      static_cast<unsigned long long>(out.id.encode_seq),
-                      static_cast<unsigned long long>(im_.next_encode_seq));
-        return;
-      }
-      im_.NotePublished(out.id.encode_seq);
-      EncodedAU eau;
-      eau.id = out.id;
-      eau.width = im_.stream_w;
-      eau.height = im_.stream_h;
-      eau.flags = is_idr ? AuFlags::kAuFlagKey : AuFlags::kAuFlagNone;
-      eau.annexb = std::make_shared<const std::vector<uint8_t>>(im_.shaped);
-      im_.res.aus_written++;
-      im_.res.bytes_written += im_.shaped.size();
-      if (const char* err = im_.sink().OnAu(eau)) {
-        im_.Fatal(err);
-        XNC_LOG_ERROR("sink_onau_failed err=\"%s\"", err);
-        return;
-      }
-      if (is_idr) {
-        im_.res.keyframes++;
-        im_.have_key = true;
-        if (im_.idr_in_flight) {
-          XNC_LOG_INFO("idr_delivered seq=%llu",
-                       static_cast<unsigned long long>(out.id.encode_seq));
-          im_.idr_in_flight = false;
+      if (skipped != 0) {
+        im_.res.reorder_gap_skips += skipped;
+        if (!im_.reorder_gap_idr_armed) {
+          im_.reorder_gap_idr_armed = true;
+          im_.mbox.ArmIdr("reorder_gap");
         }
+        XNC_LOG_INFO("media_v2_reorder_gap skipped=%llu next_on_wire=%llu (sticky IDR armed)",
+                     static_cast<unsigned long long>(skipped),
+                     static_cast<unsigned long long>(
+                         im_.reorder_window_.front().id.encode_seq));
       }
     }
+    while (!im_.reorder_window_.empty()) {
+      EncoderOutput next = std::move(im_.reorder_window_.front());
+      im_.reorder_window_.erase(im_.reorder_window_.begin());
+      const uint64_t seq = next.id.encode_seq;
+      if (!PublishNow(next)) return;  // fatal; window state is moot then
+      if (seq >= im_.publish_next_seq) im_.publish_next_seq = seq + 1;
+    }
+    im_.window_park_ms = 0;
+  }
+
+  // The publish step itself (shape + guards + sink). False = fatal.
+  bool PublishNow(const EncoderOutput& out) {
+    const bool is_idr = NalHasType(out.au.data(), out.au.size(), 5);
+    if (is_idr && im_.sps_pps.empty()) {
+      // Harvest the session's own parameter sets for the IDR prefix
+      // (the sessions do not expose MfSoftEncoder::SpsPps()).
+      const uint8_t types[2] = {7, 8};
+      NalExtractTypes(out.au.data(), out.au.size(), types, 2, &im_.sps_pps);
+    }
+    ShapeAu(out.au.data(), out.au.size(), is_idr, im_.sps_pps, &im_.shaped);
+    if (im_.shaped.empty()) {
+      XNC_LOG_INFO("media_v2_empty_au seq=%llu",
+                   static_cast<unsigned long long>(out.id.encode_seq));
+      return true;
+    }
+    if (is_idr && im_.sps_pps.empty() && !im_.sps_pps_missing_logged) {
+      im_.sps_pps_missing_logged = true;
+      XNC_LOG_INFO("media_v2_spspps_absent (backend IDR carries none)");
+    }
+    // Publication guard: the identity must be one of OUR submissions and
+    // must never publish twice. (The M1 FrameIdentityLedger itself runs at
+    // the SUBMISSION boundary in M0's exact spot - see TrySubmit - because
+    // the software rung's AUs surface reordered; delivery-order
+    // monotonicity is the reorder window's job above.)
+    if (out.id.encode_seq > im_.next_encode_seq ||
+        im_.AlreadyPublished(out.id.encode_seq)) {
+      im_.Fatal("encoder_identity_mismatch");
+      XNC_LOG_ERROR("encoder_identity_mismatch source=publish seq=%llu next=%llu",
+                    static_cast<unsigned long long>(out.id.encode_seq),
+                    static_cast<unsigned long long>(im_.next_encode_seq));
+      return false;
+    }
+    im_.NotePublished(out.id.encode_seq);
+    EncodedAU eau;
+    eau.id = out.id;
+    eau.width = im_.stream_w;
+    eau.height = im_.stream_h;
+    eau.flags = is_idr ? AuFlags::kAuFlagKey : AuFlags::kAuFlagNone;
+    eau.annexb = std::make_shared<const std::vector<uint8_t>>(im_.shaped);
+    im_.res.aus_written++;
+    im_.res.bytes_written += im_.shaped.size();
+    if (const char* err = im_.sink().OnAu(eau)) {
+      im_.Fatal(err);
+      XNC_LOG_ERROR("sink_onau_failed err=\"%s\"", err);
+      return false;
+    }
+    if (is_idr) {
+      im_.res.keyframes++;
+      im_.have_key = true;
+      im_.reorder_gap_idr_armed = false;  // a new incident may re-arm
+      if (im_.idr_in_flight) {
+        XNC_LOG_INFO("idr_delivered seq=%llu",
+                     static_cast<unsigned long long>(out.id.encode_seq));
+        im_.idr_in_flight = false;
+      }
+    }
+    return true;
   }
 
   // ---- external request polling ----

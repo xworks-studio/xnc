@@ -312,15 +312,32 @@ int RtServer::Serve(ICapture& cap, MfSoftEncoder& enc, const Opts& o) {
 // stops the loop, Shutdown drains); the single media loop thread owns
 // capture -> convert -> encode and publishes through OnAu exactly like the
 // M0 encode thread did, so subscribers see the identical wire traffic.
-int RtServer::ServeV2(ICapture& cap, ICaptureSurface& surf, const Opts& o) {
+// Fix round 1 (finding 2): max_width threads --max-w into the pipeline's
+// VideoProcessor and the HOST_HELLO carries the SCALED stream dims (the
+// M0 path's ScaledCapture equivalent lives inside MediaPipelineV2).
+int RtServer::ServeV2(ICapture& cap, ICaptureSurface& surf, const Opts& o,
+                      uint32_t max_width) {
+  // Stream dims: the VideoProcessor output space (== the encoder, hello,
+  // input and cursor spaces when the caller sizes them the same way).
+  uint32_t w = cap.Width(), h = cap.Height();
+  if (max_width > 0) {
+    uint32_t sw = 0, sh = 0;
+    if (!GpuScaledDims(w, h, Rotate::kNone, max_width, &sw, &sh)) {
+      XNC_LOG_ERROR("console_rt_v2 bad scaled dims w=%u h=%u max_w=%u", w, h,
+                    max_width);
+      return 1;
+    }
+    w = sw;
+    h = sh;
+  }
   if (!started_) {
-    if (!Start(o, cap.Width(), cap.Height())) return 1;
+    if (!Start(o, w, h)) return 1;
   }
   g_active_rt.store(this);
   SetConsoleCtrlHandler(OnRtCtrlEvent, TRUE);
-  XNC_LOG_INFO("console_rt_v2_start pipe=%ls fps=%u bitrate=%u max_subs=%u w=%u h=%u",
-               o.pipe_name.c_str(), o.fps, o.bitrate_bps, o.max_subs,
-               cap.Width(), cap.Height());
+  XNC_LOG_INFO("console_rt_v2_start pipe=%ls fps=%u bitrate=%u max_subs=%u w=%u h=%u max_w=%u src=%ux%u",
+               o.pipe_name.c_str(), o.fps, o.bitrate_bps, o.max_subs, w, h,
+               max_width, cap.Width(), cap.Height());
 
   MediaPipelineV2::Config cfg;
   cfg.cap = &cap;
@@ -330,6 +347,7 @@ int RtServer::ServeV2(ICapture& cap, ICaptureSurface& surf, const Opts& o) {
   cfg.bitrate_bps = o.bitrate_bps;
   cfg.duration_s = 0;  // until Ctrl+C / RequestStop
   cfg.stop = &stop_;
+  cfg.max_width = max_width;  // fix round 1: --max-w honored end to end
   cfg.desktop_name_fn = o.desktop_name_fn;  // DesktopWatch beat (M2-S1 T1)
   cfg.desktop_name_ctx = o.desktop_name_ctx;
   cfg.reset = o.reset;  // unified CaptureReset (M2-S1 T2)
@@ -346,14 +364,16 @@ int RtServer::ServeV2(ICapture& cap, ICaptureSurface& surf, const Opts& o) {
   SetConsoleCtrlHandler(OnRtCtrlEvent, FALSE);
   g_active_rt.store(nullptr);
   Shutdown();
-  XNC_LOG_INFO("console_rt_v2_stop captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu resets=%u aus=%llu ok=%d backend=%s",
+  XNC_LOG_INFO("console_rt_v2_stop captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu resets=%u aus=%llu reorder_gap_skips=%llu reorder_late_drops=%llu ok=%d backend=%s",
                static_cast<unsigned long long>(res.captured),
                static_cast<unsigned long long>(res.encoded),
                static_cast<unsigned long long>(res.keyframes),
                static_cast<unsigned long long>(res.timeouts),
                static_cast<unsigned long long>(res.warmup_feeds), res.resets,
-               static_cast<unsigned long long>(res.aus_written), res.ok ? 1 : 0,
-               res.encoder_backend);
+               static_cast<unsigned long long>(res.aus_written),
+               static_cast<unsigned long long>(res.reorder_gap_skips),
+               static_cast<unsigned long long>(res.reorder_late_drops),
+               res.ok ? 1 : 0, res.encoder_backend);
   return res.ok ? 0 : 1;
 }
 

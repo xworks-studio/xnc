@@ -924,7 +924,10 @@ int RunConsoleRt(const xnc::DiagOptions& opt, bool desktop_pipeline_v2) {
       ro.displays_fn = [](void*) { return xnc::DxgiDisplaysSnapshot(); };
       ro.switch_display_fn = [](void*, uint32_t idx) { return xnc::DxgiSelectDisplay(idx); };
       xnc::RtServer server;
-      const int rc = server.ServeV2(*v2_cap, *v2_surf, ro);
+      // Fix round 1 (finding 2): --max-w rides into the pipeline's
+      // VideoProcessor; ServeV2 starts the HOST_HELLO at the same scaled
+      // dims computed above (input/cursor/bitrate already use them).
+      const int rc = server.ServeV2(*v2_cap, *v2_surf, ro, opt.max_width);
       watch.Stop();
       input.StopJanitor();  // ReleaseAll already ran in RtServer::Shutdown
       return rc;

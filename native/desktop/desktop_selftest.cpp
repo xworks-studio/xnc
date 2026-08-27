@@ -8091,6 +8091,11 @@ int SelftestMain(bool desktop_pipeline_v2) {
     // hold=true models the GPU shape (leases + outputs gated until `open`
     // - the busy-slot coalescing test); hold=false models the CPU shape
     // (lease completed at consumption, outputs ready immediately).
+    // Fix round 1 knobs (v2g, non-hold only): delay queues outputs behind
+    // `delay` further submissions; swap_pairs emits each eligible pair as
+    // [k+1, k] (the measured software-MFT emission reorder); swallow_seq
+    // never emits that seq at all (a never-filling gap for the
+    // reorder-before-publish window's skip path).
     struct SessionLog {
       struct Rec {
         xnc::FrameIdentity id{};
@@ -8098,7 +8103,7 @@ int SelftestMain(bool desktop_pipeline_v2) {
       };
       std::mutex mu;
       std::vector<Rec> subs;    // every submission, in order (never erased)
-      std::deque<Rec> fifo;     // pending outputs (hold mode)
+      std::deque<Rec> fifo;     // pending outputs (hold mode / delay queue)
       std::deque<Rec> ready;    // ready outputs (non-hold mode)
       std::atomic<size_t> submits{0};
       size_t completes = 0, double_completes = 0;
@@ -8108,6 +8113,9 @@ int SelftestMain(bool desktop_pipeline_v2) {
       std::atomic<bool> open{false};
       uint32_t reconf_bitrate = 0, reconf_fps = 0;
       bool reconf_ok = true;
+      uint32_t delay = 0;                 // v2g: emit after N more submits
+      bool swap_pairs = false;            // v2g: emit pairs [k+1, k]
+      uint64_t swallow_seq = 0;           // v2g: never emit this seq
     };
     class LogSession final : public xnc::IEncoderSession {
      public:
@@ -8128,10 +8136,27 @@ int SelftestMain(bool desktop_pipeline_v2) {
           std::lock_guard<std::mutex> lk(log_->mu);
           log_->subs.push_back(r);
           ++log_->submits;
-          if (log_->hold)
+          if (log_->hold) {
             log_->fifo.push_back(r);
-          else {
-            log_->ready.push_back(r);
+          } else if (id.encode_seq == log_->swallow_seq) {
+            // Counted as submitted + lease completed, but its output is
+            // never emitted: a permanent gap for the reorder window.
+            complete_now = true;
+          } else {
+            log_->fifo.push_back(r);
+            while (log_->fifo.size() > log_->delay) {
+              if (log_->swap_pairs && log_->fifo.size() >= 2) {
+                const SessionLog::Rec a = log_->fifo.front();
+                log_->fifo.pop_front();
+                const SessionLog::Rec b = log_->fifo.front();
+                log_->fifo.pop_front();
+                log_->ready.push_back(b);  // k+1 first, then k
+                log_->ready.push_back(a);
+              } else {
+                log_->ready.push_back(log_->fifo.front());
+                log_->fifo.pop_front();
+              }
+            }
             complete_now = true;
           }
         }
@@ -8474,34 +8499,12 @@ int SelftestMain(bool desktop_pipeline_v2) {
       // session (hardware-first, CPU fallback - under RDP the documented
       // rung is software), decoded-pixel determinism across a pristine
       // second run. ----
-      // Delivery-order identity check for the REAL rung: publication
-      // follows the MFT's emission order, which on the software rung is
-      // REORDERED relative to submissions (M1 Task 3 measurement; that is
-      // why the pipeline gates the ledger at the submission boundary). The
-      // wire contract that still must hold: epochs never regress in
-      // delivery order, every identity is unique, and the SET replays
-      // cleanly through a fresh ledger in (epoch, seq) order.
-      auto delivered_set_valid = [](const std::vector<xnc::FrameIdentity>& ids) {
-        bool ok = true;
-        std::vector<xnc::FrameIdentity> sorted = ids;
-        std::sort(sorted.begin(), sorted.end(),
-                  [](const xnc::FrameIdentity& a, const xnc::FrameIdentity& b) {
-                    if (a.capture_epoch != b.capture_epoch)
-                      return a.capture_epoch < b.capture_epoch;
-                    if (a.codec_epoch != b.codec_epoch)
-                      return a.codec_epoch < b.codec_epoch;
-                    return a.encode_seq < b.encode_seq;
-                  });
-        xnc::FrameIdentityLedger l;
-        for (const auto& id : sorted) ok = ok && l.Accept(id);
-        for (size_t i = 1; i < ids.size(); ++i) {
-          if (ids[i].capture_epoch < ids[i - 1].capture_epoch) ok = false;
-          if (ids[i].capture_epoch == ids[i - 1].capture_epoch &&
-              ids[i].codec_epoch < ids[i - 1].codec_epoch)
-            ok = false;
-        }
-        return ok;
-      };
+      // Fix round 1: the v2 wire's delivery contract is STRICT delivery-
+      // order monotonicity (what the Go client's frameLedger enforces on
+      // every 0x0205 frame). The pipeline's reorder-before-publish window
+      // restores it despite the software rung's reordered emissions, so
+      // the strict DeliveredIdentitiesValid replay is asserted everywhere
+      // below (there is exactly ONE definition of the contract).
       auto run_v2_e2e = [&](ScriptedDeviceCapture& cap, V2RecordingSink& sink,
                             uint32_t max_w, uint32_t fps, uint32_t duration) ->
           xnc::MediaPipelineV2::Result {
@@ -8537,14 +8540,12 @@ int SelftestMain(bool desktop_pipeline_v2) {
         CHECK("v2c-aus", r1.aus_written >= 8);
         CHECK("v2c-keys", r1.keyframes >= 1);
         const auto ids_c = sink1.CopyIds();
-        size_t reorder_adjacent = 0;
-        for (size_t i = 1; i < ids_c.size(); ++i)
-          if (ids_c[i].encode_seq < ids_c[i - 1].encode_seq) ++reorder_adjacent;
-        CHECK("v2c-identity-monotonic", delivered_set_valid(ids_c));
-        std::printf("SELFTEST NOTE: v2c delivery reorder adjacent=%zu/%zu "
-                    "(software-rung emission order; the ledger gates at "
-                    "submission)\n",
-                    reorder_adjacent, ids_c.size());
+        CHECK("v2c-identity-monotonic", DeliveredIdentitiesValid(ids_c));
+        std::printf("SELFTEST NOTE: v2c delivery strictly monotonic n=%zu "
+                    "(reorder window: gap_skips=%llu late_drops=%llu)\n",
+                    ids_c.size(),
+                    (unsigned long long)r1.reorder_gap_skips,
+                    (unsigned long long)r1.reorder_late_drops);
         const auto aus_c = sink1.CopyAus();
         // Stream contract: 4-byte start codes everywhere; the first key AU
         // is SPS/PPS-prefixed (7/8 before the IDR 5).
@@ -8641,7 +8642,7 @@ int SelftestMain(bool desktop_pipeline_v2) {
                             (unsigned long long)res.encoded);
               CHECK("v2e-keys", res.keyframes >= 1 || res.encoded >= 10);
               CHECK("v2e-identity-monotonic",
-                    delivered_set_valid(sink.CopyIds()));
+                    DeliveredIdentitiesValid(sink.CopyIds()));
               std::printf("SELFTEST NOTE: v2e rung=%s friendly=\"%s\" "
                           "w=%u h=%u aus=%llu keys=%llu feeds=%llu\n",
                           res.encoder_backend, res.encoder_friendly.c_str(),
@@ -8654,16 +8655,18 @@ int SelftestMain(bool desktop_pipeline_v2) {
         }
       }
 
-      // ---- (F) identical publication to the v2 wire: MediaPipelineV2
-      // driving the REAL RtServer (0x0206 HOST_HELLO media_protocol=2 +
-      // validated 0x0205 frames) over a real pipe with a fake viewer. ----
+      // ---- (F) identical publication to the v2 wire on the REAL software
+      // rung (fix round 1: no fake session anymore): MediaPipelineV2
+      // driving the REAL RtServer (HOST_HELLO media_protocol=2 + validated
+      // 0x0205 frames) over a real pipe with a fake viewer, asserting the
+      // STRICT delivery-order monotonicity the Go client's frameLedger
+      // enforces - through PushAuV2, at the real encoder's reordered
+      // emission order. ----
       {
-        const uint32_t w = 64, h = 48, frames = 40;
+        const uint32_t w = 64, h = 48, frames = 90;
         std::vector<ScriptedDeviceCapture::Step> script(
             frames, ScriptedDeviceCapture::Step::kFrame);
         ScriptedDeviceCapture cap(v2_dev.Get(), v2_ctx.Get(), script, w, h);
-        SessionLog log;
-        log.hold = false;
         xnc::RtServer rt;
         xnc::RtServer::Opts ro;
         ro.pipe_name = RtPipeNameOf(15);  // the name table has 16 slots
@@ -8680,12 +8683,7 @@ int SelftestMain(bool desktop_pipeline_v2) {
         cfg.surf = &cap;
         cfg.sink = &rt;
         cfg.fps = 15;
-        cfg.duration_s = 30;
-        cfg.session_factory = [](void* ctx, xnc::Nv12SurfacePool* pool) ->
-            xnc::IEncoderSession* {
-              return new LogSession(static_cast<SessionLog*>(ctx), pool);
-        };
-        cfg.session_ctx = &log;
+        cfg.duration_s = 60;  // safety bound; the test Stops the pipe
         xnc::MediaPipelineV2 pipe;
         CHECK("v2f-start", pipe.Start(cfg));
         if (pipe.running()) {
@@ -8693,7 +8691,7 @@ int SelftestMain(bool desktop_pipeline_v2) {
           CHECK("v2f-connect",
                 a.Connect(ro.pipe_name.c_str(), kRtSecret, sizeof(kRtSecret)));
           CHECK("v2f-attach-hello", a.Attach(12));
-          a.Pump(5000, [&a] { return a.keys_ >= 1 && a.v2_frames_ >= 2; });
+          a.Pump(9000, [&a] { return a.keys_ >= 1 && a.v2_frames_ >= 20; });
           const xnc::MediaPipelineV2::Result res = pipe.Stop();
           a.Pump(1500);  // drain in-flight frames + stream_end
           rt.Shutdown();
@@ -8704,13 +8702,144 @@ int SelftestMain(bool desktop_pipeline_v2) {
           CHECK("v2f-stream-end", a.saw_stream_end_);
           CHECK("v2f-identity-monotonic", DeliveredIdentitiesValid(a.v2_ids_));
           CHECK("v2f-pipeline-ok", res.ok);
-          std::printf("SELFTEST NOTE: v2f frames=%llu v2=%llu keys=%llu "
-                      "aus=%llu\n",
+          std::printf("SELFTEST NOTE: v2f REAL rung=%s frames=%llu v2=%llu "
+                      "keys=%llu aus=%llu gap_skips=%llu late_drops=%llu\n",
+                      res.encoder_backend,
                       (unsigned long long)a.frames_,
                       (unsigned long long)a.v2_frames_,
                       (unsigned long long)a.keys_,
-                      (unsigned long long)res.aus_written);
+                      (unsigned long long)res.aus_written,
+                      (unsigned long long)res.reorder_gap_skips,
+                      (unsigned long long)res.reorder_late_drops);
         }
+      }
+
+      // ---- (G) the reorder-before-publish window, deterministically: a
+      // fake session emits swapped pairs ([k+1, k] - the measured software
+      // -MFT emission shape) and swallows seq 3 entirely (a never-filling
+      // gap). The wire must stay STRICTLY monotonic: swapped pairs
+      // re-sequenced, the permanent gap skipped + counted + recovered by
+      // a sticky IDR that forces a later submission. ----
+      {
+        const uint32_t w = 320, h = 240, frames = 120;
+        std::vector<ScriptedDeviceCapture::Step> script(
+            frames, ScriptedDeviceCapture::Step::kFrame);
+        ScriptedDeviceCapture cap(v2_dev.Get(), v2_ctx.Get(), script, w, h);
+        SessionLog log;
+        log.hold = false;
+        log.delay = 1;        // emit pairs two submissions apart
+        log.swap_pairs = true;  // emission order [k+1, k]
+        log.swallow_seq = 3;    // never emitted: the permanent gap
+        V2RecordingSink sink;
+        xnc::MediaPipelineV2::Config cfg;
+        cfg.cap = &cap;
+        cfg.surf = &cap;
+        cfg.sink = &sink;
+        cfg.fps = 60;
+        cfg.duration_s = 60;  // safety bound
+        cfg.session_factory = [](void* ctx, xnc::Nv12SurfacePool* pool) ->
+            xnc::IEncoderSession* {
+              return new LogSession(static_cast<SessionLog*>(ctx), pool);
+        };
+        cfg.session_ctx = &log;
+        xnc::MediaPipelineV2 pipe;
+        CHECK("v2g-start", pipe.Start(cfg));
+        if (pipe.running()) {
+          // Wait until the gap was skipped, the post-gap run published AND
+          // the recovery IDR actually forced a later submission (the flush
+          // fires on the window cap or the hold timeout; the sticky is
+          // consumed by the NEXT submission after it).
+          CHECK("v2g-gap-skipped",
+                wait_for([&] {
+                  const auto ids = sink.CopyIds();
+                  if (ids.size() < 8 || ids.back().encode_seq < 10)
+                    return false;
+                  std::lock_guard<std::mutex> lk(log.mu);
+                  for (const auto& s : log.subs)
+                    if (s.force && s.id.encode_seq > 3) return true;
+                  return false;
+                }, 8000));
+          const xnc::MediaPipelineV2::Result res = pipe.Stop();
+          CHECK("v2g-ok", res.ok);
+          const auto ids = sink.CopyIds();
+          // Strict delivery-order monotonicity - the one wire contract.
+          CHECK("v2g-identity-monotonic", DeliveredIdentitiesValid(ids));
+          // The swallowed seq never reached the wire...
+          bool saw_3 = false;
+          for (const auto& id : ids)
+            if (id.encode_seq == 3) saw_3 = true;
+          CHECK("v2g-gap-not-on-wire", !saw_3);
+          // ...but everything around it did, in order.
+          CHECK("v2g-published-past-gap", ids.size() >= 8 &&
+                                              ids.front().encode_seq == 1 &&
+                                              ids.back().encode_seq >= 10);
+          CHECK("v2g-gap-accounted", res.reorder_gap_skips >= 1);
+          // The gap incident armed a sticky IDR that forced a LATER
+          // submission (the recovery contract).
+          std::vector<SessionLog::Rec> subs;
+          {
+            std::lock_guard<std::mutex> lk(log.mu);
+            subs = log.subs;
+          }
+          bool forced_after_gap = false;
+          for (const auto& s : subs)
+            if (s.force && s.id.encode_seq > 3) forced_after_gap = true;
+          CHECK("v2g-gap-idr-forced", forced_after_gap);
+          std::printf("SELFTEST NOTE: v2g aus=%llu gap_skips=%llu "
+                      "late_drops=%llu forced_after_gap=%d\n",
+                      (unsigned long long)ids.size(),
+                      (unsigned long long)res.reorder_gap_skips,
+                      (unsigned long long)res.reorder_late_drops,
+                      forced_after_gap ? 1 : 0);
+        }
+      }
+
+      // ---- (H) finding 2 end-to-end: ServeV2 with --max-w - the
+      // HOST_HELLO carries the SCALED stream dims, the encoder runs at
+      // them, and the REAL software rung's delivery stays strictly
+      // monotonic through the full Serve path. ----
+      {
+        const uint32_t w = 640, h = 480, frames = 90;
+        std::vector<ScriptedDeviceCapture::Step> script(
+            frames, ScriptedDeviceCapture::Step::kFrame);
+        ScriptedDeviceCapture cap(v2_dev.Get(), v2_ctx.Get(), script, w, h);
+        xnc::RtServer server;
+        xnc::RtServer::Opts ro;
+        ro.pipe_name = RtPipeNameOf(14);  // the name table has 16 slots
+        ro.secret = kRtSecret;
+        ro.secret_len = sizeof(kRtSecret);
+        ro.max_subs = 4;
+        ro.fps = 15;
+        ro.bitrate_bps = 500000;
+        ro.sddl_override = L"D:P(A;;GA;;;WD)";  // TEST-ONLY permissive DACL
+        ro.pipeline_v2 = true;
+        int rc = 1;
+        std::thread serve_th([&] { rc = server.ServeV2(cap, cap, ro, 320); });
+        RtTestClient a;
+        CHECK("v2h-connect",
+              a.Connect(ro.pipe_name.c_str(), kRtSecret, sizeof(kRtSecret)));
+        CHECK("v2h-attach-hello", a.Attach(13));
+        // HOST_HELLO must carry the SCALED dims (320x240), not the
+        // capture's native 640x480.
+        CHECK("v2h-hello-scaled-dims",
+              a.hello_ok_ && a.hello_.w == 320 && a.hello_.h == 240);
+        a.Pump(9000, [&a] { return a.keys_ >= 1 && a.v2_frames_ >= 8; });
+        server.RequestStop();
+        serve_th.join();
+        a.Pump(1500);  // drain + stream_end
+        server.Shutdown();
+        CHECK("v2h-v2-frames", a.v2_frames_ >= 1);
+        CHECK("v2h-frame-dims-scaled",
+              a.first_key_w_ == 320 && a.first_key_h_ == 240);
+        CHECK("v2h-keys", a.keys_ >= 1);
+        CHECK("v2h-identity-monotonic", DeliveredIdentitiesValid(a.v2_ids_));
+        CHECK("v2h-serve-ok", rc == 0);
+        std::printf("SELFTEST NOTE: v2h hello=%ux%u first_key=%ux%u "
+                    "frames=%llu v2=%llu keys=%llu rc=%d\n",
+                    a.hello_.w, a.hello_.h, a.first_key_w_, a.first_key_h_,
+                    (unsigned long long)a.frames_,
+                    (unsigned long long)a.v2_frames_,
+                    (unsigned long long)a.keys_, rc);
       }
     }
   }
