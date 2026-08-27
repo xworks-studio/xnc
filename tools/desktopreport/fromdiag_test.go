@@ -68,6 +68,16 @@ const metricsFixture = `{"ts":"2026-08-26T10:00:00Z","pid":4242,"cpuPercent":4.2
 {"ts":"2026-08-26T10:00:02Z","pid":4242,"cpuPercent":6.0,"workingSetMB":220.25}
 `
 
+// A written-but-disconnected viewer summary (dial failure that still printed
+// its JSON before exiting 1): non-empty file, zero receive-side evidence.
+const e2eDialFailureFixture = `{"mode":"direct","connected":false,"firstFrameMs":0,
+  "frames":0,"keyframes":0,"bytes":0,"plisSent":0,"pliToIdrMaxMs":0,
+  "queueAgeP50Ms":0,"queueAgeP95Ms":0,"queueAgeMaxMs":0,
+  "rtpTsRegressions":0,"frameMetaCount":0,"contentIdRegressions":0,
+  "encodeSeqRegressions":0,"codecEpochRegressions":0,"recoveryViolations":0,
+  "pausedEvents":0,"pausedMs":0,"durationMs":30000,"assertionsPassed":false,
+  "failures":["viewer not connected after 25s (state=failed)"]}`
+
 const browserMetricsFixture = `{"browser":"Chrome 126","inputToPresentP95Ms":87.5}`
 
 func statsPath(t *testing.T, stats string) string {
@@ -134,10 +144,13 @@ func TestFromDiagFullMapping(t *testing.T) {
 func TestFromDiagRegressionsMapping(t *testing.T) {
 	// OldFrameRegressions = contentId + rtpTs + encodeSeq regressions;
 	// EpochRegressions = codecEpoch; UnrecoveredFreezes = recoveryViolations.
+	// Complete fixture (stats + e2e + metrics) so the verdict reflects the
+	// violations, not missing evidence.
 	res, err := FromDiag(FromDiagInput{
-		StatsPath: statsPath(t, diagStatsV2Fixture),
-		E2EPaths:  []string{writeTemp(t, "viewer.json", e2eFailFixture)},
-		Gates:     DefaultGates(),
+		StatsPath:   statsPath(t, diagStatsV2Fixture),
+		E2EPaths:    []string{writeTemp(t, "viewer.json", e2eFailFixture)},
+		MetricsPath: writeTemp(t, "metrics.jsonl", metricsFixture),
+		Gates:       DefaultGates(),
 	})
 	if err != nil {
 		t.Fatalf("FromDiag: %v", err)
@@ -187,9 +200,10 @@ func TestFromDiagMultipleViewersMergeWorst(t *testing.T) {
 }
 
 func TestFromDiagV1SidecarNoStages(t *testing.T) {
-	// A v1 (M0) sidecar carries no stages: CaptureToAUP95Ms stays 0 and the
-	// resolution/fps/duration still map.
-	res, err := FromDiag(FromDiagInput{
+	// A v1 (M0) sidecar carries no stages: CaptureToAUP95Ms stays 0, the
+	// resolution/fps/duration still map, and the absent stage makes the run
+	// NO-EVIDENCE (a v1 soak cannot evidence the capture-to-AU gate).
+	res, missing, err := FromDiagDetailed(FromDiagInput{
 		StatsPath: statsPath(t, diagStatsV1Fixture),
 		Gates:     DefaultGates(),
 	})
@@ -202,14 +216,21 @@ func TestFromDiagV1SidecarNoStages(t *testing.T) {
 	if res.Resolution != "1280x720" || res.TargetFPS != 15 || res.DurationSec != 30 {
 		t.Errorf("v1 mapping wrong: %+v", res)
 	}
+	if res.Verdict != VerdictNoEvidence {
+		t.Errorf("Verdict = %q, want NO-EVIDENCE (capture stage absent)", res.Verdict)
+	}
+	if !containsStr(missing, "CaptureToAUP95Ms") {
+		t.Errorf("missing list = %v, want CaptureToAUP95Ms", missing)
+	}
 }
 
 func TestFromDiagCommandEndToEnd(t *testing.T) {
 	stats := statsPath(t, diagStatsV2Fixture)
 	e2e := writeTemp(t, "viewer.json", e2eFailFixture)
+	metrics := writeTemp(t, "metrics.jsonl", metricsFixture)
 	out := writeTemp(t, "runresult.json", "")
 	code := run([]string{
-		"from-diag", "-stats", stats, "-e2e", e2e,
+		"from-diag", "-stats", stats, "-e2e", e2e, "-metrics", metrics,
 		"-host", "box-a", "-gpu", "Intel Iris", "-browser", "e2eviewer",
 		"-out", out,
 	})
@@ -252,10 +273,11 @@ func TestFromDiagMissingStatsExits2(t *testing.T) {
 func TestFromDiagGatesOverrideFlipsVerdict(t *testing.T) {
 	stats := statsPath(t, diagStatsV2Fixture)
 	e2e := writeTemp(t, "viewer.json", e2eFailFixture)
+	metrics := writeTemp(t, "metrics.jsonl", metricsFixture)
 	relaxed := writeTemp(t, "gates.json", `{"QueueP95Ms":60,"QueueMaxMs":200}`)
 	out := writeTemp(t, "runresult.json", "")
 	if code := run([]string{"from-diag", "-stats", stats, "-e2e", e2e,
-		"-gates", relaxed, "-out", out}); code != 0 {
+		"-metrics", metrics, "-gates", relaxed, "-out", out}); code != 0 {
 		t.Fatalf("from-diag exit = %d, want 0", code)
 	}
 	res, err := LoadResult(out)
@@ -268,6 +290,136 @@ func TestFromDiagGatesOverrideFlipsVerdict(t *testing.T) {
 	}
 }
 
+// ---- fail closed: absent mandatory evidence must read NO-EVIDENCE, not PASS ----
+// (Review finding Important 1: missing receive-side evidence used to leave
+// QueueP95/QueueMax + the three P0 counters - and, for empty inputs, CPU/
+// WorkingSet and CaptureToAUP95 - at a passing zero.)
+
+func TestFromDiagNoViewerEvidenceIsNoEvidence(t *testing.T) {
+	// No -e2e at all: Queue metrics + the three P0 counters have no evidence.
+	res, missing, err := FromDiagDetailed(FromDiagInput{
+		StatsPath:   statsPath(t, diagStatsV2Fixture),
+		MetricsPath: writeTemp(t, "metrics.jsonl", metricsFixture),
+		Gates:       DefaultGates(),
+	})
+	if err != nil {
+		t.Fatalf("FromDiag: %v", err)
+	}
+	if res.Verdict != VerdictNoEvidence {
+		t.Errorf("Verdict = %q, want NO-EVIDENCE (no viewer reports supplied)", res.Verdict)
+	}
+	for _, want := range []string{"QueueP95Ms", "QueueMaxMs",
+		"OldFrameRegressions", "EpochRegressions", "UnrecoveredFreezes"} {
+		if !containsStr(missing, want) {
+			t.Errorf("missing list %v lacks %s", missing, want)
+		}
+	}
+	if containsStr(missing, "CPUPercent") || containsStr(missing, "CaptureToAUP95Ms") {
+		t.Errorf("metrics/stage evidence WAS supplied but flagged missing: %v", missing)
+	}
+
+	// A written-but-disconnected viewer summary (frames=0, e.g. a dial
+	// failure that still printed its JSON) is equally no evidence.
+	res, missing, err = FromDiagDetailed(FromDiagInput{
+		StatsPath:   statsPath(t, diagStatsV2Fixture),
+		E2EPaths:    []string{writeTemp(t, "dial.json", e2eDialFailureFixture)},
+		MetricsPath: writeTemp(t, "metrics.jsonl", metricsFixture),
+		Gates:       DefaultGates(),
+	})
+	if err != nil {
+		t.Fatalf("FromDiag dial-failure: %v", err)
+	}
+	if res.Verdict != VerdictNoEvidence {
+		t.Errorf("Verdict = %q, want NO-EVIDENCE (viewer decoded zero frames)", res.Verdict)
+	}
+	if !containsStr(missing, "QueueP95Ms") {
+		t.Errorf("missing list %v lacks QueueP95Ms", missing)
+	}
+}
+
+func TestFromDiagAbsentStageAndEmptyMetricsIsNoEvidence(t *testing.T) {
+	// v1 sidecar (no stages block; the native emitter omits zero-sample
+	// stages - absent, not zero) + an EMPTY metrics file: CaptureToAUP95Ms,
+	// CPUPercent and WorkingSetMB have no evidence.
+	res, missing, err := FromDiagDetailed(FromDiagInput{
+		StatsPath:   statsPath(t, diagStatsV1Fixture),
+		E2EPaths:    []string{writeTemp(t, "viewer.json", e2ePassFixture)},
+		MetricsPath: writeTemp(t, "metrics.jsonl", ""),
+		Gates:       DefaultGates(),
+	})
+	if err != nil {
+		t.Fatalf("FromDiag: %v", err)
+	}
+	if res.CPUPercent != 0 || res.WorkingSetMB != 0 || res.CaptureToAUP95Ms != 0 {
+		t.Errorf("absent metrics must stay zero, got %+v", res)
+	}
+	if res.Verdict != VerdictNoEvidence {
+		t.Errorf("Verdict = %q, want NO-EVIDENCE (stage absent, zero metric samples)", res.Verdict)
+	}
+	for _, want := range []string{"CaptureToAUP95Ms", "CPUPercent", "WorkingSetMB"} {
+		if !containsStr(missing, want) {
+			t.Errorf("missing list %v lacks %s", missing, want)
+		}
+	}
+
+	// A present-but-zero-sample stage entry (n=0) is likewise absent: the
+	// emitter omits zero-sample stages by contract, and a defensive n=0
+	// read must not count as evidence either.
+	zeroSample := `{"duration_s":30,"width":1280,"height":720,"fps":15,
+	  "stages":{"capture_to_au_us":{"n":0,"p50":0,"p95":0,"p99":0}},"ok":1}`
+	var ms float64
+	var ok bool
+	var st diagStats
+	if err := json.Unmarshal([]byte(zeroSample), &st); err != nil {
+		t.Fatalf("unmarshal zero-sample fixture: %v", err)
+	}
+	if ms, ok = st.stageP95Ms("capture_to_au_us"); ok || ms != 0 {
+		t.Errorf("zero-sample stage = (%v, %v), want (0, false)", ms, ok)
+	}
+}
+
+func TestFromDiagNoEvidenceFailsVerifyEndToEnd(t *testing.T) {
+	statsV2 := statsPath(t, diagStatsV2Fixture)
+	statsV1 := statsPath(t, diagStatsV1Fixture)
+	e2e := writeTemp(t, "viewer.json", e2ePassFixture)
+	metrics := writeTemp(t, "metrics.jsonl", metricsFixture)
+	emptyMetrics := writeTemp(t, "metrics-empty.jsonl", "")
+
+	// 1. No viewer evidence: from-diag emits a result, verify exits nonzero.
+	out := writeTemp(t, "runresult-noe2e.json", "")
+	if code := run([]string{"from-diag", "-stats", statsV2, "-metrics", metrics, "-out", out}); code != 0 {
+		t.Fatalf("from-diag (no -e2e) exit = %d, want 0 (it still emits a result)", code)
+	}
+	res, err := LoadResult(out)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if res.Verdict != "NO-EVIDENCE" {
+		t.Errorf("Verdict = %q, want NO-EVIDENCE", res.Verdict)
+	}
+	if code := run([]string{"verify", out}); code != 1 {
+		t.Errorf("verify no-e2e result = %d, want 1", code)
+	}
+
+	// 2. Absent stage + empty metrics through the same chain.
+	out2 := writeTemp(t, "runresult-nostage.json", "")
+	if code := run([]string{"from-diag", "-stats", statsV1, "-e2e", e2e, "-metrics", emptyMetrics, "-out", out2}); code != 0 {
+		t.Fatalf("from-diag (v1 + empty metrics) exit = %d, want 0", code)
+	}
+	if code := run([]string{"verify", out2}); code != 1 {
+		t.Errorf("verify absent-stage/empty-metrics result = %d, want 1", code)
+	}
+
+	// 3. The complete fixture (stats + e2e + metrics) still passes.
+	out3 := writeTemp(t, "runresult-complete.json", "")
+	if code := run([]string{"from-diag", "-stats", statsV2, "-e2e", e2e, "-metrics", metrics, "-out", out3}); code != 0 {
+		t.Fatalf("from-diag (complete) exit = %d, want 0", code)
+	}
+	if code := run([]string{"verify", out3}); code != 0 {
+		t.Errorf("verify complete fixture = %d, want 0", code)
+	}
+}
+
 func readFileForTest(t *testing.T, path string) string {
 	t.Helper()
 	jb, err := os.ReadFile(path)
@@ -275,4 +427,13 @@ func readFileForTest(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return strings.TrimSpace(string(jb))
+}
+
+func containsStr(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }

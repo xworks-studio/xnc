@@ -7,6 +7,9 @@
 //	    exceeded); exit 1 = any rule failed; exit 2 = usage/IO error.
 //	    The P0 counters (OldFrameRegressions, EpochRegressions,
 //	    UnrecoveredFreezes) must be zero and are NOT gate-relaxable.
+//	    A Verdict of NO-EVIDENCE also fails (exit 1, likewise not
+//	    gate-relaxable): a run whose mandatory metrics were absent is not
+//	    verifiable and must not read as an all-zero PASS.
 //
 //	desktopreport merge   [-out table.md] result.json ...
 //	    One deterministic Markdown table from N results (stdout or -out).
@@ -25,8 +28,9 @@
 //
 //	Resolution/TargetFPS/DurationSec <- stats.json width x height / fps /
 //	  duration_s (overridable by flags; zero-value flags keep the stats).
-//	CaptureToAUP95Ms  <- stages.capture_to_au_us.p95 / 1000 (0 when the
-//	  v1/M0 sidecar carries no stages block).
+//	CaptureToAUP95Ms  <- stages.capture_to_au_us.p95 / 1000. The native
+//	  sidecar emits absent-not-zero for zero-sample stages, so a missing
+//	  stage (or one with n=0) is NO EVIDENCE, not a passing 0.
 //	QueueP95Ms/QueueMaxMs <- e2eviewer queueAgeP95Ms / queueAgeMaxMs;
 //	  multiple viewers merge WORST (max) - any viewer tripping is a trip.
 //	OldFrameRegressions <- sum over viewers of contentIdRegressions +
@@ -41,6 +45,14 @@
 //	InputToPresentP95Ms + Browser <- browser-metrics JSON
 //	  {"browser": "...", "inputToPresentP95Ms": N} (the Task 3 browser
 //	  gates; absent = 0/"" for diag-only rows).
+//
+// Mandatory evidence (fail closed; review finding Important 1): when there
+// is no viewer report that decoded at least one frame, QueueP95Ms,
+// QueueMaxMs and the three P0 counters are UNEVIDENCED; when the metrics
+// file yielded zero samples, CPUPercent/WorkingSetMB are UNEVIDENCED; when
+// the capture_to_au_us stage is absent, CaptureToAUP95Ms is UNEVIDENCED.
+// Any unevidenced mandatory metric forces Verdict NO-EVIDENCE (which verify
+// fails). InputToPresentP95Ms stays optional (Task 3 browser rows only).
 //
 // The harness moves counters/hashes/percentiles only - never raw pixels.
 package main
@@ -133,13 +145,21 @@ func cmdVerify(args []string) int {
 			fmt.Fprintf(os.Stderr, "desktopreport verify: %s: %v\n", f, err)
 			return 2
 		}
+		// NO-EVIDENCE is the one verdict value verify honors as-is: it
+		// encodes a fact about the run's INPUTS (mandatory metrics were
+		// absent) that the zeroed numbers cannot recompute. PASS/FAIL are
+		// still recomputed below; this verdict is not gate-relaxable.
+		noEvidence := res.Verdict == VerdictNoEvidence
 		vs := CheckResult(&res, gates)
-		if len(vs) == 0 {
+		if len(vs) == 0 && !noEvidence {
 			fmt.Printf("PASS %s\n", f)
 			continue
 		}
 		failed++
 		fmt.Printf("FAIL %s\n", f)
+		if noEvidence {
+			fmt.Printf("  Verdict=%s: mandatory metrics were absent (not gate-relaxable; re-run with viewer/metrics/stage evidence)\n", VerdictNoEvidence)
+		}
 		for _, v := range vs {
 			fmt.Printf("  %s\n", v.String())
 		}
@@ -234,27 +254,36 @@ type diagStats struct {
 }
 
 type stagePercentiles struct {
+	N   uint64 `json:"n"`
 	P95 uint64 `json:"p95"`
 }
 
-func (d *diagStats) stageP95Ms(name string) float64 {
+// stageP95Ms returns the stage's p95 in ms and whether the stage carried
+// samples. The native sidecar deliberately emits absent-not-zero for
+// zero-sample stages (pipeline.cpp FormatStagesJson), so a missing key, a
+// zero-sample entry, or a malformed entry all mean NO EVIDENCE (bool false).
+func (d *diagStats) stageP95Ms(name string) (float64, bool) {
 	if d.Stages == nil {
-		return 0
+		return 0, false
 	}
 	raw, ok := d.Stages[name]
 	if !ok {
-		return 0
+		return 0, false
 	}
 	var s stagePercentiles
 	if err := json.Unmarshal(raw, &s); err != nil {
-		return 0
+		return 0, false
 	}
-	return float64(s.P95) / 1000.0
+	if s.N == 0 {
+		return 0, false
+	}
+	return float64(s.P95) / 1000.0, true
 }
 
 // viewerSummary mirrors the e2eviewer report fields this tool consumes
 // (tools/e2eviewer main.go `summary`; unknown members ignored on decode).
 type viewerSummary struct {
+	Frames                uint64  `json:"frames"` // 0 = never decoded a frame (dial failure) = no receive-side evidence
 	QueueAgeP95Ms         float64 `json:"queueAgeP95Ms"`
 	QueueAgeMaxMs         float64 `json:"queueAgeMaxMs"`
 	RtpTsRegressions      int     `json:"rtpTsRegressions"`
@@ -299,14 +328,24 @@ type FromDiagInput struct {
 // FromDiag converts real tool outputs into one RunResult (see the mapping
 // table in the file header).
 func FromDiag(in FromDiagInput) (RunResult, error) {
+	res, _, err := FromDiagDetailed(in)
+	return res, err
+}
+
+// FromDiagDetailed is FromDiag plus the list of MANDATORY metrics that were
+// absent from the inputs (empty = fully evidenced). Any missing mandatory
+// metric forces Verdict NO-EVIDENCE, which verify fails: absent must never
+// read as a passing zero (review finding Important 1).
+func FromDiagDetailed(in FromDiagInput) (RunResult, []string, error) {
 	res := RunResult{}
+	var missing []string
 	jb, err := os.ReadFile(in.StatsPath)
 	if err != nil {
-		return res, fmt.Errorf("stats: %w", err)
+		return res, nil, fmt.Errorf("stats: %w", err)
 	}
 	var stats diagStats
 	if err := json.Unmarshal(jb, &stats); err != nil {
-		return res, fmt.Errorf("stats %s: %w", in.StatsPath, err)
+		return res, nil, fmt.Errorf("stats %s: %w", in.StatsPath, err)
 	}
 	res.TargetFPS = stats.FPS
 	res.DurationSec = uint64(stats.DurationS)
@@ -314,17 +353,23 @@ func FromDiag(in FromDiagInput) (RunResult, error) {
 		res.Resolution = strconv.FormatUint(uint64(stats.Width), 10) + "x" +
 			strconv.FormatUint(uint64(stats.Height), 10)
 	}
-	res.CaptureToAUP95Ms = stats.stageP95Ms("capture_to_au_us")
+	var captureOK bool
+	res.CaptureToAUP95Ms, captureOK = stats.stageP95Ms("capture_to_au_us")
+	if !captureOK {
+		missing = append(missing, "CaptureToAUP95Ms")
+	}
 
+	viewerFrames := uint64(0)
 	for _, p := range in.E2EPaths {
 		jb, err := os.ReadFile(p)
 		if err != nil {
-			return res, fmt.Errorf("e2e: %w", err)
+			return res, nil, fmt.Errorf("e2e: %w", err)
 		}
 		var v viewerSummary
 		if err := json.Unmarshal(jb, &v); err != nil {
-			return res, fmt.Errorf("e2e %s: %w", p, err)
+			return res, nil, fmt.Errorf("e2e %s: %w", p, err)
 		}
+		viewerFrames += v.Frames
 		if v.QueueAgeP95Ms > res.QueueP95Ms {
 			res.QueueP95Ms = v.QueueAgeP95Ms
 		}
@@ -335,11 +380,19 @@ func FromDiag(in FromDiagInput) (RunResult, error) {
 		res.EpochRegressions += uint64(v.CodecEpochRegressions)
 		res.UnrecoveredFreezes += uint64(v.RecoveryViolations)
 	}
+	// Receive-side evidence = at least one viewer that decoded a frame. A
+	// dial-failure summary (frames=0) or no -e2e at all leaves Queue metrics
+	// and the three P0 counters unevidenced.
+	if viewerFrames == 0 {
+		missing = append(missing, "QueueP95Ms", "QueueMaxMs",
+			"OldFrameRegressions", "EpochRegressions", "UnrecoveredFreezes")
+	}
 
+	samples := 0
 	if in.MetricsPath != "" {
 		f, err := os.Open(in.MetricsPath)
 		if err != nil {
-			return res, fmt.Errorf("metrics: %w", err)
+			return res, nil, fmt.Errorf("metrics: %w", err)
 		}
 		defer f.Close()
 		var cpus, ws []float64
@@ -351,14 +404,15 @@ func FromDiag(in FromDiagInput) (RunResult, error) {
 			}
 			var m metricSample
 			if err := json.Unmarshal([]byte(line), &m); err != nil {
-				return res, fmt.Errorf("metrics %s: bad line %q: %w", in.MetricsPath, line, err)
+				return res, nil, fmt.Errorf("metrics %s: bad line %q: %w", in.MetricsPath, line, err)
 			}
 			cpus = append(cpus, m.CPUPercent)
 			ws = append(ws, m.WorkingSetMB)
 		}
 		if err := sc.Err(); err != nil {
-			return res, fmt.Errorf("metrics %s: %w", in.MetricsPath, err)
+			return res, nil, fmt.Errorf("metrics %s: %w", in.MetricsPath, err)
 		}
+		samples = len(cpus)
 		res.CPUPercent = Percentile(cpus, 0.95)
 		for _, w := range ws {
 			if w > res.WorkingSetMB {
@@ -366,15 +420,18 @@ func FromDiag(in FromDiagInput) (RunResult, error) {
 			}
 		}
 	}
+	if samples == 0 {
+		missing = append(missing, "CPUPercent", "WorkingSetMB")
+	}
 
 	if in.BrowserPath != "" {
 		jb, err := os.ReadFile(in.BrowserPath)
 		if err != nil {
-			return res, fmt.Errorf("browser-metrics: %w", err)
+			return res, nil, fmt.Errorf("browser-metrics: %w", err)
 		}
 		var b browserMetrics
 		if err := json.Unmarshal(jb, &b); err != nil {
-			return res, fmt.Errorf("browser-metrics %s: %w", in.BrowserPath, err)
+			return res, nil, fmt.Errorf("browser-metrics %s: %w", in.BrowserPath, err)
 		}
 		res.InputToPresentP95Ms = b.InputToPresentP95Ms
 		if b.Browser != "" {
@@ -408,12 +465,16 @@ func FromDiag(in FromDiagInput) (RunResult, error) {
 		res.DurationSec = in.Meta.DurationSec
 	}
 
-	if len(CheckResult(&res, in.Gates)) == 0 {
+	// Missing evidence outranks everything: the run is not judgeable, and a
+	// numeric FAIL on the evidence that DID arrive cannot mask that.
+	if len(missing) > 0 {
+		res.Verdict = VerdictNoEvidence
+	} else if len(CheckResult(&res, in.Gates)) == 0 {
 		res.Verdict = "PASS"
 	} else {
 		res.Verdict = "FAIL"
 	}
-	return res, nil
+	return res, missing, nil
 }
 
 func cmdFromDiag(args []string) int {
@@ -454,7 +515,7 @@ func cmdFromDiag(args []string) int {
 			host = hn
 		}
 	}
-	res, err := FromDiag(FromDiagInput{
+	res, missing, err := FromDiagDetailed(FromDiagInput{
 		StatsPath:   *stats,
 		E2EPaths:    e2e,
 		MetricsPath: *metrics,
@@ -469,6 +530,12 @@ func cmdFromDiag(args []string) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "desktopreport from-diag: %v\n", err)
 		return 2
+	}
+	if res.Verdict == VerdictNoEvidence {
+		// The runresult still emits (exit 0 here); verify is the gate and
+		// will fail it. The list names WHAT was missing, for the run log.
+		fmt.Fprintf(os.Stderr, "desktopreport from-diag: NO-EVIDENCE, mandatory metrics absent: %s\n",
+			strings.Join(missing, ", "))
 	}
 	jb, err := MarshalResult(&res)
 	if err != nil {

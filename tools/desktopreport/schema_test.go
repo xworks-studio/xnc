@@ -224,6 +224,32 @@ func TestVerifyCommandExitCodes(t *testing.T) {
 	}
 }
 
+const noEvidenceFixture = `{
+  "Host": "local", "GPU": "Intel hybrid", "Driver": "31.0", "OS": "Win11",
+  "Browser": "e2eviewer", "Resolution": "1920x1080", "TargetFPS": 30,
+  "DurationSec": 60,
+  "OldFrameRegressions": 0, "EpochRegressions": 0, "UnrecoveredFreezes": 0,
+  "CaptureToAUP95Ms": 0, "InputToPresentP95Ms": 0,
+  "QueueP95Ms": 0, "QueueMaxMs": 0, "CPUPercent": 0,
+  "WorkingSetMB": 0, "Verdict": "NO-EVIDENCE"
+}`
+
+func TestVerifyNoEvidenceVerdictExits1(t *testing.T) {
+	// Every number is zero because nothing was measured, not because zero
+	// was observed. Only the NO-EVIDENCE verdict distinguishes it from a
+	// true all-zero PASS - verify must fail it (fail closed, review finding
+	// Important 1).
+	p := writeTemp(t, "noevidence.json", noEvidenceFixture)
+	if code := run([]string{"verify", p}); code != 1 {
+		t.Errorf("verify NO-EVIDENCE = %d, want 1", code)
+	}
+	// Not gate-relaxable either: gates cannot manufacture evidence.
+	relaxed := writeTemp(t, "gates.json", `{"QueueP95Ms":1000,"CPUPercent":100}`)
+	if code := run([]string{"verify", "-gates", relaxed, p}); code != 1 {
+		t.Errorf("verify NO-EVIDENCE with relaxed gates = %d, want 1", code)
+	}
+}
+
 func TestVerifyCommandGatesFlag(t *testing.T) {
 	fail := writeTemp(t, "fail.json", failingFixture)
 	relaxed := writeTemp(t, "gates.json",

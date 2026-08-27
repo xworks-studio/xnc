@@ -16,16 +16,33 @@
 #                   --pipe <run pipe> --secret <run secret> --log-file <run>\native.log
 #     = capture pipeline + stats.json sidecar + live rt subscribers
 #   collect-metrics.ps1 -TargetPid <native pid>   (CPU%/working-set JSONL)
-#   e2eviewer.exe -direct-pipe ... per event      (viewer/pli/overflow/reconnect)
+#   e2eviewer.exe -direct-pipe ... per event      (viewer/pli/burst/reconnect)
 #   desktopreport.exe from-diag|verify|merge      (post-processing, in-shell)
 #
 # Event schedule: -EventSchedule <file.json>
-#   {"events":[{"type":"viewer|pli|overflow|reconnect","atSec":N,"durationSec":N},
-#              {"type":"overflow","atSec":N,"durationSec":N,"fbQueueMs":250}]}
+#   {"events":[{"type":"viewer|pli|burst|reconnect","atSec":N,"durationSec":N},
+#              {"type":"burst","atSec":N,"durationSec":N,"pliIntervalMs":500}]}
 # or the built-in default (fractions of -DurationSec): a standing viewer for
-# the whole run, one PLI event at 20%, one feedback-overflow event at 40%,
-# one reconnect (two short viewers with a gap) at 60%. A reconnect event
-# runs as TWO sequential viewer processes (connect, drop, reconnect).
+# the whole run, one PLI event at 20%, one burst event at 40%, one reconnect
+# (two short viewers with a gap) at 60%. A reconnect event runs as TWO
+# sequential viewer processes (connect, drop, reconnect).
+#
+# Fix round 1 (review Important 2): the old "feedback-overflow" event was
+# INERT in this topology - direct-pipe mode has no viewer_feedback channel
+# (the synthetic fb hook rides the server-mode session WS and needs
+# --fb-bps > 0), so it degenerated into a duplicate plain viewer. Replaced
+# (option c) with "burst": a SECOND concurrent viewer that fires an RTCP PLI
+# every pliIntervalMs (default 500ms) - a real direct-mode stressor that
+# forces repeated IDR generation while the native fans out to multiple
+# subscribers. Overflow-under-congestion stays covered where a feedback
+# channel exists (server-mode e2eviewer runs, M3 Task 6).
+#
+# Fix round 1 (review Important 1): receive-side evidence is MANDATORY. If
+# no viewer report reaches from-diag (rt pipe never appeared, events skipped,
+# or every report empty/a dial failure), desktopreport stamps the run
+# NO-EVIDENCE and verify FAILS it (exit 1) - absent never reads as a
+# passing zero. Same for an empty metrics file and an absent stats stage.
+#
 # Validation: every event must end inside the soak window and at most 4
 # viewers may overlap (the native --max-subs default).
 #
@@ -39,8 +56,8 @@
 #   powershell ... -DurationSec 5400 -Pipeline v2 -Fps 30            # 90min bounded soak
 #   powershell ... -DurationSec 600 -EventSchedule C:\sched.json     # custom schedule
 #
-# Exit codes: 0 = soak verified PASS; 1 = verify FAIL (P0/gate); 2 = harness
-# error (missing binary, bad schedule, native failed to start...).
+# Exit codes: 0 = soak verified PASS; 1 = verify FAIL (P0/gate/NO-EVIDENCE);
+# 2 = harness error (missing binary, bad schedule, native failed to start...).
 
 param(
     [int]$DurationSec = 300,
@@ -135,12 +152,12 @@ $defaultSchedule = {
     # Fractions of DurationSec, all bounded inside the soak window.
     $d = [double]$DurationSec
     $pliDur = [Math]::Max(1, [Math]::Min(30, [int][Math]::Floor($d * 0.10)))
-    $ovfDur = [Math]::Max(1, [Math]::Min(30, [int][Math]::Floor($d * 0.10)))
+    $bstDur = [Math]::Max(1, [Math]::Min(30, [int][Math]::Floor($d * 0.10)))
     $recDur = [Math]::Max(2, [Math]::Min(40, [int][Math]::Floor($d * 0.15)))
     @(
         @{ type = "viewer";     atSec = 0;                durationSec = $DurationSec },
         @{ type = "pli";        atSec = [int][Math]::Floor($d * 0.20); durationSec = $pliDur },
-        @{ type = "overflow";   atSec = [int][Math]::Floor($d * 0.40); durationSec = $ovfDur; fbQueueMs = 250 },
+        @{ type = "burst";      atSec = [int][Math]::Floor($d * 0.40); durationSec = $bstDur; pliIntervalMs = 500 },
         @{ type = "reconnect";  atSec = [int][Math]::Floor($d * 0.60); durationSec = $recDur }
     )
 }
@@ -150,7 +167,7 @@ if ($EventSchedule -ne "") {
     if (-not (Test-Path -LiteralPath $EventSchedule)) { Fail "EventSchedule not found: $EventSchedule" }
     try {
         $sched = Get-Content -Raw -LiteralPath $EventSchedule | ConvertFrom-Json
-        foreach ($e in @($sched.events)) { $events += @{ type = [string]$e.type; atSec = [int]$e.atSec; durationSec = [int]$e.durationSec; fbQueueMs = [int]$e.fbQueueMs } }
+        foreach ($e in @($sched.events)) { $events += @{ type = [string]$e.type; atSec = [int]$e.atSec; durationSec = [int]$e.durationSec; pliIntervalMs = [int]$e.pliIntervalMs } }
     } catch {
         Fail "EventSchedule JSON invalid: $($_.Exception.Message)"
     }
@@ -159,7 +176,7 @@ if ($EventSchedule -ne "") {
 }
 
 if ($events.Count -eq 0) { Fail "event schedule is empty" }
-$knownTypes = @("viewer", "pli", "overflow", "reconnect")
+$knownTypes = @("viewer", "pli", "burst", "reconnect")
 foreach ($e in $events) {
     if ($knownTypes -notcontains $e.type) { Fail "unknown event type '$($e.type)'" }
     if ($e.atSec -lt 0) { Fail "event atSec must be >= 0" }
@@ -215,10 +232,12 @@ function Viewer-Args([int]$durationSec, [hashtable]$e) {
            "-duration", ("{0}s" -f $durationSec), "-json",
            "-expect-frames-max", "0")
     if ($e.type -eq "pli") { $a += @("-pli-at", "5s") }
-    if ($e.type -eq "overflow") {
-        $q = 250
-        if ($e.fbQueueMs -gt 0) { $q = $e.fbQueueMs }
-        $a += @("-fb-queue-ms", "$q")
+    if ($e.type -eq "burst") {
+        # Fix round 1 (Important 2): a second concurrent viewer firing PLI
+        # every interval - a stressor that actually exists in direct mode.
+        $q = 500
+        if ($e.pliIntervalMs -gt 0) { $q = $e.pliIntervalMs }
+        $a += @("-pli-interval", ("{0}ms" -f $q))
     }
     return ,$a
 }
@@ -429,8 +448,12 @@ foreach ($r in $viewerReports) {
     }
     $e2eFlags += @("-e2e", $r)
 }
-if ($viewerReports.Count -eq 0) {
-    Write-Host "run-soak: WARNING no viewer evidence in this run (rt pipe or events missing); receive-side gates read 0" -ForegroundColor Yellow
+if ($e2eFlags.Count -eq 0) {
+    # Fix round 1 (Important 1): no viewer report reached from-diag (rt pipe
+    # never appeared, events skipped, or every report empty/a dial failure).
+    # from-diag will stamp NO-EVIDENCE and verify FAILS the run - absent
+    # receive-side evidence must not read as a passing zero.
+    Write-Host "run-soak: FAIL no viewer evidence in this run (rt pipe missing, events skipped, or every report empty/a dial failure); the RunResult will be NO-EVIDENCE and verify will fail it" -ForegroundColor Red
 }
 if ($emptyReports -gt 0) {
     Write-Host ("run-soak: WARNING {0} viewer report(s) empty and excluded from the RunResult (see run log)" -f $emptyReports) -ForegroundColor Yellow

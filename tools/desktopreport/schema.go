@@ -40,6 +40,16 @@ type Gates struct {
 	WorkingSetMB        float64
 }
 
+// VerdictNoEvidence is the verdict from-diag stamps when a MANDATORY metric
+// had no evidence in the inputs (no viewer report that decoded frames, no
+// metrics samples, or an absent stats stage). Absent must not read as a
+// passing zero: verify FAILS any result carrying this verdict, and it is not
+// gate-relaxable - gates cannot manufacture evidence. The schema cannot grow
+// an evidence map (it is locked to the brief's 18 fields), so the verdict
+// string is the wire channel; from-diag prints the missing-metric list to
+// stderr for the run log.
+const VerdictNoEvidence = "NO-EVIDENCE"
+
 // DefaultGates: the plan controller's default gate profile.
 func DefaultGates() Gates {
 	return Gates{
