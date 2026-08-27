@@ -664,12 +664,28 @@ class RtTestClient {
       if (xnc::DecodeFrameEventV2(f, &v2) && v2.annexb) {
         frames_++;
         v2_frames_++;
+        // M1 Task 4: 重建信号之后,旧 epoch 的 AU 不得再发布(spec 10.2)。
+        if (saw_rebuilt_state_ && v2.id.capture_epoch == 1)
+          old_epoch_after_rebuilt_++;
+        // M1 Task 4: WAIT_IDR 语义 —— 0x020B 之后的首个 v2 帧必须是所携
+        // epoch 对的 IDR(delta = 违反断流契约,记负)。
+        if (disc_waiting_idr_) {
+          const bool is_key = (v2.flags & xnc::AuFlags::kAuFlagKey) != 0;
+          if (is_key && v2.id.capture_epoch == disc_capture_epoch_ &&
+              v2.id.codec_epoch == disc_codec_epoch_)
+            disc_idr_ok_ = true;
+          else if (!is_key)
+            disc_delta_seen_ = true;
+          disc_waiting_idr_ = false;
+        }
         if ((v2.flags & xnc::AuFlags::kAuFlagKey) != 0) {
           keys_++;
           first_key_mono_us_ = first_key_mono_us_ == 0 ? v2.id.present_mono_us
                                                        : first_key_mono_us_;
           last_key_mono_us_ = v2.id.present_mono_us;
           last_key_payload_ = *v2.annexb;
+          last_key_id_ = v2.id;
+          last_key_id_set_ = true;
           if (!first_key_id_set_) {
             first_key_id_ = v2.id;
             first_key_w_ = v2.width;
@@ -678,10 +694,20 @@ class RtTestClient {
           }
         }
       }
+    } else if (f.message_type == xnc::kMsgStreamDiscontinuity) {
+      // M1 Task 4: 0x020B STREAM_DISCONTINUITY(v2 模式;v1 永不发送)。
+      xnc::StreamDiscontinuityPayload d;
+      if (xnc::DecodeStreamDiscontinuity(f, &d)) {
+        discontinuities_++;
+        disc_capture_epoch_ = d.capture_epoch;
+        disc_codec_epoch_ = d.codec_epoch;
+        disc_waiting_idr_ = true;
+      }
     } else if (f.message_type == xnc::kMsgState) {
       xnc::StateEventPayload st;
       if (xnc::DecodeStateEvent(f, &st)) {
         if (std::strcmp(st.code, "stream_end") == 0) saw_stream_end_ = true;
+        if (std::strcmp(st.code, "capture_rebuilt") == 0) saw_rebuilt_state_ = true;
         state_codes_.emplace_back(st.code);
       }
     } else if (f.message_type == xnc::kMsgCursor) {
@@ -701,6 +727,8 @@ class RtTestClient {
   xnc::FrameIdentity first_key_id_{};  // identity of the first v2 key AU
   uint32_t first_key_w_ = 0, first_key_h_ = 0;
   bool first_key_id_set_ = false;
+  xnc::FrameIdentity last_key_id_{};  // identity of the most recent v2 key AU
+  bool last_key_id_set_ = false;
   uint64_t cursors_ = 0;
   int32_t cursor_x_ = -1, cursor_y_ = -1;
   uint8_t cursor_visible_ = 0xFF;
@@ -709,6 +737,14 @@ class RtTestClient {
   xnc::HostHelloPayload hello_{};
   uint32_t media_protocol_ = 0;  // HOST_HELLO v2 trailing u32 (0 = legacy)
   bool hello_ok_ = false, saw_stream_end_ = false, frame_before_hello_ = false;
+  // M1 Task 4: 0x020B STREAM_DISCONTINUITY observations.
+  uint64_t discontinuities_ = 0;
+  uint64_t disc_capture_epoch_ = 0, disc_codec_epoch_ = 0;
+  bool disc_waiting_idr_ = false;   // 0x020B seen; the next v2 frame is judged
+  bool disc_idr_ok_ = false;        // ...and it was the expected-epoch IDR
+  bool disc_delta_seen_ = false;    // ...or a delta slipped through (contract break)
+  bool saw_rebuilt_state_ = false;  // STATE{capture_rebuilt} seen (M1 Task 4)
+  uint64_t old_epoch_after_rebuilt_ = 0;  // old-epoch v2 frames after a rebuild (bug)
 
   bool SawState(const char* code) const {
     return std::find(state_codes_.begin(), state_codes_.end(), std::string(code)) !=
@@ -3173,6 +3209,160 @@ int SelftestMain() {
     CHECK("sub-depth-zero-clamped-key", q4.PushAu(true, delta) == A::kEnqueued);
     CHECK("sub-depth-zero-clamped-overflow",
           q4.PushAu(false, delta) == A::kDroppedQueueFull);
+  }
+  { // M1 Task 4: v2 每订阅者 WAIT_IDR 状态机(纯逻辑;v1 路径不经过它)。
+    // 契约:join/溢出/断流/epoch 变化 → 清空队列 + kWaitIdr;WAIT_IDR 期间
+    // 不投递任何 delta;仅「期望 epoch 对」的 IDR 恢复 kLive;epoch 前进
+    // 标记 discontinuity(调用方随后推 0x020B);key 永不阻塞(挤掉旧帧)。
+    using A = xnc::SubSendQueue::AuAction;
+    using V = xnc::SubSendQueue::VideoState;
+    xnc::SubSendQueue q;
+    const xnc::Frame delta{xnc::kFlagEvent, xnc::kMsgFrameV2, 0, {1}};
+    const xnc::Frame key{xnc::kFlagEvent, xnc::kMsgFrameV2, 0, {2}};
+    // join:kWaitIdr + needs(表侧 sub_join 合并);无 epoch 基线。
+    CHECK("v2sm-join-waitidr", q.video_state() == V::kWaitIdr && q.needs_keyframe());
+    // joiner 从 IDR 入流:基线前的 delta 直接丢,状态不变。
+    CHECK("v2sm-join-delta-dropped",
+          q.PushAuV2(false, 1, 1, delta).action == A::kDroppedNeedKey &&
+              q.video_state() == V::kWaitIdr && q.video_depth() == 0);
+    // 首个 IDR 入队并进入 kLive(join 不发 0x020B:客户端尚无一帧)。
+    const auto first = q.PushAuV2(true, 1, 1, key);
+    CHECK("v2sm-first-idr-live",
+          first.action == A::kEnqueued && !first.discontinuity &&
+              q.video_state() == V::kLive && !q.needs_keyframe() &&
+              q.video_depth() == 1);
+    // 深度 3:填满后第 4 个 delta 溢出 → 清空队列 + kWaitIdr + needs。
+    xnc::Frame drained;
+    while (q.Pop(&drained)) {}
+    CHECK("v2sm-fill", q.PushAuV2(false, 1, 1, delta).action == A::kEnqueued &&
+                           q.PushAuV2(false, 1, 1, delta).action == A::kEnqueued &&
+                           q.PushAuV2(false, 1, 1, delta).action == A::kEnqueued &&
+                           q.video_depth() == 3);
+    CHECK("v2sm-overflow-waitidr",
+          q.PushAuV2(false, 1, 1, delta).action == A::kDroppedQueueFull &&
+              q.video_state() == V::kWaitIdr && q.video_depth() == 0 &&
+              q.needs_keyframe());
+    // WAIT_IDR 期间不投递任何后续 delta(收到即丢)。
+    CHECK("v2sm-waitidr-suppresses-delta",
+          q.PushAuV2(false, 1, 1, delta).action == A::kDroppedNeedKey &&
+              q.video_depth() == 0);
+    // 旧 epoch 的 IDR(回退)不得复活:保持 kWaitIdr(上游身份账本已挡此路,
+    // 这里是防御)。
+    CHECK("v2sm-stale-idr-rejected",
+          q.PushAuV2(true, 0, 1, key).action == A::kDroppedNeedKey &&
+              q.video_state() == V::kWaitIdr && q.video_depth() == 0);
+    // 期望 epoch 对的 IDR:恢复 kLive,合并 needs 清位。
+    CHECK("v2sm-expected-idr-live",
+          q.PushAuV2(true, 1, 1, key).action == A::kEnqueued &&
+              q.video_state() == V::kLive && !q.needs_keyframe() &&
+              q.video_depth() == 1);
+    // epoch 前进(kLive):断流标记 + 清空 + 新 epoch 的 IDR 直接恢复。
+    CHECK("v2sm-live-fill-2", q.PushAuV2(false, 1, 1, delta).action == A::kEnqueued);
+    const auto disc = q.PushAuV2(true, 2, 1, key);
+    CHECK("v2sm-epoch-change-discontinuity",
+          disc.action == A::kEnqueued && disc.discontinuity &&
+              disc.capture_epoch == 2 && disc.codec_epoch == 1 &&
+              q.video_state() == V::kLive && q.video_depth() == 1);
+    // 新 epoch 的 delta 正常投递。
+    CHECK("v2sm-new-epoch-delta",
+          q.PushAuV2(false, 2, 1, delta).action == A::kEnqueued);
+    // 重建断流(捕获线程信号):清空 + kWaitIdr;旧 epoch 的一切(含 IDR)
+    // 被抑制;首个更新 epoch 的 AU 触发 0x020B 路径。floor = 重建前服务端
+    // 最后扇出的 epoch 对(此处基线 (2,1))。
+    q.OnRebuildDiscontinuity(2, 1);
+    CHECK("v2sm-rebuild-waitidr",
+          q.video_state() == V::kWaitIdr && q.video_depth() == 0);
+    CHECK("v2sm-rebuild-suppresses-old-delta",
+          q.PushAuV2(false, 2, 1, delta).action == A::kDroppedNeedKey &&
+              q.video_depth() == 0);
+    CHECK("v2sm-rebuild-suppresses-old-idr",
+          q.PushAuV2(true, 2, 1, key).action == A::kDroppedNeedKey &&
+              q.video_state() == V::kWaitIdr && q.video_depth() == 0);
+    // 旧 epoch 的 delta 即便回到 kLive 也绝不投递(epoch 回退防御)。
+    // 新 epoch 首 AU 不是 IDR(前瞻延迟)→ 断流 + 合并请求位再武装。
+    const auto disc2 = q.PushAuV2(false, 3, 2, delta);
+    CHECK("v2sm-rebuild-new-epoch-disc",
+          disc2.action == A::kDroppedNeedKey && disc2.discontinuity &&
+              disc2.capture_epoch == 3 && disc2.codec_epoch == 2 &&
+              q.video_state() == V::kWaitIdr && q.needs_keyframe());
+    CHECK("v2sm-regressed-delta-dropped",
+          q.PushAuV2(false, 3, 1, delta).action == A::kDroppedNeedKey &&
+              q.video_depth() == 0);
+    CHECK("v2sm-recovery-idr-live",
+          q.PushAuV2(true, 3, 2, key).action == A::kEnqueued &&
+              q.video_state() == V::kLive);
+    // kLive 且队列满时 key 挤掉旧 delta,永不阻塞、不丢 key。
+    while (q.Pop(&drained)) {}
+    CHECK("v2sm-key-never-dropped-fill",
+          q.PushAuV2(false, 3, 2, delta).action == A::kEnqueued &&
+              q.PushAuV2(false, 3, 2, delta).action == A::kEnqueued &&
+              q.PushAuV2(false, 3, 2, delta).action == A::kEnqueued);
+    CHECK("v2sm-key-displaces-deltas",
+          q.PushAuV2(true, 3, 2, key).action == A::kEnqueuedDisplacingDeltas &&
+              q.video_state() == V::kLive && q.video_depth() == 1);
+    // 合并请求清位(v1 PushAu 契约):每一个「入队」的 IDR 都必须清
+    // needs_keyframe——否则 sub_join / queue_overflow / explicit 的合并
+    // reason 永不清除,PendingIdrReason() 恒非空,pipeline 每 500ms 重臂
+    // ForceNextIdr(无谓的 IDR 洪流)。两处此前漏清:epoch 前进的 IDR、
+    // kLive 同 epoch 的 IDR(显式 0x0104 请求的应答路径)。
+    xnc::SubSendQueue q5;
+    q5.PushAuV2(false, 1, 1, delta);  // joiner delta:丢弃,needs 保持
+    CHECK("v2sm-epoch-idr-clears-needs",
+          q5.PushAuV2(true, 2, 1, key).action == A::kEnqueued &&
+              q5.video_state() == V::kLive && !q5.needs_keyframe());
+    CHECK("v2sm-live-fill-3",
+          q5.PushAuV2(false, 2, 1, delta).action == A::kEnqueued &&
+              q5.PushAuV2(false, 2, 1, delta).action == A::kEnqueued &&
+              q5.video_depth() == 3);
+    q5.MarkNeedsKeyframe();  // 显式 0x0104 请求(kLive 期间)
+    CHECK("v2sm-live-idr-clears-needs",
+          q5.PushAuV2(true, 2, 1, key).action == A::kEnqueuedDisplacingDeltas &&
+              !q5.needs_keyframe());
+    // 重建时「尚无基线」的订阅者(刚 attach、一个 AU 都没收到):floor
+    // 同样必须挡住重建前的编码器前瞻尾 —— 旧 epoch 的一切(含 IDR)被抑制,
+    // 首个过 floor 的 AU 走 0x020B 断流路径(它错过的那次重建就是断流)。
+    xnc::SubSendQueue q6;
+    q6.OnRebuildDiscontinuity(1, 1);  // floor = 重建前最后扇出的 epoch 对
+    CHECK("v2sm-rebuild-no-baseline-suppress",
+          q6.PushAuV2(true, 1, 1, key).action == A::kDroppedNeedKey &&
+              q6.video_state() == V::kWaitIdr && q6.video_depth() == 0);
+    const auto d3 = q6.PushAuV2(true, 2, 1, key);
+    CHECK("v2sm-rebuild-no-baseline-disc",
+          d3.discontinuity && d3.capture_epoch == 2 && d3.codec_epoch == 1 &&
+              d3.action == A::kEnqueued && q6.video_state() == V::kLive);
+  }
+  { // M1 Task 4: 0x020B STREAM_DISCONTINUITY wire codec(精确字节)
+    const std::vector<uint8_t> w =
+        xnc::EncodeStreamDiscontinuity(2, 3, xnc::kStreamDiscontinuityReason);
+    CHECK("disc-enc-size", w.size() == 48);
+    const uint8_t want_disc[48] = {2, 0, 0, 0, 0, 0, 0, 0,   // capture_epoch=2
+                                   3, 0, 0, 0, 0, 0, 0, 0,   // codec_epoch=3
+                                   0};                       // reason NUL 填充
+    std::vector<uint8_t> want(48, 0);
+    std::memcpy(want.data(), want_disc, 16);
+    std::memcpy(want.data() + 16, xnc::kStreamDiscontinuityReason,
+                std::strlen(xnc::kStreamDiscontinuityReason));
+    CHECK("disc-enc-bytes",
+          std::equal(w.begin(), w.end(), want.begin()));
+    xnc::StreamDiscontinuityPayload d;
+    CHECK("disc-enc-rt",
+          xnc::DecodeStreamDiscontinuity(xnc::Frame{0, xnc::kMsgStreamDiscontinuity, 0, w},
+                                         &d) &&
+              d.capture_epoch == 2 && d.codec_epoch == 3 &&
+              std::strcmp(d.reason, xnc::kStreamDiscontinuityReason) == 0);
+    CHECK("disc-dec-badsize",
+          !xnc::DecodeStreamDiscontinuity(
+              xnc::Frame{0, xnc::kMsgStreamDiscontinuity, 0, {1, 2, 3}}, &d));
+    CHECK("disc-dec-null", !xnc::DecodeStreamDiscontinuity(
+                               xnc::Frame{0, xnc::kMsgStreamDiscontinuity, 0, w},
+                               nullptr));
+    // reason 截断到 31 字符 + NUL 填充(长 reason 只保留前缀)
+    const std::vector<uint8_t> wl = xnc::EncodeStreamDiscontinuity(1, 1, "r");
+    xnc::StreamDiscontinuityPayload dl;
+    CHECK("disc-reason-nulpadded",
+          xnc::DecodeStreamDiscontinuity(xnc::Frame{0, xnc::kMsgStreamDiscontinuity, 0, wl},
+                                         &dl) &&
+              std::strcmp(dl.reason, "r") == 0);
   }
   // ---- M1-Slice2 Task 2:AuSink 默认行为 + TeeAuSink ----
   {
@@ -6010,6 +6200,119 @@ int SelftestMain() {
                   (unsigned long long)a.first_key_id_.encode_seq,
                   (unsigned long long)a.first_key_id_.source_mono_us,
                   (unsigned long long)a.first_key_id_.present_mono_us);
+    }
+  }
+  { // rt 场景 ⑩(M1 Task 4):v2 队列溢出 —— 卡死订阅者 → 溢出 → 清空队列 +
+    // WAIT_IDR + 合并 IDR(reason=queue_overflow);健康订阅者照常收到第二个
+    // IDR;本场景无 epoch 变化 → 无 0x020B。噪声帧(320x240)保证溢出确定
+    // 触发(同 rt3;64x48 彩条 AU 太小打不满管道缓冲)。
+    const uint32_t nw = 320, nh = 240, nfps = 15, nbitrate = 2300000;
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(nw, nh, nfps, nbitrate, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: rt10-init err=%s\n", err.c_str());
+    CHECK("rt10-init", init_ok);
+    if (init_ok) {
+      xnc::RtServer rt;
+      xnc::RtServer::Opts ro = rt_opts(9);
+      ro.fps = nfps;
+      ro.bitrate_bps = nbitrate;
+      ro.pipeline_v2 = true;  // M1 Task 4: WAIT_IDR/0x020B 是 v2 模式行为
+      CHECK("rt10-start", rt.Start(ro, nw, nh));
+      NoisyCapture cap(nw, nh, 130);  // ~8.7s 连续噪声帧
+      xnc::PipelineOpts po;
+      po.duration_s = 9;
+      po.fps = nfps;
+      po.target_bitrate_bps = nbitrate;
+      xnc::PipelineResult res;
+      std::thread pipe_th([&] { res = xnc::Pipeline::Run(cap, enc, rt, po); });
+      RtTestClient a;  // 健康订阅者
+      CHECK("rt10-a-connect", a.Connect(ro.pipe_name.c_str(), kRtSecret, sizeof(kRtSecret)));
+      CHECK("rt10-a-attach", a.Attach(7));
+      RtTestClient b;  // 卡死订阅者:attach 后一个字节都不读
+      CHECK("rt10-b-connect", b.Connect(ro.pipe_name.c_str(), kRtSecret, sizeof(kRtSecret)));
+      CHECK("rt10-b-attach", b.Attach(9));
+      a.Pump(8500, [&a] { return a.keys_ >= 2; });
+      pipe_th.join();
+      a.Pump(500);
+      rt.Shutdown();
+      CHECK("rt10-a-two-keys", a.keys_ >= 2);  // 溢出合并的 IDR 广播给了健康订阅者
+      CHECK("rt10-pipeline-ok", res.ok);
+      const xnc::RtServer::Stats st = rt.stats();
+      CHECK("rt10-overflow-drops", st.frames_dropped_overflow >= 1);
+      CHECK("rt10-overflow-merged-idr", st.idr_queue_overflow >= 1);
+      // 无 epoch 变化:WAIT_IDR 来自溢出,不产生任何 0x020B。
+      CHECK("rt10-no-discontinuity",
+            st.stream_discontinuities == 0 && a.discontinuities_ == 0);
+      std::printf("SELFTEST NOTE: rt10 a_keys=%llu drop_of=%llu drop_nk=%llu overflow_idr=%llu disc=%llu\n",
+                  (unsigned long long)a.keys_,
+                  (unsigned long long)st.frames_dropped_overflow,
+                  (unsigned long long)st.frames_dropped_needkey,
+                  (unsigned long long)st.idr_queue_overflow,
+                  (unsigned long long)st.stream_discontinuities);
+    }
+  }
+  { // rt 场景 ⑪(M1 Task 4):v2 epoch 前进(capture 重建)→ 每订阅者 0x020B
+    // STREAM_DISCONTINUITY(新 epoch 对 + 固定 reason)+ 清空 + WAIT_IDR;随后
+    // 新 epoch 的 IDR 恢复 LIVE。断流后首帧必须是该 epoch 的 IDR,重建后
+    // 旧 epoch 的 AU(编码器前瞻尾)一律被抑制 —— 重建信号之后再无
+    // epoch-1 帧上线(rebuild floor 挡尾),最后一个 key 是 epoch 2。
+    xnc::MfSoftEncoder enc;
+    std::string err;
+    const bool init_ok = enc.Init(kRtW, kRtH, kRtFps, kRtBitrate, &err);
+    if (!init_ok) std::printf("SELFTEST NOTE: rt11-init err=%s\n", err.c_str());
+    CHECK("rt11-init", init_ok);
+    if (init_ok) {
+      xnc::RtServer rt;
+      xnc::RtServer::Opts ro = rt_opts(10);
+      ro.pipeline_v2 = true;
+      CHECK("rt11-start", rt.Start(ro, kRtW, kRtH));
+      // 第 40 帧 err_rebuilt → capture_epoch 2;重建晚于首个 AU 的出现
+      // (编码器 warm-up ~12+ 帧),保证服务端已有扇出历史 → rebuild floor
+      // 生效;之后 20 帧持续流入,保证重建强制的 IDR 在运行期内浮现。
+      ScriptedCapture cap(kRtW, kRtH, 60, 40);
+      xnc::PipelineOpts po;
+      po.duration_s = 6;
+      po.fps = kRtFps;
+      po.target_bitrate_bps = kRtBitrate;
+      xnc::PipelineResult res;
+      std::thread pipe_th([&] { res = xnc::Pipeline::Run(cap, enc, rt, po); });
+      RtTestClient a;
+      CHECK("rt11-connect", a.Connect(ro.pipe_name.c_str(), kRtSecret, sizeof(kRtSecret)));
+      CHECK("rt11-attach-hello", a.Attach(11));
+      a.Pump(5800, [&a] { return a.discontinuities_ >= 1 && a.keys_ >= 1; });
+      pipe_th.join();
+      a.Pump(2000);  // 排空在途帧(含可能的第二把 epoch-2 IDR)
+      rt.Shutdown();
+      CHECK("rt11-first-key", a.keys_ >= 1);
+      CHECK("rt11-discontinuity", a.discontinuities_ >= 1);
+      // 一次重建 = 一次 epoch 前进 = 恰一条 0x020B,携带新 epoch 对。
+      CHECK("rt11-disc-epochs",
+            a.discontinuities_ == 1 && a.disc_capture_epoch_ == 2 &&
+                a.disc_codec_epoch_ == 1);
+      CHECK("rt11-disc-then-idr", a.disc_idr_ok_ && !a.disc_delta_seen_);
+      // 旧 epoch 的一切 AU 被抑制(确定性契约):重建信号之后再无 epoch-1
+      // 帧上线,最后一个 key 也是 epoch 2。(不断言「首个 key 即 epoch 2」:
+      // 若流水线首个 AU 先于重建上线,订阅者按 join-from-IDR 合法收到
+      // epoch-1 的 IDR —— 那是编码器预热与重建的时序竞态,非契约。)
+      CHECK("rt11-last-key-epoch",
+            a.last_key_id_set_ && a.last_key_id_.capture_epoch == 2);
+      CHECK("rt11-old-epoch-suppressed", a.old_epoch_after_rebuilt_ == 0);
+      CHECK("rt11-pipeline-ok", res.ok);
+      const xnc::RtServer::Stats st = rt.stats();
+      CHECK("rt11-stats-disc", st.stream_discontinuities >= 1);
+      std::printf("SELFTEST NOTE: rt11 keys=%llu frames=%llu v2=%llu disc=%llu disc_ep=[%llu,%llu] disc_idr=%d disc_delta=%d old_epoch=%llu stats_disc=%llu enq=%llu keyenq=%llu dropnk=%llu streamend=%d\n",
+                  (unsigned long long)a.keys_, (unsigned long long)a.frames_,
+                  (unsigned long long)a.v2_frames_, (unsigned long long)a.discontinuities_,
+                  (unsigned long long)a.disc_capture_epoch_,
+                  (unsigned long long)a.disc_codec_epoch_,
+                  a.disc_idr_ok_ ? 1 : 0, a.disc_delta_seen_ ? 1 : 0,
+                  (unsigned long long)a.old_epoch_after_rebuilt_,
+                  (unsigned long long)st.stream_discontinuities,
+                  (unsigned long long)st.frames_enqueued,
+                  (unsigned long long)st.keys_enqueued,
+                  (unsigned long long)st.frames_dropped_needkey,
+                  a.saw_stream_end_ ? 1 : 0);
     }
   }
   if (fails == 0) std::printf("selftest ok\n");

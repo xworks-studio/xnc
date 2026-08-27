@@ -43,6 +43,17 @@
 //                                 [u32 h][u8 primary] } (21 bytes/entry);
 //                               legacy w/h/fps/max_subs stay = the ACTIVE
 //                               display's geometry.
+//   MSG_STREAM_DISCONTINUITY 0x020B event (M1 Task 4; v2 mode ONLY)
+//                               [u64 capture_epoch][u64 codec_epoch]
+//                               [char reason[32]] with a FIXED reason
+//                               (kStreamDiscontinuityReason). Sent to a
+//                               subscriber when the AU stream's epoch pair
+//                               advances (a capture rebuild); the client
+//                               discards its buffered frames and waits for
+//                               the IDR of exactly these epochs. v1 mode
+//                               never emits it (no epoch concept on the
+//                               v1 wire; M4 deletes v1) - the legacy
+//                               rt_state 0x0107 flow stays byte-identical.
 //
 // sub_ids are client-chosen (non-zero, unique per server). IDR semantics
 // (spec §7.5 + Slice1 carry-over): attach/queue-overflow/explicit requests
@@ -50,6 +61,11 @@
 // MfSoftEncoder::ForceNextIdr at most once per 500ms and, on a static
 // screen, re-feeds the cached base frame (bounded, never re-forcing) until
 // the IDR AU emerges - the on-demand warm-up.
+// M1 Task 4: with pipeline_v2, each subscriber additionally runs the
+// WAIT_IDR state machine (subscribers.h SubSendQueue::PushAuV2): join,
+// overflow, discontinuity and epoch change flush the queue and set
+// kWaitIdr; only the IDR of the expected epoch pair resumes kLive. OnAu
+// never blocks for a key frame (the key path displaces stale deltas).
 //
 // Input/cursor wiring (M1-Slice3 Task 1): RtServer.Opts carries OPTIONAL
 // pointers to an externally-owned InputManager and CursorManager. 0x0108
@@ -102,6 +118,12 @@ constexpr uint16_t kMsgAttach = 0x0102, kMsgDetach = 0x0103, kMsgKeyframeReq = 0
                    kMsgInput = 0x0108, kMsgCursor = 0x0109,
                    kMsgDisplayChanged = 0x010A, kMsgSwitchDisplay = 0x0128,
                    kMsgFrameV2 = 0x0205;  // M1 Task 2: validated Pipe v2 media frame
+// M1 Task 4: stream discontinuity (v2 mode only; see header comment).
+constexpr uint16_t kMsgStreamDiscontinuity = 0x020B;
+// The 0x020B reason field is FIXED: the message type already identifies the
+// cause (an epoch advance = capture rebuild); the field exists so future
+// protocol revisions can differentiate without a new message type.
+inline constexpr char kStreamDiscontinuityReason[] = "stream_discontinuity";
 
 // AU payload bound (proto.MaxSessionFrameBytes).
 inline constexpr size_t kMaxAuBytes = size_t(8) << 20;
@@ -436,6 +458,35 @@ inline bool DecodeStateEvent(const Frame& f, StateEventPayload* out) {
   return true;
 }
 
+// ---- 0x020B MSG_STREAM_DISCONTINUITY event (M1 Task 4; v2 mode only) ----
+// [u64 capture_epoch][u64 codec_epoch][char reason[32]] (NUL padded). The
+// epoch pair is the NEW generation the client must wait an IDR for; the
+// reason field carries the fixed kStreamDiscontinuityReason today.
+
+struct StreamDiscontinuityPayload {
+  uint64_t capture_epoch = 0, codec_epoch = 0;
+  char reason[32] = {0};  // NUL-padded fixed field
+};
+
+inline std::vector<uint8_t> EncodeStreamDiscontinuity(uint64_t capture_epoch,
+                                                      uint64_t codec_epoch,
+                                                      const char* reason) {
+  std::vector<uint8_t> p(48, 0);
+  rt_detail::PutU64(p.data(), capture_epoch);
+  rt_detail::PutU64(p.data() + 8, codec_epoch);
+  CopyPad32(reinterpret_cast<char*>(p.data()) + 16, reason);
+  return p;
+}
+inline bool DecodeStreamDiscontinuity(const Frame& f,
+                                      StreamDiscontinuityPayload* out) {
+  if (out == nullptr || f.payload.size() != 48) return false;
+  out->capture_epoch = rt_detail::GetU64(f.payload.data());
+  out->codec_epoch = rt_detail::GetU64(f.payload.data() + 8);
+  std::memcpy(out->reason, f.payload.data() + 16, 32);
+  out->reason[31] = '\0';
+  return true;
+}
+
 // ---- 0x010A MSG_DISPLAY_CHANGED event: [u32 gen][u32 w][u32 h]
 // [char reason[24]] (M2-Slice1 Task 2). gen is the server's current
 // generation (already incremented by the capture_rebuilt STATE that
@@ -689,6 +740,7 @@ class RtServer : public AuSink {
     uint64_t display_changes = 0; // 0x010A events broadcast (M2-S1 T2)
     uint64_t switch_accepted = 0; // 0x0128 accepted -> reset(reason=switch)
     uint64_t switch_invalid = 0;  // 0x0128 rejected idx / no handler (M2-S3 T5)
+    uint64_t stream_discontinuities = 0;  // 0x020B sent (v2 epoch advances; M1 Task 4)
   };
 
   RtServer() = default;
@@ -715,8 +767,10 @@ class RtServer : public AuSink {
   // Broadcasts one immutable AU (M1 Task 1: key bit in au.flags,
   // present_mono_us in au.id; the v1 0x0105 wire event is unchanged while
   // opts.pipeline_v2 is false; with the flag on, the validated 0x0205 v2
-  // frame carries the full identity); never fatal (drops per subscriber
-  // instead).
+  // frame carries the full identity and each subscriber's WAIT_IDR state
+  // machine (subscribers.h) drives overflow/epoch-change recovery with
+  // 0x020B - see the header comment); never fatal (drops per subscriber
+  // instead) and NEVER blocks - OnAu must not stall for a key frame.
   const char* OnAu(const EncodedAU& au) override;
   const char* PendingIdrReason() override;
   void ConsumePendingIdr(const char* reason) override;
@@ -746,6 +800,10 @@ class RtServer : public AuSink {
   // Pushes a control frame to one subscriber (never dropped; backlog
   // overflow returns false = wedged connection, caller disconnects).
   bool PushControlTo(SubConn* c, const Frame& f);
+  // Shared drop/enqueue bookkeeping for one subscriber's PushAu/PushAuV2
+  // result (v1 and v2 paths feed the same Stats counters; caller holds
+  // mu_ + c->mu).
+  void CountAuAction(uint32_t sub_id, SubSendQueue::AuAction a, bool is_idr);
   // CursorManager sink target: encodes 0x0109 and fans it out to every
   // attached subscriber (called on the cursor poll thread).
   void BroadcastCursor(int32_t x, int32_t y, uint8_t visible);
@@ -759,6 +817,14 @@ class RtServer : public AuSink {
   uint32_t src_w_ = 0, src_h_ = 0;
   std::atomic<bool> stop_{false};
   std::atomic<uint32_t> gen_{1};
+  // M1 Task 4: epoch pair of the last AU fanned out (under mu_; the encode
+  // thread updates it in OnAu, the capture thread reads it in OnState as
+  // the SubSendQueue rebuild floor that suppresses the pre-rebuild
+  // encoder-lookahead tail). fan_out_seen_ = at least one AU fanned out:
+  // a rebuild BEFORE any AU exists has no floor (nothing is stale yet) -
+  // baseline-less subscribers then keep plain join-from-IDR semantics.
+  uint64_t last_au_cap_ = 0, last_au_codec_ = 0;
+  bool fan_out_seen_ = false;
   mutable std::mutex mu_;  // guards table_, conns_, stats_, readers_
   SubscriberTable table_;
   std::map<uint32_t, std::shared_ptr<SubConn>> conns_;

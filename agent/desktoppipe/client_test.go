@@ -552,12 +552,15 @@ func TestInputEncodeAndCursor(t *testing.T) {
 
 // overflowHost:握手 → ATTACH → HOST_HELLO 后按 burstCh 指令突发 delta;
 // 每收到一条 KEYFRAME_REQ 记录 reason 并回一个 key 帧(解除客户端的
-// 合并位,使下一轮溢出可再次触发)。
+// 合并位,使下一轮溢出可再次触发)。v2 形态(v2=true)说 0x0205 帧 + v2
+// hello,seq/content_id 经 wmu 串行单调递增(镜像生产编码器)。
 type overflowHost struct {
 	ln      net.Listener
 	secret  string
 	burstCh chan int
 	kfCh    chan string // 每条收到的 KEYFRAME_REQ reason
+	v2      bool        // v2 媒体协议(0x0205 + v2 hello)
+	seq     uint64      // v2:连续 encode_seq/content_id(wmu 串行)
 }
 
 func startOverflowHost(t *testing.T, secret string) *overflowHost {
@@ -579,7 +582,20 @@ func startOverflowHost(t *testing.T, secret string) *overflowHost {
 	return h
 }
 
+// startOverflowHostV2:v2 媒体协议形态(M1 Task 4 溢出/WAIT_IDR 测试)。
+func startOverflowHostV2(t *testing.T, secret string) *overflowHost {
+	h := startOverflowHost(t, secret)
+	h.v2 = true
+	return h
+}
+
 func (h *overflowHost) name() string { return h.ln.Addr().String() }
+
+// nextV2Seq 取下一个 v2 seq(调用方须持 wmu)。
+func (h *overflowHost) nextV2Seq() uint64 {
+	h.seq++
+	return h.seq
+}
 
 func (h *overflowHost) serve() {
 	conn, err := h.ln.Accept()
@@ -594,11 +610,15 @@ func (h *overflowHost) serve() {
 	if err != nil || f.MessageType != msgAttach {
 		return
 	}
+	hello := tEncHostHello(1, 64, 48, 15, 4)
+	if h.v2 {
+		hello = tEncHostHelloV2(1, 64, 48, 15, 4)
+	}
 	if err := ipc.WriteFrame(conn, &ipc.Frame{Flags: ipc.FlagEvent, MessageType: msgHostHello,
-		Payload: tEncHostHello(1, 64, 48, 15, 4)}); err != nil {
+		Payload: hello}); err != nil {
 		return
 	}
-	var wmu sync.Mutex // 串行化 burst 写与 key 帧应答写
+	var wmu sync.Mutex // 串行化 burst 写与 key 帧应答写(以及 v2 seq 分配)
 	go func() {        // 控制帧读取:KEYFRAME_REQ → 记 reason → 回 key
 		for {
 			f, err := ipc.ReadFrame(conn)
@@ -617,16 +637,29 @@ func (h *overflowHost) serve() {
 			}
 			h.kfCh <- reason
 			wmu.Lock()
-			_ = ipc.WriteFrame(conn, &ipc.Frame{Flags: ipc.FlagEvent, MessageType: msgFrame,
-				Payload: tEncFrame(999, true, []byte{0, 0, 0, 1, 0x65})})
+			if h.v2 {
+				seq := h.nextV2Seq()
+				_ = ipc.WriteFrame(conn, &ipc.Frame{Flags: ipc.FlagEvent, MessageType: msgFrameV2,
+					Payload: tEncFrameV2(1, 1, seq, seq, seq, seq, 64, 48, 1, []byte{0, 0, 0, 1, 0x65})})
+			} else {
+				_ = ipc.WriteFrame(conn, &ipc.Frame{Flags: ipc.FlagEvent, MessageType: msgFrame,
+					Payload: tEncFrame(999, true, []byte{0, 0, 0, 1, 0x65})})
+			}
 			wmu.Unlock()
 		}
 	}()
 	for n := range h.burstCh {
 		for i := 0; i < n; i++ {
 			wmu.Lock()
-			err := ipc.WriteFrame(conn, &ipc.Frame{Flags: ipc.FlagEvent, MessageType: msgFrame,
-				Payload: tEncFrame(uint64(i+1), false, []byte{0, 0, 0, 1, 0x41})})
+			var err error
+			if h.v2 {
+				seq := h.nextV2Seq()
+				err = ipc.WriteFrame(conn, &ipc.Frame{Flags: ipc.FlagEvent, MessageType: msgFrameV2,
+					Payload: tEncFrameV2(1, 1, seq, seq, seq, seq, 64, 48, 0, []byte{0, 0, 0, 1, 0x41})})
+			} else {
+				err = ipc.WriteFrame(conn, &ipc.Frame{Flags: ipc.FlagEvent, MessageType: msgFrame,
+					Payload: tEncFrame(uint64(i+1), false, []byte{0, 0, 0, 1, 0x41})})
+			}
 			wmu.Unlock()
 			if err != nil {
 				return
@@ -672,7 +705,7 @@ func TestFrameChOverflowMergesKeyframeRequest(t *testing.T) {
 	if got := recvOrFatal[string](t, h.kfCh, "first client_overflow request"); got != "client_overflow" {
 		t.Fatalf("first keyframe reason = %q, want client_overflow", got)
 	}
-	// host 收到请求即回 key;key 阻塞送达直到消费侧开始读。
+	// host 收到请求即回 key;key 非阻塞送达(满时先清空缓冲帧)。
 	d1 := drainUntilKeyFrame(t, sub)
 
 	// 第二轮:仍不消费 → 再次溢出 → 恰第二次合并请求。
@@ -704,6 +737,41 @@ drain:
 	}
 	if d1+d2 >= 40 {
 		t.Fatalf("no deltas dropped: delivered %d+%d of 40", d1, d2)
+	}
+}
+
+// TestFrameChOverflowWaitsIdr(M1 Task 4):v2 连接 FrameCh 溢出 → 清空缓冲帧
+// + 置 needKey + 恰一次合并 keyframe 请求 + 抑制后续 delta(恢复 IDR 前
+// 不送达任何 delta);仅 IDR 到达后恢复投递。溢出清空语义:恢复 IDR 前
+// 送达的 delta 数必须为 0。
+func TestFrameChOverflowWaitsIdr(t *testing.T) {
+	h := startOverflowHostV2(t, "desktop-pipe-secret")
+	sub, err := Dial(h.name(), "desktop-pipe-secret", 7, SubOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	// 20 v2 delta(> 缓冲 16)不消费 → 溢出:清空缓冲帧 + 恰一次合并请求。
+	h.burstCh <- 20
+	if got := recvOrFatal[string](t, h.kfCh, "overflow keyframe request"); got != "client_overflow" {
+		t.Fatalf("keyframe reason = %q, want client_overflow", got)
+	}
+	// 缓冲帧已清空、后续 delta 被抑制:恢复 IDR 之前不得出现任何 delta。
+	if d := drainUntilKeyFrame(t, sub); d != 0 {
+		t.Fatalf("%d deltas delivered before the recovery IDR, want 0 (buffered frames must be cleared)", d)
+	}
+	// 恢复:IDR 之后 delta 恢复投递(带完整 v2 身份)。
+	h.burstCh <- 1
+	f := recvOrFatal[Frame](t, sub.FrameCh(), "post-recovery delta")
+	if f.Key || f.CaptureEpoch != 1 || f.CodecEpoch != 1 || f.ContentID == 0 || f.EncodeSeq == 0 {
+		t.Fatalf("post-recovery frame = %+v", f)
+	}
+	// 合并语义:两段突发只允许恰一条请求。
+	select {
+	case extra := <-h.kfCh:
+		t.Fatalf("unexpected extra KEYFRAME_REQ %q (merge broken)", extra)
+	case <-time.After(300 * time.Millisecond):
 	}
 }
 
@@ -1112,5 +1180,128 @@ func TestFrameV2Pump(t *testing.T) {
 	f2 := recvOrFatal[Frame](t, sub.FrameCh(), "v2 delta frame")
 	if f2.Key || f2.ContentID != 4 || f2.EncodeSeq != 5 || f2.PresentMonoUs != 8 {
 		t.Fatalf("v2 delta frame = %+v", f2)
+	}
+}
+
+// ---- M1 Task 4:0x020B STREAM_DISCONTINUITY ----
+
+// tEncStreamDiscontinuity 编码 0x020B [u64 capture_epoch][u64 codec_epoch]
+// [char reason[32]] NUL 填充(layout = native EncodeStreamDiscontinuity,
+// 48 字节精确长度)。
+func tEncStreamDiscontinuity(ce, ke uint64, reason string) []byte {
+	p := make([]byte, 48)
+	tPut64(p, 0, ce)
+	tPut64(p, 8, ke)
+	copy(p[16:], reason)
+	return p
+}
+
+// TestDecodeStreamDiscontinuity:0x020B 载荷黄金字节 + 畸形拒绝。
+func TestDecodeStreamDiscontinuity(t *testing.T) {
+	p := tEncStreamDiscontinuity(2, 3, "stream_discontinuity")
+	want := make([]byte, 48)
+	tPut64(want, 0, 2)
+	tPut64(want, 8, 3)
+	copy(want[16:], "stream_discontinuity")
+	if string(p) != string(want) {
+		t.Fatalf("encode = %x, want %x", p, want)
+	}
+	ev, err := decodeStreamDiscontinuity(p)
+	if err != nil || ev.CaptureEpoch != 2 || ev.CodecEpoch != 3 ||
+		ev.Reason != "stream_discontinuity" {
+		t.Fatalf("decode = %+v err=%v", ev, err)
+	}
+	if _, err := decodeStreamDiscontinuity(p[:47]); err == nil {
+		t.Fatal("47-byte payload accepted")
+	}
+	if _, err := decodeStreamDiscontinuity(append(append([]byte(nil), p...), 0)); err == nil {
+		t.Fatal("49-byte payload accepted")
+	}
+}
+
+// TestStreamDiscontinuityV2:v2 泵 —— 0x020B 清空已缓冲的旧 epoch 帧 +
+// needKey,随后该 epoch 对的 IDR 恢复投递;断流本身不致命。
+func TestStreamDiscontinuityV2(t *testing.T) {
+	hello := tEncHostHelloV2(1, 64, 48, 15, 4)
+	msgs := []v2Msg{
+		{msgFrameV2, tEncFrameV2(1, 1, 3, 4, 5, 6, 64, 48, 1, []byte{0, 0, 0, 1, 0x65})},
+		{msgFrameV2, tEncFrameV2(1, 1, 4, 5, 7, 8, 64, 48, 0, []byte{0, 0, 0, 1, 0x41})},
+		{msgStreamDisc, tEncStreamDiscontinuity(2, 1, "stream_discontinuity")},
+		{msgFrameV2, tEncFrameV2(2, 1, 5, 6, 9, 10, 64, 48, 1, []byte{0, 0, 0, 1, 0x65})},
+		{msgFrameV2, tEncFrameV2(2, 1, 6, 7, 11, 12, 64, 48, 0, []byte{0, 0, 0, 1, 0x41})},
+	}
+	h := startV2Host(t, "desktop-pipe-secret", hello, msgs)
+	sub, err := Dial(h.name(), "desktop-pipe-secret", 7, SubOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	// host 一次性下发全部 5 帧;等泵处理完(断流已清空缓冲帧)后再读:
+	// 缓冲中只应剩断流之后的两帧,首帧必须是新 epoch 的 IDR。
+	time.Sleep(300 * time.Millisecond)
+	f1 := recvOrFatal[Frame](t, sub.FrameCh(), "post-discontinuity IDR")
+	if !f1.Key || f1.CaptureEpoch != 2 || f1.CodecEpoch != 1 || f1.ContentID != 5 {
+		t.Fatalf("first frame after discontinuity = %+v", f1)
+	}
+	// 恢复:IDR 之后 delta 正常投递。
+	f2 := recvOrFatal[Frame](t, sub.FrameCh(), "post-discontinuity delta")
+	if f2.Key || f2.CaptureEpoch != 2 || f2.ContentID != 6 {
+		t.Fatalf("recovery delta = %+v", f2)
+	}
+	// 断流前的缓冲帧(epoch 1 的 IDR + delta)必须已被清空,不残留。
+	select {
+	case extra, ok := <-sub.FrameCh():
+		if ok {
+			t.Fatalf("stale pre-discontinuity frame survived the drain: %+v", extra)
+		}
+	case <-time.After(100 * time.Millisecond):
+	}
+	// 泵保持健康(断流不致命)。
+	select {
+	case <-sub.Done():
+		t.Fatalf("pump torn down on discontinuity: %v", sub.Err())
+	default:
+	}
+}
+
+// TestStreamDiscontinuityEpochRegression:断流携带的 epoch 对相对已收身份
+// 回退 → 按身份回归致命下线(WAIT_IDR 不覆盖说谎的 host)。
+func TestStreamDiscontinuityEpochRegression(t *testing.T) {
+	hello := tEncHostHelloV2(1, 64, 48, 15, 4)
+	msgs := []v2Msg{
+		{msgFrameV2, tEncFrameV2(2, 1, 3, 4, 5, 6, 64, 48, 1, []byte{0, 0, 0, 1, 0x65})},
+		{msgStreamDisc, tEncStreamDiscontinuity(1, 1, "stream_discontinuity")},
+	}
+	h := startV2Host(t, "desktop-pipe-secret", hello, msgs)
+	sub, err := Dial(h.name(), "desktop-pipe-secret", 7, SubOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-sub.Done():
+		if sub.Err() == nil {
+			t.Fatal("Err() must carry the discontinuity regression")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("pump must tear down on discontinuity epoch regression")
+	}
+}
+
+// TestStreamDiscontinuityV1Reject:v1 连接收到 0x020B → 协议错误下线
+// (0x020B 是 v2 模式消息,镜像 0x0205 的版本拒绝)。
+func TestStreamDiscontinuityV1Reject(t *testing.T) {
+	h := startV2Host(t, "desktop-pipe-secret", tEncHostHello(1, 64, 48, 15, 4),
+		[]v2Msg{{msgStreamDisc, tEncStreamDiscontinuity(2, 1, "stream_discontinuity")}})
+	sub, err := Dial(h.name(), "desktop-pipe-secret", 7, SubOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-sub.Done():
+		if sub.Err() == nil {
+			t.Fatal("Err() must carry the version mismatch")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("pump must tear down on v1 discontinuity")
 	}
 }

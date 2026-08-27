@@ -719,33 +719,76 @@ const char* RtServer::OnAu(const EncodedAU& au) {
   const Frame ev{kFlagEvent, msg_type, 0, std::move(payload)};
   std::lock_guard<std::mutex> lk(mu_);
   stats_.aus_emitted++;
+  // M1 Task 4: remember the fan-out epoch pair - OnState reads it as the
+  // rebuild floor for SubSendQueue::OnRebuildDiscontinuity (suppresses the
+  // pre-rebuild lookahead tail; see subscribers.h).
+  last_au_cap_ = au.id.capture_epoch;
+  last_au_codec_ = au.id.codec_epoch;
+  fan_out_seen_ = true;
   for (auto& kv : conns_) {
     SubConn* c = kv.second.get();
     std::lock_guard<std::mutex> clk(c->mu);
-    const SubSendQueue::AuAction a = c->q->PushAu(is_idr, ev);
-    switch (a) {
-      case SubSendQueue::AuAction::kEnqueued:
-      case SubSendQueue::AuAction::kEnqueuedDisplacingDeltas:
-        stats_.frames_enqueued++;
-        if (is_idr) stats_.keys_enqueued++;
-        break;
-      case SubSendQueue::AuAction::kDroppedNeedKey:
-        // joiner awaiting its IDR (expected, spec §7.5 join-from-IDR)
-        stats_.frames_dropped++;
-        stats_.frames_dropped_needkey++;
-        break;
-      case SubSendQueue::AuAction::kDroppedQueueFull:
-        stats_.frames_dropped++;
-        stats_.frames_dropped_overflow++;
-        // Overflow bookkeeping: re-mark through the table so the merged
-        // pending reason becomes "queue_overflow" (spec §7.5/§7.9).
-        table_.MarkNeedsKeyframe(kv.first, "queue_overflow");
-        XNC_LOG_INFO("rt queue overflow sub=%u (delta dropped)", kv.first);
-        break;
+    if (!opts_.pipeline_v2) {
+      // ---- v1 wire (M0-pinned): §7.9 drop policy, unchanged ----
+      CountAuAction(kv.first, c->q->PushAu(is_idr, ev), is_idr);
+    } else {
+      // ---- v2 wire (M1 Task 4): WAIT_IDR state machine + 0x020B ----
+      const SubSendQueue::V2Push r =
+          c->q->PushAuV2(is_idr, au.id.capture_epoch, au.id.codec_epoch, ev);
+      if (r.discontinuity) {
+        // Epoch advance: tell the client to discard buffered frames and
+        // wait for the IDR of exactly these epochs. Control frames pop
+        // before video AUs, so the 0x020B reaches the wire ahead of the
+        // recovery IDR regardless of push order.
+        c->q->PushControl(
+            Frame{kFlagEvent, kMsgStreamDiscontinuity, 0,
+                  EncodeStreamDiscontinuity(r.capture_epoch, r.codec_epoch,
+                                            kStreamDiscontinuityReason)});
+        stats_.stream_discontinuities++;
+        XNC_LOG_INFO("rt stream discontinuity sub=%u capture_epoch=%llu codec_epoch=%llu",
+                     kv.first, static_cast<unsigned long long>(r.capture_epoch),
+                     static_cast<unsigned long long>(r.codec_epoch));
+        if (r.action == SubSendQueue::AuAction::kDroppedNeedKey) {
+          // The new epoch's first AU was NOT its IDR (encoder lookahead can
+          // delay the reset's forced IDR past the warm-up window). Re-arm a
+          // merged request: the pipeline's on-demand path re-forces an IDR
+          // of the new epoch (spec §13 lists codec-epoch change as a
+          // request source). Never blocks OnAu.
+          table_.MarkNeedsKeyframe(kv.first, "epoch_change");
+          XNC_LOG_INFO("rt epoch change without IDR sub=%u (merged request)", kv.first);
+        }
+      }
+      CountAuAction(kv.first, r.action, is_idr);
     }
     c->cv.notify_all();
   }
   return nullptr;  // never fatal: drops, does not abort the pipeline
+}
+
+void RtServer::CountAuAction(uint32_t sub_id, SubSendQueue::AuAction a,
+                             bool is_idr) {
+  switch (a) {
+    case SubSendQueue::AuAction::kEnqueued:
+    case SubSendQueue::AuAction::kEnqueuedDisplacingDeltas:
+      stats_.frames_enqueued++;
+      if (is_idr) stats_.keys_enqueued++;
+      break;
+    case SubSendQueue::AuAction::kDroppedNeedKey:
+      // joiner awaiting its IDR (expected, spec §7.5 join-from-IDR); also
+      // every delta suppressed by the v2 WAIT_IDR machine (M1 Task 4).
+      stats_.frames_dropped++;
+      stats_.frames_dropped_needkey++;
+      break;
+    case SubSendQueue::AuAction::kDroppedQueueFull:
+      stats_.frames_dropped++;
+      stats_.frames_dropped_overflow++;
+      // Overflow bookkeeping: re-mark through the table so the merged
+      // pending reason becomes "queue_overflow" (spec §7.5/§7.9). In v2
+      // mode PushAuV2 already flushed the queue and re-armed WAIT_IDR.
+      table_.MarkNeedsKeyframe(sub_id, "queue_overflow");
+      XNC_LOG_INFO("rt queue overflow sub=%u (delta dropped)", sub_id);
+      break;
+  }
 }
 
 const char* RtServer::PendingIdrReason() {
@@ -779,6 +822,18 @@ void RtServer::OnState(const char* code, bool recoverable) {
     std::lock_guard<std::mutex> clk(kv.second->mu);
     kv.second->q->PushControl(ev);
     if (rebuilt) {
+      // M1 Task 4 (v2): the rebuild invalidated every pre-rebuild AU still
+      // queued or in flight (encoder lookahead tail) - flush + WAIT_IDR;
+      // the floor (last pre-rebuild fan-out epoch pair) suppresses the old
+      // generation until the new one publishes, and 0x020B rides that first
+      // AU of the new epoch, which the reset forces to be an IDR. A rebuild
+      // BEFORE any AU was fanned out has no floor (nothing is stale yet):
+      // skip - baseline-less subscribers keep join-from-IDR semantics and
+      // still see the 0x020B at the real epoch advance. v1 has no epoch
+      // concept: its flow below stays byte-identical to the M0-pinned
+      // behavior.
+      if (opts_.pipeline_v2 && fan_out_seen_)
+        kv.second->q->OnRebuildDiscontinuity(last_au_cap_, last_au_codec_);
       HostHelloPayload hh{gen_.load(), src_w_, src_h_, opts_.fps, opts_.max_subs};
       hh.displays = CurrentDisplays();
       // M1 Task 2: pipeline_v2 appends the u32 media_protocol=2 field.

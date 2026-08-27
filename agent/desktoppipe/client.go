@@ -26,13 +26,18 @@
 //	MSG_DISPLAY_CHANGED 0x010A event [u32 gen][u32 w][u32 h][char reason[24]]
 //	                            (M2-Slice1 Task 2 入站;统一 CaptureReset 改变
 //	                            流几何时广播;消费侧视作 HOST_HELLO 更新)
+//	MSG_STREAM_DISCONTINUITY 0x020B event (M1 Task 4;v2 模式):[u64 capture_epoch]
+//	                            [u64 codec_epoch][char reason[32]](固定 reason)
+//	                            host 在 epoch 前进(capture 重建)时广播;消费侧
+//	                            清空缓冲帧并 WAIT_IDR,直到该 epoch 对的 IDR。
+//	                            v1 连接收到即拒(反之亦然,镜像 0x0205)。
 //
 // sub_id 由调用方选定(非 0、每 host 唯一——core 侧 StartCapture 每次会话
 // 一连接,随机 u32 即可)。ATTACH 成功无显式响应:HOST_HELLO 即确认
 // (T2 服务端契约);失败形态 = ATTACH FlagError 帧或 STATE{too_many_subs}
-// 后断连。消费模型:FrameCh/StateCh 缓冲通道,FrameCh 满时丢 delta 并
-// 合并请求一次 keyframe(镜像服务端 §7.9 语义),key 帧阻塞送达(可被
-// Close 解除)。
+// 后断连。消费模型:FrameCh/StateCh 缓冲通道;FrameCh 满时清空缓冲帧 +
+// 合并请求一次 keyframe 并抑制 delta 直到 IDR(host 侧 WAIT_IDR 状态机的
+// 镜像;M1 Task 4),key 帧非阻塞送达(满时先排空缓冲帧)。
 package desktoppipe
 
 import (
@@ -64,6 +69,7 @@ const (
 	msgDisplayChg  uint16 = 0x010A
 	msgSwitchDisp  uint16 = 0x0128
 	msgFrameV2     uint16 = 0x0205 // M1 Task 2/3:v2 已验证媒体帧
+	msgStreamDisc  uint16 = 0x020B // M1 Task 4:断流(v2 模式;v1 收到即拒)
 )
 
 // 0x0108 type 值(C++ kInput* 镜像)。
@@ -184,6 +190,14 @@ type DisplayChanged struct {
 	Reason string
 }
 
+// StreamDiscontinuity 是 0x020B 事件(M1 Task 4;仅 v2 连接):epoch 前进
+// (capture 重建)时 host 广播 —— 消费者须丢弃缓冲帧并等待所携 epoch 对
+// 的 IDR。Reason 为固定串(kStreamDiscontinuityReason 镜像)。
+type StreamDiscontinuity struct {
+	CaptureEpoch, CodecEpoch uint64
+	Reason                   string
+}
+
 // InputMsg 是 0x0108 消息的解码形态(payload' 字段逐 type 复用,镜像
 // native InputMsg)。EncodeInputMsg 用 SubID/Seq/Type + 载荷字段产线。
 type InputMsg struct {
@@ -216,15 +230,15 @@ type Sub struct {
 
 	writeMu sync.Mutex // 串行化 DETACH/KEYFRAME_REQ 写
 
-	mu           sync.Mutex // 守护 hello/mediaProto/needKey/closed/pumpErr
-	hello        *HelloInfo
-	mediaProto   uint32 // 协商媒体协议(hello 尾随字段;0 = v1)
-	needKey      bool   // 消费侧丢 delta 后合并的 keyframe 请求标志
-	closed       bool
-	pumpErr      error
-	closeOne     sync.Once
-	closeErr     error
-	ledger       frameLedger // v2 帧身份单调性(pump 独占)
+	mu         sync.Mutex // 守护 hello/mediaProto/needKey/closed/pumpErr
+	hello      *HelloInfo
+	mediaProto uint32 // 协商媒体协议(hello 尾随字段;0 = v1)
+	needKey    bool   // WAIT_IDR 镜像:抑制 delta 直到下一个 IDR(泵独占读)
+	closed     bool
+	pumpErr    error
+	closeOne   sync.Once
+	closeErr   error
+	ledger     frameLedger // v2 帧身份单调性(pump 独占)
 
 	frameCh   chan Frame
 	stateCh   chan StateEvent
@@ -277,6 +291,22 @@ func (l *frameLedger) accept(id frameIdentity) bool {
 	}
 	l.last = id
 	return true
+}
+
+// acceptDiscontinuity 校验 0x020B 所携 epoch 对相对已收身份不回退
+// (M1 Task 4;镜像 accept 的 epoch 序,不改动基线——基线仍由后续帧的
+// accept 推进)。说 epoch 谎的 host 按身份回归致命下线,不走 WAIT_IDR。
+func (l *frameLedger) acceptDiscontinuity(ce, ke uint64) bool {
+	if !l.hasLast {
+		return true
+	}
+	if ce < l.last.captureEpoch {
+		return false
+	}
+	if ce > l.last.captureEpoch {
+		return true
+	}
+	return ke >= l.last.codecEpoch
 }
 
 // Dial 连接 xnc-desktop 实时 pipe,完成握手与 ATTACH,等待 HOST_HELLO
@@ -500,9 +530,9 @@ func (s *Sub) writeCtrl(f *ipc.Frame) error {
 	return nil
 }
 
-// pump 是唯一读方:FRAME → FrameCh(满则丢 delta + 合并 keyframe 请求,
-// key 帧阻塞但可被 Done 解除)、HOST_HELLO → Hello()、STATE → StateCh;
-// 读终结时关闭全部通道。
+// pump 是唯一读方:FRAME → FrameCh(WAIT_IDR 镜像:满则清空 + 合并
+// keyframe 请求,needKey 抑制 delta,key 非阻塞送达)、0x020B → 清空 +
+// needKey、HOST_HELLO → Hello()、STATE → StateCh;读终结时关闭全部通道。
 func (s *Sub) pump() {
 	for {
 		f, err := ipc.ReadFrame(s.conn)
@@ -549,6 +579,30 @@ func (s *Sub) pump() {
 			if !s.deliverFrame(frm) {
 				return
 			}
+		case msgStreamDisc:
+			// M1 Task 4:0x020B 是 v2 模式消息(v1 收到即拒,镜像 0x0205)。
+			if s.mediaProto != mediaProtocolV2 {
+				s.teardown(fmt.Errorf("desktoppipe: v2 stream discontinuity on v1 media connection"))
+				return
+			}
+			ev, err := decodeStreamDiscontinuity(f.Payload)
+			if err != nil {
+				s.teardown(err)
+				return
+			}
+			// 断流携带的 epoch 对必须不回退:说谎的 host 按身份回归下线
+			// (WAIT_IDR 只恢复 overflow/discontinuity/epoch change)。
+			if !s.ledger.acceptDiscontinuity(ev.CaptureEpoch, ev.CodecEpoch) {
+				s.teardown(fmt.Errorf("desktoppipe: stream discontinuity epoch regression: capture_epoch=%d codec_epoch=%d",
+					ev.CaptureEpoch, ev.CodecEpoch))
+				return
+			}
+			// 清空缓冲帧(旧 epoch 已失效)→ WAIT_IDR(needKey):host 侧
+			// reset 已强制该 epoch 对的 IDR,无需再发合并请求。
+			s.drainFrameCh()
+			s.mu.Lock()
+			s.needKey = true
+			s.mu.Unlock()
 		case msgHostHello:
 			h, err := decodeHostHello(f.Payload)
 			if err != nil {
@@ -619,11 +673,18 @@ func (s *Sub) pump() {
 	}
 }
 
-// deliverFrame 交付一帧到 FrameCh:key 帧阻塞送达(可被 Close 解除)并
-// 清合并位;delta 满时丢弃并合并请求一次 keyframe。返回 false 表示泵
-// 已 teardown(调用方须退出)。
+// deliverFrame 交付一帧到 FrameCh(M1 Task 4:host 侧 WAIT_IDR 状态机的
+// 消费侧镜像)。needKey(WAIT_IDR)期间抑制一切 delta;delta 满时溢出:
+// 清空缓冲帧(已缺解码参考,不可补回)、置 needKey、合并请求恰一次
+// keyframe;key 帧非阻塞送达(送达前先排空缓冲帧,缓冲帧相对新 key 已
+// 过期且清空后必有容量)。返回 false 表示泵已 teardown(调用方须退出)。
 func (s *Sub) deliverFrame(frm Frame) bool {
+	s.mu.Lock()
+	needKey := s.needKey
+	s.mu.Unlock()
 	if frm.Key {
+		// 排空再送达:key 永不阻塞泵(慢消费侧由溢出路径合并请求 IDR)。
+		s.drainFrameCh()
 		select {
 		case s.frameCh <- frm:
 		case <-s.done:
@@ -631,26 +692,44 @@ func (s *Sub) deliverFrame(frm Frame) bool {
 			return false
 		}
 		s.mu.Lock()
-		s.needKey = false // key 已送达,合并请求清位
+		s.needKey = false // IDR 已送达,合并请求清位
 		s.mu.Unlock()
 		return true
 	}
+	if needKey {
+		return true // WAIT_IDR:抑制 delta,直到 IDR
+	}
 	select {
 	case s.frameCh <- frm:
+		return true
 	case <-s.done:
 		s.teardown(nil)
 		return false
 	default:
-		// 消费侧落后:丢 delta,合并请求一次 keyframe(§7.9 客户端镜像)。
+		// 消费侧落后:清空缓冲帧(§9 客户端镜像),置 needKey,合并请求
+		// 恰一次 keyframe。
+		s.drainFrameCh()
 		s.mu.Lock()
-		need := s.needKey
+		first := !s.needKey
 		s.needKey = true
 		s.mu.Unlock()
-		if !need {
+		if first {
 			go func() { _ = s.RequestKeyframe("client_overflow") }() //nolint:errcheck // 记账请求,失败随连接终结
 		}
 	}
 	return true
+}
+
+// drainFrameCh 非阻塞排空 FrameCh(泵是唯一发送方,排空后再投递必有余量;
+// 溢出/断流时被丢的缓冲帧是不可恢复的历史,丢弃正是恢复语义)。
+func (s *Sub) drainFrameCh() {
+	for {
+		select {
+		case <-s.frameCh:
+		default:
+			return
+		}
+	}
 }
 
 // teardown 是泵的唯一下线路径:记录终结原因(主动 Close 后为 nil)、
@@ -852,6 +931,24 @@ func decodeState(p []byte) (StateEvent, error) {
 	return StateEvent{Code: string(code), Recoverable: p[32] != 0}, nil
 }
 
+// decodeStreamDiscontinuity 解码 0x020B 事件
+// [u64 capture_epoch][u64 codec_epoch][char reason[32]](M1 Task 4;镜像
+// native DecodeStreamDiscontinuity:48 字节精确长度)。
+func decodeStreamDiscontinuity(p []byte) (StreamDiscontinuity, error) {
+	if len(p) != 48 {
+		return StreamDiscontinuity{}, fmt.Errorf("desktoppipe: stream discontinuity payload %d bytes, want 48", len(p))
+	}
+	reason := p[16:48]
+	if i := bytes.IndexByte(reason, 0); i >= 0 {
+		reason = reason[:i]
+	}
+	return StreamDiscontinuity{
+		CaptureEpoch: binary.LittleEndian.Uint64(p),
+		CodecEpoch:   binary.LittleEndian.Uint64(p[8:]),
+		Reason:       string(reason),
+	}, nil
+}
+
 // decodeCursor 解码 0x0109 光标事件 [s32 x][s32 y][u8 visible]。
 func decodeCursor(p []byte) (CursorEvent, error) {
 	if len(p) != 9 {
@@ -890,7 +987,7 @@ func displayAsHello(ev DisplayChanged, prev *HelloInfo) *HelloInfo {
 	if prev != nil {
 		h.Fps = prev.Fps
 		h.MaxSubs = prev.MaxSubs
-		h.Displays = prev.Displays     // 0x010A 不携带 displays;沿用旧表
+		h.Displays = prev.Displays // 0x010A 不携带 displays;沿用旧表
 		h.MediaProtocol = prev.MediaProtocol
 	}
 	return h
