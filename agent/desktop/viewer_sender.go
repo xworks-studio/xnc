@@ -279,7 +279,14 @@ func (s *ViewerSender) Enqueue(f Frame) error {
 	}
 	s.mu.Lock()
 	now := s.nowFn()
-	keyReason, _ := s.drainLocked(now)
+	// 入口 drain 的写失败同样是发送面死亡:上抛(帧泵据此收线)+ 已转
+	// closed(Task 2 carry:此前被静默吞掉,泵会继续投喂死发送器)。
+	keyReason, derr := s.drainLocked(now)
+	if derr != nil {
+		s.mu.Unlock()
+		s.fireKey(keyReason)
+		return derr
+	}
 
 	fe := frameEpoch{f.CaptureEpoch, f.CodecEpoch}
 	// 自检出不连续(0x020B 丢失的兜底):live 期间帧自带 epoch 前进,

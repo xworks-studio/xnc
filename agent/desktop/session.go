@@ -178,6 +178,10 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 // setupPublisher 建 PeerConnection、接好回调和帧泵,并返回 answer。
 // ictl 在 offer 应答前 attach 三条输入/光标 DataChannel(必须先于
 // HandleOffer 建立),并在 answer 后启动 cursor 泵(0x0109 → cursor 通道)。
+// M3 Task 2:关键帧请求协调器在此组建——本会话全部请求源(RTCP PLI/FIR、
+// 连接就绪、viewer 发送器 overflow/pacer/resume)经 OnKeyRequest seam 汇入
+// (connect=新订阅 urgent),帧泵的 IDR 观测经 idrObservingSource 喂
+// OnIDR;生命周期随 ctx(与帧/状态泵同一收线模型)。
 func (h *Handler) setupPublisher(ctx context.Context, w *wsWriter, src Source,
 	p *proto.DesktopParams, offerSDP string, defDur time.Duration,
 	ictl *inputController, log *slog.Logger) (*Publisher, error) {
@@ -202,11 +206,24 @@ func (h *Handler) setupPublisher(ctx context.Context, w *wsWriter, src Source,
 	if err != nil {
 		return nil, err
 	}
-	// PLI/FIR → host 按需 IDR(reason 进 host 记账)。
+	// 关键帧请求协调器(M3 Task 2):PLI/FIR/connect/overflow/pacer/resume
+	// 全部经协调器合并(connect=新订阅 urgent 绕过 250ms 冷却,其余常规);
+	// host 侧按需产 IDR。宽限内无 IDR → OnState 下发 encoder_idr_timeout
+	// (与 pumpStateEvents 同一 state 帧形态)。sink=src(动态源):重挂后
+	// 请求自动走新 sub。watcher 随 ctx 收线。
+	coord := newKeyframeCoordinator(KeyframeCoordinatorConfig{
+		Sink: src,
+		Ctx:  ctx,
+		OnState: func(code string, recoverable bool) {
+			w.write(ctx, stateFrame{Type: vocabState, Code: code, Recoverable: recoverable})
+		},
+		FramePeriod: defDur,
+		Log:         log,
+	})
+	coord.start()
+	// PLI/FIR/connect/overflow/pacer/resume → 协调器(见上)。
 	pub.OnKeyRequest(func(reason string) {
-		if err := src.RequestKeyframe(reason); err != nil {
-			log.Debug("request keyframe failed", "reason", reason, "err", err)
-		}
+		coord.Request(reason, keyRequestIsUrgent(reason))
 	})
 	// 本地候选 → viewer(trickle;含收集完成哨兵)。
 	pub.OnICECandidate(func(c webrtc.ICECandidateInit) {
@@ -226,8 +243,10 @@ func (h *Handler) setupPublisher(ctx context.Context, w *wsWriter, src Source,
 	w.write(ctx, answerFrame{Type: vocabAnswer, SDP: answerSDP})
 
 	// 帧泵 + 光标泵(泵体见 frames.go;源终结/PC 死即各自退出,会话由
-	// 信令主循环的 WS 错误路径统一收线)。
-	go pumpFrames(ctx, log, src, pub)
+	// 信令主循环的 WS 错误路径统一收线)。帧泵的源经 idrObservingSource
+	// 包裹:key 帧身份(CodecEpoch/EncodeSeq,Task 1 透传)在汇出点喂
+	// coord.OnIDR——在途关键帧请求只被「匹配或更新」的 IDR 清除。
+	go pumpFrames(ctx, log, idrObservingSource{Source: src, onIDR: coord.OnIDR}, pub)
 	go pumpCursor(ctx, src, ictl)
 	return pub, nil
 }

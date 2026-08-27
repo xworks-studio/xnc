@@ -4,8 +4,10 @@
 // ConfigureTWCCHeaderExtensionSender 装配;本文件只做:
 //
 //   - RTCP 泵:消费 viewer 回传的 PLI/FIR/NACK/TWCC 反馈——PLI/FIR 触发
-//     OnKeyRequest(reason)→ session 侧转成 Source.RequestKeyframe
-//     (host 侧 ForceNextIdr 记账,reason="pli"/"fir" ≤31B);
+//     OnKeyRequest(reason)→ session 侧经 KeyframeCoordinator(M3 Task 2)
+//     合并后转 Source.RequestKeyframe(reason="pli"/"fir",≤31B);
+//   - keyRequestIsUrgent:Publisher seam 各 reason 的 urgent 判定(connect=
+//     新订阅绕过 250ms 冷却;其余常规);
 //   - 计数器透传:PubStats 快照供 session/日志/e2e 观测(不含任何凭据)。
 //
 // Slice3 扩展位:按 TWCC/REMB 反馈调码率、按 NACK 率降帧率(本片不实现)。
@@ -68,9 +70,20 @@ func (p *Publisher) rtcpLoop() {
 	}
 }
 
-// fireKeyRequest 触发注册的关键帧回调(session 侧接 Source.RequestKeyframe)。
+// fireKeyRequest 触发注册的关键帧回调(session 侧接 KeyframeCoordinator:
+// RTCP PLI/FIR、连接就绪 connect 与发送器 overflow/pacer/resume 全部经此
+// seam 汇入协调器,由它合并/冷却后打 host)。
 func (p *Publisher) fireKeyRequest(reason string) {
 	if fn := p.keyFn; fn != nil {
 		fn(reason)
 	}
+}
+
+// keyRequestIsUrgent 判定 Publisher seam 上一个 reason 是否 urgent(裁决 2:
+// 绕过 250ms 常规冷却,但在途请求仍不复制):connect=新订阅——ICE+DTLS
+// 就绪需要立即产 fresh IDR(首帧语义);epoch 变更的 urgent 请求由 Task 3
+// 的 QoS 动作直接走 coordinator API。其余(pli/fir/overflow/pacer/resume)
+// 一律常规冷却。
+func keyRequestIsUrgent(reason string) bool {
+	return reason == "connect"
 }

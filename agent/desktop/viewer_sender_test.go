@@ -5,9 +5,12 @@
 package desktop
 
 import (
+	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -703,4 +706,65 @@ func expectedPacketCount(t *testing.T, au []byte) int {
 		t.Fatalf("expectedPacketCount: no packets for %d byte AU", len(au))
 	}
 	return n
+}
+
+// ---- Task 2 carry(Task 1 遗留):入口 drain 写错误上抛 ----
+
+// failableRTPSink 在置位后对每个写出返回错误(模拟 PC 关闭形态的出口死亡)。
+type failableRTPSink struct {
+	inner *fakeRTPSink
+	fail  atomic.Bool
+}
+
+func (s *failableRTPSink) write(p *rtp.Packet) error {
+	if s.fail.Load() {
+		return errors.New("sink dead")
+	}
+	return s.inner.write(p)
+}
+
+// TestViewerSenderEntryDrainWriteErrorPropagates:入口 drain(Enqueue 开头
+// 对到期在队包的冲写)遇写失败时,错误必须上抛(发送面死亡,pumpFrames
+// 据此收线)且发送器转 closed——不得静默吞掉后继续被投喂。
+func TestViewerSenderEntryDrainWriteErrorPropagates(t *testing.T) {
+	sink := &failableRTPSink{inner: &fakeRTPSink{}}
+	clk := newManualClock()
+	vs, err := newViewerSender(ViewerSenderConfig{
+		WritePacket: sink.write,
+		Now:         clk.Now,
+		Log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("newViewerSender: %v", err)
+	}
+	// 小预算铺开大 IDR:首 drain 出 burst,余包在队(到期时刻分布在未来)。
+	if err := vs.Enqueue(Frame{Key: true, PresentMonoUs: vsMono(1), AU: vsBigIDRAU(20_000)}); err != nil {
+		t.Fatalf("big idr: %v", err)
+	}
+	total := expectedPacketCount(t, vsBigIDRAU(20_000))
+	if sent := sink.inner.count(); sent == 0 || sent >= total {
+		t.Fatalf("expected deferred remainder, sent=%d/%d", sent, total)
+	}
+	// 推进 50ms(队列年龄 50ms < 100ms:不走 overflow,走到期包冲写路径),
+	// 出口死亡后下一次 Enqueue 的入口 drain 必须把写错误上抛。
+	clk.advance(50 * time.Millisecond)
+	sink.fail.Store(true)
+	err = vs.Enqueue(delta(2))
+	if err == nil {
+		t.Fatal("entry-drain write error was silently swallowed")
+	}
+	if !strings.Contains(err.Error(), "write RTP packet") {
+		t.Fatalf("err = %v, want write RTP packet failure", err)
+	}
+	if st := vs.stateSnapshot(); st != stateClosed {
+		t.Fatalf("state after entry-drain failure=%v, want closed", st)
+	}
+	// closed 后续帧静默丢弃(不报错),泵侧可凭首错收线。
+	if err := vs.Enqueue(delta(3)); err != nil {
+		t.Fatalf("closed enqueue must not error: %v", err)
+	}
+	if st := vs.Stats(); st.ClosedDropped != 1 {
+		t.Fatalf("closedDropped=%d, want 1", st.ClosedDropped)
+	}
+	vs.Close() // 幂等,无泵也能安全收线
 }

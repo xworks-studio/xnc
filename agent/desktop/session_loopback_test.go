@@ -621,19 +621,21 @@ func TestSessionLoopbackVideoAndPLI(t *testing.T) {
 		t.Fatalf("no keyframe before PLI (frames=%d)", vstats.frames.Load())
 	}
 
-	// ④ PLI → RequestKeyframe("pli") → 新 IDR:
-	if err := vpc.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(track.SSRC())}}); err != nil {
-		t.Fatalf("write PLI: %v", err)
-	}
+	// ④ PLI → KeyframeCoordinator(M3 Task 2:connect 请求后 250ms 冷却内的
+	// PLI 会被合并——真实 viewer 在未恢复时会按节奏重发,此处同样重发)
+	// → RequestKeyframe("pli") → 新 IDR:
 	gotPLI := false
 	deadline := time.Now().Add(5 * time.Second)
 	for !gotPLI && time.Now().Before(deadline) {
+		if err := vpc.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(track.SSRC())}}); err != nil {
+			t.Fatalf("write PLI: %v", err)
+		}
 		for _, r := range src.KeyRequests() {
 			if r == "pli" {
 				gotPLI = true
 			}
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(300 * time.Millisecond)
 	}
 	if !gotPLI {
 		t.Fatalf("PLI never reached source as RequestKeyframe(\"pli\"); reqs=%v", src.KeyRequests())
