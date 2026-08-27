@@ -38,9 +38,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -79,7 +81,13 @@ type config struct {
 	inputBeforeKeyframe bool          // 探针:跳过首关键帧门(锁屏静止场景注入)
 	sas                 bool          // server 模式:连接后发一次 secure_attention,结果+计时进 summary
 	switchDisplay       int           // server 模式:连接后发一次 switch_display(-1=off;M2-S3 Task 5)
-	jsonOnly            bool
+	// M3 Task 6:TURN/TCP 拥塞 E2E。
+	fbBps             uint64  // >0:server 模式每 1s 注入一条合成 viewer_feedback(estimatedBps=fbBps)
+	fbQueueMs         float64 // 合成反馈的 queueMs(拥塞判据:>100 触发立即降档)
+	fbRttMs           float64 // 合成反馈的 rttMs(随档记录,不参与 agent 判据)
+	expectQueueMaxMs  int     // 0=跳过;接收侧排队年龄硬上限断言(全局约束 100ms)
+	expectRecoveryIdr bool    // 恢复必须 IDR 起步(接收间隙后首帧非 IDR = 违例)
+	jsonOnly          bool
 }
 
 func parseFlags() *config {
@@ -112,6 +120,16 @@ func parseFlags() *config {
 		"server mode: after connect, send one {secure_attention} control frame (core 0x0110) and record the result + timing in the summary JSON (sas field)")
 	flag.IntVar(&c.switchDisplay, "switch-display", -1,
 		"server mode: after connect, send one {switch_display,index=N} control frame (M2-S3 Task 5; observe displaySamples reason=switch / state invalid_display)")
+	// M3 Task 6:合成 viewer_feedback 注入(网络矩阵的 loopback/确定性模式:
+	// 链路不受限,由 harness 按档位驱动 agent 的 QoS 决策环)。
+	flag.Uint64Var(&c.fbBps, "fb-bps", 0,
+		"synthetic viewer_feedback: send {estimatedBps=fb-bps, queueMs=fb-queue-ms, rttMs=fb-rtt-ms} every 1s over the session WS (server mode; 0=off)")
+	flag.Float64Var(&c.fbQueueMs, "fb-queue-ms", 5, "synthetic viewer_feedback queueMs (>100 = congestion at the agent)")
+	flag.Float64Var(&c.fbRttMs, "fb-rtt-ms", 30, "synthetic viewer_feedback rttMs (recorded, not part of the agent's decision)")
+	flag.IntVar(&c.expectQueueMaxMs, "expect-queue-max-ms", 0,
+		"fail if the receive-side queue-age max exceeds this ms (0=skip; global constraint hard max 100)")
+	flag.BoolVar(&c.expectRecoveryIdr, "expect-recovery-idr", false,
+		"fail if any recovery (first decoded AU after a receive gap) is not an IDR (no post-drop delta continuation)")
 	flag.BoolVar(&c.jsonOnly, "json", false, "print only the JSON summary")
 	flag.Parse()
 	return c
@@ -190,6 +208,18 @@ type viewer struct {
 	pliAttempts atomic.Int32 // 本轮(episode)PLI 已发送数(含首发)
 	pliRetries  atomic.Uint64
 	pliIDRMax   atomic.Int64 // PLI→IDR 最大时延(ms;0=未发生)
+	// M3 Task 6:PLI→present(首 PLI → IDR AU 从 samplebuilder 拼出可解码,
+	// 即 harness 的渲染代理;与 pliIDRMax 的差 ≈ 一个帧距 + 重组时延)。
+	pliPresentMax atomic.Int64
+	// lastMarkerNs:最近一个 marker 包(帧尾包)到达时刻(UnixNano)。pop
+	// 出的 AU 的 marker 必先于触发本次 pop 的下一帧首包到达,故 pop 时刻
+	// 读它即被 pop AU 的帧尾到达时刻(PLI→IDR 的 IDR 产出点)。
+	lastMarkerNs atomic.Int64
+
+	// fbFn 是合成 viewer_feedback 发送钩(runServer / loopback 测试注入;
+	// runFor 的 1s ticker 调用)。fbSent 计数进 summary。
+	fbFn   func()
+	fbSent atomic.Uint64
 
 	// cursor 通道记录(server 模式;计数全量,样本截 cap —— T6 门④
 	// 时延核对用,TMs = 相对 viewer start)。
@@ -214,11 +244,27 @@ type viewer struct {
 	// AU/IDR 到达环(M2-Slice1 Task 6 门时序证据):解码 AU(与其中关键
 	// 帧)的相对到达 ms,截尾保留最近一段;collect 时导出 + 计算
 	// DISPLAY_CHANGED 后首帧间隔(门③ ≤2s)与窗口内 fps/IDR(门④)。
-	auMu     sync.Mutex
-	auTimes  []int64
-	keyTimes []int64
+	// M3 Task 6:环元素改为 (tMs, isKey) 记录 —— 恢复检测(间隙后首帧
+	// 必须 IDR)需要两列对齐;导出形态(AuTimesMs/KeyTimesMs)不变。
+	auMu sync.Mutex
+	aus  []auRec
 
-	// --sas(--input-script sas op 同路)结果记录(M2-Slice1 Task 5):
+	// M3 Task 6:接收侧排队年龄采样 + RTP 时戳回归计数(noteMarker 维护;
+	// 见 queueAgeStats 的基线抵消说明)。latSamples 为环形截尾。
+	latMu      sync.Mutex
+	latSamples []float64
+	tsExt      int64  // 回绕展开后的 90kHz 时戳(ticks)
+	tsLast     uint32 // 最近一个 marker 包的原始 32 位时戳
+	tsInit     bool
+	rtpRegs    int // 帧边界(marker)RTP 时戳回归计数(重复/回退)
+
+	// M3 Task 6:frame-meta 通道记录(agent 侧每帧一条 56B FrameMetaV1;
+	// decodeFrameMetaRec 解码)。计数全量,样本截 cap。
+	metaMu    sync.Mutex
+	metaCount uint64
+	metas     []frameMetaRec
+
+	// sas(--input-script sas op 同路)结果记录(M2-Slice1 Task 5):
 	// 请求发出时刻 + 回执(ok/hr/code)+ rtt;summary.sas。
 	sasMu     sync.Mutex
 	sasResult *sasOutcome
@@ -389,24 +435,23 @@ func (v *viewer) stateStats() (uint64, []stateSample) {
 const (
 	auRingCap  = 8192
 	auRingKeep = 4096
-	keyRingCap = 2048
-	keyRingKeep = 1024
 )
 
-// recordAu 记一个解码 AU 的到达时刻(关键帧另记 keyTimes)。
+// auRec 是到达环元素:解码 AU 的相对到达 ms + 是否关键帧(恢复检测需要
+// 两列对齐 —— 间隙后的首帧必须 IDR)。
+type auRec struct {
+	TMs int64
+	Key bool
+}
+
+// recordAu 记一个解码 AU 的到达时刻与关键帧位。
 func (v *viewer) recordAu(isKey bool) {
 	t := time.Since(v.start).Milliseconds()
 	v.auMu.Lock()
 	defer v.auMu.Unlock()
-	v.auTimes = append(v.auTimes, t)
-	if len(v.auTimes) > auRingCap {
-		v.auTimes = append(v.auTimes[:0], v.auTimes[len(v.auTimes)-auRingKeep:]...)
-	}
-	if isKey {
-		v.keyTimes = append(v.keyTimes, t)
-		if len(v.keyTimes) > keyRingCap {
-			v.keyTimes = append(v.keyTimes[:0], v.keyTimes[len(v.keyTimes)-keyRingKeep:]...)
-		}
+	v.aus = append(v.aus, auRec{TMs: t, Key: isKey})
+	if len(v.aus) > auRingCap {
+		v.aus = append(v.aus[:0], v.aus[len(v.aus)-auRingKeep:]...)
 	}
 }
 
@@ -415,23 +460,267 @@ func (v *viewer) recordAu(isKey bool) {
 func (v *viewer) firstAuAfter(t int64) int64 {
 	v.auMu.Lock()
 	defer v.auMu.Unlock()
-	for _, at := range v.auTimes {
-		if at >= t {
-			return at
+	for _, a := range v.aus {
+		if a.TMs >= t {
+			return a.TMs
 		}
 	}
 	return -1
 }
 
-// auRingSnapshot 返回(auTimes, keyTimes)副本。
-func (v *viewer) auRingSnapshot() ([]int64, []int64) {
+// auRingSnapshot 返回到达环副本。
+func (v *viewer) auRingSnapshot() []auRec {
 	v.auMu.Lock()
 	defer v.auMu.Unlock()
-	a := make([]int64, len(v.auTimes))
-	copy(a, v.auTimes)
-	k := make([]int64, len(v.keyTimes))
-	copy(k, v.keyTimes)
-	return a, k
+	out := make([]auRec, len(v.aus))
+	copy(out, v.aus)
+	return out
+}
+
+// latSampleCap / latSampleKeep:排队年龄采样环上限与截尾保留量。
+const (
+	latSampleCap  = 8192
+	latSampleKeep = 4096
+)
+
+// noteMarker 记一次帧边界到达(marker 包):展开 90kHz 时戳(回绕感知)、
+// 计 RTP 时戳回归、追加单向时延代理样本 lat = 到达相对 ms − 时戳 ms。发
+// 送侧 RTP 时戳源自其单调钟,与 v.start 的零点差/传播时延是常量偏置 ——
+// queueAgeStats 以运行最小值抵消,余量即发送侧排队(pacing 铺开)的增长。
+func (v *viewer) noteMarker(ts uint32, at time.Time) {
+	elapsed := float64(at.Sub(v.start)) / float64(time.Millisecond)
+	v.latMu.Lock()
+	if v.tsInit {
+		d, reg := rtpStep(v.tsLast, ts)
+		if reg {
+			v.rtpRegs++
+		}
+		v.tsExt += d
+	} else {
+		v.tsInit = true
+		v.tsExt = int64(ts)
+	}
+	v.tsLast = ts
+	v.latSamples = append(v.latSamples, elapsed-float64(v.tsExt)/90.0)
+	if len(v.latSamples) > latSampleCap {
+		v.latSamples = append(v.latSamples[:0], v.latSamples[len(v.latSamples)-latSampleKeep:]...)
+	}
+	v.latMu.Unlock()
+	v.lastMarkerNs.Store(at.UnixNano())
+}
+
+// latSnapshot 返回排队年龄样本副本。
+func (v *viewer) latSnapshot() []float64 {
+	v.latMu.Lock()
+	defer v.latMu.Unlock()
+	out := make([]float64, len(v.latSamples))
+	copy(out, v.latSamples)
+	return out
+}
+
+// rtpRegressionCount 返回帧边界 RTP 时戳回归计数。
+func (v *viewer) rtpRegressionCount() int {
+	v.latMu.Lock()
+	defer v.latMu.Unlock()
+	return v.rtpRegs
+}
+
+// metaSampleCap:frame-meta 样本上限(回归计数只吃样本内;遥测本就可丢)。
+const metaSampleCap = 4096
+
+// recordMetaMsg 解码并记录一条 frame-meta 通道消息(形态不符静默丢弃 ——
+// 遥测绝不成媒体状态)。
+func (v *viewer) recordMetaMsg(b []byte) {
+	rec, ok := decodeFrameMetaRec(b)
+	if !ok {
+		return
+	}
+	v.metaMu.Lock()
+	defer v.metaMu.Unlock()
+	v.metaCount++
+	if len(v.metas) < metaSampleCap {
+		v.metas = append(v.metas, rec)
+	}
+}
+
+// metaStats 返回(累计记录数,样本副本)。
+func (v *viewer) metaStats() (uint64, []frameMetaRec) {
+	v.metaMu.Lock()
+	defer v.metaMu.Unlock()
+	out := make([]frameMetaRec, len(v.metas))
+	copy(out, v.metas)
+	return v.metaCount, out
+}
+
+// ---- M3 Task 6 纯逻辑(单测钉死;collect/evaluate 消费)----
+
+// percentile 是 nearest-rank 百分位:输入必须已升序;空 = 0。
+// idx = ceil(p·n) − 1,钳到 [0, n−1]。
+func percentile(sorted []float64, p float64) float64 {
+	n := len(sorted)
+	if n == 0 {
+		return 0
+	}
+	idx := int(math.Ceil(p*float64(n))) - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= n {
+		idx = n - 1
+	}
+	return sorted[idx]
+}
+
+// queueAgeStats 把逐帧单向时延代理(见 noteMarker)折算成排队年龄分布:
+// 每样本减去运行最小值(≈ 无排队基线,含时钟零点差与传播时延),返回
+// p50/p95/max(ms)。max 即「队列硬上限 100ms」断言的接收侧观测量。
+func queueAgeStats(latMs []float64) (p50, p95, maxAge float64) {
+	if len(latMs) == 0 {
+		return 0, 0, 0
+	}
+	base := latMs[0]
+	ages := make([]float64, len(latMs))
+	for i, l := range latMs {
+		if l < base {
+			base = l
+		}
+		ages[i] = l - base
+	}
+	sort.Float64s(ages)
+	return percentile(ages, 0.50), percentile(ages, 0.95), ages[len(ages)-1]
+}
+
+// rtpStep 计算 32 位 RTP 时戳的帧间步进(回绕感知:int32 差值让 2^32 回
+// 绕天然为正)。delta <= 0 即回归(重复或回退)。
+func rtpStep(prev, cur uint32) (delta int64, regression bool) {
+	d := int32(cur - prev)
+	return int64(d), d <= 0
+}
+
+// frameMetaRec 是 agent/desktop/frame_meta.go FrameMetaV1 的 56 字节记录
+// 中参与回归观测的字段(布局镜像;两侧均禁手拼 —— 本文件是第三份镜像,
+// 与 web/src/lib/desktopFrameMeta.ts 同源)。
+type frameMetaRec struct {
+	RTPTimestamp uint32
+	CodecEpoch   uint64
+	ContentID    uint64
+	EncodeSeq    uint64
+	SourceMonoUs uint64
+}
+
+const (
+	frameMetaV1Size    = 56
+	frameMetaV1Version = 1
+	// dcLabelFrameMeta 是 agent 创建的 frame-meta DataChannel 标签
+	//(agent/desktop/frame_meta.go dcLabelFrameMeta 的跨模块镜像)。
+	dcLabelFrameMeta = "frame-meta"
+	// spectatorPausedCode 是 QoS PauseSpectator 下发的稳定态 state code
+	//(agent/desktop/signaling.go vocabStateSpectatorPaused 的镜像)。
+	spectatorPausedCode = "spectator_network_paused"
+)
+
+// decodeFrameMetaRec 解码一条 56 字节 FrameMetaV1(小端;version 必须 1,
+// 长度必须精确 56;其余形态一律拒绝)。
+func decodeFrameMetaRec(b []byte) (frameMetaRec, bool) {
+	if len(b) != frameMetaV1Size || b[0] != frameMetaV1Version {
+		return frameMetaRec{}, false
+	}
+	return frameMetaRec{
+		RTPTimestamp: binary.LittleEndian.Uint32(b[4:]),
+		CodecEpoch:   binary.LittleEndian.Uint64(b[8:]),
+		ContentID:    binary.LittleEndian.Uint64(b[16:]),
+		EncodeSeq:    binary.LittleEndian.Uint64(b[24:]),
+		SourceMonoUs: binary.LittleEndian.Uint64(b[32:]),
+	}, true
+}
+
+// countFrameMetaRegressions 镜像 desktoppipe frameLedger.accept 的身份单
+// 调性(codecEpoch 维 —— captureEpoch 不进 56 字节记录):epoch 前进重基
+// 线;同 epoch 内 contentId 回退 / encodeSeq 不前进即回归;被拒记录不推
+// 进基线。按到达序消费(unordered 通道:乱序到达即表现为回归,如实计数)。
+func countFrameMetaRegressions(recs []frameMetaRec) (contentIDRegs, encodeSeqRegs, epochRegs int) {
+	var hasLast bool
+	var le, lc, ls uint64
+	for _, r := range recs {
+		if !hasLast {
+			hasLast, le, lc, ls = true, r.CodecEpoch, r.ContentID, r.EncodeSeq
+			continue
+		}
+		switch {
+		case r.CodecEpoch < le:
+			epochRegs++
+			continue // 拒收:基线不动
+		case r.CodecEpoch > le:
+			// epoch 前进:重基线,跌落合法
+		case r.ContentID < lc:
+			contentIDRegs++
+			continue
+		case r.EncodeSeq <= ls:
+			encodeSeqRegs++
+			continue
+		}
+		le, lc, ls = r.CodecEpoch, r.ContentID, r.EncodeSeq
+	}
+	return contentIDRegs, encodeSeqRegs, epochRegs
+}
+
+// 恢复检测参数:间隙阈值 = max(300ms, 6×p50 帧距)—— 稳定帧距不构成恢
+// 复,真实丢帧(溢出抑制/暂停)远超一个帧距的倍数。
+const (
+	recoveryGapFloorMs int64 = 300
+	recoveryGapMult          = 6
+)
+
+// recoveryGapMs 计算到达序列的自适应恢复间隙阈值。
+func recoveryGapMs(aus []auRec) int64 {
+	if len(aus) < 2 {
+		return recoveryGapFloorMs
+	}
+	iv := make([]float64, 0, len(aus)-1)
+	for i := 1; i < len(aus); i++ {
+		iv = append(iv, float64(aus[i].TMs-aus[i-1].TMs))
+	}
+	sort.Float64s(iv)
+	g := int64(float64(recoveryGapMult) * percentile(iv, 0.50))
+	if g < recoveryGapFloorMs {
+		g = recoveryGapFloorMs
+	}
+	return g
+}
+
+// recoveryViolations 数「恢复违例」:接收间隙 ≥ gapMs 后的首帧非 IDR
+//(丢帧后 delta 续流 —— WAIT_IDR 语义被破坏的直接接收侧证据)。
+func recoveryViolations(aus []auRec, gapMs int64) int {
+	if len(aus) < 2 || gapMs <= 0 {
+		return 0
+	}
+	n := 0
+	for i := 1; i < len(aus); i++ {
+		if aus[i].TMs-aus[i-1].TMs >= gapMs && !aus[i].Key {
+			n++
+		}
+	}
+	return n
+}
+
+// pausedIntervals 从 state 样本推导暂停区间(M3 词汇无解除帧:暂停是稳
+// 定态,直到会话结束;后续不同 code 的样本不解除)。events = 观测到的
+// spectator_network_paused 帧数;pausedMs = 首个暂停样本 → run 结束。
+func pausedIntervals(samples []stateSample, endMs int64) (events int, pausedMs int64) {
+	first := int64(-1)
+	for _, s := range samples {
+		if s.Code != spectatorPausedCode {
+			continue
+		}
+		events++
+		if first < 0 || s.TMs < first {
+			first = s.TMs
+		}
+	}
+	if first >= 0 && endMs > first {
+		pausedMs = endMs - first
+	}
+	return events, pausedMs
 }
 
 // recordCursor 记一条 cursor 通道事件(server 模式 OnDataChannel 调用)。
@@ -504,6 +793,9 @@ func newViewer(c *config, ice []webrtc.ICEServer, relay bool, log *slog.Logger) 
 				return
 			}
 			v.rtpPkts.Add(1)
+			if pkt.Marker {
+				v.noteMarker(pkt.Timestamp, time.Now())
+			}
 			sb.Push(pkt)
 			for {
 				smp := sb.Pop()
@@ -522,12 +814,26 @@ func newViewer(c *config, ice []webrtc.ICEServer, relay bool, log *slog.Logger) 
 				if isKey {
 					if t := v.pliMu.Swap(0); t != 0 {
 						// PLI→IDR 从本轮首 PLI 起算(重发不重置表尺:
-						// 慢就是慢,门④不能被 retry 稀释)。
+						// 慢就是慢,门④不能被 retry 稀释)。M3 Task 6
+						// 起 IDR 产出点 = IDR AU 帧尾包(marker)到达
+						// (lastMarkerNs,见字段注释),present 点 = 本
+						// 次 pop(harness 的渲染代理)。
 						if f := v.pliFirstAt.Swap(0); f != 0 {
-							ms := time.Since(time.Unix(0, f)).Milliseconds()
+							idrNs := v.lastMarkerNs.Load()
+							if idrNs < f {
+								idrNs = now // 病态(标记早于首 PLI):保守上界
+							}
+							ms := (idrNs - f) / int64(time.Millisecond)
 							for {
 								old := v.pliIDRMax.Load()
 								if ms <= old || v.pliIDRMax.CompareAndSwap(old, ms) {
+									break
+								}
+							}
+							pms := (now - f) / int64(time.Millisecond)
+							for {
+								old := v.pliPresentMax.Load()
+								if pms <= old || v.pliPresentMax.CompareAndSwap(old, pms) {
 									break
 								}
 							}
@@ -592,44 +898,101 @@ func pliRetryDecision(since time.Duration, attempts, maxSends int, retryAfter ti
 
 // summary 是断言输入与 --json 输出形态(T6 脚本契约)。
 type summary struct {
-	Mode             string          `json:"mode"`
-	StartUnixMs      int64           `json:"startUnixMs"` // viewer 起点绝对时刻(cursorSamples.tMs 的零点)
-	Connected        bool            `json:"connected"`
-	FirstFrameMs     int64           `json:"firstFrameMs"`
-	FirstKey         bool            `json:"firstKey"`
-	RtpPackets       uint64          `json:"rtpPackets"`
-	Frames           uint64          `json:"frames"`
-	Keyframes        uint64          `json:"keyframes"`
-	Bytes            uint64          `json:"bytes"`
-	DumpFile         string          `json:"dumpFile,omitempty"`
-	Relay            bool            `json:"relay"`
-	PlisSent         uint64          `json:"plisSent"`
-	PliRetries       uint64          `json:"pliRetries"`
-	KeyframeReqs     uint64          `json:"keyframeReqs"`
-	PliToIdrMaxMs    int64           `json:"pliToIdrMaxMs"`
-	CursorEvents     uint64          `json:"cursorEvents"`
-	CursorSamples    []cursorSample  `json:"cursorSamples,omitempty"`
-	DisplayEvents    uint64          `json:"displayEvents"`
-	HelloDisplays    []displayInfo   `json:"helloDisplays,omitempty"`
-	DisplaySamples   []displaySample `json:"displaySamples,omitempty"`
-	DisplayResumeMs  []int64         `json:"displayResumeMs,omitempty"`
-	StateEvents      uint64          `json:"stateEvents"`
-	StateSamples     []stateSample   `json:"stateSamples,omitempty"`
-	AuTimesMs        []int64         `json:"auTimesMs,omitempty"`
-	KeyTimesMs       []int64         `json:"keyTimesMs,omitempty"`
-	Sas              *sasOutcome     `json:"sas,omitempty"`
-	Switch           *switchOutcome  `json:"switch,omitempty"`
-	Input            *scriptResult   `json:"input,omitempty"`
-	DurationMs       int64           `json:"durationMs"`
-	AssertionsPassed bool            `json:"assertionsPassed"`
-	Failures         []string        `json:"failures,omitempty"`
+	Mode            string          `json:"mode"`
+	StartUnixMs     int64           `json:"startUnixMs"` // viewer 起点绝对时刻(cursorSamples.tMs 的零点)
+	Connected       bool            `json:"connected"`
+	FirstFrameMs    int64           `json:"firstFrameMs"`
+	FirstKey        bool            `json:"firstKey"`
+	RtpPackets      uint64          `json:"rtpPackets"`
+	Frames          uint64          `json:"frames"`
+	Keyframes       uint64          `json:"keyframes"`
+	Bytes           uint64          `json:"bytes"`
+	DumpFile        string          `json:"dumpFile,omitempty"`
+	Relay           bool            `json:"relay"`
+	PlisSent        uint64          `json:"plisSent"`
+	PliRetries      uint64          `json:"pliRetries"`
+	KeyframeReqs    uint64          `json:"keyframeReqs"`
+	PliToIdrMaxMs   int64           `json:"pliToIdrMaxMs"`
+	CursorEvents    uint64          `json:"cursorEvents"`
+	CursorSamples   []cursorSample  `json:"cursorSamples,omitempty"`
+	DisplayEvents   uint64          `json:"displayEvents"`
+	HelloDisplays   []displayInfo   `json:"helloDisplays,omitempty"`
+	DisplaySamples  []displaySample `json:"displaySamples,omitempty"`
+	DisplayResumeMs []int64         `json:"displayResumeMs,omitempty"`
+	StateEvents     uint64          `json:"stateEvents"`
+	StateSamples    []stateSample   `json:"stateSamples,omitempty"`
+	AuTimesMs       []int64         `json:"auTimesMs,omitempty"`
+	KeyTimesMs      []int64         `json:"keyTimesMs,omitempty"`
+	Sas             *sasOutcome     `json:"sas,omitempty"`
+	Switch          *switchOutcome  `json:"switch,omitempty"`
+	Input           *scriptResult   `json:"input,omitempty"`
+
+	// ---- M3 Task 6:TURN/TCP 拥塞 E2E 报告字段(来源见 task-6 报告的
+	// source map:接收侧 = 本 viewer 的 RTP/AU/frame-meta 观测;agent 侧
+	// = direct 模式同进程 Publisher 的既有 stats 面)----
+
+	// QueueAge*:接收侧排队年龄分布(noteMarker 采样 → queueAgeStats;
+	// 单向时延代理减运行最小值,余量 = 发送侧排队/pacing 铺开)。
+	QueueAgeP50Ms float64 `json:"queueAgeP50Ms"`
+	QueueAgeP95Ms float64 `json:"queueAgeP95Ms"`
+	QueueAgeMaxMs float64 `json:"queueAgeMaxMs"`
+	// RtpTsRegressions:接收流帧边界(marker)RTP 时戳回归计数。
+	RtpTsRegressions int `json:"rtpTsRegressions"`
+	// FrameMeta*:frame-meta 通道(56B FrameMetaV1)解码计数与身份回归
+	//(contentId/encodeSeq/epoch;desktoppipe frameLedger 语义的镜像)。
+	FrameMetaCount        uint64 `json:"frameMetaCount,omitempty"`
+	ContentIdRegressions  int    `json:"contentIdRegressions"`
+	EncodeSeqRegressions  int    `json:"encodeSeqRegressions"`
+	CodecEpochRegressions int    `json:"codecEpochRegressions"`
+	// PliToPresentMaxMs:首 PLI → IDR AU 拼出可解码(harness 渲染代理)。
+	PliToPresentMaxMs int64 `json:"pliToPresentMaxMs"`
+	// Recovery*:接收间隙(≥ 自适应阈值)后的首帧非 IDR = 违例
+	//(丢帧后 delta 续流的接收侧证据;--expect-recovery-idr 消费)。
+	RecoveryGapMs      int64 `json:"recoveryGapMs"`
+	RecoveryViolations int   `json:"recoveryViolations"`
+	// Paused*:spectator_network_paused 稳定态观测(per-viewer:每个
+	// viewer 进程各记各的;M3 无解除词汇 → 区间 = 首个暂停样本 → run 结束)。
+	PausedEvents int   `json:"pausedEvents"`
+	PausedMs     int64 `json:"pausedMs"`
+	// FbSent:合成 viewer_feedback 发出条数(--fb-bps / loopback 注入)。
+	FbSent uint64 `json:"fbSent,omitempty"`
+	// Pub / TelemetryDrops:direct 模式专属 —— 同进程 agent Publisher 的
+	// 既有 stats 面(PubStats + frame-meta 遥测丢弃)。server 模式为 nil
+	//(跨进程不可见;QoS 动作经 state 帧/pacing 观测)。
+	Pub            *pubStatsReport `json:"pub,omitempty"`
+	TelemetryDrops uint64          `json:"telemetryDrops,omitempty"`
+
+	DurationMs       int64    `json:"durationMs"`
+	AssertionsPassed bool     `json:"assertionsPassed"`
+	Failures         []string `json:"failures,omitempty"`
+}
+
+// pubStatsReport 是 direct 模式汇入 summary 的 agent 侧 Publisher 计数
+//(desktop.PubStats 的 JSON 形态;计数语义见 agent/desktop/transport.go)。
+type pubStatsReport struct {
+	FramesWritten  uint64 `json:"framesWritten"`
+	BytesWritten   uint64 `json:"bytesWritten"`
+	PreConnDropped uint64 `json:"preConnDropped"`
+	PreKeyDropped  uint64 `json:"preKeyDropped"`
+	PLI            uint64 `json:"pli"`
+	FIR            uint64 `json:"fir"`
+	NACK           uint64 `json:"nack"`
+	TWCC           uint64 `json:"twcc"`
 }
 
 func (v *viewer) collect(mode, dump string, ran time.Duration) *summary {
 	cur, samples := v.cursorStats()
 	dEvents, dSamples := v.displayStats()
 	sEvents, sSamples := v.stateStats()
-	auTimes, keyTimes := v.auRingSnapshot()
+	aus := v.auRingSnapshot()
+	auTimes := make([]int64, 0, len(aus))
+	keyTimes := make([]int64, 0, len(aus))
+	for _, a := range aus {
+		auTimes = append(auTimes, a.TMs)
+		if a.Key {
+			keyTimes = append(keyTimes, a.TMs)
+		}
+	}
 	// displayResumeMs[i] = ms from displaySamples[i].TMs to the NEXT decoded
 	// AU (-1 = none after; only ring-searchable - collect runs late, usually
 	// in-window). Delta, not the absolute AU time (run-3 gate-3 finding).
@@ -641,6 +1004,12 @@ func (v *viewer) collect(mode, dump string, ran time.Duration) *summary {
 			resume = append(resume, -1)
 		}
 	}
+	// M3 Task 6:排队年龄 / 回归 / 恢复 / 暂停区间 / PLI→present。
+	p50, p95, maxAge := queueAgeStats(v.latSnapshot())
+	gap := recoveryGapMs(aus)
+	metaCount, metas := v.metaStats()
+	cRegs, sRegs, eRegs := countFrameMetaRegressions(metas)
+	pausedE, pausedMs := pausedIntervals(sSamples, ran.Milliseconds())
 	s := &summary{
 		Mode: mode, Relay: v.relay, DumpFile: dump,
 		StartUnixMs: v.start.UnixMilli(),
@@ -648,15 +1017,27 @@ func (v *viewer) collect(mode, dump string, ran time.Duration) *summary {
 		Keyframes: v.keyframes.Load(), Bytes: v.bytes.Load(),
 		PlisSent: v.plisSent.Load(), PliRetries: v.pliRetries.Load(),
 		KeyframeReqs: v.keyframeReqs.Load(), PliToIdrMaxMs: v.pliIDRMax.Load(),
-		CursorEvents: cur, CursorSamples: samples,
+		PliToPresentMaxMs: v.pliPresentMax.Load(),
+		CursorEvents:      cur, CursorSamples: samples,
 		DisplayEvents: dEvents, DisplaySamples: dSamples,
-		HelloDisplays: v.helloDisplaysSnapshot(),
+		HelloDisplays:   v.helloDisplaysSnapshot(),
 		DisplayResumeMs: resume,
 		StateEvents:     sEvents, StateSamples: sSamples,
-		AuTimesMs:  auTimes,
-		KeyTimesMs: keyTimes,
-		Sas:        v.sasSnapshot(),
-		DurationMs: ran.Milliseconds(),
+		AuTimesMs:     auTimes,
+		KeyTimesMs:    keyTimes,
+		Sas:           v.sasSnapshot(),
+		QueueAgeP50Ms: p50, QueueAgeP95Ms: p95, QueueAgeMaxMs: maxAge,
+		RtpTsRegressions:      v.rtpRegressionCount(),
+		FrameMetaCount:        metaCount,
+		ContentIdRegressions:  cRegs,
+		EncodeSeqRegressions:  sRegs,
+		CodecEpochRegressions: eRegs,
+		RecoveryGapMs:         gap,
+		RecoveryViolations:    recoveryViolations(aus, gap),
+		PausedEvents:          pausedE,
+		PausedMs:              pausedMs,
+		FbSent:                v.fbSent.Load(),
+		DurationMs:            ran.Milliseconds(),
 	}
 	if t := v.firstAt.Load(); t != 0 {
 		s.FirstFrameMs = time.Unix(0, t).Sub(v.start).Milliseconds()
@@ -694,6 +1075,13 @@ func (s *summary) evaluate(c *config) {
 		} else if s.PliToIdrMaxMs > int64(c.expectPliIdrMs) {
 			s.Failures = append(s.Failures, fmt.Sprintf("PLI->IDR %dms > %dms", s.PliToIdrMaxMs, c.expectPliIdrMs))
 		}
+	}
+	// M3 Task 6:拥塞恢复门 —— 排队硬上限 + 恢复 IDR 起步。
+	if c.expectQueueMaxMs > 0 && s.QueueAgeMaxMs > float64(c.expectQueueMaxMs) {
+		s.Failures = append(s.Failures, fmt.Sprintf("queue age max %.1fms > %dms (sender hard bound)", s.QueueAgeMaxMs, c.expectQueueMaxMs))
+	}
+	if c.expectRecoveryIdr && s.RecoveryViolations > 0 {
+		s.Failures = append(s.Failures, fmt.Sprintf("%d recovery(ies) began with a delta frame (post-drop delta continuation)", s.RecoveryViolations))
 	}
 	s.AssertionsPassed = len(s.Failures) == 0
 }
@@ -738,7 +1126,8 @@ func drainSasReplies(ch <-chan sasReply) int {
 }
 
 // runFor 跑满 d:PLI 心跳(可选)+ 单发 PLI(--pli-at)+ pending-PLI
-// 超时重发(--pli-retry-after)+ 中途进度一行。d 与 c.duration 分离:
+// 超时重发(--pli-retry-after)+ 合成 viewer_feedback(--fb-bps,1s 节奏,
+// 与 web DesktopLive 的上报节奏一致)+ 中途进度一行。d 与 c.duration 分离:
 // --input-script 场景脚本结束后仍有观察尾段。
 func (v *viewer) runFor(ctx context.Context, c *config, d time.Duration) {
 	deadline := time.Now().Add(d)
@@ -754,6 +1143,12 @@ func (v *viewer) runFor(ctx context.Context, c *config, d time.Duration) {
 		defer t.Stop()
 		pliOnce = t.C
 	}
+	var fbTick <-chan time.Time
+	if c.fbBps > 0 && v.fbFn != nil {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		fbTick = t.C
+	}
 	for {
 		if ctx.Err() != nil || time.Now().After(deadline) {
 			return
@@ -768,6 +1163,8 @@ func (v *viewer) runFor(ctx context.Context, c *config, d time.Duration) {
 			if ok := v.sendPLI(2 * time.Second); ok {
 				v.log.Info("one-shot PLI sent (--pli-at)")
 			}
+		case <-fbTick:
+			v.fbFn()
 		case <-time.After(200 * time.Millisecond):
 			// 丢包自救 ①:首帧迟迟未落地(首 IDR 被链路打散)→ 经信令重请
 			// 关键帧,节流 = 冷却期不短于 --keyframe-retry-after 的一半。
@@ -909,6 +1306,12 @@ func runDirect(c *config) (*summary, error) {
 	defer cancel()
 	v.runFor(ctx, c, c.duration)
 
+	// M3 Task 6:agent 侧既有 stats 面(同进程可见;server 模式跨进程没有)
+	// —— PubStats(帧/字节/抑制/RTCP 计数)+ frame-meta 遥测丢弃。取自
+	// Close 前(计数为累计值,Close 后不再前进)。
+	pubSt := pub.Stats()
+	telDrops := pub.TelemetryDrops()
+
 	_ = pub.Close()
 	_ = sub.Close()
 	<-pumpDone
@@ -916,7 +1319,14 @@ func runDirect(c *config) (*summary, error) {
 	if v.out != nil {
 		_ = v.out.Close()
 	}
-	return v.collect("direct", c.out, time.Since(v.start)), nil
+	s := v.collect("direct", c.out, time.Since(v.start))
+	s.Pub = &pubStatsReport{
+		FramesWritten: pubSt.FramesWritten, BytesWritten: pubSt.BytesWritten,
+		PreConnDropped: pubSt.PreConnDropped, PreKeyDropped: pubSt.PreKeyDropped,
+		PLI: pubSt.PLI, FIR: pubSt.FIR, NACK: pubSt.NACK, TWCC: pubSt.TWCC,
+	}
+	s.TelemetryDrops = telDrops
+	return s, nil
 }
 
 func randSubID() (uint32, error) {
@@ -1027,6 +1437,26 @@ func runServer(c *config) (*summary, error) {
 		b, _ := json.Marshal(map[string]any{"type": "keyframe-req"})
 		_ = ws.Write(wctx, websocket.MessageText, b)
 	}
+	// M3 Task 6:合成 viewer_feedback(--fb-bps;与 web DesktopLive 同一
+	// 1s 节奏/同一字段形态 —— agent events.go onViewerFeedback 消费)。
+	if c.fbBps > 0 {
+		v.fbFn = func() {
+			v.fbSent.Add(1)
+			wctx, wcancel := context.WithTimeout(ctx, 10*time.Second)
+			defer wcancel()
+			b, _ := json.Marshal(map[string]any{
+				"type":         "viewer_feedback",
+				"visible":      true,
+				"estimatedBps": c.fbBps,
+				"queueMs":      c.fbQueueMs,
+				"decodeQueue":  0,
+				"rttMs":        c.fbRttMs,
+			})
+			if err := ws.Write(wctx, websocket.MessageText, b); err != nil {
+				log.Warn("synthetic viewer_feedback send failed", "err", err)
+			}
+		}
+	}
 
 	// m=application 前提(T3 报告结论):pion viewer 的 offer 需先建一条
 	// 占位 DC 才含 SCTP 段,agent 预建的 input/mouse/cursor 通道(in-band
@@ -1047,6 +1477,10 @@ func runServer(c *config) (*summary, error) {
 					v.recordCursor(x, y, vis)
 				}
 			})
+		case dcLabelFrameMeta:
+			// M3 Task 6:frame-meta 遥测通道(56B FrameMetaV1/帧;形态不
+			// 符静默丢弃 —— 只做 contentId/encodeSeq 回归观测)。
+			dc.OnMessage(func(m webrtc.DataChannelMessage) { v.recordMetaMsg(m.Data) })
 		}
 	})
 

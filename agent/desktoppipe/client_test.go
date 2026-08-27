@@ -563,7 +563,9 @@ type overflowHost struct {
 	seq     uint64      // v2:连续 encode_seq/content_id(wmu 串行)
 }
 
-func startOverflowHost(t *testing.T, secret string) *overflowHost {
+// v2 以参数注入而非事后改字段:h.v2 由 serve 读取,go h.serve() 之后写
+// 即数据竞态形状(M1-deferred nit,Task 6 fold)。
+func startOverflowHost(t *testing.T, secret string, v2 bool) *overflowHost {
 	t.Helper()
 	ln, err := winio.ListenPipe(`\\.\pipe\xnc-desktoppipe-test-`+t.Name(), nil)
 	if err != nil {
@@ -571,7 +573,7 @@ func startOverflowHost(t *testing.T, secret string) *overflowHost {
 	}
 	t.Cleanup(func() { ln.Close() })
 	h := &overflowHost{
-		ln: ln, secret: secret,
+		ln: ln, secret: secret, v2: v2,
 		burstCh: make(chan int, 4),
 		kfCh:    make(chan string, 16),
 	}
@@ -584,9 +586,7 @@ func startOverflowHost(t *testing.T, secret string) *overflowHost {
 
 // startOverflowHostV2:v2 媒体协议形态(M1 Task 4 溢出/WAIT_IDR 测试)。
 func startOverflowHostV2(t *testing.T, secret string) *overflowHost {
-	h := startOverflowHost(t, secret)
-	h.v2 = true
-	return h
+	return startOverflowHost(t, secret, true)
 }
 
 func (h *overflowHost) name() string { return h.ln.Addr().String() }
@@ -692,7 +692,7 @@ func drainUntilKeyFrame(t *testing.T, s *Sub) int {
 // 丢 delta 并合并恰一次 reason=client_overflow 的 KEYFRAME_REQ(§7.9 客户端
 // 镜像);key 帧送达清位后,第二轮溢出再次恰触发一次。
 func TestFrameChOverflowMergesKeyframeRequest(t *testing.T) {
-	h := startOverflowHost(t, "desktop-pipe-secret")
+	h := startOverflowHost(t, "desktop-pipe-secret", false)
 	sub, err := Dial(h.name(), "desktop-pipe-secret", 7, SubOpts{})
 	if err != nil {
 		t.Fatal(err)
@@ -735,8 +735,13 @@ drain:
 			break drain
 		}
 	}
-	if d1+d2 >= 40 {
-		t.Fatalf("no deltas dropped: delivered %d+%d of 40", d1, d2)
+	// 断言确实发生了丢弃(M1-deferred nit,Task 6 fold:旧 `d1+d2 >= 40`
+	// 恒假——key 送达前 drainFrameCh 清空缓冲,两轮存活 delta ≤ 通道容量,
+	// 永远到不了 40)。真实界:d1(清空后被 key 替代)+ d2(第二轮缓冲内
+	// delta)之和不得超过 FrameCh 容量 frameChDepth;40 - 存活数 ≥ 24 即
+	// 溢出丢弃的直接证据。
+	if d1+d2 > frameChDepth {
+		t.Fatalf("delivered %d+%d deltas exceeds FrameCh capacity %d (overflow drain semantics broken)", d1, d2, frameChDepth)
 	}
 }
 
