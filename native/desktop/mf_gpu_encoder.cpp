@@ -289,31 +289,41 @@ class GpuEventPump final : public IMFAsyncCallback {
     }
     ComPtr<IMFMediaEvent> ev;
     HRESULT hr = gen_->EndGetEvent(ar, ev.GetAddressOf());
-    if (SUCCEEDED(hr)) {
-      MediaEventType et = 0;
-      ev->GetType(&et);
-      if (et == METransformNeedInput) {
-        cr_need.fetch_add(1);
-      } else if (et == METransformHaveOutput) {
-        cr_have.fetch_add(1);
-      } else if (et == MEError) {
-        HRESULT st = S_OK;
-        ev->GetStatus(&st);
-        XNC_LOG_ERROR("gpu_mft_event_meerror status=0x%08x",
-                      static_cast<unsigned int>(st));
-      } else if (et == METransformDrainComplete) {
-        cr_drain.store(true);
-      } else if (QsvDiagVerbose()) {
-        XNC_LOG_INFO("gpu_pump_event_unexpected et=%s(%u)", EventTypeName(et),
-                     static_cast<unsigned>(et));
-      }
-      // Re-arm UNDER THE SAME LOCK as the entry check: Stop() can no
-      // longer slip between the check and the re-arm (it must take lock_
-      // to set stopping_, which serializes it behind this whole block).
-      gen_->BeginGetEvent(this, nullptr);  // continuous re-arm
+    if (FAILED(hr)) {
+      // Shutdown race: the pending operation completed with an error and
+      // the chain ends (no re-arm). MF releases its callback reference
+      // when Invoke returns - the UNIT's own reference (ConfigureUnit
+      // keeps it for exactly this case) is what keeps `this` alive until
+      // ReleaseUnit.
+      if (QsvDiagVerbose())
+        XNC_LOG_INFO("gpu_pump_endgetevent_failed hr=0x%08x",
+                     static_cast<unsigned int>(hr));
+      LeaveCriticalSection(&lock_);
+      return S_OK;  // stop pumping
     }
+    MediaEventType et = 0;
+    ev->GetType(&et);
+    if (et == METransformNeedInput) {
+      cr_need.fetch_add(1);
+    } else if (et == METransformHaveOutput) {
+      cr_have.fetch_add(1);
+    } else if (et == MEError) {
+      HRESULT st = S_OK;
+      ev->GetStatus(&st);
+      XNC_LOG_ERROR("gpu_mft_event_meerror status=0x%08x",
+                    static_cast<unsigned int>(st));
+    } else if (et == METransformDrainComplete) {
+      cr_drain.store(true);
+    } else if (QsvDiagVerbose()) {
+      XNC_LOG_INFO("gpu_pump_event_unexpected et=%s(%u)", EventTypeName(et),
+                   static_cast<unsigned>(et));
+    }
+    // Re-arm UNDER THE SAME LOCK as the entry check: Stop() can no
+    // longer slip between the check and the re-arm (it must take lock_
+    // to set stopping_, which serializes it behind this whole block).
+    gen_->BeginGetEvent(this, nullptr);  // continuous re-arm
     LeaveCriticalSection(&lock_);
-    return S_OK;  // EndGetEvent failed: shutdown race, stop pumping
+    return S_OK;
   }
 
  private:
@@ -743,6 +753,12 @@ bool ConfigureUnit(Unit& u, IMFDXGIDeviceManager* mgr, uint32_t w, uint32_t h,
   // Arm the callback-channel event pump LAST: the Arc driver delivers
   // METransformHaveOutput only to an active BeginGetEvent listener (see
   // GpuEventPump); events queued before arming dispatch on the next arm.
+  // The UNIT keeps its own reference (the initial AddRef): MF drops ITS
+  // callback reference when a pending operation completes without a
+  // re-arm (Invoke's EndGetEvent-failure path), so without this reference
+  // the pump would self-destruct while Unit::pump still points at it (the
+  // 2026-08-28 intermittent v2-selftest teardown segfault: Stop()/credit
+  // reads on freed memory). ReleaseUnit releases it (deferred).
   if (u.is_async && u.gen.Get() != nullptr) {
     u.pump = new GpuEventPump(u.gen.Get());
     hr = u.gen->BeginGetEvent(u.pump, nullptr);
@@ -753,7 +769,6 @@ bool ConfigureUnit(Unit& u, IMFDXGIDeviceManager* mgr, uint32_t w, uint32_t h,
       if (err) *err = HrStep("BeginGetEvent(pump)", hr);
       return false;
     }
-    u.pump->Release();  // the pending BeginGetEvent holds the reference
   }
   return true;
 }
