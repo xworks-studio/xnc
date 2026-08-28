@@ -690,3 +690,145 @@ Local: `artifacts\desktop-media\rerun4-remote\` (~807 MB; remote origin
    gates; the mandated per-cycle gates are wire-measured and unaffected.
 4. 8 h soak and lock/UAC transitions remain the two open PENDING rows (exact command recorded in
    §12.9); they must not be summarized as passed.
+
+## 13. 2026-08-28 Task 3 — performance and network gates (evidence run)
+
+Third Task of the M4 desktop validation: hardware matrix, 1080p60 performance gate, TURN network
+matrix, Chrome/Edge browser gates. No production code changed; every script written lives under
+git-ignored `artifacts\desktop-media\` (t3-* trees). Binary identity: the SAME validated build as
+rerun-4 (`0001b94`-lineage, docs-only commits since; local hash `9C7E966C…E2AED95`, remote
+hash-verified identical at deploy).
+
+### 13.1 Step 1 — hardware matrix
+
+| Row | Host / session | GPU / driver | OS | v2 hardware rung | Selected MFT | Fallback reason | D3D debug verdict |
+|---|---|---|---|---|---|---|---|
+| Intel integrated (hybrid CPU) | LABS-DEV, RDP session 1 ATTACHED | Intel Arc 140T iGPU (16 GB), driver 32.0.101.7026 (2025-08-19), Core Ultra 7 255H; 2nd adapter = Microsoft Remote Display Adapter (RDP virtual) | Win11 Pro 10.0.26200 | **PASS** — `gpu_probe ok=1` (first output at input 5 / 31 ms), `encoder_backend=hardware` at 3440x1440 (15 s diag, captured 293/encoded 292) | `Intel? Quick Sync Video H.264 Encoder MFT` | none (`why=""`; no fallback log lines) | **debug layer ACTIVE** (`gpu-surface device driver=hardware debug_layer=1`), v2 selftest exit 0, 0 FAIL lines (`XNC_D3D_DEBUG=1`) |
+| Intel integrated (console) | LABS-XIAOXIN, console session 5 ACTIVE | Intel Arc 130T (12 GB), driver 32.0.101.8801 (2026-05-11) | Win11 Pro 10.0.26200 | **PASS** — refreshed this run: `gpu_probe ok=1` (5/31 ms), `media_v2_stream_init src=2880x1800 backend=hardware` (refresh diag `artifacts\desktop-media\t3-matrix\remote-pull\...\diag-v2`) | `Intel? Quick Sync Video H.264 Encoder MFT` | none | not re-run remotely (rerun-4 §12.8 console selftest PASS stands) |
+| NVIDIA discrete | — | — | — | UNAVAILABLE (no machine) | — | — | — |
+| AMD discrete | — | — | — | UNAVAILABLE (no machine) | — | — | — |
+| Software-only / VM | — | — | — | UNAVAILABLE (no machine; the software rung itself is exercised by selftest scenarios §12.8) | — | — | — |
+
+Adapter LUID: the xnc-desktop diag does not print the selected adapter's LUID; a DXGI
+P/Invoke enumerator (`t3-matrix\dxgi-luid.ps1`) captured the adapter inventory on both boxes
+(`adapter[0]/[1] desc=Intel(R) Arc(TM) 140T…`, `adapter[2] Microsoft Basic Render Driver` locally;
+Arc 130T remotely) — raw bytes retained in `dxgi-adapters.txt`; the LUID field is therefore
+order-mapped (default adapter = the Arc), not natively emitted.
+
+### 13.2 Step 2 — 1080p60 performance gate (both boxes)
+
+Harness: `t3-1080p60\t3-run-p60.ps1` (run-soak's topology trimmed to a standing viewer, PLUS
+`--max-w 1920` which run-soak does not pass): native `--console-diag --desktop-pipeline-v2 --fps 60
+--max-w 1920 --duration 60` + collect-metrics + standing e2eviewer + desktopreport from-diag/verify.
+
+| Gate (per box) | LABS-DEV (1920x804 scaled) | LABS-XIAOXIN (1920x1200 scaled) | LABS-XIAOXIN native@60 (2880x1800, for the record) |
+|---|---|---|---|
+| P0 counters (freezes/regressions) | **PASS** 0/0/0 | **PASS** 0/0/0 | **PASS** 0/0/0 |
+| GPU copy+convert p95 <3 ms | **PASS (enqueue-cost caveat)** — `gpu_convert_us` p95 **0.852 ms** (true VideoProcessorBlt enqueue); `gpu_copy_us` p95 14.3 ms is wait-inclusive (AcquireNextFrame compositor wait up to spf + enqueue; timestamp queries still deferred) | **PASS (same caveat)** — convert p95 **1.134 ms**; copy p95 14.5 ms wait-inclusive | convert p95 **0.897 ms**; copy p95 12.7 ms wait-inclusive |
+| capture→AU p95 <15 ms | **FAIL — 52.16 ms** | **FAIL — 74.06 ms** | **FAIL — 390.98 ms** |
+| CPU <15% | **PASS** 0.097% | **PASS** 0.552% | **PASS** 0.55% |
+| Working set <350 MB | **PASS** 235.6 MB | **PASS** 279.4 MB | **FAIL** 419.4 MB |
+| Target FPS ≥95% | **FAIL (content cadence)** — 1,873 viewer frames / 60.1 s = **31.2 fps (52%)**; desktop mostly static (DXGI delivers on change; the 60 fps pacing target is unreachable without real motion) | **FAIL (content cadence)** — 2,196 frames = **36.6 fps (61%)**, static desktop | 1,745 frames = **29.1 fps (49%)** |
+| Receive queue p95 <50 / max ≤100 (viewer) | **PASS** 22.3 / 52.2 ms | **PASS** 34.5 / 65.5 ms | p95 48.9 PASS / **max 182.1 FAIL** |
+| firstFrameMs (viewer) | 597 | 66 | 484 |
+| Verdict | FAIL (capture→AU only) | FAIL (capture→AU only) | FAIL (4 gates) |
+
+Key finding: at the 1080p-class operating point the emit-depth latency drops ~4.6–8x vs native
+(52/74 ms vs 241–594 ms §12.6) and CPU/WS gates PASS — the residual `capture_to_au` p95 is the
+QSV emit dwell (mft p50 45–66 ms) against the 60 fps cadence, still 3.5–4.9x over the 15 ms gate.
+Artifacts: `t3-1080p60\local\p60-local-20260828-182907\`, `t3-matrix\remote-pull\…\p60-remote-20260828-033511\`,
+remote-native runresult quoted in §13.2 (host-side copy `t3-1080p60\` after pull).
+
+### 13.3 Step 3 — TURN network matrix (REAL relay + REAL shaping)
+
+Vehicle (first REAL-relay execution in the milestone): local docker dev stack
+(`docker-compose.yml + dev + slice2` overlays; server on 127.0.0.1:8080 / 192.168.1.12:18080,
+coturn :3478 tcp/udp with relay 49160-49200) PLUS an artifacts-only overlay
+`t3-turn\docker-compose.t3turn.yml` adding **toxiproxy** (34790 → coturn:3478, API :8474) and
+pointing the server's `XNC_TURN_URLS` at the shaped listener. Runs are e2eviewer DIRECT mode with
+`--turn xncdev:xncdev-secret@192.168.1.12:34790` (relay-only ICE on BOTH ends — media genuinely
+transits coturn through the shaped TCP legs). Shaping per profile: latency toxic = rtt/4 ms per
+direction (media crosses 2 legs → RTT = profile) and bandwidth toxic = bps/8/1000 KB/s per
+direction (toxiproxy rate unit is KILOBYTES/s).
+
+Two recipe defects found and fixed during bring-up (both now encoded in the overlay/script):
+1. coturn with plain `--external-ip=192.168.1.12` treats the advertised address as its own →
+   every `CREATE_PERMISSION` for the other peer's relayed candidate returns **403 "Forbidden IP"**
+   (anti-reflection). Fix: the MAPPED form `--external-ip=192.168.1.12/172.19.0.3` — permissions
+   pass, ICE completes (`probe3478h`: connected, relay=true).
+2. toxiproxy latency attribute must be an integer; bandwidth rate is KB/s (a bps-as-KB/s reading
+   would shape 8x loose).
+
+| Profile (real relay, 45 s runs) | queue p95 <50 | queue max ≤100 | latency accumulation | PLI→IDR <1 s | notes |
+|---|---|---|---|---|---|
+| 15 Mbps / 30 ms | **PASS** 23.6 ms | **PASS** 30.9 ms | **NONE** — inter-arrival 1st-half 46.8 ms vs 2nd-half 46.9 ms (drift 0.1 ms) | **PASS** 177 ms | connected, 956 frames (~20.2 fps, static content), firstFrame 2,473 ms |
+| 5 Mbps / 100 ms | **PASS** 25.0 ms | **PASS** 41.8 ms | **NONE** (drift 0.0 ms) | **PASS** 256 ms | connected, 955 frames, firstFrame 2,851 ms |
+| 1 Mbps / 250 ms | **FAIL** 107.2 ms | **FAIL** 196.6 ms | **NONE — bounded, not accumulating** (drift 0.2 ms; the tail is keyframe bursts through the 1 Mbps leg) | **PASS** 466 ms | attempt-1: ICE did not complete inside the harness's 25 s connect bound (state=connecting) — attempt-2 connected, firstFrame 3,607 ms |
+
+**Slow-spectator isolation**: not exercisable on the direct-mode vehicle (no viewer_feedback
+channel, no shared publisher across viewers). Complemented by the M3 Task-6 loopback matrix
+(synthetic feedback, REAL QoS decision loop) re-run this session — **all 3 cases PASS**
+(`t3-turn\m3t6-matrix\`: controller queueAgeMax 18.5/18.8/32.8 ms, only the spectator pauses
+1,179/1,204/1,981 ms, recoveryViolations 0, 1 Mbps case downshifts — configs 6). The
+**combined** real-relay + real-QoS-loop run (server-mode agent) stays **PENDING**: it needs the
+core-pipe agent topology (see §13.4 blocker); the validated recipe for it is the compose overlay +
+mapped external-ip + toxiproxy toxics above.
+
+Artifacts: `t3-turn\{15mbps-30ms,5mbps-100ms,1mbps-250ms}\run-*\` (viewer.json + native.log +
+profile.json each), `t3-turn\summary.md`, `t3-turn\probe3478*` (debug ladder),
+`t3-turn\coturn-full.log` (Forbidden-IP evidence), `t3-turn\docker-compose.t3turn.yml` (recipe,
+uncommitted by design).
+
+### 13.4 Step 4 - Chrome + Edge browser gates
+
+Validated: `web` built (vite, `t3-turn\web-build.log`) and served BY the dev server itself
+(go:embed - `http://192.168.1.12:18080/` 200 text/html); **real headed Chrome AND real Edge**
+(temp profiles, CDP-driven `t3-browser\cdp-drive.mjs`) load the app: login page renders
+(`chrome-login.png`, `edge-login.png`), JWT-bootstrapped nodes page renders against the live API
+(`chrome-nodes.png`, `edge-nodes.png`; CDP FACTS show `0 nodes / No nodes` - true state).
+
+All four session-dependent gates - first visible frame p95 <1 s, input-to-present p95 <150 ms,
+PLI-to-present p95 <1 s, frame-meta correlation over sampled rVFC - are **PENDING**: they need a
+desktop session, which needs an enrolled agent node, which needs the XNIP core pipe. Blocker chain
+(this box, unelevated shell): the core pipe's DACL is `SYSTEM + Administrators`
+(`native/core/pipe_server.cpp` kSddl) -> the dev agent must run with an elevated token ->
+`schtasks /Create ... /RL HIGHEST` is denied from this non-elevated session (Access denied; the
+UAC prompt is not interactable from here) and no SYSTEM exec channel exists locally (the
+historical path, `xnc exec` via the prod agent, is out of scope for evidence runs).
+Input-to-present has the additional standing gap: no input-injection path exists for browser
+viewers (e2eviewer's `--input-script` is server-mode only).
+
+### 13.5 Task-3 gate status summary
+
+| Gate | Status | Numbers |
+|---|---|---|
+| HW matrix: Intel hybrid (local) hardware rung + D3D debug | **PASS** | 13.1 |
+| HW matrix: Intel console (remote) refresh | **PASS** | 13.1 |
+| HW matrix: NVIDIA / AMD / VM | UNAVAILABLE (no machines) | - |
+| 1080p60 GPU enqueue (convert) p95 <3 ms | **PASS** (copy stage wait-inclusive caveat) | 0.852 / 1.134 / 0.897 ms |
+| 1080p60 capture-to-AU p95 <15 ms | **FAIL** | 52.16 (local) / 74.06 (remote) / 390.98 (native) ms |
+| 1080p60 CPU <15% | **PASS** | 0.097 / 0.552 / 0.55 % |
+| 1080p60 WS <350 MB | PASS / PASS / **FAIL** | 235.6 / 279.4 / 419.4 MB |
+| 1080p60 target FPS >=95% | **FAIL** (static-content cadence; honest measure) | 31.2 / 36.6 / 29.1 fps of 60 |
+| TURN 15 Mbps/30 ms: queue gates + no accumulation | **PASS** | 23.6 / 30.9 ms, drift 0.1 ms |
+| TURN 5 Mbps/100 ms | **PASS** | 25.0 / 41.8 ms, drift 0.0 ms |
+| TURN 1 Mbps/250 ms | **FAIL** queue (bounded, NOT accumulating) + attempt-1 ICE connect timeout | 107.2 / 196.6 ms, drift 0.2 ms |
+| TURN slow-spectator isolation | **PASS via M3-T6 synthetic matrix** (real loop = PENDING, same agent blocker) | m3t6-matrix all green |
+| Browser: page loads + app render (Chrome, Edge) | **PASS** (page-level) | t3-browser pngs + FACTS |
+| Browser: first visible frame / input-to-present / PLI-to-present / frame-meta correlation | **PENDING** (no agent node: core-pipe elevation blocker 13.4; input injection additionally missing) | - |
+
+### 13.6 Concerns
+
+1. The 15 ms capture-to-AU gate stays structurally unmet at 1080p60 (4-5-input emit depth measured
+   in 11/12); at 1920-wide it is 3.5-4.9x over - the 52-74 ms numbers are the planning baseline.
+2. Target-FPS >=95% is unmeasurable honestly on static desktops (DXGI is change-driven); a real
+   motion source (video playback window) is needed for a meaningful row.
+3. The 1 Mbps relay row fails the queue gates WITHOUT runaway accumulation - with the QoS loop
+   (M3-T6 green) it is expected to downshift; the combined real-relay+QoS run remains the top
+   follow-up, unblocked by elevating one agent host (labs-xiaoxin via its SYSTEM channel).
+4. coturn's plain `--external-ip` form breaks same-server relay pairs with 403 Forbidden IP - the
+   mapped `public/private` form is REQUIRED for any local/CI relay topology (recipe in the
+   artifacts overlay; worth productizing in deploy/ as a follow-up).
+5. Browser session gates hinge on the same core-pipe elevation wall as 13.4; any follow-up should
+   schedule the interactive UAC once (or use the labs-xiaoxin SYSTEM exec channel) to unlock both
+   the combined TURN row and the browser rVFC evidence.
