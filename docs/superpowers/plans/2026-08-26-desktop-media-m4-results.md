@@ -1,9 +1,21 @@
 # M4 Task 2 (rerun) — correctness and recovery gates on REAL console hardware
 
-**Overall: BLOCKED — see §10 (2026-08-28 rerun-3, the current state): with the QSV hardware rung
-LIVE (fb02a85), the mandated 5-minute smoke soak at native 2880x1800 fails P0 `UnrecoveredFreezes=4`
-(bursty tens-of-seconds AU emission); the suite stopped per the STOP rule. The earlier §3–§8
-narrative below is the PREVIOUS attempt's (software-rung) P0 and is retained as history.**
+**Overall (2026-08-28 rerun-4, §12 — the current state): the mandated gates EXECUTED CLEAN of P0 on
+the repaired hardware path (0001b94): smoke 5-min v2 and 60-min v2 soak both `UnrecoveredFreezes=0`
+with all content regressions 0 and `encoder_backend=hardware`; 100/100 reset cycles pass all three
+recovery gates; console v2 selftest exit 0 with the new pump-stress/idle-flush pins green on real
+hardware. The latency/memory gates (CaptureToAUP95 / QueueP95 / WorkingSet) still FAIL — non-P0,
+recorded as the Task-3 known-gap data. 8 h soak and lock/UAC transitions remain PENDING (exact
+command / manual). §3–§11 are retained history (previous attempts' P0s and the QSV repair).**
+
+**Previous attempt summary (BLOCKED — the bounded-soak gate FAILED on a P0 counter and the suite
+stopped per the STOP rule).** The run executed on labs-xiaoxin console session 5 (the designated
+validation node, interactive desktop attached). The harness pipe bug from the first attempt is confirmed fixed by
+commit `6f61605` (full `\\.\pipe\...` path: the rt server appeared, all viewer events dialed,
+`from-diag` produced real verdicts). A second, previously-unknown harness-side defect was found and
+fixed DURING this rerun (uncommitted in the worktree — see §7): `FormatStagesJson` emitted a
+trailing comma in the `stages` object, so every v2 `stats.json` was invalid JSON and `from-diag`
+rejected it. The binary validated here includes that fix.
 
 **Previous attempt summary (BLOCKED — the bounded-soak gate FAILED on a P0 counter and the suite
 stopped per the STOP rule).** The run executed on labs-xiaoxin console session 5 (the designated
@@ -478,3 +490,203 @@ Local: `artifacts\desktop-media\qsvfix-local-desktop-now.jpg` (the console's con
 the matrix), markers mirrored in this section. Remote (`\labs-xiaoxin\C$\xnc-m4\artifacts\
 desktop-media\`): `qsvfix\<run>\{out.h264,stats.json,console.log}`, `logs\{matrix,static,smoke,
 smokebits,smokeflush,smokecbr}.done` + `drive-qsvfix-*.log` transcripts + soak run dirs.
+
+---
+
+## 12. 2026-08-28 rerun-4 — repaired hardware path (0001b94): ALL GATES EXECUTED, P0 CLEAN → suite completes
+
+Fourth execution of the Task-2 gates, after the §9 probe fix, the §11 segfault/burst fixes, and the
+regression pins landed (`0001b94` "test(desktop): pin gpu pump races and idle flush reset"). Every
+phase of the execution plan ran end-to-end on labs-xiaoxin console session 5; **no P0 counter fired
+anywhere in this suite** — the STOP rule was never triggered. No code was changed; the only commit
+created is this results doc.
+
+### 12.1 Environment & binary identity
+
+| Row | Value |
+|---|---|
+| Host / session | LABS-XIAOXIN, console session 5 ACTIVE (phase-0 driver pid 27684, `ProcessIdToSessionId`=5, `>` marker on the `console LABS 5 Active` row) — `logs\env-proof-r3.txt` (refreshed this run), `logs\phase0.done exit=0` |
+| GPU / OS | Intel Arc 130T (12GB), driver 32.0.101.8801 (2026-05-11), Win11 Pro 10.0.26200; \.\DISPLAY11 primary 1440x900@32bpp (200% scaling) → DXGI native 2880x1800; `--jpeg-single` live-desktop smoke exit=0 (269,562 B) |
+| Binary | `xnc-desktop.exe` SHA256 `9C7E966C29CB86848F0CCD8A1E3660DC5F5A77BEFBCF32BAEC25CD568E2AED95`, built from clean `0001b94` (`cmd /c native\desktop\build.bat`), hash-verified local↔remote at deploy (e2eviewer `FA64AB4C…B1B4EF`, desktopreport `46FEDED9…EBB38`, resetloop `7ADD7EAB…CA759C1` — all three unchanged from prior reruns) |
+| Vehicle | scheduled task `xnc-m4-t2r4` (`LABS` Interactive principal) → `C:\xnc-m4\drivers\drive-rerun4.ps1 -Phase <name>`; one phase per start; WinRM marker polling (≥60 s); per-phase wall budgets respected (smoke 5:10, soak 60:15, v1 10:15, cycles 16:55, selftest 3:20) |
+
+Cleanup verified after the suite: `xnc-m4*` tasks remaining = 0, no processes from `C:\xnc-m4\bin`,
+console session 5 still Active, no display/resolution/desktop setting changed (the reso_rt cycles
+change the native's internal max-w only; switch_display idx=0 re-selects the same single display).
+
+### 12.2 Exact commands
+
+```
+# local build + deploy (hash proof in deploy transcript)
+cmd /c native\desktop\build.bat
+cd tools\e2eviewer && go build -o ..\..\bin\e2eviewer.exe .
+cd tools\desktopreport && go build -o ..\..\bin\desktopreport.exe .
+cd artifacts\desktop-media\resetloop-tool && GOWORK=off go build -o ..\..\..\bin\resetloop.exe .
+powershell -File artifacts\desktop-media\deploy-rerun4.ps1
+
+# remote, console session 5 (task xnc-m4-t2r4, one phase per start)
+powershell -File artifacts\desktop-media\run-phase4.ps1 -Phase phase0
+powershell -File artifacts\desktop-media\run-phase4.ps1 -Phase smoke    -ExtraArgs "-SmokeSec 300"
+powershell -File artifacts\desktop-media\run-phase4.ps1 -Phase soakv2   # 3600 s default
+powershell -File artifacts\desktop-media\run-phase4.ps1 -Phase soakv1   # 600 s default
+powershell -File artifacts\desktop-media\run-phase4.ps1 -Phase cycles   # 100, budget 3300 s
+powershell -File artifacts\desktop-media\run-phase4.ps1 -Phase selftestv2
+# the harness commands the phases ran (C:\xnc-m4\scripts\desktop-media\run-soak.ps1):
+#   smoke: -DurationSec 300  -Pipeline v2 -Fps 30 -RunDir <art>\soak-smoke-20260828-004709
+#   soak : -DurationSec 3600 -Pipeline v2 -Fps 30        -> soak-20260828-005556
+#   v1   : -DurationSec 600  -Pipeline v1 -Fps 30        -> soak-20260828-015941
+# cycles: resetloop.exe -exe xnc-desktop.exe -out resetloop-100-r4 -cycles 100 -variants switch_diag,reso_rt -max-total-sec 3300
+```
+
+### 12.3 Smoke (5-min v2 pilot, native 2880x1800) — P0 GATE PASSED
+
+`runresult.json` (`Verdict: FAIL` — latency/memory gates only, §12.6):
+`UnrecoveredFreezes=0`, `OldFrameRegressions=0`, `EpochRegressions=0` (all P0 counters zero),
+`CaptureToAUP95Ms=241.215` (gate 15), `QueueP95Ms=64.81` (gate 50), `QueueMaxMs=90.95` (gate 100
+PASS), `WorkingSetMB=413.6` (gate 350), `CPUPercent=0.329`.
+
+`stats.json` (`ok=1`): **`encoder_backend=hardware`**, `cpu_readbacks=0`, captured=5828,
+encoded=6159, keyframes=80, `resets=0`, `rebuilds=0`, 2880x1800. Suite proceeded past the gate
+(P0-zero + hardware backend are the smoke gate; the latency-gate FAIL is the pre-declared Task-3
+known-gap, not a P0).
+
+### 12.4 60-min v2 soak (native, default events) — P0 GATE PASSED
+
+`runresult.json`: `UnrecoveredFreezes=0`, `OldFrameRegressions=0`, `EpochRegressions=0`;
+`CaptureToAUP95Ms=593.568` (gate 15 FAIL), `QueueP95Ms=72.52` (gate 50 FAIL), `QueueMaxMs=101.92`
+(gate 100 PASS), `WorkingSetMB=413.9` (gate 350 FAIL), `CPUPercent=0.221`, `Verdict: FAIL`
+(latency/memory only).
+
+`stats.json`: **`encoder_backend=hardware`**, captured=70845, encoded=74359, keyframes=306,
+`resets=0`, `rebuilds=0`, `cpu_readbacks=0`; terminal native line
+`media_v2_stop elapsed=3600515ms … aus=74358 bytes=660092903 reorder_gap_skips=0
+reorder_late_drops=0 backend=hardware ok=1`; `desktop_watch_stop polls=7037 failures=0
+state=Default`. **625 `idle_flush_begin` events** — the §11.2 idle park flush actively served the
+static stretches; zero freezes resulted (the rerun-3 failure shape is gone).
+
+Viewer-side shape (all five events, zero regression counters everywhere):
+- standing viewer: **74,331 frames** delivered, `firstFrameMs=183`, `queueAgeP95Ms=72.5`,
+  `recoveryGapMs=354`, `recoveryViolations=0`;
+- PLI viewer: `firstFrameMs=198`, `pliToIdrMaxMs=152`, `queueAgeP95Ms=29.1`, `recoveryViolations=0`;
+- burst/reconnect viewers: same clean shape (files in the run dir).
+
+### 12.5 10-min v1 rollback soak — documented NO-EVIDENCE row
+
+`runresult.json`: `Verdict: NO-EVIDENCE` with `CaptureToAUP95Ms=0` — the documented fail-closed
+expectation (the v1/M0 pipeline has no stage instrumentation, so its latency percentile is
+NO-EVIDENCE by design). Recorded counters (the rollback row, not a v2 gate):
+`UnrecoveredFreezes=363`, `OldFrameRegressions=1`, `QueueP95Ms=7719.2`, `WorkingSetMB=1103.9`,
+`CPUPercent=15.7`; stats `captured=2956 encoded=3711 keyframes=169 resets=0` (no `stages` object,
+no `encoder_backend` field — v1 sidecar shape). This is the known v1 degradation the v2 pipeline
+(idle flush + hardware rung) exists to fix — retained as the rollback-path evidence.
+
+### 12.6 Paced capture→AU percentiles (Task-3 known-gap data, measured)
+
+Stage histograms from the two v2 runs (n = 4096-sample window; hardware rung, native 2880x1800,
+30 fps paced feed, driver 32.0.101.8801):
+
+| run | stage | p50 | p95 | p99 |
+|---|---|---|---|---|
+| smoke 300 s | `capture_to_au_us` | 109,803 | 241,215 | 565,357 |
+| smoke 300 s | `mft_submit_to_output_us` | 64,961 | 102,450 | 117,817 |
+| soak 3600 s | `capture_to_au_us` | 196,576 | 593,568 | 630,587 |
+| soak 3600 s | `mft_submit_to_output_us` | 83,906 | 118,684 | 121,077 |
+| both | `gpu_copy_us` | ~318 | 698–14,184 | 6,789–30,415 |
+| both | `gpu_convert_us` | ~500–640 | ~1,000–1,240 | ~1,900–2,800 |
+
+**Task-3 known-gap data (measured, not assumed):** hardware-rung paced capture→AU at native sits at
+p50 ≈ 110–197 ms / p95 ≈ 241–594 ms / p99 ≈ 0.57–0.63 s across the two regimes (motion-heavy smoke
+vs the 60-min mixed/static soak; the soak tail includes the idle-flush feed-stamp artifacts
+documented in §11.2). The 15 ms Task-3 gate remains unmet by ~16–40x — this is the number Task-3
+planning must use. Viewer-experienced queueing stayed small (`queueAgeP95Ms` 72.5 standing / 29.1
+PLI) and recovery stayed IDR-first — the latency failure is in the emit-depth dwell, not queueing.
+
+### 12.7 100 reset cycles — ALL THREE GATES PASS (100/100)
+
+`resetloop-100-r4` (50 `switch_diag` 0x0128 + 50 `reso_rt` 0x0129, 09:15:47–09:32:37Z, within the
+3300 s budget; ACCESS_LOST injection remains impossible on Win11 26200 — §5). Recounted directly
+from `cycles.jsonl` (100 lines):
+
+| Gate | Result | Numbers |
+|---|---|---|
+| epoch increment EXACTLY 1 per reset | **100/100 PASS** | zero failures |
+| recovery ≤ 2 s (target ≥ 99/100) | **100/100 PASS** | p50 1,309 ms / p95 1,504 ms / max 1,677 ms; switch_diag p50 1,431 / p95 1,523 / max 1,677; reso_rt p50 1,130 / p95 1,250 / max 1,317 |
+| stale frames = 0 | **100/100 PASS** | zero failures |
+
+Host corroboration: `capture_reset_done` exactly once per cycle in all 100 native logs (reasons
+`switch`/`resolution`, reset elapsed ≈ 78 ms), `hw_contract_failures=0` everywhere, and
+`first_new_epoch_frame_is_key=100/100` (every post-reset stream resumes IDR-first).
+
+Tool-harness caveats (documented, not product failures): the tool's own `cycles_all_gates_ok=50`
+and the 50 `failing_cycles` entries for switch_diag are caused solely by its auxiliary
+`stats.json` check — the runner kills the console-diag native at the end of its 5 s watch tail,
+before the 15 s `--duration` would flush `stats.json` (`stats_err="stats.json missing"`; reso_rt
+cycles are exempt by design because rt mode writes no sidecar). `summary.json`'s top-level
+`cycles: 0` is a second tool artifact (the counter is never incremented in main.go). The three
+mandated gates above are computed per-cycle from the v2 wire + native logs and are unaffected.
+
+### 12.8 Console hardware v2 selftest (deployed build, session 5) — PASS
+
+`--selftest --desktop-pipeline-v2` on the deployed `0001b94` binary: **exit 0, 2,753 log lines,
+zero `SELFTEST FAIL` lines**, terminal `selftest ok`. Citations (verbatim NOTE lines):
+
+- **New pins, real hardware:** `gpu-pump-stress iters=12 ok=12 dt=6719ms (pre-fix 729bfaf: 8
+  crashes/20 qsvdiag runs; post-fix 0/20)`; `v2s idle-flush subs=6->14 aus=1->9 (delay=5 park;
+  flush env=on)`; `v2t flush-reset subs=14(pre)15(rebuild)23(post) rebuilds=1 resets=1
+  flush_env=on` — the exact UAF-window stress and both idle-flush pins pass on the Arc 130T.
+- **Hardware branch:** repeated `gpu_probe friendly="Intel? Quick Sync Video H.264 Encoder MFT"
+  ok=1` and `gpu_encoder_init ... async=1` (the stress loop re-inits 12x without a crash).
+- **v2e (real GDI capture of the live 2880x1800 desktop) now serves on the HARDWARE rung:**
+  `v2e rung=hardware friendly="Intel? Quick Sync Video H.264 Encoder MFT" w=2880 h=1800 aus=10
+  keys=1 feeds=2` (in §3's attempt it starved; in §10's build it was software-rung at best).
+- **Encoder contracts (silent-pass CHECKs + NOTEs):** `mf-flush first-au-nal=6 types: 9 7 8 6 6
+  5`; `rsA ... resets=1 requests=7 merged=6`; `rsC ... resets=1 w=96 h=64`; `rsD rebuilds=6`;
+  `v2d aus=9 resets=1 rebuilds=1`; `v2c rung=hardware ... n=55 ... strictly monotonic`;
+  `v2k retired_drops=9 aus=19 gap_skips=10`; `v2l resets=3 storm=0/25/50`;
+  `v2m hw_faults=3 creates=3 resets=3 strikes=3`; `v2n hw_creates=3 resets=2 locked=1`;
+  `v2r hw_creates=0 backend=factory aus=2`.
+
+### 12.9 Gate status after rerun-4 (the current state)
+
+| Gate | Status | Evidence |
+|---|---|---|
+| Smoke (5-min v2, native, hardware rung): zero P0 counters | **PASS** | §12.3; freezes/regressions all 0 |
+| Smoke: `encoder_backend=hardware` | **PASS** | §12.3 stats.json |
+| Smoke: latency/memory gates | **FAIL** (non-P0, known-gap) | CaptureToAUP95 241.2 ms (gate 15), QueueP95 64.8 (gate 50), WS 413.6 (gate 350) |
+| 60-min v2 soak: zero unrecovered freezes | **PASS** | §12.4 `UnrecoveredFreezes=0` |
+| 60-min v2 soak: zero contentId/hash/epoch regressions | **PASS** | §12.4 all viewer + runresult counters 0 |
+| 60-min v2 soak: latency/memory gates | **FAIL** (non-P0, known-gap) | CaptureToAUP95 593.6, QueueP95 72.5, WS 413.9; QueueMax 101.9 PASSES gate 100 |
+| Paced capture→AU percentiles (Task-3 known-gap data) | **MEASURED** — p95 241–594 ms, fails the 15 ms gate ~16–40x | §12.6 table |
+| 10-min v1 rollback soak | **DOCUMENTED** — `Verdict: NO-EVIDENCE` on CaptureToAUP95 as expected (fail-closed); rollback counters recorded (freezes 363, 1 regression, WS 1104) | §12.5 |
+| 100 cycles: epoch increment exactly 1 | **PASS 100/100** | §12.7 |
+| 100 cycles: recovery ≤ 2 s for ≥ 99 | **PASS 100/100** (p95 1,504 ms) | §12.7 |
+| 100 cycles: no stale frame | **PASS 100/100** | §12.7 |
+| ACCESS_LOST injection cycles | **NOT POSSIBLE on Win11 26200** (standing finding §5); covered by selftest rsD (injected backend, PASS §12.8) | §5, §12.8 |
+| Console v2 selftest (current build) | **PASS** (exit 0, 0 FAIL, new pins green on hardware) | §12.8 |
+| 8 h soak completion | **PENDING** — exact command: `powershell -NoProfile -ExecutionPolicy Bypass -File C:\xnc-m4\scripts\desktop-media\run-soak.ps1 -DurationSec 28800 -Pipeline v2 -Fps 30` (from the repo: `run-soak.ps1 -DurationSec 28800 -Pipeline v2 -Fps 30`); not started in this suite | — |
+| Lock/unlock + UAC transitions | **PENDING** (manual, interactive console; not automatable unattended) | — |
+
+### 12.10 Artifacts (git-ignored)
+
+Local: `artifacts\desktop-media\rerun4-remote\` (~807 MB; remote origin
+`C:\xnc-m4\artifacts\desktop-media\`):
+- `soak-smoke-20260828-004709\`, `soak-20260828-005556\`, `soak-20260828-015941\` — each: runresult,
+  stats, native.log, 5 viewer reports + stderr, metrics.jsonl, table.md, capture.h264
+- `resetloop-100-r4\` — summary.json, cycles.jsonl, cycle-001..100 (native.log + cycle.json each)
+- `logs\` — env-proof-r3.txt, phase0.done, smoke/soakv2/soakv1/cycles/selftestv2 markers + console
+  logs, selftest-v2-r4.log, drive-rerun4-<phase>-*.log transcripts, phase0-smoke.jpg
+- Tooling (artifacts-local): `drive-rerun4.ps1`, `deploy-rerun4.ps1`, `run-phase4.ps1`,
+  `cleanup-rerun4.ps1`, `poll-rerun4.ps1`, `pull-rerun4.ps1`, cycles/summary/selftest helpers
+
+### 12.11 Concerns
+
+1. The latency gates remain failed (p95 241–594 ms vs the 15 ms Task-3 gate) even with the emit
+   path healthy — the residual is the QSV emit depth at feed cadence plus the idle-flush feed-stamp
+   artifacts (§11.2/§11.3); Task 3 owns this gap with the measured numbers in §12.6.
+2. WorkingSet 413–414 MB sits above the 350 MB gate on both v2 runs (stable across 60 min — no
+   growth trend: smoke 413.6 vs soak 413.9).
+3. The resetloop tool's auxiliary stats.json roll-up and its never-incremented `cycles` counter
+   mislabel switch_diag cycles as failing (§12.7) — any future reuse should fix the tool, not the
+   gates; the mandated per-cycle gates are wire-measured and unaffected.
+4. 8 h soak and lock/UAC transitions remain the two open PENDING rows (exact command recorded in
+   §12.9); they must not be summarized as passed.
