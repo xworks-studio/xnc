@@ -27,6 +27,10 @@ services:
       XNC_JWT_SECRET: ${XNC_JWT_SECRET}
       XNC_ADMIN_EMAIL: ${XNC_ADMIN_EMAIL}
       XNC_ADMIN_PASSWORD: ${XNC_ADMIN_PASSWORD}
+      # M4 金丝雀开关(§14): compose 此前未接线,M4-T4 部署缺口,生产 2026-08-28 补
+      XNC_DESKTOP_MEDIA_V2_PERCENT: ${XNC_DESKTOP_MEDIA_V2_PERCENT:-0}
+      XNC_DESKTOP_MEDIA_V2_ALLOWLIST: ${XNC_DESKTOP_MEDIA_V2_ALLOWLIST:-}
+      XNC_DESKTOP_MEDIA_V2_ROLLBACK: ${XNC_DESKTOP_MEDIA_V2_ROLLBACK:-false}
       # TURN relay config handed to desktop sessions (mirrors coturn below).
       # server 只读 XNC_TURN_CREDENTIAL(单一来源,config.go);XNC_TURN_PASSWORD
       # 仅供 coturn 自身用户配置(turnserver.conf 模板,见下),与 server env 无关。
