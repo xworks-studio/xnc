@@ -14,9 +14,31 @@
 // credits one ProcessInput, METransformHaveOutput credits one ProcessOutput.
 // Those events only flow after MFStartup (sync MFTs - everything else in
 // this binary - never needed it), so MfGpuEncoder::Init owns one
-// MFStartup reference and releases it at Shutdown. Event waits are bounded
-// low-frequency Sleep(2) polls (no hot spin, no blocking GetEvent - the
-// C++ IMFMediaEventGenerator::GetEvent has no timeout flag).
+// MFStartup reference and releases it at Shutdown.
+//
+// 2026-08-28 Arc/QSV root cause (driver 32.0.101.8801, measured on BOTH
+// the RDP dev box and the real console - three independent defects, all
+// fixed here; see GpuEventPump / ConfigureUnit / PullOneOutput):
+//   1. CODECAPI_AVLowLatencyMode (and AVEncCommonLowLatency, and the
+//      MF_LOW_LATENCY attribute) are ACCEPTED (S_OK) then the MFT stops
+//      raising METransformNeedInput after the first ProcessInput - the
+//      historical "no METransformNeedInput within budget (input #1)"
+//      probe failure was ALWAYS the second wait, wedged by the
+//      low-latency set, never a budget/pumping problem.
+//   2. METransformHaveOutput is delivered ONLY to a registered
+//      BeginGetEvent callback; the polled GetEvent(NO_WAIT) queue never
+//      sees event 602 (8/8 inputs accepted, zero outputs even across
+//      drain). The GpuEventPump callback counts credits; the media
+//      thread absorbs them (AbsorbCallbackCredits) and stays the only
+//      thread calling ProcessInput/ProcessOutput.
+//   3. The first ProcessOutput returns MF_E_TRANSFORM_STREAM_CHANGE and
+//      the driver does NOT raise a fresh HaveOutput for the retried
+//      pull - PullOneOutput renegotiates the offered output type and
+//      retries within the same credit.
+// The encoder's structural ~4-5-input emit depth (QSV AsyncDepth) stands:
+// every low-latency knob on this driver wedges (1) or is rejected
+// (LowDelayVBR / AVEncCommonRealTime -> 0x80070057); the 8.3 first-output
+// bound therefore holds through its 100 ms half (measured 11-25 ms).
 //
 // Startup probe (spec §8.3): every hardware candidate must encode >= 8
 // synthetic inputs (alternating two contents, distinct ids, forced IDRs at
@@ -38,6 +60,7 @@
 
 #include <d3d11.h>
 #include <d3d11_1.h>  // ID3D11VideoContext1 (color-space APIs)
+#include <d3d10.h>    // ID3D10Multithread (device-manager sharing contract)
 #include <codecapi.h>
 #include <mfapi.h>
 #include <mferror.h>
@@ -45,6 +68,7 @@
 #include <strmif.h>
 #include <wrl/client.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 
@@ -64,6 +88,34 @@ constexpr uint32_t kNeedInputWaitMs = 200;
 constexpr uint32_t kProbeFirstOutputMs = 100;  // spec §8.3 item 2
 constexpr uint32_t kProbeInputBound = 8;       // spec §8.3 item 1
 constexpr uint32_t kDrainWaitMs = 500;
+
+// Debug-level verbosity gate for the configure/pump path (XNC_QSV_DIAG=1).
+// The ladder probe failures of 2026-08-28 needed per-step HRESULTs and
+// event-level traces; this keeps them available without paying the log
+// noise in production runs. Read once per process.
+bool QsvDiagVerbose() {
+  static const bool v = [] {
+    char buf[8]{};
+    const DWORD n = GetEnvironmentVariableA("XNC_QSV_DIAG", buf, sizeof(buf));
+    return n > 0 && buf[0] == '1';
+  }();
+  return v;
+}
+
+// Best-effort name for the event types this pump can meet (diagnostics).
+const char* EventTypeName(MediaEventType et) {
+  switch (et) {
+    case MEError: return "MEError";
+    case MEExtendedType: return "MEExtendedType";
+    case METransformNeedInput: return "METransformNeedInput";
+    case METransformHaveOutput: return "METransformHaveOutput";
+    case METransformDrainComplete: return "METransformDrainComplete";
+    case METransformMarker: return "METransformMarker";
+    case METransformInputStreamStateChanged:
+      return "METransformInputStreamStateChanged";
+    default: return "other";
+  }
+}
 
 std::string HrStep(const char* step, HRESULT hr) {
   char buf[160];
@@ -160,6 +212,91 @@ struct UnitAu {
 };
 
 // ---- one activated candidate (the live unit or a probe instance) ----
+
+// The Arc/QSV event-channel pump (2026-08-28 root cause): this driver
+// delivers METransformHaveOutput ONLY to a registered
+// IMFMediaEventGenerator::BeginGetEvent callback - the polled
+// GetEvent(MF_EVENT_FLAG_NO_WAIT) queue receives METransformNeedInput but
+// never event 602 (measured on driver 32.0.101.8801: polled drive accepts
+// 8/8 inputs with ZERO outputs even across drain; the callback drive
+// receives HaveOutput ~50-75 ms after the first submit). The callback only
+// COUNTS credits into its own atomics; all ProcessInput/ProcessOutput stay
+// on the media thread (AbsorbCallbackCredits folds the counts into the
+// unit's credit bookkeeping before every pump).
+class GpuEventPump final : public IMFAsyncCallback {
+ public:
+  GpuEventPump(IMFMediaEventGenerator* gen) : gen_(gen) {
+    gen_->AddRef();  // own the gen: in-flight invokes outlive ReleaseUnit
+  }
+
+  void Stop() { stopped_.store(true); }
+
+  // Callback-channel credits (folded into a Unit's counters by
+  // AbsorbCallbackCredits on the media thread).
+  std::atomic<int> cr_need{0};
+  std::atomic<int> cr_have{0};
+  std::atomic<bool> cr_drain{false};
+
+  STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+    if (ppv == nullptr) return E_POINTER;
+    if (riid == __uuidof(IUnknown) ||
+        riid == __uuidof(IMFAsyncCallback)) {
+      *ppv = static_cast<IMFAsyncCallback*>(this);
+      AddRef();
+      return S_OK;
+    }
+    *ppv = nullptr;
+    return E_NOINTERFACE;
+  }
+  STDMETHODIMP_(ULONG) AddRef() override {
+    return InterlockedIncrement(&refs_);
+  }
+  STDMETHODIMP_(ULONG) Release() override {
+    const ULONG r = InterlockedDecrement(&refs_);
+    if (r == 0) {
+      gen_->Release();
+      delete this;
+    }
+    return r;
+  }
+  STDMETHODIMP GetParameters(DWORD* flow, DWORD* queue) override {
+    if (flow != nullptr) *flow = 0;
+    if (queue != nullptr) *queue = MFASYNC_CALLBACK_QUEUE_MULTITHREADED;
+    return S_OK;
+  }
+  STDMETHODIMP Invoke(IMFAsyncResult* ar) override {
+    if (stopped_.load()) return S_OK;  // teardown: no re-arm
+    ComPtr<IMFMediaEvent> ev;
+    HRESULT hr = gen_->EndGetEvent(ar, ev.GetAddressOf());
+    if (FAILED(hr)) return S_OK;  // shutdown race: stop pumping
+    MediaEventType et = 0;
+    ev->GetType(&et);
+    if (et == METransformNeedInput) {
+      cr_need.fetch_add(1);
+    } else if (et == METransformHaveOutput) {
+      cr_have.fetch_add(1);
+    } else if (et == MEError) {
+      HRESULT st = S_OK;
+      ev->GetStatus(&st);
+      XNC_LOG_ERROR("gpu_mft_event_meerror status=0x%08x",
+                    static_cast<unsigned int>(st));
+    } else if (et == METransformDrainComplete) {
+      cr_drain.store(true);
+    } else if (QsvDiagVerbose()) {
+      XNC_LOG_INFO("gpu_pump_event_unexpected et=%s(%u)", EventTypeName(et),
+                   static_cast<unsigned>(et));
+    }
+    gen_->BeginGetEvent(this, nullptr);  // continuous re-arm
+    return S_OK;
+  }
+
+ private:
+  ~GpuEventPump() = default;
+  IMFMediaEventGenerator* gen_;  // owning raw ref (see ctor)
+  std::atomic<bool> stopped_{false};
+  ULONG refs_ = 1;
+};
+
 struct Unit {
   ComPtr<IMFTransform> mft;
   ComPtr<ICodecAPI> codec_api;
@@ -171,11 +308,28 @@ struct Unit {
   size_t out_buf_size = 0;
   int need_credits = 0;  // queued METransformNeedInput
   int have_credits = 0;  // queued METransformHaveOutput
+  GpuEventPump* pump = nullptr;  // armed after streaming start; refcounted
 };
+
+// Folds callback-channel credits into the unit's credit counters (the
+// media thread's single point of absorption).
+void AbsorbCallbackCredits(Unit& u) {
+  if (u.pump == nullptr) return;
+  const int n = u.pump->cr_need.exchange(0);
+  if (n > 0) u.need_credits += n;
+  const int h = u.pump->cr_have.exchange(0);
+  if (h > 0) u.have_credits += h;
+}
 
 // Drains queued MFT events for up to slice_ms (bounded Sleep(2) polls; no
 // hot spin). Accounts NeedInput/HaveOutput credits; notes drain-complete.
+// Callback-channel credits (the Arc HaveOutput path - see GpuEventPump)
+// are folded in first.
 void PumpEvents(Unit& u, uint32_t slice_ms, bool* drain_done = nullptr) {
+  AbsorbCallbackCredits(u);
+  if (drain_done != nullptr && u.pump != nullptr &&
+      u.pump->cr_drain.exchange(false))
+    *drain_done = true;
   if (u.gen.Get() == nullptr) return;
   const ULONGLONG deadline = GetTickCount64() + slice_ms;
   for (;;) {
@@ -187,7 +341,13 @@ void PumpEvents(Unit& u, uint32_t slice_ms, bool* drain_done = nullptr) {
       Sleep(2);
       continue;
     }
-    if (FAILED(hr)) return;
+    if (FAILED(hr)) {
+      if (QsvDiagVerbose())
+        XNC_LOG_INFO("gpu_pump getevent_failed hr=0x%08x gen=0x%p",
+                     static_cast<unsigned int>(hr),
+                     reinterpret_cast<void*>(u.gen.Get()));
+      return;
+    }
     MediaEventType et = 0;
     ev->GetType(&et);
     if (et == METransformNeedInput) {
@@ -196,38 +356,99 @@ void PumpEvents(Unit& u, uint32_t slice_ms, bool* drain_done = nullptr) {
       ++u.have_credits;
     } else if (et == METransformDrainComplete) {
       if (drain_done != nullptr) *drain_done = true;
+    } else if (et == MEError) {
+      // An async MFT that hits an internal fault reports it as MEError with
+      // the failing HRESULT as the event status - without this log the pump
+      // swallows the only failure signal a wedged MFT ever emits.
+      HRESULT st = S_OK;
+      ev->GetStatus(&st);
+      XNC_LOG_ERROR("gpu_mft_event_meerror status=0x%08x",
+                    static_cast<unsigned int>(st));
+    } else {
+      // METransformMarker / stream-state changes: ignored, but surfaced at
+      // debug level so an unexpected cadence is diagnosable from logs.
+      if (QsvDiagVerbose()) {
+        HRESULT st = S_OK;
+        ev->GetStatus(&st);
+        XNC_LOG_INFO("gpu_mft_event_unexpected et=%s(%u) status=0x%08x",
+                     EventTypeName(et), static_cast<unsigned>(et),
+                     static_cast<unsigned int>(st));
+      }
     }
-    // METransformMarker / stream-state changes: ignored.
   }
 }
 
 enum class PullResult : uint8_t { kGot = 0, kNeedMore = 1, kError = 2 };
 
 // One ProcessOutput. kGot appends to outs; kNeedMore = drained for now;
-// kError sets *err. STREAM_CHANGE is consumed and reported as kGot without
-// an AU (the caller's bounded loop retries).
+// kError sets *err. STREAM_CHANGE (the classic async-MFT first-output
+// format change) refreshes the output stream info and RETRIES in-place -
+// the driver does not raise a fresh HaveOutput for the retried pull
+// (measured 2026-08-28: consuming the change and waiting stranded every
+// AU behind it), so the retry must happen within this credit.
 PullResult PullOneOutput(Unit& u, std::vector<UnitAu>* outs,
                           std::string* err) {
   MFT_OUTPUT_DATA_BUFFER ob{};
   ComPtr<IMFSample> client_sample;  // holds the client-provided case
-  if (!u.provides_samples) {
-    ComPtr<IMFMediaBuffer> client_buffer;
-    HRESULT hrb = MFCreateSample(client_sample.GetAddressOf());
-    if (SUCCEEDED(hrb))
-      hrb = MFCreateMemoryBuffer(static_cast<DWORD>(u.out_buf_size),
-                                 client_buffer.GetAddressOf());
-    if (SUCCEEDED(hrb)) hrb = client_sample->AddBuffer(client_buffer.Get());
-    if (FAILED(hrb)) {
-      if (err) *err = HrStep("output sample alloc", hrb);
-      return PullResult::kError;
-    }
-    ob.pSample = client_sample.Get();
-  }
   DWORD status = 0;
-  HRESULT hr = u.mft->ProcessOutput(0, 1, &ob, &status);
-  if (ob.pEvents) {
-    ob.pEvents->Release();
-    ob.pEvents = nullptr;
+  HRESULT hr = S_OK;
+  for (int round = 0; round < 3; ++round) {
+    if (!u.provides_samples) {
+      ComPtr<IMFMediaBuffer> client_buffer;
+      HRESULT hrb = MFCreateSample(client_sample.GetAddressOf());
+      if (SUCCEEDED(hrb))
+        hrb = MFCreateMemoryBuffer(static_cast<DWORD>(u.out_buf_size),
+                                   client_buffer.GetAddressOf());
+      if (SUCCEEDED(hrb)) hrb = client_sample->AddBuffer(client_buffer.Get());
+      if (FAILED(hrb)) {
+        if (err) *err = HrStep("output sample alloc", hrb);
+        return PullResult::kError;
+      }
+      ob.pSample = client_sample.Get();
+    }
+    status = 0;
+    hr = u.mft->ProcessOutput(0, 1, &ob, &status);
+    if (ob.pEvents) {
+      ob.pEvents->Release();
+      ob.pEvents = nullptr;
+    }
+    if (hr != MF_E_TRANSFORM_STREAM_CHANGE) break;
+    if (u.provides_samples && ob.pSample) {
+      ob.pSample->Release();
+      ob.pSample = nullptr;
+    }
+    // Refresh the (possibly changed) output contract and RENEGOTIATE the
+    // output type (the async-MFT stream-change contract: the MFT offers
+    // its final format; ProcessOutput yields data only after SetOutputType
+    // is re-acknowledged), then retry within this credit - the driver does
+    // not raise a fresh HaveOutput for the retried pull (measured
+    // 2026-08-28: consuming the change and waiting stranded every AU).
+    MFT_OUTPUT_STREAM_INFO osi{};
+    if (SUCCEEDED(u.mft->GetOutputStreamInfo(0, &osi))) {
+      u.provides_samples =
+          (osi.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) != 0;
+      if (osi.cbSize > u.out_buf_size) u.out_buf_size = osi.cbSize;
+    }
+    ComPtr<IMFMediaType> offered;
+    for (DWORD k = 0;; ++k) {
+      ComPtr<IMFMediaType> cand;
+      if (FAILED(u.mft->GetOutputAvailableType(0, k, cand.GetAddressOf())))
+        break;
+      GUID sub{};
+      if (FAILED(cand->GetGUID(MF_MT_SUBTYPE, &sub)) ||
+          sub != MFVideoFormat_H264)
+        continue;
+      offered = cand;
+      break;
+    }
+    const HRESULT sr = offered.Get() != nullptr
+                           ? u.mft->SetOutputType(0, offered.Get(), 0)
+                           : E_FAIL;
+    if (QsvDiagVerbose())
+      XNC_LOG_INFO("gpu_output_stream_change provides=%d cb=%lu "
+                   "renegotiate hr=0x%08x",
+                   u.provides_samples ? 1 : 0, osi.cbSize,
+                   static_cast<unsigned int>(sr));
   }
   if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return PullResult::kNeedMore;
   if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
@@ -298,10 +519,26 @@ bool CollectUnitOutputs(Unit& u, uint32_t wait_slice_ms,
 bool WaitForNeedInput(Unit& u, uint32_t budget_ms) {
   if (!u.is_async) return true;  // sync MFT: ProcessInput directly
   const ULONGLONG deadline = GetTickCount64() + budget_ms;
+  const ULONGLONG t0 = GetTickCount64();
+  int polls = 0;
+  const bool dbg = QsvDiagVerbose();
   for (;;) {
     PumpEvents(u, 2);
-    if (u.need_credits > 0) return true;
-    if (GetTickCount64() >= deadline) return false;
+    ++polls;
+    if (u.need_credits > 0) {
+      if (dbg)
+        XNC_LOG_INFO("gpu_wait_need_input got=1 polls=%d t=%ums gen=0x%p",
+                     polls, static_cast<unsigned>(GetTickCount64() - t0),
+                     reinterpret_cast<void*>(u.gen.Get()));
+      return true;
+    }
+    if (GetTickCount64() >= deadline) {
+      if (dbg)
+        XNC_LOG_INFO("gpu_wait_need_input TIMEOUT polls=%d budget=%ums "
+                     "gen=0x%p",
+                     polls, budget_ms, reinterpret_cast<void*>(u.gen.Get()));
+      return false;
+    }
   }
 }
 
@@ -310,6 +547,14 @@ bool ConfigureUnit(Unit& u, IMFDXGIDeviceManager* mgr, uint32_t w, uint32_t h,
                    uint32_t fps, uint32_t bitrate, std::string* err) {
   const uint64_t frame_size = (static_cast<uint64_t>(w) << 32) | h;
   const uint64_t frame_rate = (static_cast<uint64_t>(fps) << 32) | 1;
+  const bool cfg_dbg = QsvDiagVerbose();
+  const ULONGLONG cfg_t0 = GetTickCount64();
+  auto steplog = [cfg_dbg, cfg_t0](const char* step, HRESULT h) {
+    if (cfg_dbg)
+      XNC_LOG_INFO("gpu_cfg step=%s hr=0x%08x t=%ums", step,
+                   static_cast<unsigned int>(h),
+                   static_cast<unsigned>(GetTickCount64() - cfg_t0));
+  };
 
   // Async unlock FIRST: every other call returns MF_E_TRANSFORM_ASYNC_LOCKED
   // (0xC00D6D77) until this is set on the MFT's own attribute store.
@@ -320,6 +565,7 @@ bool ConfigureUnit(Unit& u, IMFDXGIDeviceManager* mgr, uint32_t w, uint32_t h,
     if (SUCCEEDED(attrs->GetUINT32(MF_TRANSFORM_ASYNC, &async)) && async) {
       u.is_async = true;
       hr = attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+      steplog("async_unlock", hr);
       if (FAILED(hr)) {
         if (err) *err = HrStep("MF_TRANSFORM_ASYNC_UNLOCK", hr);
         return false;
@@ -334,6 +580,11 @@ bool ConfigureUnit(Unit& u, IMFDXGIDeviceManager* mgr, uint32_t w, uint32_t h,
   }
   if (u.is_async) {
     hr = u.mft.As(&u.gen);
+    steplog("qi_event_gen", hr);
+    if (QsvDiagVerbose())
+      XNC_LOG_INFO("gpu_cfg mft=0x%p gen=0x%p",
+                   reinterpret_cast<void*>(u.mft.Get()),
+                   reinterpret_cast<void*>(u.gen.Get()));
     if (FAILED(hr)) {
       if (err) *err = HrStep("QI(IMFMediaEventGenerator)", hr);
       return false;
@@ -343,13 +594,15 @@ bool ConfigureUnit(Unit& u, IMFDXGIDeviceManager* mgr, uint32_t w, uint32_t h,
   // Device manager BEFORE media types (the D3D11-aware contract).
   hr = u.mft->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER,
                              reinterpret_cast<UINT_PTR>(mgr));
+  steplog("set_d3d_manager", hr);
   if (FAILED(hr)) {
     if (err) *err = HrStep("SET_D3D_MANAGER", hr);
     return false;
   }
 
   // Rate control BEFORE types (the mf_encoder.cpp lesson). LowDelayVBR
-  // first, CBR fallback - measured: QSV accepts both, software only CBR.
+  // first, CBR fallback - measured: software only accepts CBR; QSV/Arc
+  // rejects LowDelayVBR with 0x80070057 and takes CBR.
   u.codec_api.Reset();
   u.mft->QueryInterface(IID_PPV_ARGS(u.codec_api.GetAddressOf()));
   if (u.codec_api.Get() != nullptr) {
@@ -367,6 +620,7 @@ bool ConfigureUnit(Unit& u, IMFDXGIDeviceManager* mgr, uint32_t w, uint32_t h,
   ComPtr<IMFMediaType> out_mt;
   hr = MakeH264OutputType(w, h, fps, bitrate, out_mt.GetAddressOf());
   if (SUCCEEDED(hr)) hr = u.mft->SetOutputType(0, out_mt.Get(), 0);
+  if (SUCCEEDED(hr)) steplog("set_output_type(caller)", hr);
   if (FAILED(hr)) {
     for (DWORD i = 0;; ++i) {
       ComPtr<IMFMediaType> t;
@@ -381,7 +635,10 @@ bool ConfigureUnit(Unit& u, IMFDXGIDeviceManager* mgr, uint32_t w, uint32_t h,
         hr = t->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
       if (SUCCEEDED(hr)) hr = t->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
       if (SUCCEEDED(hr)) hr = u.mft->SetOutputType(0, t.Get(), 0);
-      if (SUCCEEDED(hr)) break;
+      if (SUCCEEDED(hr)) {
+        steplog("set_output_type(enum)", hr);
+        break;
+      }
     }
   }
   if (FAILED(hr)) {
@@ -393,6 +650,7 @@ bool ConfigureUnit(Unit& u, IMFDXGIDeviceManager* mgr, uint32_t w, uint32_t h,
   ComPtr<IMFMediaType> in_mt;
   hr = MakeNv12InputType(w, h, fps, in_mt.GetAddressOf());
   if (SUCCEEDED(hr)) hr = u.mft->SetInputType(0, in_mt.Get(), 0);
+  steplog("set_input_type", hr);
   if (FAILED(hr)) {
     if (err) *err = HrStep("SetInputType(hw)", hr);
     return false;
@@ -411,35 +669,64 @@ bool ConfigureUnit(Unit& u, IMFDXGIDeviceManager* mgr, uint32_t w, uint32_t h,
                  Nv12ColorForSize(h).matrix);
   }
 
-  // Low-latency shaping after types (accepted there; best-effort).
+  // Post-type shaping (accepted, best-effort). NOTE: CODECAPI_AVLowLatency
+  // Mode and the MF_LOW_LATENCY attribute are deliberately NOT set on this
+  // path: measured 2026-08-28 on Intel Arc (driver 32.0.101.8801), both on
+  // the RDP dev box and the real console - the MFT ACCEPTS the set (S_OK)
+  // then stops raising METransformNeedInput after the first ProcessInput
+  // (one HaveOutput may still arrive; then permanent silence). Every other
+  // property in this block is verified innocent by per-set bisection.
   if (u.codec_api.Get() != nullptr) {
     CodecApiSetUi4(u.codec_api.Get(), &CODECAPI_AVEncMPVGOPSize, fps * 10,
                    "gop_size");
     CodecApiSetUi4(u.codec_api.Get(), &CODECAPI_AVEncMPVDefaultBPictureCount,
                    0, "b_picture_count");
-    VARIANT v{};  // AVLowLatencyMode is VT_BOOL
-    v.vt = VT_BOOL;
-    v.boolVal = VARIANT_TRUE;
-    if (FAILED(u.codec_api->SetValue(&CODECAPI_AVLowLatencyMode, &v)))
-      XNC_LOG_INFO("gpu_codec_api_set_skip name=low_latency hr=rejected");
+    // A two-frame HRD buffer: bounds the emit depth (best-effort; the
+    // Arc/QSV low-latency properties - AVLowLatencyMode and
+    // AVEncCommonLowLatency - are BOTH accepted-then-wedging on driver
+    // 32.0.101.8801 and must not be set, see the note above).
+    CodecApiSetUi4(u.codec_api.Get(), &CODECAPI_AVEncCommonBufferSize,
+                   bitrate / (fps ? fps : 30) / 8 * 2, "buffer_size");
   }
 
   MFT_OUTPUT_STREAM_INFO osi{};
   hr = u.mft->GetOutputStreamInfo(0, &osi);
+  steplog("get_output_stream_info", hr);
   if (SUCCEEDED(hr)) {
     u.provides_samples =
         (osi.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) != 0;
     if (osi.cbSize > u.out_buf_size) u.out_buf_size = osi.cbSize;
+    if (QsvDiagVerbose())
+      XNC_LOG_INFO("gpu_cfg out_stream_info provides=%d cb=%lu",
+                   u.provides_samples ? 1 : 0, osi.cbSize);
   }
   if (u.out_buf_size == 0)
     u.out_buf_size = static_cast<size_t>(w) * h * 4 + 65536;
 
   hr = u.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+  steplog("begin_streaming", hr);
   if (SUCCEEDED(hr))
     hr = u.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+  steplog("start_of_stream", hr);
   if (FAILED(hr)) {
     if (err) *err = HrStep("ProcessMessage(start streaming)", hr);
     return false;
+  }
+
+  // Arm the callback-channel event pump LAST: the Arc driver delivers
+  // METransformHaveOutput only to an active BeginGetEvent listener (see
+  // GpuEventPump); events queued before arming dispatch on the next arm.
+  if (u.is_async && u.gen.Get() != nullptr) {
+    u.pump = new GpuEventPump(u.gen.Get());
+    hr = u.gen->BeginGetEvent(u.pump, nullptr);
+    steplog("begin_get_event", hr);
+    if (FAILED(hr)) {
+      u.pump->Release();
+      u.pump = nullptr;
+      if (err) *err = HrStep("BeginGetEvent(pump)", hr);
+      return false;
+    }
+    u.pump->Release();  // the pending BeginGetEvent holds the reference
   }
   return true;
 }
@@ -451,6 +738,13 @@ bool ConfigureUnit(Unit& u, IMFDXGIDeviceManager* mgr, uint32_t w, uint32_t h,
 // owner - never released here AND there; the activated object is
 // ShutdownObject'd by that same cleanup).
 void ReleaseUnit(Unit& u, bool release_activate = true) {
+  // Stop the callback pump FIRST (no re-arm; an in-flight invoke holds its
+  // own generator reference, so the COM releases below are safe).
+  if (u.pump != nullptr) {
+    u.pump->Stop();
+    u.pump->Release();
+    u.pump = nullptr;
+  }
   if (u.mft.Get() != nullptr)
     u.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
   if (release_activate && u.activate.Get() != nullptr) {
@@ -480,7 +774,8 @@ bool UnitSubmitTexture(Unit& u, ID3D11Texture2D* tex, int64_t time_100ns,
     sample->SetSampleDuration(dur_100ns);
   }
   if (FAILED(hr)) return false;
-  // One-shot force-key at SUBMISSION (E2 contract; consumed unconditionally).
+  // One-shot force-key at SUBMISSION (E2 contract; consumed unconditionally
+  // - verified innocent in the 2026-08-28 per-set bisection).
   if (force_idr && u.codec_api.Get() != nullptr) {
     VARIANT v{};
     v.vt = VT_UI4;
@@ -719,6 +1014,11 @@ bool RunStartupProbe(IMFDXGIDeviceManager* mgr, ID3D11Device* dev,
   uint32_t first_output_ms = 0;
   size_t outputs = 0;
   std::string why;
+  if (QsvDiagVerbose())
+    XNC_LOG_INFO("gpu_probe_begin mft=0x%p gen=0x%p async=%d",
+                 reinterpret_cast<void*>(probe.mft.Get()),
+                 reinterpret_cast<void*>(probe.gen.Get()),
+                 probe.is_async ? 1 : 0);
   for (uint32_t i = 0; i < kProbeInputBound && why.empty(); ++i) {
     if (!WaitForNeedInput(probe, kNeedInputWaitMs)) {
       why = "probe: no METransformNeedInput within budget (input #" +
@@ -874,6 +1174,22 @@ bool MfGpuEncoder::Init(ID3D11Device* dev, Nv12SurfacePool* pool, uint32_t w,
   impl_->h = h;
   impl_->fps = fps;
   impl_->bitrate = bitrate_bps;
+
+  // Multithread protection BEFORE ResetDevice (the IMFDXGIDeviceManager::
+  // ResetDevice contract): the hardware MFT's internal worker threads use
+  // the shared immediate context concurrently with this thread's
+  // VideoProcessorBlt writes. Without the D3D thread-safe layer the first
+  // submitted DXGI sample wedges the MFT - measured 2026-08-28: negotiation
+  // all S_OK, first METransformNeedInput in ~16 ms, then NO further events
+  // (no second NeedInput, no HaveOutput) after the first ProcessInput on
+  // both the RDP dev box and the Arc 130T console. Intel QSV + Arc.
+  {
+    ComPtr<ID3D10Multithread> mt;
+    HRESULT mt_hr = dev->QueryInterface(IID_PPV_ARGS(mt.GetAddressOf()));
+    if (SUCCEEDED(mt_hr)) mt_hr = mt->SetMultithreadProtected(TRUE);
+    XNC_LOG_INFO("gpu_dev_multithread hr=0x%08x",
+                 static_cast<unsigned int>(mt_hr));
+  }
 
   hr = MFCreateDXGIDeviceManager(&impl_->reset_token,
                                  impl_->mgr.GetAddressOf());
@@ -1395,6 +1711,196 @@ const char* MfCpuEncoder::BackendName() const { return enc_.BackendName(); }
 EncoderBackend MfCpuEncoder::backend() const { return enc_.backend(); }
 const std::string& MfCpuEncoder::FriendlyName() const {
   return enc_.FriendlyName();
+}
+
+// ---- QSV hardware-ladder diagnostic (2026-08-28 root-cause tooling) ----
+//
+// Drives the production ladder (MfGpuEncoder::Init with the full §8.3
+// probe) plus one 8-input miniprobe through the production unit machinery
+// in a fresh process, with the configure-path step logs on (XNC_QSV_DIAG).
+// The 2026-08-28 root-cause session used the strategy-matrix ancestors of
+// this mode to bisect the three independent Arc/QSV defects fixed in this
+// file (see GpuEventPump / ConfigureUnit / PullOneOutput notes).
+int RunQsvProbeDiagnostic(bool mf_startup_full) {
+  // Turn the configure-path step logs on for this process.
+  SetEnvironmentVariableA("XNC_QSV_DIAG", "1");
+  const ULONGLONG t_all = GetTickCount64();
+  HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  const bool co_owner = SUCCEEDED(hr);
+  if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+    XNC_LOG_INFO("qsvdiag abort coinit hr=0x%08x",
+                 static_cast<unsigned int>(hr));
+    return 2;
+  }
+  hr = MFStartup(MF_VERSION,
+                 mf_startup_full ? MFSTARTUP_FULL : MFSTARTUP_LITE);
+  XNC_LOG_INFO("qsvdiag start startup=%s hr=0x%08x",
+               mf_startup_full ? "full" : "lite",
+               static_cast<unsigned int>(hr));
+  if (FAILED(hr)) {
+    if (co_owner) CoUninitialize();
+    return 2;
+  }
+
+  const UINT create_flags =
+      D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+  ComPtr<ID3D11Device> dev;
+  ComPtr<ID3D11DeviceContext> ctx;
+  D3D_FEATURE_LEVEL fl{};
+  hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                         create_flags, nullptr, 0, D3D11_SDK_VERSION, &dev, &fl,
+                         &ctx);
+  XNC_LOG_INFO("qsvdiag device hr=0x%08x fl=0x%04x",
+               static_cast<unsigned int>(hr), static_cast<unsigned>(fl));
+  if (FAILED(hr)) {
+    MFShutdown();
+    if (co_owner) CoUninitialize();
+    return 2;
+  }
+
+  UINT reset_token = 0;
+  ComPtr<IMFDXGIDeviceManager> mgr;
+  hr = MFCreateDXGIDeviceManager(&reset_token, mgr.GetAddressOf());
+  if (SUCCEEDED(hr)) hr = mgr->ResetDevice(dev.Get(), reset_token);
+  XNC_LOG_INFO("qsvdiag dxgi_manager hr=0x%08x", static_cast<unsigned int>(hr));
+  if (FAILED(hr)) {
+    MFShutdown();
+    if (co_owner) CoUninitialize();
+    return 2;
+  }
+
+  MFT_REGISTER_TYPE_INFO in_ri{MFMediaType_Video, MFVideoFormat_NV12};
+  MFT_REGISTER_TYPE_INFO out_ri{MFMediaType_Video, MFVideoFormat_H264};
+  IMFActivate** acts = nullptr;
+  UINT32 nacts = 0;
+  hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
+                 MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER, &in_ri,
+                 &out_ri, &acts, &nacts);
+  XNC_LOG_INFO("qsvdiag enum hr=0x%08x n=%u", static_cast<unsigned int>(hr),
+               nacts);
+  if (FAILED(hr) || nacts == 0 || acts == nullptr) {
+    if (acts != nullptr) {
+      for (UINT32 i = 0; i < nacts; ++i) acts[i]->Release();
+      CoTaskMemFree(acts);
+    }
+    MFShutdown();
+    if (co_owner) CoUninitialize();
+    return 2;
+  }
+  const std::wstring friendly = ActivateFriendlyName(acts[0]);
+  XNC_LOG_INFO("qsvdiag candidate friendly=\"%s\"",
+               WideToNarrow(friendly).c_str());
+
+  // The probe scenario's own geometry (the selftest's hardware branch).
+  const uint32_t w = 640, h = 480, fps = 30, bitrate = 2000000;
+  bool mini_ok = false;
+
+  // (1) The PRODUCTION Init (full 8.3 probe through the real ladder) in
+  // this process - the headline result.
+  {
+    Nv12SurfacePool pool;
+    std::string perr2;
+    const bool pool_ok = pool.Init(dev.Get(), w, h, &perr2);
+    XNC_LOG_INFO("qsvdiag production_pool ok=%d err=\"%s\"", pool_ok ? 1 : 0,
+                 perr2.c_str());
+    if (pool_ok) {
+      MfGpuEncoder gpu;
+      std::string gerr;
+      const ULONGLONG t0 = GetTickCount64();
+      const bool gok = gpu.Init(dev.Get(), &pool, w, h, fps, bitrate, &gerr);
+      XNC_LOG_INFO("qsvdiag production_init ok=%d dt=%ums err=\"%s\" "
+                   "friendly=\"%s\"",
+                   gok ? 1 : 0, static_cast<unsigned>(GetTickCount64() - t0),
+                   gerr.c_str(), gpu.FriendlyName().c_str());
+      if (gok) gpu.Shutdown(ShutdownMode::kImmediate);
+    }
+  }
+
+  // (2) One 8-input miniprobe through the production unit machinery
+  // (ConfigureUnit + pump + WaitForNeedInput + texture submit + collect)
+  // with per-input logs - exercises exactly the live-path shapes.
+  {
+    const ULONGLONG t0 = GetTickCount64();
+    Unit u;
+    hr = acts[0]->ActivateObject(IID_PPV_ARGS(u.mft.GetAddressOf()));
+    if (FAILED(hr)) {
+      XNC_LOG_INFO("qsvdiag mini activate hr=0x%08x",
+                   static_cast<unsigned int>(hr));
+    } else {
+      u.activate = acts[0];
+      std::string cerr3;
+      if (!ConfigureUnit(u, mgr.Get(), w, h, fps, bitrate, &cerr3)) {
+        XNC_LOG_INFO("qsvdiag mini configure FAILED err=\"%s\"",
+                     cerr3.c_str());
+      } else {
+        std::vector<uint8_t> nv12(static_cast<size_t>(w) * h * 3 / 2);
+        for (uint32_t y = 0; y < h; ++y)
+          for (uint32_t x = 0; x < w; ++x)
+            nv12[static_cast<size_t>(y) * w + x] =
+                static_cast<uint8_t>((x + y) & 0xFF);
+        for (size_t i = static_cast<size_t>(w) * h; i < nv12.size(); i += 2) {
+          nv12[i] = 128;
+          nv12[i + 1] = 128;
+        }
+        ComPtr<ID3D11Texture2D> tex[3];
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = w;
+        td.Height = h;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.SampleDesc.Count = 1;
+        td.Format = DXGI_FORMAT_NV12;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET;
+        bool tex_ok = true;
+        for (int i = 0; i < 3; ++i)
+          if (FAILED(dev->CreateTexture2D(&td, nullptr, &tex[i])))
+            tex_ok = false;
+        int submitted = 0, outputs = 0;
+        if (tex_ok) {
+          const int64_t frame_dur = 10000000 / fps;
+          for (uint32_t i = 0; i < 8; ++i) {
+            if (!WaitForNeedInput(u, 3000)) {
+              XNC_LOG_INFO("qsvdiag mini stall_at_input=%u", i + 1);
+              break;
+            }
+            if (u.is_async) --u.need_credits;
+            ctx->UpdateSubresource(tex[i % 3].Get(), 0, nullptr, nv12.data(),
+                                   w, 0);
+            const int64_t t = static_cast<int64_t>(i + 1) * frame_dur;
+            if (!UnitSubmitTexture(u, tex[i % 3].Get(), t, frame_dur,
+                                   i == 0 || i == 7)) {
+              XNC_LOG_INFO("qsvdiag mini submit_rejected at=%u", i + 1);
+              break;
+            }
+            ++submitted;
+            std::vector<UnitAu> aus;
+            CollectUnitOutputs(u, 120, &aus, nullptr);
+            outputs += static_cast<int>(aus.size());
+            if (!aus.empty())
+              XNC_LOG_INFO("qsvdiag mini input=%u aus=%zu first_au_bytes=%zu",
+                           i + 1, aus.size(), aus.front().au.size());
+          }
+        }
+        mini_ok = submitted == 8 && outputs > 0;
+        XNC_LOG_INFO("qsvdiag mini submitted=%d outputs=%d dt=%ums", submitted,
+                     outputs, static_cast<unsigned>(GetTickCount64() - t0));
+      }
+      ReleaseUnit(u);
+    }
+  }
+
+  XNC_LOG_INFO("qsvdiag summary startup=%s mini_ok=%d total_ms=%u",
+               mf_startup_full ? "full" : "lite", mini_ok ? 1 : 0,
+               static_cast<unsigned>(GetTickCount64() - t_all));
+  for (UINT32 i = 0; i < nacts; ++i) {
+    acts[i]->ShutdownObject();
+    acts[i]->Release();
+  }
+  CoTaskMemFree(acts);
+  MFShutdown();
+  if (co_owner) CoUninitialize();
+  return mini_ok ? 0 : 1;
 }
 
 }  // namespace xnc

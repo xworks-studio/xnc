@@ -361,6 +361,18 @@ class MfCpuEncoder final : public IEncoderSession {
   EncoderSessionError last_error_ = EncoderSessionError::kNone;
 };
 
+// ---- QSV hardware-ladder diagnostic (2026-08-28 root-cause tooling) ----
+// Diagnostic-only entry point (no production caller; wmain's
+// --qsv-probe-diag mode). In a fresh process: platform init
+// (MFSTARTUP_LITE, or FULL with mf_startup_full), a hardware D3D11 device
+// + DXGI device manager, then (1) the PRODUCTION MfGpuEncoder::Init (the
+// full §8.3 ladder probe) and (2) one 8-input miniprobe through the
+// production unit machinery (ConfigureUnit + GpuEventPump + texture
+// submits + collection), with per-step HRESULTs and event traces
+// (XNC_QSV_DIAG=1 is set for the process). Returns 0 iff the miniprobe
+// submitted 8 inputs and collected outputs.
+int RunQsvProbeDiagnostic(bool mf_startup_full);
+
 }  // namespace xnc
 
 #endif  // XNC_NATIVE_DESKTOP_MF_GPU_ENCODER_H_

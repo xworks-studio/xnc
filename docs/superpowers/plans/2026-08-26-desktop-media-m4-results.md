@@ -164,3 +164,68 @@ a fix commit is a follow-up.
 3. Land the `pipeline.cpp` JSON fix (§7).
 4. Reset cycles need either the two scriptable mechanisms only, or a real ACCESS_LOST trigger
    (mode change / secure-desktop) — second-duplication eviction does not exist on Win11 26200.
+
+---
+
+## 9. 2026-08-28 addendum — QSV hardware rung: ROOT-CAUSED AND FIXED (Outcome A)
+
+The §4 P0 "hardware encoder rung does not serve on this node" is resolved. The
+`"probe: no METransformNeedInput within budget (input #1)"` failure was misread twice: the message's
+`input #1` is the probe loop's SECOND wait (0-based), and pointer-level instrumentation
+(`gpu_wait_need_input` logs, `--qsv-probe-diag` mode) shows the FIRST NeedInput always arrives in
+~16 ms. The stall was after the first ProcessInput, and it reproduced identically on the RDP dev
+box — the earlier "understood: RDP" note was wrong; environment was never the variable.
+
+Three independent defects in `native/desktop/mf_gpu_encoder.cpp`, all measured on driver
+32.0.101.8801 on BOTH the dev box and the console (per-set bisection via a temporary
+`XNC_QSV_CA_MASK` env in the diag build; artifacts `artifacts\desktop-media\qsvdiag-remote\`):
+
+1. **`CODECAPI_AVLowLatencyMode = TRUE` wedges the MFT** — accepted (S_OK) and logged as such, but
+   from the next ProcessInput on, no further METransformNeedInput is ever raised (one HaveOutput
+   may still arrive; then permanent silence; drain yields nothing). `AVEncCommonLowLatency` and the
+   `MF_LOW_LATENCY` attribute wedge identically. GOP size, B-picture count and submit-time
+   `AVEncVideoForceKeyFrame` are innocent (verified individually).
+2. **`METransformHaveOutput` is delivered ONLY to a registered `BeginGetEvent` callback** — the
+   polled `GetEvent(MF_EVENT_FLAG_NO_WAIT)` queue never sees event 602. With the wedging property
+   removed, a polled drive accepts 8/8 inputs yet collects ZERO outputs even across
+   END_OF_STREAM+DRAIN; the callback drive receives HaveOutput ~50-75 ms after the first submit.
+   Fix: `GpuEventPump` (an `IMFAsyncCallback` armed after streaming start) counts credits;
+   `AbsorbCallbackCredits` folds them into the unit's counters on the media thread, which stays
+   the only thread calling ProcessInput/ProcessOutput.
+3. **The first ProcessOutput returns `MF_E_TRANSFORM_STREAM_CHANGE` and no fresh HaveOutput
+   follows the consumed change** — the old code consumed the change inside a credit and then
+   waited for a credit that never comes, stranding every AU. Fix: `PullOneOutput` renegotiates the
+   MFT's offered H.264 output type (`GetOutputAvailableType`→`SetOutputType`) and retries within
+   the same credit.
+
+Remaining characterization: the encoder has a structural ~4-5-input emit depth (QSV AsyncDepth).
+Every low-latency knob on this driver either wedges (defect 1) or is rejected
+(LowDelayVBR / AVEncCommonRealTime → 0x80070057); a 2-frame `AVEncCommonBufferSize` is set as a
+best-effort bound. First output lands at input ~5 in 11-25 ms wall — §8.3 item 2's "two inputs OR
+100 ms" holds through its latency half. The selftest's `gpu-probe-first-output-strict` had
+implemented the bound as AND (≤2 inputs AND ≤100 ms), contradicting both the spec wording quoted in
+its own comment and the probe's own gate; corrected to the documented OR.
+
+**Evidence (console session 5, scheduled task `xnc-m4-qsvdiag`, artifacts pulled to
+`artifacts\desktop-media\qsvdiag-remote\`):**
+- `--qsv-probe-diag`: exit 0 — `production_init ok=1 dt=391ms friendly="Intel? Quick Sync Video
+  H.264 Encoder MFT"`; miniprobe `submitted=8 outputs=4` (AUs 7991/52/7988/8332 B).
+- Full `--selftest` on console hardware: **exit 0, zero FAIL lines, hardware branch LIVE** —
+  `gpu_probe ok=1 inputs=8 outputs=3 first_out_input=5 first_out_ms=25`,
+  `gpu_encoder_init … async=1 provides=1 friendly="Intel? Quick Sync Video H.264 Encoder MFT"`,
+  negotiated matrix 2 (BT.601) == rule, `gpu-session hardware INITIALIZED`. The hardware-branch
+  CHECKs that now actually execute green: `gpu-probe-ok`, `gpu-probe-1to1-mapping`,
+  `gpu-probe-first-output-strict`, `gpu-probe-discriminates`, `gpu-input-matrix-agrees` (VUI is
+  not signaled by this backend — loud NOTE, matrix is the hard check).
+- Same binary, dev box: local selftest exit 0.
+
+New diagnostic surface landed with the fix (generically useful, read-only instrumentation):
+`--qsv-probe-diag[-full]` mode, `XNC_QSV_DIAG=1` per-step configure logs (`gpu_cfg step=…`),
+`gpu_wait_need_input` outcomes, permanent `gpu_mft_event_meerror` logging, and
+`gpu_output_stream_change` traces. The probe/failover contract is unchanged — a candidate that
+fails the §8.3 probe still loses the rung to software (the software failover code paths were not
+modified).
+
+§8 follow-up 1 is closed. Follow-up 2 (software rung at unclamped 2880x1800) is expected to be
+overtaken by the hardware rung serving, but was NOT re-measured here — a fresh bounded soak with
+the hardware rung live is the natural next gate.

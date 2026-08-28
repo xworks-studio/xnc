@@ -73,6 +73,11 @@ struct DiagOptions {
                                 // (feat/rt-scale): every captured frame is
                                 // downscaled before encode, encoder Init +
                                 // HOST_HELLO carry the scaled dims (0 = none)
+  bool qsv_probe_diag = false;      // --qsv-probe-diag: QSV pump-strategy
+                                    // diagnostic (mf_gpu_encoder.cpp; debug
+                                    // tool for the hardware ladder probe)
+  bool qsv_probe_diag_full = false; // --qsv-probe-diag-full: same, with
+                                    // MFSTARTUP_FULL platform init
 };
 
 // Parses argv[1..] (argv[0] is skipped). Returns true on success; on failure

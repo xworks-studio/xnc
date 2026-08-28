@@ -52,6 +52,7 @@
 #include "jpeg_wic.h"      // DownscaleBgra / WicEncodeJpeg (M2-Slice3 T3)
 #include "media_pipeline_v2.h"  // MediaPipelineV2 (M2 Task 4)
 #include "mf_encoder.h"    // MfSoftEncoder
+#include "mf_gpu_encoder.h"  // RunQsvProbeDiagnostic (--qsv-probe-diag)
 #include "pipeline.h"      // Pipeline::Run + stats.json sidecar
 #include "rt_pipe_server.h"  // RtServer (real-time fan-out)
 #include "scaled_capture.h"  // ScaledCapture (--max-w rt/diag downscale)
@@ -252,6 +253,13 @@ void Usage(FILE* out) {
       L"  --selftest      arg parsing + FrameBlob/encoder/pipeline/rt selftest\n"
       L"                  (--selftest --desktop-pipeline-v2 additionally runs\n"
       L"                  the MediaPipelineV2 scenarios)\n"
+      L"  --qsv-probe-diag\n"
+      L"                  QSV hardware-ladder diagnostic: the production\n"
+      L"                  ladder probe (full 8.3 startup probe) plus one\n"
+      L"                  8-input miniprobe with per-step HRESULTs and\n"
+      L"                  event traces; exit 0 iff the miniprobe collected\n"
+      L"                  outputs. -full variant initializes the MF\n"
+      L"                  platform with MFSTARTUP_FULL\n"
       L"  --desktop-pipeline-v2  select the M2 depth-one GPU media pipeline\n"
       L"                  AND the v2 media wire TOGETHER (default off = the\n"
       L"                  M0 pipeline; the env XNC_DESKTOP_PIPELINE_V2 is the\n"
@@ -471,13 +479,18 @@ bool ParseDiagArgs(int argc, wchar_t** argv, DiagOptions* opt, std::wstring* err
       } else {
         return fail(L"--encoder must be hardware or software");
       }
+    } else if (std::wcscmp(a, L"--qsv-probe-diag") == 0) {
+      opt->qsv_probe_diag = true;
+    } else if (std::wcscmp(a, L"--qsv-probe-diag-full") == 0) {
+      opt->qsv_probe_diag = true;
+      opt->qsv_probe_diag_full = true;
     } else {
       return fail(std::wstring(L"unknown argument: ") + a);
     }
   }
   const int modes = (opt->console_diag ? 1 : 0) + (opt->console_rt ? 1 : 0) +
                     (opt->selftest ? 1 : 0) + (opt->help ? 1 : 0) +
-                    (opt->jpeg_single ? 1 : 0);
+                    (opt->jpeg_single ? 1 : 0) + (opt->qsv_probe_diag ? 1 : 0);
   if (modes > 1)
     return fail(L"--console-diag, --console-rt, --jpeg-single, --selftest "
                 L"and --help are mutually exclusive");
@@ -1297,6 +1310,11 @@ int wmain(int argc, wchar_t** argv) {
     xnc::SetLogFile(narrow.c_str());
   }
   if (opt.selftest) return SelftestMain(desktop_pipeline_v2);
+  if (opt.qsv_probe_diag) {
+    // Diagnostic-only QSV hardware-ladder probe (2026-08-28 root-cause);
+    // runs before any secret/stdin handling - it needs no secret.
+    return xnc::RunQsvProbeDiagnostic(opt.qsv_probe_diag_full);
+  }
   if (opt.secret_stdin) {
     // Service path: the secret enters via stdin, never argv (spec 1.5).
     // The parser guarantees --secret-stdin only survives when a mode that
