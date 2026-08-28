@@ -361,12 +361,20 @@ func (s *ViewerSender) Enqueue(f Frame) error {
 	case statePaused:
 		s.stats.pausedDropped++
 	case stateWaitIDR:
-		switch {
-		case !s.epochAcceptsLocked(fe):
-			s.stats.epochDropped++
-		case !f.Key:
+		if !s.epochAcceptsLocked(fe) {
+			// M4 修正(livelock 加固):等待期间 host 又前进了一代 ——
+			// 重定位到更新的 epoch(其恢复 IDR 不被旧目标永久压制:修
+			// 前 pendingEpoch 停在旧代,新代关键帧永远 epochDropped,
+			// 观众饿死而 host 徒劳产 IDR)。旧代帧照旧抑制。
+			if !epochNewer(fe, s.pendingEpoch) {
+				s.stats.epochDropped++
+				break
+			}
+			s.pendingEpoch = fe
+		}
+		if !f.Key {
 			s.stats.preKeyDropped++
-		default:
+		} else {
 			s.epoch, s.pendingEpoch = fe, frameEpoch{}
 			s.state = stateLive
 			proceed = true
@@ -581,6 +589,19 @@ func (s *ViewerSender) epochAcceptsLocked(fe frameEpoch) bool {
 		return true
 	}
 	return fe == s.pendingEpoch
+}
+
+// epochNewer 报告 a 是否严格新于 b(字典序:capture 先、codec 后;任一
+// 无身份(v1 帧/未指明)则不参与重定位)。waitIDR 期间用它把等待目标
+// 前移到 host 的最新代(M4 livelock 加固,见 Enqueue)。
+func epochNewer(a, b frameEpoch) bool {
+	if !a.known() || !b.known() {
+		return false
+	}
+	if a.capture != b.capture {
+		return a.capture > b.capture
+	}
+	return a.codec > b.codec
 }
 
 // discontinuityLocked 执行 epoch 不连续转移(丢队列 + waitIDR +

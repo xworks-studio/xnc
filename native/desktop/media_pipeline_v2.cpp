@@ -828,6 +828,20 @@ class Loop {
       im_.cfg.fps = fps;
       im_.spf_ms = 1000u / fps;
       im_.warmup_feed_bound = WarmupFeedBound(fps);
+      // Hot-fps fix (M4 congestion repro, 2026-08-28): TrySubmit's FPS gate
+      // paces on the ABSOLUTE deadline submit_t0 + (submit_count+1)*spf_ms.
+      // A hot spf change (30fps -> 5fps) re-scales the whole accumulated
+      // count by the NEW spf - 171 submits x 200ms = +34s - jumping the
+      // next deadline tens of seconds into the future. The loop then sleeps
+      // inside the gate (15ms slices) and stops serving outputs, resets and
+      // diag beats until wall time catches up (observed as a ~20s media-
+      // loop stall right after the fps ladder bottomed out; stack captured
+      // in a live dump: SleepEx <- Loop::TrySubmit <- Loop::Run). Rebase
+      // the gate on the reconfigure: anti-drift pacing restarts from now,
+      // the relative by_last term (last_submit_ms + spf) keeps the local
+      // no-burst guarantee.
+      im_.submit_t0 = NowMs();
+      im_.submit_count = 0;
     }
   }
 

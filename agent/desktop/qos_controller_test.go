@@ -247,11 +247,15 @@ func TestQoSLadderEscalationAndRecovery(t *testing.T) {
 	c.Observe(fb("s1", true, 8_000_000, 5))
 
 	congest := func() VideoConfig {
-		clk.advance(100 * time.Millisecond)
+		// M4 修正后的契约:决策按真实反馈节奏(≥1/s)驱动,且每步之间
+		// 帧流持续(max_w 步后由新代帧确认重置完成——reset-recovery
+		// grace;间隔同时满足 reset-triggering 剪刀的最小间隔)。
+		clk.advance(1100 * time.Millisecond)
 		cfg, ok := configOf(t, c.Observe(fb("s1", true, 1_000, 500)))
 		if !ok {
 			t.Fatalf("congestion step missing an action")
 		}
+		c.FrameObserved()
 		return cfg
 	}
 	// 码率连降(立即通道)到 500k 下限:2.3M→1.61M→1.127M→789k→552k→500k。
@@ -297,6 +301,7 @@ func TestQoSLadderEscalationAndRecovery(t *testing.T) {
 	var steps []VideoConfig
 	for i := 0; i < 40; i++ {
 		clk.advance(3500 * time.Millisecond)
+		c.FrameObserved() // 恢复期帧流持续(上一步若改了 max_w,新代帧确认)
 		cfg, ok := configOf(t, c.Observe(fb("s1", true, 30_000_000, 5)))
 		if !ok {
 			break
@@ -351,6 +356,94 @@ func TestQoSMaxWAspectMapping(t *testing.T) {
 	cfg, ok := configOf(t, c.Observe(fb("s1", true, 1_000, 500)))
 	if !ok || cfg.MaxW != 1920 {
 		t.Fatalf("aspect mapping: first height step 1080 -> maxW 1920, got %+v", cfg)
+	}
+}
+
+// ---- M4 修正:reset-recovery grace(重置风暴 / 饿死回归)----
+
+// TestQoSCongestionHeldWhileResetInFlight:首档 max_w 剪刀下发后(host 编
+// 码器重置在途),持续拥塞反馈一律挂起 —— 不级联第二/第三个 max_w 重
+// 置(修前:立即通道绕过限速,每条反馈再剪一档 → 重置风暴 → 恢复 IDR
+// 反复作废 → 观众饿死)。grace 由新代帧观测解除;且 reset-triggering 剪
+// 刀即便在 grace 解除后也遵守 1s 最小间隔(立即通道不再完全绕过)。
+func TestQoSCongestionHeldWhileResetInFlight(t *testing.T) {
+	c, clk := newQoSTestController()
+	c.Observe(fb("s1", true, 8_000_000, 5))
+	// 码率 5 步 + fps 4 步打到底(均非 max_w 决策:不受 grace 影响)。
+	for i := 0; i < 9; i++ {
+		clk.advance(1100 * time.Millisecond)
+		c.Observe(fb("s1", true, 1_000, 500))
+	}
+	clk.advance(1100 * time.Millisecond)
+	cfg, ok := configOf(t, c.Observe(fb("s1", true, 1_000, 500)))
+	if !ok || cfg.MaxW != 1600 || cfg.FPS != 5 || cfg.Bitrate != 500_000 {
+		t.Fatalf("first height step (maxW 1600) missing: got %+v ok=%v", cfg, ok)
+	}
+	held0 := c.HeldCuts()
+
+	// 重置在途:反复拥塞(高速反馈模拟立即通道)→ 全部挂起,单一边界
+	// 动作之后不再有第二个 max_w 重置。
+	for i := 0; i < 5; i++ {
+		clk.advance(100 * time.Millisecond)
+		if acts := c.Observe(fb("s1", true, 1_000, 500)); len(acts) != 0 {
+			t.Fatalf("congestion while reset in flight must be held, got %+v", acts)
+		}
+	}
+	if held := c.HeldCuts() - held0; held != 5 {
+		t.Fatalf("held cuts = %d, want 5 (observability counter)", held)
+	}
+	if got := c.Current().MaxW; got != 1600 {
+		t.Fatalf("maxW cascaded to %d while reset in flight, want 1600", got)
+	}
+
+	// (b)grace 被帧观测解除后,<1s 的立即通道拥塞仍被最小间隔挡住。
+	c.FrameObserved()
+	clk.advance(100 * time.Millisecond)
+	if acts := c.Observe(fb("s1", true, 1_000, 500)); len(acts) != 0 {
+		t.Fatalf("immediate path must respect the min interval after a reset-triggering cut, got %+v", acts)
+	}
+
+	// 间隔过后:恰再降一档(1600→1280),并再次置 grace(下一档等确认)。
+	clk.advance(2 * time.Second)
+	cfg, ok = configOf(t, c.Observe(fb("s1", true, 1_000, 500)))
+	if !ok || cfg.MaxW != 1280 {
+		t.Fatalf("post-confirmation congestion should step exactly one height rung, got %+v ok=%v", cfg, ok)
+	}
+	if acts := c.Observe(fb("s1", true, 1_000, 500)); len(acts) != 0 {
+		t.Fatalf("new maxW cut must re-arm the grace, got %+v", acts)
+	}
+}
+
+// TestQoSGraceClearsOnFrameObservation:FrameObserved 解除 grace 后拥塞控
+// 制恢复(下一档可降);ResetConfirmed(host 未收配置 → 无重置在途)同效。
+func TestQoSGraceClearsOnFrameObservation(t *testing.T) {
+	c, clk := newQoSTestController()
+	c.Observe(fb("s1", true, 8_000_000, 5))
+	for i := 0; i < 9; i++ {
+		clk.advance(1100 * time.Millisecond)
+		c.Observe(fb("s1", true, 1_000, 500))
+	}
+	clk.advance(1100 * time.Millisecond)
+	if cfg, ok := configOf(t, c.Observe(fb("s1", true, 1_000, 500))); !ok || cfg.MaxW != 1600 {
+		t.Fatalf("height step setup failed: %+v ok=%v", cfg, ok)
+	}
+	// 帧观测解除(grace 清空即恢复;返回值报告确有一次在途挂起被解除)。
+	clk.advance(2 * time.Second)
+	if !c.FrameObserved() {
+		t.Fatal("FrameObserved should report clearing an in-flight hold")
+	}
+	if c.FrameObserved() {
+		t.Fatal("second FrameObserved must be a no-op (no hold outstanding)")
+	}
+	if cfg, ok := configOf(t, c.Observe(fb("s1", true, 1_000, 500))); !ok || cfg.MaxW != 1280 {
+		t.Fatalf("post-grace congestion should cut again, got %+v ok=%v", cfg, ok)
+	}
+	// host 不支持 SET_VIDEO_CONFIG:apply 侧走 ResetConfirmed,grace 不滞留
+	// (720 已是 16:9 height 阶梯最底:全底后拥塞本就无动作)。
+	c.ResetConfirmed()
+	clk.advance(2 * time.Second)
+	if acts := c.Observe(fb("s1", true, 1_000, 500)); len(acts) != 0 {
+		t.Fatalf("ladder floor: congestion is a no-op, got %+v", acts)
 	}
 }
 

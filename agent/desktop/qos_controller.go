@@ -38,6 +38,14 @@
 // 有界状态:viewer 表按 lastSeen 修剪(2 分钟未见即删,controller 亦不例
 // 外——离场的主导者让位),上限 64 条(超出的新 viewer 按字典序挤掉最旧
 // 表项)。时钟注入(Now)使全部时间规则可确定性单测。
+//
+// reset-recovery grace(M4 修正):max_w 变更的决策走 host 的 resolution
+// 重置(编码器重建、codec epoch 前进、首个恢复 IDR 之前无帧产出)。
+// 重置在途(FrameObserved 尚未确认)期间拥塞剪码一律挂起(held,不累
+// 积——阶梯是状态机,恢复确认后自然续降);且 reset-triggering 剪刀之
+// 后立即通道不再完全绕过 qosDownMinInterval。修前:每条拥塞反馈都再剪
+// 一档 max_w → 密集重置风暴 → 恢复 IDR 反复作废 → 观众饿死而 host 徒
+// 劳产 IDR(M3-T6 合成矩阵的假编码器无重启延迟,从未暴露此链)。
 package desktop
 
 import (
@@ -168,6 +176,15 @@ type QoSController struct {
 	lastDownAt  time.Time
 	lastUpAt    time.Time
 
+	// reset-recovery grace(M4 修正,见文件头):resetPending = 一条改变
+	// max_w 的配置已下发、尚未被帧流确认(host 重置编码器期间)。此间拥
+	// 塞剪码挂起;lastMaxWActAt 让 reset-triggering 剪刀即便在立即通道
+	// 也遵守 qosDownMinInterval(修前立即通道完全绕过限速)。heldCuts 记
+	// 数挂起次数(可观测性:streamQoS 观测并记日志)。
+	resetPending  bool
+	lastMaxWActAt time.Time
+	heldCuts      uint32
+
 	// C1 迟滞参考:上一拍 controller 观测的 (est, 该拍生效码率[动作前])。
 	// 以动作前码率为参考,我们自己降档后 goodput 的等比例回落(比率回
 	// 到 ~0.85)不构成新证据 —— 真实 dip 之后的棘轮同样止步。
@@ -262,7 +279,19 @@ func (c *QoSController) decide(fb ViewerFeedback, now time.Time) []Action {
 	if fb.QueueMs > qosQueueAgeMs {
 		// 拥塞:稳定窗作废;立即 30% 通道(绕过 1/s 限速)。
 		c.stableSince = time.Time{}
+		// reset-recovery grace:重置在途期间挂起(编码器重启本身就会推
+		// 高排队年龄——此刻的拥塞证据是垃圾;剪码只会再触发一次重置,
+		// 把上一代的恢复 IDR 作废)。挂起不累积:阶梯是状态机,确认后
+		// 的下一条拥塞反馈自然续降。
+		if c.resetPending {
+			c.heldCuts++
+			return nil
+		}
 		if next := c.stepDown(); next != c.cur {
+			if !c.noteMaxWChange(next, now) {
+				c.heldCuts++
+				return nil
+			}
 			c.cur = next
 			c.lastDownAt = now
 			return []Action{{Kind: actionSetVideoConfig, Config: c.cur}}
@@ -293,12 +322,51 @@ func (c *QoSController) decide(fb ViewerFeedback, now time.Time) []Action {
 		return nil
 	}
 	if next := c.stepUp(target); next != c.cur {
+		// height 升档同样改变 max_w → 同样触发 host 重置:同受 grace 与
+		// 最小间隔约束(升档本就要求 10s 稳定 + 3s 限速,这里是防御性
+		// 的对称闭合)。
+		if !c.noteMaxWChange(next, now) {
+			return nil
+		}
 		c.cur = next
 		c.lastUpAt = now
 		return []Action{{Kind: actionSetVideoConfig, Config: c.cur}}
 	}
 	return nil
 }
+
+// noteMaxWChange 判定 next 是否为 reset-triggering 决策(max_w 变更):
+// 是则记录时刻并置 grace(resetPending);若距上一次 reset-triggering 决
+// 策不足 qosDownMinInterval(立即通道也不许完全绕过——密集 max_w 变更
+// 就是重置风暴)则返回 false = 本拍挂起。非 max_w 决策(bitrate/fps 热
+// 更新)恒 true。
+func (c *QoSController) noteMaxWChange(next VideoConfig, now time.Time) bool {
+	if next.MaxW == c.cur.MaxW {
+		return true
+	}
+	if now.Sub(c.lastMaxWActAt) < qosDownMinInterval {
+		return false
+	}
+	c.lastMaxWActAt = now
+	c.resetPending = true
+	return true
+}
+
+// FrameObserved 通知决策器「流又产出帧了」(session 帧泵逐帧喂入):host
+// 重置后的新代帧流确认重置已完成 → 解除 reset-recovery grace。返回是否
+// 解除了一次在途挂起(真值时 streamQoS 记一条恢复日志)。
+func (c *QoSController) FrameObserved() bool {
+	held := c.resetPending
+	c.resetPending = false
+	return held
+}
+
+// ResetConfirmed 无帧观测地解除 grace(host 未收到配置 → 无重置可能在
+// 途;apply 侧 configSend=false 时调用)。
+func (c *QoSController) ResetConfirmed() { c.resetPending = false }
+
+// HeldCuts 返回 grace 挂起的拥塞剪码累计数(可观测性)。
+func (c *QoSController) HeldCuts() uint32 { return c.heldCuts }
 
 // stepDown 计算拥塞时的下一档(码率 70% → fps 降档 → height 降档;全在
 // 底则返回当前值 = 无动作)。

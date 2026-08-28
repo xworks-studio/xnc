@@ -102,11 +102,29 @@ func newStreamQoS(cfg QoSControllerConfig, log *slog.Logger) *streamQoS {
 	return &streamQoS{log: log, ctrl: newQoSController(cfg), sessions: make(map[string]*qosSession), configSend: true}
 }
 
-// observe 消费一条反馈并返回决策(控制器互斥;动作应用在锁外)。
+// observe 消费一条反馈并返回决策(控制器互斥;动作应用在锁外)。grace
+// 挂起的拥塞剪码记一条 INFO(重置风暴诊断的核心观测线)。
 func (q *streamQoS) observe(fb ViewerFeedback) []Action {
 	q.mu.Lock()
-	defer q.mu.Unlock()
-	return q.ctrl.Observe(fb)
+	before := q.ctrl.HeldCuts()
+	acts := q.ctrl.Observe(fb)
+	held := q.ctrl.HeldCuts() - before
+	q.mu.Unlock()
+	if held > 0 {
+		q.log.Info("desktop qos: congestion cut held (encoder reset in flight)", "held_total", held)
+	}
+	return acts
+}
+
+// frameObserved 通知决策器帧流仍在产出(session 帧泵逐帧喂入):host 重
+// 置后的新代帧确认重置完成 → 解除 reset-recovery grace,拥塞控制恢复。
+func (q *streamQoS) frameObserved() {
+	q.mu.Lock()
+	held := q.ctrl.FrameObserved()
+	q.mu.Unlock()
+	if held {
+		q.log.Info("desktop qos: encoder reset confirmed by frame flow; congestion control resumed")
+	}
 }
 
 // attach 注册一个会话的 QoS 应用端点(pub 已建联;Handle 收线时 detach)。
@@ -147,8 +165,15 @@ func (q *streamQoS) apply(acts []Action, src Source) {
 			for _, s := range sessions {
 				s.apply(a) // 每会话自己的发送器预算
 			}
+			q.log.Info("desktop qos: set_video_config",
+				"bitrate_bps", a.Config.Bitrate, "fps", a.Config.FPS, "max_w", a.Config.MaxW)
 			if !send {
-				continue // host 已判不支持:决策留在 agent 侧(预算仍接线)
+				// host 已判不支持:决策留在 agent 侧(预算仍接线)。配置
+				// 未下发 → 不可能有编码器重置在途 → grace 立即解除。
+				q.mu.Lock()
+				q.ctrl.ResetConfirmed()
+				q.mu.Unlock()
+				continue
 			}
 			if err := src.SetVideoConfig(a.Config); err != nil {
 				if errors.Is(err, errVideoConfigUnsupported) {
@@ -359,9 +384,11 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 // 连接就绪、viewer 发送器 overflow/pacer/resume)经 OnKeyRequest seam 汇入
 // (connect=新订阅 urgent),帧泵的 IDR 观测经 idrObservingSource 喂
 // OnIDR;生命周期随 ctx(与帧/状态泵同一收线模型)。
+// M4 修正:qos(共享决策点,可 nil)经 qosObservingSource 收到帧泵的逐
+// 帧观测——reset-recovery grace 由新代帧流解除(见 qos_controller.go)。
 func (h *Handler) setupPublisher(ctx context.Context, w *wsWriter, src Source,
 	p *proto.DesktopParams, offerSDP string, defDur time.Duration,
-	ictl *inputController, log *slog.Logger) (*Publisher, error) {
+	ictl *inputController, qos *streamQoS, log *slog.Logger) (*Publisher, error) {
 	relay := p.IceTransportPolicy != proto.DesktopIceAll
 	var ice []webrtc.ICEServer
 	if p.Turn != nil {
@@ -429,8 +456,14 @@ func (h *Handler) setupPublisher(ctx context.Context, w *wsWriter, src Source,
 	// 帧泵 + 光标泵(泵体见 frames.go;源终结/PC 死即各自退出,会话由
 	// 信令主循环的 WS 错误路径统一收线)。帧泵的源经 idrObservingSource
 	// 包裹:key 帧身份(CodecEpoch/EncodeSeq,Task 1 透传)在汇出点喂
-	// coord.OnIDR——在途关键帧请求只被「匹配或更新」的 IDR 清除。
-	go pumpFrames(ctx, log, idrObservingSource{Source: src, onIDR: coord.OnIDR}, pub)
+	// coord.OnIDR——在途关键帧请求只被「匹配或更新」的 IDR 清除。M4 修
+	// 正:再包一层 qosObservingSource,逐帧喂共享 QoS(reset-recovery
+	// grace 的解除信号;连接就绪前的帧同样计入)。
+	var pumpSrc Source = idrObservingSource{Source: src, onIDR: coord.OnIDR}
+	if qos != nil {
+		pumpSrc = qosObservingSource{Source: pumpSrc, onFrame: qos.frameObserved}
+	}
+	go pumpFrames(ctx, log, pumpSrc, pub)
 	go pumpCursor(ctx, src, ictl)
 	return pub, nil
 }

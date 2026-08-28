@@ -64,7 +64,7 @@ func (e *sessionEvents) onOffer(f compactFrame) bool {
 	if e.pub != nil {
 		return true // 重复 offer:忽略(已应答)
 	}
-	pub, err := e.h.setupPublisher(e.ctx, e.w, e.dyn, e.params, f.SDP, e.defDur, e.ictl, e.log)
+	pub, err := e.h.setupPublisher(e.ctx, e.w, e.dyn, e.params, f.SDP, e.defDur, e.ictl, e.qos, e.log)
 	if err != nil {
 		e.log.Warn("desktop webrtc setup failed", "err", err)
 		e.w.write(e.ctx, errorFrame{Type: vocabError, Code: "webrtc_failed", Message: err.Error()})

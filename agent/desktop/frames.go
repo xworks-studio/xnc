@@ -32,6 +32,23 @@ func pumpDisplayEvents(ctx context.Context, w *wsWriter, dyn Source) {
 	}
 }
 
+// qosObservingSource 在帧汇出点(source → publisher 帧泵)喂养共享 QoS
+// 的帧观测(M4 修正):透传全部 Source 行为,仅对每帧回调一次 —— host
+// 重置后的新代帧流由此解除 qos 控制器的 reset-recovery grace。onFrame
+// 为 nil 时纯透传。
+type qosObservingSource struct {
+	Source
+	onFrame func()
+}
+
+func (s qosObservingSource) RecvFrame(ctx context.Context) (Frame, bool) {
+	f, ok := s.Source.RecvFrame(ctx)
+	if ok && s.onFrame != nil {
+		s.onFrame()
+	}
+	return f, ok
+}
+
 // pumpFrames 帧泵:pipe → RTP。源终结(RecvFrame false)或写失败(PC 已死)
 // 即退出——会话由信令主循环的 WS 错误路径统一收线。
 func pumpFrames(ctx context.Context, log *slog.Logger, src Source, pub *Publisher) {

@@ -314,6 +314,70 @@ func TestViewerSenderEpochJumpWithoutEvent(t *testing.T) {
 	}
 }
 
+// TestViewerSenderWaitIDRRetargetsNewerEpoch(M4 livelock 加固):已在
+// waitIDR 等待 (capture,codec) 的 IDR 时 host 又重置了一代 → 等待目标
+// 重定位到更新的 epoch,其恢复 IDR 被接受(修前:pendingEpoch 停在旧代,
+// 新代关键帧永远 epochDropped —— 观众饿死而 host 徒劳产 IDR)。旧代帧
+// 照旧抑制。
+func TestViewerSenderWaitIDRRetargetsNewerEpoch(t *testing.T) {
+	s := newFakeViewerSender()
+	if err := s.Enqueue(idrE(1, 3, 2)); err != nil {
+		t.Fatalf("initial idr: %v", err)
+	}
+	sent0 := s.sent()
+	// 等待 (3,4) 的 IDR(0x020B 镜像)。
+	s.vs.Discontinuity(3, 4)
+	if s.state() != stateWaitIDR {
+		t.Fatalf("state after Discontinuity=%v, want waitIDR", s.state())
+	}
+	// 旧代 (3,3) 的 IDR 仍被压制(epochDropped)……
+	if err := s.Enqueue(idrE(2, 3, 3)); err != nil {
+		t.Fatalf("old-epoch idr: %v", err)
+	}
+	if s.sent() != sent0 || s.state() != stateWaitIDR {
+		t.Fatalf("old-epoch IDR must stay suppressed: sent %d->%d state=%v", sent0, s.sent(), s.state())
+	}
+	// ……而等待期间 host 又前进到 (3,5):更新一代的 IDR 必须被接受
+	//(重定位),流恢复 live —— 修前它被旧目标 (3,4) 永久压制。
+	if err := s.Enqueue(idrE(3, 3, 5)); err != nil {
+		t.Fatalf("newer-epoch idr: %v", err)
+	}
+	if s.state() != stateLive {
+		t.Fatalf("state after newer-epoch IDR=%v, want live (re-targeted)", s.state())
+	}
+	if s.sent() != sent0+1 {
+		t.Fatalf("newer-epoch IDR was suppressed: %d -> %d", sent0, s.sent())
+	}
+	// 重定位同样适用于增量帧:live 于 (3,5),自检出到 (4,5) 的跳代 →
+	// waitIDR 等待 (4,5);期间 host 又前进到 (4,6) 的 delta 把目标前移
+	//(仍抑制 —— 非 key),随后 (4,6) 的 IDR 恢复。
+	if err := s.Enqueue(deltaE(4, 4, 5)); err != nil {
+		t.Fatalf("epoch-jump delta: %v", err)
+	}
+	if s.state() != stateWaitIDR {
+		t.Fatalf("state after epoch jump=%v, want waitIDR", s.state())
+	}
+	if err := s.Enqueue(deltaE(5, 4, 6)); err != nil {
+		t.Fatalf("newer-epoch delta: %v", err)
+	}
+	if s.state() != stateWaitIDR {
+		t.Fatalf("state after newer-epoch delta=%v, want waitIDR", s.state())
+	}
+	if err := s.Enqueue(idrE(6, 4, 6)); err != nil {
+		t.Fatalf("re-targeted idr: %v", err)
+	}
+	if s.state() != stateLive || s.sent() != sent0+2 {
+		t.Fatalf("re-targeted IDR must recover: state=%v sent=%d", s.state(), s.sent()-sent0)
+	}
+	// 旧代帧自始至终被压制。
+	if err := s.Enqueue(deltaE(7, 3, 4)); err != nil {
+		t.Fatalf("old-epoch delta: %v", err)
+	}
+	if s.sent() != sent0+2 {
+		t.Fatalf("old-epoch delta was sent: %d", s.sent()-sent0)
+	}
+}
+
 // ---- Ruling 3:队列年龄 100ms 硬上限(真实检测路径) ----
 
 // TestViewerSenderQueueAgeOverflowFlushesAndRequestsKeyOnce:小预算使包
