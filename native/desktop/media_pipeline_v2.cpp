@@ -76,6 +76,31 @@ class TimePeriodGuard {
 constexpr DWORD kIdleSleepMs = 15;
 // Warm-up wall bound (spec 7.4; mirrors pipeline.cpp).
 constexpr uint64_t kWarmupWallBoundMs = 2000ull;
+// 2026-08-28 QSV static-idle park: the idle flush's trigger and budget.
+// kFlushAfterSpf: input starvation threshold in spf units before a flush
+// feed fires (2 = one missed submission slot; the healthy paced path never
+// qualifies because last_submit_ms advances every slot).
+// kFlushFeedBound: feeds per content episode - the QSV emit depth is ~5,
+// so 8 covers the tail with margin; a new captured frame resets the
+// episode (AcquireOnce kFrame branch).
+constexpr uint64_t kFlushAfterSpf = 2;
+constexpr uint32_t kFlushFeedBound = 8;
+// ON by default (the 2026-08-28 labs-xiaoxin measurement: with the flush,
+// the hardware rung's semi-static dwell collapsed from a uniform ~586 ms
+// to ~114 ms p50 / ~119 ms p95 at native 2880x1800 with zero unrecovered
+// freezes; without it, a fully static desktop parks the stream's tail
+// inside the encoder for the whole gap - the RERUN-2 P0: 4 unrecovered
+// freezes, capture->AU p95 ~59 s). XNC_QSV_IDLE_FLUSH=0 disables (A/B);
+// read once per process (the QsvDiagVerbose pattern, mf_gpu_encoder.cpp).
+bool IdleFlushEnabled() {
+  static const bool v = [] {
+    char buf[8]{};
+    const DWORD n = GetEnvironmentVariableA("XNC_QSV_IDLE_FLUSH", buf,
+                                            sizeof(buf));
+    return !(n > 0 && buf[0] == '0');
+  }();
+  return v;
+}
 // Reset retry cadence (M2-S1 T2 shape). The soft/hard rebuild backoff is
 // Config::reset_backoff_base_ms / 2x that (500/1000 ms production; M2
 // Task 5 made it injectable for the deterministic scenarios); the 500 here
@@ -405,6 +430,17 @@ struct MediaPipelineV2::Impl {
   uint64_t submit_t0 = 0, submit_count = 0;
   uint32_t spf_ms = 33;
   uint32_t warmup_feed_bound = 34;
+  // 2026-08-28 QSV static-idle park (Defect 2): the hardware rung's
+  // structural ~5-input emit depth parks the LAST submissions of a content
+  // burst inside the MFT until further inputs arrive - on a static desktop
+  // that is tens of seconds (the RERUN-2 P0 burst/stall: 4 unrecovered
+  // freezes, capture->AU p95 ~59 s at native 2880x1800 while the SAME
+  // binary at the SAME resolution paces at 65-110 ms under moving
+  // content). The idle flush re-feeds the current surface (the spec
+  // 7.4/7.5 feed mechanism, extended past warmup/IDR) when outputs are
+  // owed and input has starved, bounded per content episode.
+  uint32_t flush_feeds = 0;    // feeds spent on the current episode
+  uint64_t flush_episodes = 0; // episodes started (diagnostics)
   // M3 Task 3 (SET_VIDEO_CONFIG): live max_w (mirrors cfg.max_width at
   // Start; SetMaxWidth stores from any thread, InitStream loads on the media
   // loop - the atomic is the whole synchronization).
@@ -843,6 +879,7 @@ class Loop {
           }
         }
         im_.mbox.PublishContent(spec);  // depth-one cell (coalescing)
+        im_.flush_feeds = 0;  // new content: a fresh park-flush episode
         if (im_.warmup_started_ms == 0) im_.warmup_started_ms = NowMs();
         return true;
       }
@@ -885,6 +922,11 @@ class Loop {
   // static screen, re-publish the surface's current identity so the
   // encoder's lookahead fills and the (possibly forced) IDR emerges.
   // Bounded by WarmupFeedBound and the 2 s wall clock; paced to spf.
+  // 2026-08-28: extended with the static-idle PARK flush - the encoder
+  // rungs park the tail of a content burst inside their emit depth (QSV
+  // ~5 inputs, the software MFT ~17) and only emit when MORE inputs
+  // arrive; without a flush a static desktop freezes the stream for the
+  // whole gap (the RERUN-2 P0). XNC_QSV_IDLE_FLUSH=1 arms it (A/B gate).
   void IdleFeed() {
     if (im_.last_submit_ms != 0 &&
         NowMs() - im_.last_submit_ms < im_.spf_ms)
@@ -913,6 +955,36 @@ class Loop {
           ++im_.od_feeds;
           ++im_.res.warmup_feeds;
         }
+        return;
+      }
+    }
+    // Static-idle park flush: outputs are owed (submissions the rung has
+    // not emitted yet) and input has starved for > kFlushAfterSpf slots ->
+    // re-feed the SAME surface so the parked tail emits within ~depth*spf
+    // instead of at the next desktop change. Bounded per content episode
+    // (reset when a real frame arrives); no-op on a healthy paced feed
+    // (last_submit_ms advances every slot, so the starvation predicate
+    // never qualifies) and on the software rung (outputs surface at
+    // submit, owed stays ~0).
+    if (IdleFlushEnabled() && im_.have_key && !im_.idr_in_flight &&
+        im_.last_submit_ms != 0 &&
+        NowMs() - im_.last_submit_ms > kFlushAfterSpf * im_.spf_ms &&
+        im_.flush_feeds < kFlushFeedBound &&
+        im_.res.encoded > im_.res.aus_written) {
+      FrameIdentity sid;
+      ID3D11Texture2D* tex = nullptr;
+      if (im_.latest.Snapshot(&sid, &tex)) {
+        if (tex != nullptr) tex->Release();
+        if (im_.flush_feeds == 0) {
+          ++im_.flush_episodes;
+          XNC_LOG_INFO("idle_flush_begin owed=%llu starved_ms=%llu",
+                       static_cast<unsigned long long>(im_.res.encoded -
+                                                       im_.res.aus_written),
+                       static_cast<unsigned long long>(NowMs() -
+                                                       im_.last_submit_ms));
+        }
+        ++im_.flush_feeds;
+        im_.mbox.PublishContent(sid);  // same content, new seq at submit
         return;
       }
     }
