@@ -731,11 +731,12 @@ Harness: `t3-1080p60\t3-run-p60.ps1` (run-soak's topology trimmed to a standing 
 | Target FPS ≥95% | **FAIL (content cadence)** — 1,873 viewer frames / 60.1 s = **31.2 fps (52%)**; desktop mostly static (DXGI delivers on change; the 60 fps pacing target is unreachable without real motion) | **FAIL (content cadence)** — 2,196 frames = **36.6 fps (61%)**, static desktop | 1,745 frames = **29.1 fps (49%)** |
 | Receive queue p95 <50 / max ≤100 (viewer) | **PASS** 22.3 / 52.2 ms | **PASS** 34.5 / 65.5 ms | p95 48.9 PASS / **max 182.1 FAIL** |
 | firstFrameMs (viewer) | 597 | 66 | 484 |
-| Verdict | FAIL (capture→AU only) | FAIL (capture→AU only) | FAIL (4 gates) |
+| Verdict | FAIL (capture→AU + FPS-cadence) | FAIL (capture→AU + FPS-cadence) | FAIL (4 gates) |
 
 Key finding: at the 1080p-class operating point the emit-depth latency drops ~4.6–8x vs native
 (52/74 ms vs 241–594 ms §12.6) and CPU/WS gates PASS — the residual `capture_to_au` p95 is the
-QSV emit dwell (mft p50 45–66 ms) against the 60 fps cadence, still 3.5–4.9x over the 15 ms gate.
+QSV emit dwell (mft p50 45.2–49.5 ms; capture_to_au p50 49.8–63.0 ms across the two 1920-wide
+runs) against the 60 fps cadence, still 3.5–4.9x over the 15 ms gate.
 Artifacts: `t3-1080p60\local\p60-local-20260828-182907\`, `t3-matrix\remote-pull\…\p60-remote-20260828-033511\`,
 remote-native runresult quoted in §13.2 (host-side copy `t3-1080p60\` after pull).
 
@@ -775,9 +776,14 @@ core-pipe agent topology (see §13.4 blocker); the validated recipe for it is th
 mapped external-ip + toxiproxy toxics above.
 
 Artifacts: `t3-turn\{15mbps-30ms,5mbps-100ms,1mbps-250ms}\run-*\` (viewer.json + native.log +
-profile.json each), `t3-turn\summary.md`, `t3-turn\probe3478*` (debug ladder),
-`t3-turn\coturn-full.log` (Forbidden-IP evidence), `t3-turn\docker-compose.t3turn.yml` (recipe,
-uncommitted by design).
+profile.json each), `t3-turn\summary.md`, `t3-turn\probe3478*` (debug ladder — this is the
+Forbidden-IP evidence: under the plain `--external-ip`, `probe3478`–`probe3478g` all end with
+`viewer not connected after 25s (state=connecting)` in `viewer.stderr.log`, while `probe3478h`
+(the first run after the mapped-form switch) connects relay-only — `connected=true`, `relay=true`;
+the 403 lines themselves were read from the live container console and are not retained),
+`t3-turn\docker-compose.t3turn.yml` (recipe incl. the mapped-form/Forbidden-IP comment,
+uncommitted by design), `t3-turn\coturn-full.log` (3.4 KB startup banner only, captured from a
+teardown-time restart — no 403/session lines).
 
 ### 13.4 Step 4 - Chrome + Edge browser gates
 
@@ -785,7 +791,10 @@ Validated: `web` built (vite, `t3-turn\web-build.log`) and served BY the dev ser
 (go:embed - `http://192.168.1.12:18080/` 200 text/html); **real headed Chrome AND real Edge**
 (temp profiles, CDP-driven `t3-browser\cdp-drive.mjs`) load the app: login page renders
 (`chrome-login.png`, `edge-login.png`), JWT-bootstrapped nodes page renders against the live API
-(`chrome-nodes.png`, `edge-nodes.png`; CDP FACTS show `0 nodes / No nodes` - true state).
+(`chrome-nodes.png`, `chrome-nodes-authed.png`, `edge-nodes.png`). The CDP driver also printed the
+nodes-page FACTS to stdout, but that transcript was not retained — the retained evidence is the
+screenshots alone, which prove page render + JWT bootstrap against the live API (not the
+node-list contents).
 
 All four session-dependent gates - first visible frame p95 <1 s, input-to-present p95 <150 ms,
 PLI-to-present p95 <1 s, frame-meta correlation over sampled rVFC - are **PENDING**: they need a
@@ -794,7 +803,12 @@ desktop session, which needs an enrolled agent node, which needs the XNIP core p
 (`native/core/pipe_server.cpp` kSddl) -> the dev agent must run with an elevated token ->
 `schtasks /Create ... /RL HIGHEST` is denied from this non-elevated session (Access denied; the
 UAC prompt is not interactable from here) and no SYSTEM exec channel exists locally (the
-historical path, `xnc exec` via the prod agent, is out of scope for evidence runs).
+historical path, `xnc exec` via the prod agent, is out of scope for evidence runs). One-line
+runbook: run, from an ELEVATED shell with the same arguments, the exact `/Create` that was denied
+— `schtasks /Create /F /TN xnc-t3-agent /TR "C:\xnc-t3\agent.cmd" /SC ONCE /ST 23:59 /RU LABS /IT /RL HIGHEST`
+(`t3-turn\start-core-agent.ps1` line 43) — then `schtasks /Run /TN xnc-t3-agent`; that brings up
+`xnc-agent run-dev-console` with the elevated token against the core pipe, unblocking both the
+combined TURN+QoS run and the browser session gates.
 Input-to-present has the additional standing gap: no input-injection path exists for browser
 viewers (e2eviewer's `--input-script` is server-mode only).
 
@@ -814,7 +828,7 @@ viewers (e2eviewer's `--input-script` is server-mode only).
 | TURN 5 Mbps/100 ms | **PASS** | 25.0 / 41.8 ms, drift 0.0 ms |
 | TURN 1 Mbps/250 ms | **FAIL** queue (bounded, NOT accumulating) + attempt-1 ICE connect timeout | 107.2 / 196.6 ms, drift 0.2 ms |
 | TURN slow-spectator isolation | **PASS via M3-T6 synthetic matrix** (real loop = PENDING, same agent blocker) | m3t6-matrix all green |
-| Browser: page loads + app render (Chrome, Edge) | **PASS** (page-level) | t3-browser pngs + FACTS |
+| Browser: page loads + app render (Chrome, Edge) | **PASS** (page-level) | t3-browser pngs (login + nodes; CDP FACTS stdout not retained) |
 | Browser: first visible frame / input-to-present / PLI-to-present / frame-meta correlation | **PENDING** (no agent node: core-pipe elevation blocker 13.4; input injection additionally missing) | - |
 
 ### 13.6 Concerns
