@@ -1,8 +1,13 @@
 # M4 Task 2 (rerun) — correctness and recovery gates on REAL console hardware
 
-**Overall: BLOCKED — the bounded-soak gate FAILED on a P0 counter and the suite stopped per the
-STOP rule.** The run executed on labs-xiaoxin console session 5 (the designated validation node,
-interactive desktop attached). The harness pipe bug from the first attempt is confirmed fixed by
+**Overall: BLOCKED — see §10 (2026-08-28 rerun-3, the current state): with the QSV hardware rung
+LIVE (fb02a85), the mandated 5-minute smoke soak at native 2880x1800 fails P0 `UnrecoveredFreezes=4`
+(bursty tens-of-seconds AU emission); the suite stopped per the STOP rule. The earlier §3–§8
+narrative below is the PREVIOUS attempt's (software-rung) P0 and is retained as history.**
+
+**Previous attempt summary (BLOCKED — the bounded-soak gate FAILED on a P0 counter and the suite
+stopped per the STOP rule).** The run executed on labs-xiaoxin console session 5 (the designated
+validation node, interactive desktop attached). The harness pipe bug from the first attempt is confirmed fixed by
 commit `6f61605` (full `\\.\pipe\...` path: the rt server appeared, all viewer events dialed,
 `from-diag` produced real verdicts). A second, previously-unknown harness-side defect was found and
 fixed DURING this rerun (uncommitted in the worktree — see §7): `FormatStagesJson` emitted a
@@ -229,3 +234,151 @@ modified).
 §8 follow-up 1 is closed. Follow-up 2 (software rung at unclamped 2880x1800) is expected to be
 overtaken by the hardware rung serving, but was NOT re-measured here — a fresh bounded soak with
 the hardware rung live is the natural next gate.
+
+---
+
+## 10. 2026-08-28 rerun-3 — QSV hardware rung LIVE (fb02a85): SMOKE P0 → **BLOCKED**
+
+Third execution of the Task-2 gates, after the §9 QSV fix landed (`fb02a85`, reviewed). The smoke
+gate (5-minute v2 pilot soak, mandated native resolution) was executed end-to-end on labs-xiaoxin
+console session 5 through the fixed harness: the rt pipe served, all five viewer events dialed,
+`from-diag` produced a real verdict, and `encoder_backend=hardware` in the stats sidecar — the
+hardware rung IS serving. The run **FAILED a P0 counter** (`UnrecoveredFreezes=4`). Per the STOP
+rule the 60-min v2 soak, the 10-min v1 soak, the 100 reset cycles, and the console selftest rerun
+were NOT executed.
+
+### 10.1 Environment & binary identity
+
+| Row | Value |
+|---|---|
+| Host / session | LABS-XIAOXIN, console session 5 ACTIVE (driver process pid 6480, `ProcessIdToSessionId`=5; `>` marker on the `console LABS 5 Active` row) — `logs\env-proof-r3.txt`, `logs\phase0.done exit=0` |
+| GPU / OS | Intel Arc 130T (12GB), driver 32.0.101.8801, Win11 Pro 10.0.26200; \.\DISPLAY11 primary 1440x900@32bpp logical (200% scaling) → DXGI duplication native 2880x1800; `--jpeg-single` smoke of the live desktop exit=0 |
+| Binary | `xnc-desktop.exe` SHA256 `073E59649E8A437B29BB3D6EAA96E5EC2B119093FFA507DFFEA908DEB2F1924D`, built from clean `fb02a85` (`cmd /c native\desktop\build.bat`), hash-verified local↔remote at deploy (also e2eviewer `FA64AB4C…B1B4EF`, desktopreport `46FEDED9…EBB38`, resetloop `7ADD7EAB…CA759C1` unchanged from the prior rerun) |
+| Vehicle | scheduled task `xnc-m4-t2r3` (`LABS` Interactive principal) running `C:\xnc-m4\drivers\drive-rerun3.ps1 -Phase <name>`; one phase per start; WinRM marker polling (≥60 s intervals); per-phase wall budgets |
+
+Cleanup verified after the STOP: `xnc-m4*` tasks remaining = 0, no processes from `C:\xnc-m4\bin`,
+console session 5 still Active, no display/resolution/desktop setting ever changed (no reset
+trigger was fired in this run).
+
+### 10.2 Exact commands
+
+```
+# local build + deploy (hash proof in deploy console transcript)
+cmd /c native\desktop\build.bat
+cd tools\e2eviewer && go build -o ..\..\bin\e2eviewer.exe .
+cd tools\desktopreport && go build -o ..\..\bin\desktopreport.exe .
+cd artifacts\desktop-media\resetloop-tool && GOWORK=off go build -o ..\..\..\bin\resetloop.exe .
+powershell -File artifacts\desktop-media\deploy-rerun3.ps1 -RegisterTask
+
+# remote, console session 5 (task xnc-m4-t2r3, phase per start)
+#   -Phase phase0   environment proof                     -> phase0.done exit=0
+#   -Phase smoke -SmokeSec 300  (5-min v2 pilot soak)     -> smoke.done exit=1  (P0; suite STOPPED)
+powershell -File artifacts\desktop-media\run-phase3.ps1 -Phase smoke -ExtraArgs "-SmokeSec 300"
+#   the harness command the smoke phase ran on the console:
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\xnc-m4\scripts\desktop-media\run-soak.ps1 -DurationSec 300 -Pipeline v2 -Fps 30 -RunDir C:\xnc-m4\artifacts\desktop-media\soak-smoke-20260827-211341
+# NOT executed (STOP rule): -Phase soakv2 (3600s), -Phase soakv1 (600s), -Phase cycles (100), -Phase selftestv2
+```
+
+### 10.3 The P0 (all numbers from the artifacts)
+
+`runresult.json` (`Verdict: FAIL`):
+`UnrecoveredFreezes=4` (P0), `OldFrameRegressions=0`, `EpochRegressions=0`,
+`CaptureToAUP95Ms=59138.683` (gate 15), `QueueP95Ms=18270.4` (gate 50), `QueueMaxMs=60001.5`
+(gate 100), `WorkingSetMB=432.9` (gate 350), `CPUPercent=0.221`, Resolution 2880x1800@30fps,
+DurationSec 300.
+
+`stats.json` (valid JSON, `ok=1`): **`encoder_backend=hardware`** (the §9 fix holds in production
+shape; `cpu_readbacks=0`), `captured=30`, `encoded=158` (`warmup_feeds=128`), `keyframes=65`,
+`timeouts=8846`, `resets=0`, `rebuilds=0`, `aus_written=157`. Terminal native line:
+`media_v2_stop elapsed=300546ms captured=30 encoded=158 keyframes=65 timeouts=8846 warmup_feeds=128
+resets=0 rebuilds=0 w=2880 h=1800 aus=157 bytes=2596824 reorder_gap_skips=0 reorder_late_drops=0
+backend=hardware cpu_readbacks=0 ok=1`.
+
+Stage histograms (the measured **paced capture→AU** numbers — this run's 30fps-paced feed through
+the LIVE hardware rung at native 2880x1800; n=157 AUs):
+
+| stage | p50 | p95 | p99 |
+|---|---|---|---|
+| `gpu_copy_us` | 367 | 26,832 | 26,867 |
+| `gpu_convert_us` | 454 | 789 | 3,301 |
+| `mft_submit_to_output_us` | 118,807 | 4,972,288 | 36,517,211 |
+| `queue_age_us` | 40,602,983 | 58,100,366 | 59,632,510 |
+| `capture_to_au_us` | **41,652,505** | **59,138,683** | **60,040,206** |
+
+Viewer-side shape (standing viewer `viewer-01-viewer.json`): 21 AUs in the first 1.2 s
+(155→1159 ms), then emission gaps of ~21 s, ~36 s, ~19 s followed by dense catch-up bursts
+(~100 ms cadence) — a bursty/stalled emit pattern, not steady pacing. The PLI viewer
+(`viewer-02-pli.json`) shows `firstFrameMs=5104` (>2000 ms assertion), `queueAgeP95Ms=18270`,
+`pliToIdrMaxMs=52`, `recoveryGapMs=678`, `recoveryViolations=0`; the 4 freezes are the burst-gap
+recoveries whose first post-gap AU is not an IDR.
+
+**Task-3 known-gap data point (measured, not assumed):** the predicted ~130–165 ms paced
+capture→AU latency (from the 4–5-input QSV emit depth) is falsified at native 2880x1800 on driver
+32.0.101.8801 — measured p50 ≈ 41.7 s / p95 ≈ 59.1 s / p99 ≈ 60.0 s under the 30fps paced feed,
+i.e. the emit pipeline dwells tens of seconds between bursts even though CPU is 0.2% and
+`resets/rebuilds/strikes` are all zero. These are failure-stage numbers from the P0 run, recorded
+as the current hardware-rung latency reality; they do NOT satisfy the 15 ms gate and were not
+re-measured at other resolutions (the STOP rule halts iteration).
+
+Content integrity was NOT implicated (`OldFrameRegressions=0`, `EpochRegressions=0`,
+`rtpTsRegressions/contentIdRegressions/encodeSeqRegressions/codecEpochRegressions=0` in every
+viewer report) — this is again a latency/freeze failure, with the hardware rung serving.
+
+### 10.4 Dev-box finding during pre-deploy sanity (recorded, not iterated)
+
+The same clean-`fb02a85` build SEGFAULTS in the local dev-box (LABS-DEV, disconnected-RDP session
+1, Arc 140T driver 32.0.101.7026) v1 selftest, deterministically (2 of 2 runs), immediately after
+`gpu_probe friendly="Intel? Quick Sync Video H.264 Encoder MFT" ok=1 inputs=8 outputs=3
+first_out_input=4|5 first_out_ms=9` — i.e. right after the hardware startup probe succeeds, inside
+the gpu-session hardware scenario (`desktop_selftest.cpp` ~L2986 `run_probe(gpu)` region:
+submit/TakeOutput loop or the MF decoder hash). Bash reports `Segmentation fault` (exit 139);
+stdout is lost to block buffering (0-byte stdout artifact). Artifacts:
+`artifacts\desktop-media\selftest-local-rerun3-v1.log` (58 lines, terminal `exit=127`),
+`selftest-local-rerun3-v1b-stdout.log` (0 bytes), `selftest-local-rerun3-v1b-stderr.log` (57
+lines, ends at the `gpu_probe ok=1` line). This crash was NOT reproduced inside this task's
+executed scope on labs-xiaoxin (the console selftest phase was skipped by the STOP rule; the
+console smoke ran the production pipeline for the full 300 s without crashing) — it is flagged for
+adjudication as a separate QSV-adjacent defect signal, not evidence about the validation node.
+
+### 10.5 Gate status after rerun-3
+
+| Gate | Status | Evidence |
+|---|---|---|
+| Smoke (5-min v2, native 2880x1800, hardware rung): zero unrecovered freezes | **FAIL — P0** | §10.3; `soak-smoke-20260827-211341\runresult.json`: `UnrecoveredFreezes=4`, Verdict FAIL |
+| Smoke: hardware backend confirmed serving | **PASS** (within the failed run) | `stats.json` `encoder_backend=hardware`, `cpu_readbacks=0` |
+| Smoke: zero contentId/hash regressions | **PASS** (within the failed run) | `OldFrameRegressions=0`, `EpochRegressions=0`; all viewer regression counters 0 |
+| Smoke: latency/memory gates | **FAIL** | `CaptureToAUP95Ms` 59,138.7 (gate 15), `QueueP95Ms` 18,270.4 (gate 50), `QueueMaxMs` 60,001.5 (gate 100), `WorkingSetMB` 432.9 (gate 350) |
+| Paced capture→AU percentiles (Task-3 known-gap data point) | **MEASURED — fails the 15 ms gate by ~4000x** | §10.3 stage table (p95 ≈ 59.1 s) |
+| 60-min v2 soak | **NOT RUN — stopped on smoke P0** (STOP rule) | suite stopped after `smoke.done exit=1` |
+| 8 h soak completion | **PENDING** (not started; command per ruling 1: `run-soak.ps1 -DurationSec 28800 -Pipeline v2 -Fps 30`) | — |
+| 10-min v1 rollback soak (CaptureToAUP95 NO-EVIDENCE expected) | **NOT RUN — stopped on smoke P0** | expectation unexercised |
+| 100 reset cycles: one epoch per reset / recovery ≤2 s ≥99 / no stale frame | **NO EVIDENCE — 0 of 100 ran** (STOP rule) | mechanisms unchanged from §5 (switch_display 0x0128 / set_video_config 0x0129) |
+| Selftest v1/v2 on console, current build | **NOT RUN on console — stopped on smoke P0**; dev-box v1 selftest CRASHES post-probe (§10.4) | prior-attempt console selftests (§3) ran the earlier build |
+| Lock/unlock + UAC transitions | **PENDING (manual, interactive console)** | not automatable unattended |
+
+### 10.6 Artifacts (git-ignored)
+
+Local: `artifacts\desktop-media\rerun3-remote\`
+- `soak-smoke-20260827-211341\` — runresult.json (FAIL, freezes 4), stats.json (backend=hardware,
+  stage histograms), native.log (645 lines, terminal `media_v2_stop … backend=hardware`), 5 viewer
+  reports + stderr logs, metrics.jsonl, table.md
+- `logs\` — env-proof-r3.txt, phase0.done, smoke.txt, smoke.done, smoke-console.log,
+  drive-rerun3-{phase0,smoke}-*.log transcripts (plus the prior attempts' logs pulled earlier)
+- Dev-box segfault: `artifacts\desktop-media\selftest-local-rerun3-v1{,b-stdout,b-stderr}.log`
+- Tooling (artifacts-local): `drive-rerun3.ps1`, `deploy-rerun3.ps1`, `run-phase3.ps1`,
+  `cleanup-rerun3.ps1`
+
+### 10.7 Concerns for adjudication
+
+1. The hardware rung now initializes and produces (the probe fix holds in production shape), but
+   AU emission at native 2880x1800 is bursty with tens-of-seconds dwell
+   (`mft_submit_to_output_us` p99 ≈ 36.5 s; `capture_to_au_us` p95 ≈ 59.1 s) while CPU sits at
+   0.2% and resets/rebuilds/strikes are zero — the emit path (event pump / credit accounting /
+   output drain at 5.2 MP) needs investigation before any soak can pass. The 15 ms Task-3 gate is
+   nowhere near met by the measured numbers.
+2. The dev-box selftest SEGFAULT immediately after a successful QSV startup probe (§10.4) is a
+   second, independent QSV-adjacent defect signal in `fb02a85`; a crash dump / repro on an
+   attached session should triage it.
+3. All recovery gates (100 cycles, v1 rollback soak, console selftest on the current build) remain
+   unexercised behind the smoke P0 — no pass/fail claim exists for them; the 8 h soak and lock/UAC
+   remain PENDING as ruled.
