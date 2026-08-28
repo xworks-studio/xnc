@@ -1413,20 +1413,23 @@ std::string FormatStagesJson(const StageStat* stats, size_t n,
     char buf[128];
     std::snprintf(buf, sizeof(buf),
                   "    \"%s\": { \"n\": %llu, \"p50\": %llu, \"p95\": %llu, "
-                  "\"p99\": %llu },\n",
+                  "\"p99\": %llu }",
                   stats[i].key, static_cast<unsigned long long>(stats[i].p.n),
                   static_cast<unsigned long long>(stats[i].p.p50),
                   static_cast<unsigned long long>(stats[i].p.p95),
                   static_cast<unsigned long long>(stats[i].p.p99));
+    if (!members.empty()) members += ",\n";
     members += buf;
   }
   if (members.empty()) return std::string();
+  // Separators go BETWEEN members only: a trailing comma before the closing
+  // brace would make stats.json invalid JSON.
   std::string out = "  \"stages\": {\n";
   out += "    \"stage_semantics\": \"";
   out += StageSemanticsNote();
   out += "\",\n";
   out += members;
-  out += "  },\n";
+  out += "\n  },\n";
   char buf[96];
   std::snprintf(buf, sizeof(buf), "  \"cpu_readbacks\": %llu,\n",
                 static_cast<unsigned long long>(cpu_readbacks));

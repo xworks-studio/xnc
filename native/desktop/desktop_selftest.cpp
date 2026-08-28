@@ -4187,6 +4187,20 @@ int SelftestMain(bool desktop_pipeline_v2) {
               std::strstr(xnc::StageSemanticsNote(), "wait-inclusive") !=
                   nullptr &&
               std::strstr(xnc::StageSemanticsNote(), "enqueue") != nullptr);
+    // The multi-stage serialization is pinned byte-for-byte: the substring
+    // checks above cannot see comma/brace shape (a trailing comma before
+    // the closing brace is invisible to find()), exact equality is not.
+    const std::string golden =
+        std::string("  \"stages\": {\n"
+                    "    \"stage_semantics\": \"") +
+        xnc::StageSemanticsNote() +
+        "\",\n"
+        "    \"a_us\": { \"n\": 4, \"p50\": 20, \"p95\": 40, \"p99\": 40 },\n"
+        "    \"b_us\": { \"n\": 2, \"p50\": 1, \"p95\": 2, \"p99\": 2 }\n"
+        "  },\n"
+        "  \"cpu_readbacks\": 7,\n"
+        "  \"encoder_backend\": \"software\",\n";
+    CHECK("hist-json-golden", json == golden);
     // Sidecar splice: stages land BEFORE "ok"; an empty block keeps the
     // M0 stats.json byte-identical (no "stages" key at all).
     xnc::PipelineResult r2;
