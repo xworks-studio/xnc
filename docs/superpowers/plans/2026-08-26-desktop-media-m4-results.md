@@ -382,3 +382,99 @@ Local: `artifacts\desktop-media\rerun3-remote\`
 3. All recovery gates (100 cycles, v1 rollback soak, console selftest on the current build) remain
    unexercised behind the smoke P0 — no pass/fail claim exists for them; the 8 h soak and lock/UAC
    remain PENDING as ruled.
+
+## 11. 2026-08-28 follow-up — segfault root-caused + burst/stall CHARACTERIZED (content-regime, not resolution); idle-flush landed
+
+Two commits on top of `fb02a85`: `fix(desktop): harden gpu event pump teardown` (the §10.4 dev-box
+segfault) and the v2 idle-flush (below). All labs-xiaoxin evidence: console session 5 via the
+scheduled-task pattern, artifacts under `C:\xnc-m4\artifacts\desktop-media\qsvfix\` + `logs\`
+(markers `matrix/static/smoke*/.done`), driver `artifacts\desktop-media\drive-qsvfix.ps1`.
+
+### 11.1 Defect 1 (dev-box selftest segfault) — FIXED
+
+Reproduced locally 1-in-4 plain `--selftest` runs: log terminates exactly at
+`gpu_probe ok=1`, i.e. inside `RunStartupProbe`'s `ReleaseUnit(probe)`. Root cause as the review
+suspected: `GpuEventPump::Stop()` was a bare atomic store, so it could land between `Invoke`'s
+stopped-check and the re-arm `gen_->BeginGetEvent`, arming a callback that then called
+`EndGetEvent`/`BeginGetEvent` on a generator whose driver session `ShutdownObject` was
+concurrently tearing down. Fix: a `CRITICAL_SECTION` barrier — `Invoke` performs ALL generator
+calls under the lock and never touches the generator once `stopping_` is observed; `Stop()` sets
+the flag under the same lock, so when it returns no `Invoke` is in-flight inside the generator
+(and none will re-enter) before `END_STREAMING`/`ShutdownObject` run; the pump's own reference is
+released after those. A second lifetime hole found while hardening: `ConfigureUnit` previously
+dropped its own pump reference after arming, so MF completing the pending op without a re-arm
+(`Invoke`'s EndGetEvent-failure path) self-destructed the pump while `Unit::pump` still pointed
+at it (intermittent v2-selftest teardown crash, ~1-in-2 with the flush active) — the Unit now
+keeps its own reference. Verification: plain selftest ×11 + v2 ×4 exit 0 across the two builds
+(0 crashes; pre-fix rate 1-in-4 plain).
+
+### 11.2 Defect 2 (QSV burst/stall at native) — CHARACTERIZED + mitigated
+
+Per-hypothesis measurements, all 60 s `--console-diag --desktop-pipeline-v2 --fps 30` (or the
+5-min run-soak smoke harness = the RERUN-2 P0 workload), driver 32.0.101.8801, backend=hardware
+in every run, probe always the gate:
+
+**(a) Resolution dependence — DISPROVED.** With continuous desktop content (~21 changes/s — the
+console had a playing video + FPS-test page):
+
+| run (--max-w) | dims | mft dwell p50/p95/p99 (ms) | capture→AU p50/p95/p99 (ms) | AUs |
+|---|---|---|---|---|
+| 1920 | 1920x1200 | 65 / 68 / 69 | 110 / 113 / 115 | 1267 |
+| 1600 | 1600x1000 | 65 / 68 / 69 | 110 / 113 / 115 | 1269 |
+| 1280 | 1280x800 | 65 / 68 / 70 | 110 / 113 / 115 | 1268 |
+| 1024 | 1024x640 | 65 / 68 / 70 | 110 / 113 / 115 | 1269 |
+| native | **2880x1800** | **65 / 68 / 70** | **110 / 113 / 115** | 1265 |
+
+There is NO resolution boundary — 5.2 MP paces identically to 1024 px wide. The RERUN-2
+"resolution" reading was a confound: that run's desktop was (nearly) static (captured=30/300 s).
+
+**(b) AVEncCommonBufferSize unit (review Minor #1) — measured INERT, default unchanged.** The
+RERUN-2 P0 workload re-run via the exact soak harness: legacy bytes-ish value → 4 unrecovered
+freezes, capture→AU p95 59.3 s (REPRODUCES RERUN-2 verbatim). With the documented bits unit
+(`XNC_QSV_BUFSZ=bits`, two-frames-in-bits) under a matched content regime (~2 changes/s,
+captured 589 vs 587): freezes 0 vs 0, p95 605.6 vs 606.2 ms, mft p99 606 vs 606 ms — IDENTICAL.
+The driver ignores the property at both magnitudes; the knob stays (XNC_QSV_BUFSZ=bits|off) for
+other drivers, the legacy default stays (land-only-what-helps).
+
+**(c) Explicit CBR + MeanBitRate (flush isolated off) — measured INERT.** `XNC_QSV_RC=cbr` +
+bits buffer under the matched regime (captured 569): mft dwell p50/p95/p99 587/602/606 ms, 0
+freezes, capture→AU p95 604 ms — identical to legacy (586/605/606) and to bits-only (586/605/606);
+legacy already falls back to CBR mode after the LowDelayVBR 0x80070057 rejection. The entire
+codecapi property family (buffer magnitude, explicit RC, MeanBitRate) is inert on driver
+32.0.101.8801; only input cadence and the flush move the numbers.
+
+**Actual mechanism (from the stage decomposition).** The stage named `mft_submit_to_output_us`
+stamps at SUBMISSION and is observed at collection: it is a real encoder dwell. On a static
+desktop the rungs park the tail of a content burst inside their emit depth (QSV ~5 inputs — the
+fb02a85 structural finding; the software MFT ~17) and emit only when further inputs arrive; the
+pipeline's IdleFeed only re-fed during warmup or while an IDR was in flight (PLI-driven), so
+between desktop changes the stream froze for the whole gap — tens of seconds — then flushed as a
+catch-up burst. `queue_age_us`' tens-of-seconds p50 is the same-content re-feed stamps (feeds
+re-publish content whose source stamp is the original capture), a measurement artifact of the
+feed path, not a mailbox delay.
+
+**Mitigation landed (v2 pipeline): idle park flush, default ON.** When outputs are owed
+(submissions not yet emitted), input has starved >2 slots, and no warmup/IDR feed is active,
+re-feed the same surface (the spec §7.4/§7.5 feed mechanism extended), ≤8 feeds per content
+episode, episode reset on the next captured frame. `XNC_QSV_IDLE_FLUSH=0` disables. Measured
+(same 5-min smoke workload, native, legacy tuning): mft dwell p50/p95 586/605 ms → **114/119 ms**,
+0 unrecovered freezes, 0 content/epoch regressions, `resets=rebuilds=0`, backend=hardware. The
+remaining ~0.6 s capture→AU p95 in that run is feed-stamp artifacts (feeds carry the original
+content stamp; real-frame latency ≈ mft dwell ≈ 119 ms p95 + queue 78 ms). The fully-static P0
+regime is mechanism-bounded to ~trigger(66 ms)+8×spf+encode (<1 s) but was not re-measured in a
+verifiably fully-static console state (could not control desktop staticity remotely).
+
+### 11.3 Follow-up note (replaces the §10.7 max-w pinning idea)
+
+The hardware rung does NOT need a max-w pin for latency — native 2880x1800 paces at 65-70 ms
+under motion. The characterization for adjudication: burst/stall = static-content input
+starvation parking the encoder's emit tail, mitigated by the idle flush; the 15 ms Task-3 gate
+remains unmet at low content cadence (p95 ~119 ms dwell is the QSV emit depth at feed cadence —
+deeper driver-level low-latency knobs remain wedging/rejected on 32.0101.8801, per fb02a85).
+
+### 11.4 Artifacts
+
+Local: `artifacts\desktop-media\qsvfix-local-desktop-now.jpg` (the console's content regime during
+the matrix), markers mirrored in this section. Remote (`\labs-xiaoxin\C$\xnc-m4\artifacts\
+desktop-media\`): `qsvfix\<run>\{out.h264,stats.json,console.log}`, `logs\{matrix,static,smoke,
+smokebits,smokeflush,smokecbr}.done` + `drive-qsvfix-*.log` transcripts + soak run dirs.
