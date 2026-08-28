@@ -227,9 +227,25 @@ class GpuEventPump final : public IMFAsyncCallback {
  public:
   GpuEventPump(IMFMediaEventGenerator* gen) : gen_(gen) {
     gen_->AddRef();  // own the gen: in-flight invokes outlive ReleaseUnit
+    InitializeCriticalSection(&lock_);
   }
 
-  void Stop() { stopped_.store(true); }
+  // Teardown barrier (2026-08-28 teardown-segfault fix). Invoke touches the
+  // generator ONLY while holding lock_ and never again once stopping_ has
+  // been observed, so after Stop() returns (a) no Invoke is executing
+  // inside the generator and (b) none will re-enter - the caller may then
+  // END_STREAMING / ShutdownObject / Release the generator with no
+  // concurrent callback in flight. The pre-fix race: Stop() was a bare
+  // atomic store, so it could land between Invoke's stopped_ check and the
+  // re-arm gen_->BeginGetEvent, arming a callback that then called into a
+  // generator whose driver session ShutdownObject was tearing down -
+  // measured as the deterministic dev-box selftest segfault right after
+  // the "gpu_probe ok=1" log (ReleaseUnit of the probe unit).
+  void Stop() {
+    EnterCriticalSection(&lock_);
+    stopping_ = true;
+    LeaveCriticalSection(&lock_);
+  }
 
   // Callback-channel credits (folded into a Unit's counters by
   // AbsorbCallbackCredits on the media thread).
@@ -255,6 +271,7 @@ class GpuEventPump final : public IMFAsyncCallback {
     const ULONG r = InterlockedDecrement(&refs_);
     if (r == 0) {
       gen_->Release();
+      DeleteCriticalSection(&lock_);
       delete this;
     }
     return r;
@@ -265,35 +282,45 @@ class GpuEventPump final : public IMFAsyncCallback {
     return S_OK;
   }
   STDMETHODIMP Invoke(IMFAsyncResult* ar) override {
-    if (stopped_.load()) return S_OK;  // teardown: no re-arm
+    EnterCriticalSection(&lock_);
+    if (stopping_) {
+      LeaveCriticalSection(&lock_);
+      return S_OK;  // teardown: no generator calls, no re-arm
+    }
     ComPtr<IMFMediaEvent> ev;
     HRESULT hr = gen_->EndGetEvent(ar, ev.GetAddressOf());
-    if (FAILED(hr)) return S_OK;  // shutdown race: stop pumping
-    MediaEventType et = 0;
-    ev->GetType(&et);
-    if (et == METransformNeedInput) {
-      cr_need.fetch_add(1);
-    } else if (et == METransformHaveOutput) {
-      cr_have.fetch_add(1);
-    } else if (et == MEError) {
-      HRESULT st = S_OK;
-      ev->GetStatus(&st);
-      XNC_LOG_ERROR("gpu_mft_event_meerror status=0x%08x",
-                    static_cast<unsigned int>(st));
-    } else if (et == METransformDrainComplete) {
-      cr_drain.store(true);
-    } else if (QsvDiagVerbose()) {
-      XNC_LOG_INFO("gpu_pump_event_unexpected et=%s(%u)", EventTypeName(et),
-                   static_cast<unsigned>(et));
+    if (SUCCEEDED(hr)) {
+      MediaEventType et = 0;
+      ev->GetType(&et);
+      if (et == METransformNeedInput) {
+        cr_need.fetch_add(1);
+      } else if (et == METransformHaveOutput) {
+        cr_have.fetch_add(1);
+      } else if (et == MEError) {
+        HRESULT st = S_OK;
+        ev->GetStatus(&st);
+        XNC_LOG_ERROR("gpu_mft_event_meerror status=0x%08x",
+                      static_cast<unsigned int>(st));
+      } else if (et == METransformDrainComplete) {
+        cr_drain.store(true);
+      } else if (QsvDiagVerbose()) {
+        XNC_LOG_INFO("gpu_pump_event_unexpected et=%s(%u)", EventTypeName(et),
+                     static_cast<unsigned>(et));
+      }
+      // Re-arm UNDER THE SAME LOCK as the entry check: Stop() can no
+      // longer slip between the check and the re-arm (it must take lock_
+      // to set stopping_, which serializes it behind this whole block).
+      gen_->BeginGetEvent(this, nullptr);  // continuous re-arm
     }
-    gen_->BeginGetEvent(this, nullptr);  // continuous re-arm
-    return S_OK;
+    LeaveCriticalSection(&lock_);
+    return S_OK;  // EndGetEvent failed: shutdown race, stop pumping
   }
 
  private:
   ~GpuEventPump() = default;
   IMFMediaEventGenerator* gen_;  // owning raw ref (see ctor)
-  std::atomic<bool> stopped_{false};
+  CRITICAL_SECTION lock_;        // serializes Invoke vs Stop (the barrier)
+  bool stopping_ = false;        // guarded by lock_
   ULONG refs_ = 1;
 };
 
@@ -738,13 +765,18 @@ bool ConfigureUnit(Unit& u, IMFDXGIDeviceManager* mgr, uint32_t w, uint32_t h,
 // owner - never released here AND there; the activated object is
 // ShutdownObject'd by that same cleanup).
 void ReleaseUnit(Unit& u, bool release_activate = true) {
-  // Stop the callback pump FIRST (no re-arm; an in-flight invoke holds its
-  // own generator reference, so the COM releases below are safe).
-  if (u.pump != nullptr) {
-    u.pump->Stop();
-    u.pump->Release();
-    u.pump = nullptr;
-  }
+  // Stop the callback pump FIRST. Stop() is a barrier (see GpuEventPump):
+  // when it returns, no Invoke is inside the generator and none will
+  // re-enter, so the END_STREAMING / ShutdownObject below cannot race a
+  // concurrent EndGetEvent/BeginGetEvent on the driver's event channel
+  // (the 2026-08-28 teardown-segfault root cause). The pump's own
+  // reference is released LAST - deferred until after ShutdownObject and
+  // the generator releases: MF's pending BeginGetEvent may still hold a
+  // pump reference (and the pump its generator reference) past this
+  // point, and when MF eventually fires that leftover callback, Invoke
+  // observes stopping_ and touches nothing (the pump's destructor then
+  // drops only a generator refcount - safe on a shut-down object).
+  if (u.pump != nullptr) u.pump->Stop();
   if (u.mft.Get() != nullptr)
     u.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
   if (release_activate && u.activate.Get() != nullptr) {
@@ -754,6 +786,10 @@ void ReleaseUnit(Unit& u, bool release_activate = true) {
   u.gen.Reset();
   u.codec_api.Reset();
   u.mft.Reset();
+  if (u.pump != nullptr) {
+    u.pump->Release();  // deferred: after every generator release above
+    u.pump = nullptr;
+  }
   u.in_matrix = 0;
   u.need_credits = u.have_credits = 0;
 }
