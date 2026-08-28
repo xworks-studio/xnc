@@ -102,6 +102,43 @@ bool QsvDiagVerbose() {
   return v;
 }
 
+// QSV rate-control/buffer experiment knobs (2026-08-28 native-res
+// burst/stall root cause; each flips exactly one hypothesis so remote
+// diag runs stay attributable). Read once per process:
+//   XNC_QSV_BUFSZ=bits -> AVEncCommonBufferSize in the DOCUMENTED unit
+//                         (bits: two frames = bitrate/fps*2)   [hyp b]
+//              =off    -> no BufferSize set (control)
+//              unset   -> the historical value bitrate/fps/8*2 - an
+//                         ~8x-too-small number the driver ignored at
+//                         probe scale                          [baseline]
+//   XNC_QSV_RC=cbr     -> explicit AVEncCommonRateControlMode=CBR +
+//                         AVEncCommonMeanBitRate=bitrate       [hyp c]
+//              unset   -> the historical LowDelayVBR attempt with CBR
+//                         fallback
+// These only tune the property SETS - the §8.3 probe stays the gate for
+// every candidate regardless of mode.
+enum class QsvBufMode : uint8_t { kLegacy = 0, kBits = 1, kOff = 2 };
+QsvBufMode QsvBufSizeMode() {
+  static const QsvBufMode m = [] {
+    char buf[16]{};
+    const DWORD n = GetEnvironmentVariableA("XNC_QSV_BUFSZ", buf, sizeof(buf));
+    if (n > 0 && n < sizeof(buf)) {
+      if (_stricmp(buf, "bits") == 0) return QsvBufMode::kBits;
+      if (_stricmp(buf, "off") == 0) return QsvBufMode::kOff;
+    }
+    return QsvBufMode::kLegacy;
+  }();
+  return m;
+}
+bool QsvExplicitCbr() {
+  static const bool v = [] {
+    char buf[16]{};
+    const DWORD n = GetEnvironmentVariableA("XNC_QSV_RC", buf, sizeof(buf));
+    return n > 0 && n < sizeof(buf) && _stricmp(buf, "cbr") == 0;
+  }();
+  return v;
+}
+
 // Best-effort name for the event types this pump can meet (diagnostics).
 const char* EventTypeName(MediaEventType et) {
   switch (et) {
@@ -639,13 +676,22 @@ bool ConfigureUnit(Unit& u, IMFDXGIDeviceManager* mgr, uint32_t w, uint32_t h,
 
   // Rate control BEFORE types (the mf_encoder.cpp lesson). LowDelayVBR
   // first, CBR fallback - measured: software only accepts CBR; QSV/Arc
-  // rejects LowDelayVBR with 0x80070057 and takes CBR.
+  // rejects LowDelayVBR with 0x80070057 and takes CBR. XNC_QSV_RC=cbr
+  // (hypothesis c, 2026-08-28) makes CBR explicit AND pairs it with
+  // AVEncCommonMeanBitRate below.
   u.codec_api.Reset();
   u.mft->QueryInterface(IID_PPV_ARGS(u.codec_api.GetAddressOf()));
   if (u.codec_api.Get() != nullptr) {
-    if (!CodecApiSetUi4(u.codec_api.Get(), &CODECAPI_AVEncCommonRateControlMode,
-                        eAVEncCommonRateControlMode_LowDelayVBR,
-                        "rate_control_low_delay")) {
+    if (QsvExplicitCbr()) {
+      CodecApiSetUi4(u.codec_api.Get(), &CODECAPI_AVEncCommonRateControlMode,
+                     eAVEncCommonRateControlMode_CBR,
+                     "rate_control_cbr_explicit");
+      CodecApiSetUi4(u.codec_api.Get(), &CODECAPI_AVEncCommonMeanBitRate,
+                     bitrate, "mean_bitrate");
+    } else if (!CodecApiSetUi4(u.codec_api.Get(),
+                               &CODECAPI_AVEncCommonRateControlMode,
+                               eAVEncCommonRateControlMode_LowDelayVBR,
+                               "rate_control_low_delay")) {
       CodecApiSetUi4(u.codec_api.Get(), &CODECAPI_AVEncCommonRateControlMode,
                      eAVEncCommonRateControlMode_CBR, "rate_control_cbr");
     }
@@ -721,9 +767,32 @@ bool ConfigureUnit(Unit& u, IMFDXGIDeviceManager* mgr, uint32_t w, uint32_t h,
     // A two-frame HRD buffer: bounds the emit depth (best-effort; the
     // Arc/QSV low-latency properties - AVLowLatencyMode and
     // AVEncCommonLowLatency - are BOTH accepted-then-wedging on driver
-    // 32.0.101.8801 and must not be set, see the note above).
-    CodecApiSetUi4(u.codec_api.Get(), &CODECAPI_AVEncCommonBufferSize,
-                   bitrate / (fps ? fps : 30) / 8 * 2, "buffer_size");
+    // 32.0.101.8801 and must not be set, see the note above). The
+    // DOCUMENTED unit of AVEncCommonBufferSize is BITS; the historical
+    // value bitrate/fps/8*2 is ~8x smaller than the intended
+    // two-frames-in-bits (review Minor #1, hypothesis b of the 2026-08-28
+    // native-res burst/stall) - XNC_QSV_BUFSZ selects the variant until
+    // the measurements pick the default.
+    const uint32_t fps_safe = fps ? fps : 30;
+    const uint32_t two_frames_bits = bitrate / fps_safe * 2;
+    switch (QsvBufSizeMode()) {
+      case QsvBufMode::kBits:
+        CodecApiSetUi4(u.codec_api.Get(), &CODECAPI_AVEncCommonBufferSize,
+                       two_frames_bits, "buffer_size_bits");
+        break;
+      case QsvBufMode::kOff:
+        break;  // control: no HRD buffer constraint set at all
+      case QsvBufMode::kLegacy:
+      default:
+        CodecApiSetUi4(u.codec_api.Get(), &CODECAPI_AVEncCommonBufferSize,
+                       two_frames_bits / 8, "buffer_size");
+        break;
+    }
+    XNC_LOG_INFO("gpu_tuning buf_mode=%d buf_value=%u rc_cbr=%d",
+                 static_cast<int>(QsvBufSizeMode()),
+                 QsvBufSizeMode() == QsvBufMode::kBits ? two_frames_bits
+                                                       : two_frames_bits / 8,
+                 QsvExplicitCbr() ? 1 : 0);
   }
 
   MFT_OUTPUT_STREAM_INFO osi{};
