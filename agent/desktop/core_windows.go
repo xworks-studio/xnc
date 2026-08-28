@@ -366,7 +366,8 @@ func (p *pipeSource) Hello() *HelloInfo {
 	if h == nil {
 		return nil
 	}
-	out := &HelloInfo{Gen: h.Gen, W: h.W, H: h.H, Fps: h.Fps, MaxSubs: h.MaxSubs}
+	out := &HelloInfo{Gen: h.Gen, W: h.W, H: h.H, Fps: h.Fps, MaxSubs: h.MaxSubs,
+		MediaProtocol: h.MediaProtocol}
 	if len(h.Displays) > 0 {
 		out.Displays = make([]Display, len(h.Displays))
 		for i, d := range h.Displays {

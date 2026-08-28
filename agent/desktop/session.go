@@ -217,6 +217,11 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 		h.failFast(ctx, ws, "bad_params", "unsupported signaling: "+p.Signaling)
 		return
 	}
+	// M4 Task 4：会话级媒体版本钉子。server 在 SESSION_OPEN 前选定并快照进
+	// params（canary：节点 allowlist/百分比/回滚）；agent 强制 HOST_HELLO 的
+	// media_protocol 与钉子一致——不符即响亮收线，绝不混版续流。未知/缺席值
+	// fail closed 到 v1（旧 server 继续可用）。
+	wantMedia := mediaProtocolWireVersion(p.MediaProtocol)
 
 	// ① 启动采集 + ATTACH(pipe host 就绪才有 HOST_HELLO 维度信息)。
 	// 采集意图(M2-Slice3 Task 2):源死亡(logoff/pipe 断/core 掉线)→
@@ -244,6 +249,17 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 
 	// ② ready(HOST_HELLO 维度 + fps→默认帧时长)。
 	hello := src.Hello()
+	// ②a 媒体版本强制（M4 Task 4）：首个 HOST_HELLO 的 media_protocol 与
+	// server 选定不符 → error 帧收线（Start/Stop 配对经已登记的 defer 走）。
+	// 双向都拒：既不升版也不降版——会话版本在打开时定死。
+	if hello != nil && hello.MediaProtocol != wantMedia {
+		log.Error("desktop media protocol mismatch",
+			"selected", p.MediaProtocol, "host_wire", hello.MediaProtocol, "want_wire", wantMedia)
+		h.failFast(ctx, ws, mediaProtocolMismatchCode,
+			fmt.Sprintf("server selected media protocol %q but host hello reports wire v%d",
+				p.MediaProtocol, hello.MediaProtocol))
+		return
+	}
 	defDur := 33 * time.Millisecond
 	if hello != nil && hello.Fps > 0 {
 		if d := time.Second / time.Duration(hello.Fps); d > 0 {
@@ -262,7 +278,18 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 	// 帧 code=reattached(几何有变则补 display_changed reason=reattach,
 	// viewer 重映射输入坐标);放弃 → state 帧 code=capture_lost。PC 不
 	// 重建,帧流经同一 track 续传(viewer 无需重新协商)。
+	// M4 Task 4:重挂换了版本的 host 同样拒绝——live 会话绝不换版(绝不在
+	// 中途降版/升版续流),error 帧 + 关 WS 收线,清理走 Handle 的 defer。
 	it.onPublish = func(newSrc Source) {
+		if nh := newSrc.Hello(); nh != nil && nh.MediaProtocol != wantMedia {
+			log.Error("desktop media protocol mismatch after reattach",
+				"selected", p.MediaProtocol, "host_wire", nh.MediaProtocol, "want_wire", wantMedia)
+			w.write(ctx, errorFrame{Type: vocabError, Code: mediaProtocolMismatchCode,
+				Message: fmt.Sprintf("server selected media protocol %q but reattached host reports wire v%d",
+					p.MediaProtocol, nh.MediaProtocol)})
+			_ = ws.Close(websocket.StatusProtocolError, "media protocol mismatch")
+			return
+		}
 		w.write(ctx, stateFrame{Type: vocabState, Code: vocabStateReattached, Recoverable: true})
 		nh := newSrc.Hello()
 		if nh != nil && hello != nil && (nh.W != hello.W || nh.H != hello.H) {
@@ -412,4 +439,22 @@ func (h *Handler) setupPublisher(ctx context.Context, w *wsWriter, src Source,
 func (h *Handler) failFast(ctx context.Context, ws *websocket.Conn, code, msg string) {
 	w := &wsWriter{ws: ws}
 	w.write(ctx, errorFrame{Type: vocabError, Code: code, Message: msg})
+}
+
+// ---- M4 Task 4:会话级媒体协议钉子 ----
+
+// mediaProtocolMismatchCode 是媒体版本不符的稳定错误码(error 帧 code 字段;
+// 打开时与重挂后共用)。viewer 收到即知会话已收线,不应原参数重试。
+const mediaProtocolMismatchCode = "media_protocol_mismatch"
+
+// mediaProtocolWireVersion 把 server 选定的 mediaProtocol(proto 词汇
+// "v1"/"v2")映射为 HOST_HELLO 尾随 u32 的 wire 值:0 = v1,2 = v2(镜像
+// desktoppipe 的 mediaProtocolV2——本包跨平台,不导入 windows-only 的
+// desktoppipe,常量就地复写)。空/"v1"/未知一律 0:fail closed 到 v1,
+// 旧 server(未选择)与损坏 params 都退到安全缺省。
+func mediaProtocolWireVersion(sel string) uint32 {
+	if sel == proto.MediaProtocolV2 {
+		return 2
+	}
+	return 0
 }

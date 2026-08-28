@@ -28,12 +28,13 @@ func desktopPost(t *testing.T, env *TestEnv, nodeID, body string) *http.Response
 
 // desktopOpenResp 是 REST 响应形态（T4 e2eviewer server 模式同一契约）。
 type desktopOpenResp struct {
-	SessionID    string                   `json:"sessionId"`
-	Token        string                   `json:"token"`
-	ExpiresAt    time.Time                `json:"expiresAt"`
-	WebsocketURL string                   `json:"websocketUrl"`
-	Turn         *proto.DesktopTurnConfig `json:"turn"`
-	Lease        *desktopLeaseResp        `json:"lease"`
+	SessionID     string                   `json:"sessionId"`
+	Token         string                   `json:"token"`
+	ExpiresAt     time.Time                `json:"expiresAt"`
+	WebsocketURL  string                   `json:"websocketUrl"`
+	Turn          *proto.DesktopTurnConfig `json:"turn"`
+	Lease         *desktopLeaseResp        `json:"lease"`
+	MediaProtocol string                   `json:"mediaProtocol"`
 }
 
 // desktopLeaseResp：202 响应的 lease 判定（M2-Slice3 Task 4）。
@@ -291,4 +292,94 @@ func TestDesktopLeaseAndCapabilities(t *testing.T) {
 	require.Equal(t, 202, code)
 	require.NotNil(t, body3.Lease)
 	assert.True(t, body3.Lease.Granted, "lease must be re-grantable after holder close")
+}
+
+// openDesktopForMedia 起一套 env（可变异 config）+ 节点 + 控制连接，开一个
+// desktop 会话并返回（REST 响应体, SESSION_OPEN params, env, nodeID）。
+// M4 Task 4 的 mediaProtocol 回环共用。
+func openDesktopForMedia(t *testing.T, mutate func(*config.Config), body string) (*desktopOpenResp, json.RawMessage, *TestEnv, string) {
+	t.Helper()
+	env := newTestEnvWithCfg(t, func(c *config.Config) {
+		// desktop 会话需要 TURN（NewTestEnv 同款注入；openDesktopForMedia
+		// 不配置 TURN 时 503 TURN_UNCONFIGURED 先于媒体断言）。
+		c.TurnURLs = []string{"turn:test-turn:3478?transport=tcp", "turn:test-turn:3478"}
+		c.TurnUsername = "testuser"
+		c.TurnCredential = "testcred"
+		if mutate != nil {
+			mutate(c)
+		}
+	})
+	nodeID := env.EnrollNode(t, "WEB-MEDIA", "mid-media")
+	ctrl := dialControl(t, env, nodeID)
+	openCh := captureSessionOpen(t, ctrl)
+
+	resp := desktopPost(t, env, nodeID, body)
+	defer resp.Body.Close()
+	require.Equal(t, 202, resp.StatusCode)
+	var body202 desktopOpenResp
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body202))
+
+	select {
+	case so := <-openCh:
+		require.Equal(t, proto.KindDesktop, so.Kind)
+		return &body202, so.Params, env, nodeID
+	case <-time.After(3 * time.Second):
+		t.Fatal("no SESSION_OPEN")
+		return nil, nil, nil, ""
+	}
+}
+
+// TestDesktopMediaProtocolRollout（M4 Task 4）：百分比 100 → 一切新会话选
+// v2：SESSION_OPEN params、REST 202、manager 快照三处同源；客户端提交的
+// mediaProtocol 被白名单剥离（server 独占控制点）；审计行携带选定值。
+func TestDesktopMediaProtocolRollout(t *testing.T) {
+	body, openParams, env, nodeID := openDesktopForMedia(t, func(c *config.Config) {
+		c.DesktopMediaV2Percent = 100
+	}, `{"mediaProtocol":"v1"}`) // 客户端试图倒退回 v1——必须被忽略
+
+	assert.Equal(t, proto.MediaProtocolV2, body.MediaProtocol,
+		"REST body must report the server-selected protocol")
+
+	var p proto.DesktopParams
+	require.NoError(t, jsonUnmarshal(openParams, &p))
+	assert.Equal(t, proto.MediaProtocolV2, p.MediaProtocol,
+		"SESSION_OPEN params must embed the server selection (client value stripped)")
+
+	// 快照语义：manager 存的 params 与 SESSION_OPEN 下发的逐字节一致——
+	// 选择在会话打开时定死，live 会话没有重选路径。
+	sess := env.Sess.SessionsOf(mustUUID(nodeID), proto.KindDesktop)
+	require.NotEmpty(t, sess)
+	assert.JSONEq(t, string(openParams), string(sess[0].Params),
+		"stored session params must equal SESSION_OPEN params (selection snapshotted at open)")
+
+	// 审计：desktop.open 行携带 mediaProtocol（canary 运维证据）。
+	require.Eventually(t, func() bool {
+		var n int
+		require.NoError(t, env.Store.Pool().QueryRow(t.Context(),
+			`SELECT count(*) FROM audit_logs WHERE action = 'desktop.open'`+
+				` AND metadata ->> 'mediaProtocol' = 'v2'`).Scan(&n))
+		return n >= 1
+	}, 5*time.Second, 200*time.Millisecond)
+}
+
+// TestDesktopMediaProtocolDefaultAndRollback（M4 Task 4）：未配置（百分比 0）
+// → fail closed 到 v1；回滚开关开着时即使百分比 100 也一切新会话 v1。
+func TestDesktopMediaProtocolDefaultAndRollback(t *testing.T) {
+	// 缺省：未配置 rollout → v1。
+	body, openParams, _, _ := openDesktopForMedia(t, nil, `{}`)
+	assert.Equal(t, proto.MediaProtocolV1, body.MediaProtocol)
+	var p proto.DesktopParams
+	require.NoError(t, jsonUnmarshal(openParams, &p))
+	assert.Equal(t, proto.MediaProtocolV1, p.MediaProtocol)
+
+	// 回滚：百分比 100 + 回滚开关 → 新会话仍 v1（allowlist 胜百分比、
+	// 回滚胜一切的纯单测见 desktop_media_select_test.go）。
+	body2, openParams2, _, _ := openDesktopForMedia(t, func(c *config.Config) {
+		c.DesktopMediaV2Percent = 100
+		c.DesktopMediaV2Rollback = true
+	}, `{}`)
+	assert.Equal(t, proto.MediaProtocolV1, body2.MediaProtocol, "rollback must pin all new sessions to v1")
+	var p2 proto.DesktopParams
+	require.NoError(t, jsonUnmarshal(openParams2, &p2))
+	assert.Equal(t, proto.MediaProtocolV1, p2.MediaProtocol)
 }

@@ -49,6 +49,13 @@ func (t *DesktopTurnConfig) Configured() bool {
 	return t != nil && len(t.URLs) > 0 && t.Username != "" && t.Credential != ""
 }
 
+// Desktop mediaProtocol 词汇（M4 Task 4：server 侧 canary 选择 / agent 侧
+// 强制）。空 = 缺省 v1——旧 server 未选择时 agent fail closed 到 v1。
+const (
+	MediaProtocolV1 = "v1"
+	MediaProtocolV2 = "v2"
+)
+
 // DesktopParams 会话 Params 的 desktop 形态（M1-Slice2）。
 type DesktopParams struct {
 	// Signaling 目前仅 "webrtc"；空视同 "webrtc"（本片唯一形态）。
@@ -68,6 +75,12 @@ type DesktopParams struct {
 	// agent 侧强制：input.* 缺失拒转发对应输入、input.secure_attention
 	// 缺失拒 SAS（spec §14）。客户端提交值被白名单剥离，只来自 server。
 	Capabilities []string `json:"capabilities,omitempty"`
+	// MediaProtocol（M4 Task 4）：server 在会话创建时一次性选定的媒体管线
+	// 版本（MediaProtocolV1/V2）。canary 控制 = server config（节点
+	// allowlist + 百分比 + 回滚开关），选择先于 Host/Publisher 启动并随
+	// params 快照——live 会话绝不换版；agent 强制 HOST_HELLO 的
+	// media_protocol 与此一致，不符即收线。客户端提交值被白名单剥离。
+	MediaProtocol string `json:"mediaProtocol,omitempty"`
 }
 
 // Desktop capability 词汇（server 下发 / agent 强制，spec §14）。

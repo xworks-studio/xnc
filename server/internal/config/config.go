@@ -33,6 +33,14 @@ type Config struct {
 	TurnPool []string
 	DesktopPerNode     int           // XNC_DESKTOP_PER_NODE，默认 4（对齐 agent host max_subs=4，多 viewer），0 = 不限
 	DesktopIdleTimeout time.Duration // XNC_DESKTOP_IDLE，默认 5m（无信令活动即关），0 = 不限
+
+	// —— M4 Task 4：desktop 媒体管线 v2 canary（server 侧 per-session
+	// 选择 = 生产控制点；节点本机 XNC_DESKTOP_PIPELINE_V2 仍是 host 侧
+	// force，二者不一致时 agent 按会话钉子响亮拒绝）。百分比桶按节点 UUID
+	// 哈希（rt-pipe host 每节点共享，一个节点的并发会话必须同版）。
+	DesktopMediaV2Percent   int      // XNC_DESKTOP_MEDIA_V2_PERCENT，0-100，默认 0（全 v1）；越界视为 0
+	DesktopMediaV2Allowlist []string // XNC_DESKTOP_MEDIA_V2_ALLOWLIST，逗号分隔节点 UUID（显式胜百分比）
+	DesktopMediaV2Rollback  bool     // XNC_DESKTOP_MEDIA_V2_ROLLBACK，true = 一切新会话钉回 v1（回滚开关）
 }
 
 func Load() (Config, error) {
@@ -54,6 +62,9 @@ func Load() (Config, error) {
 		TurnPool:           envList("XNC_TURN_POOL"),
 		DesktopPerNode:     envInt("XNC_DESKTOP_PER_NODE", 4),
 		DesktopIdleTimeout: envDur("XNC_DESKTOP_IDLE", 5*time.Minute),
+		DesktopMediaV2Percent:   envInt("XNC_DESKTOP_MEDIA_V2_PERCENT", 0),
+		DesktopMediaV2Allowlist: envList("XNC_DESKTOP_MEDIA_V2_ALLOWLIST"),
+		DesktopMediaV2Rollback:  envBool("XNC_DESKTOP_MEDIA_V2_ROLLBACK", false),
 	}
 	if c.DatabaseURL == "" {
 		return c, fmt.Errorf("XNC_DATABASE_URL is required")
@@ -103,4 +114,15 @@ func envList(k string) []string {
 		}
 	}
 	return out
+}
+
+// envBool 解析布尔 env（strconv.ParseBool：1/t/T/true/TRUE…）；缺失或非法
+// 回默认（回滚开关缺省 false = fail closed 到 v1）。
+func envBool(k string, d bool) bool {
+	if v := os.Getenv(k); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
+	}
+	return d
 }

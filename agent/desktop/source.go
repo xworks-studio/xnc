@@ -31,12 +31,18 @@ type Frame struct {
 
 // HelloInfo 是 HOST_HELLO 内容镜像;gen 递增代表 capture 重建。
 // Displays 为 M2-S3 Task 5 的 displays[] 镜像(nil = 旧 host 未携带)。
+// MediaProtocol 为 HOST_HELLO 尾随的媒体协议 wire 版本(M4 Task 4 透传:
+// 0 = v1/旧 host 无该字段,2 = v2 wire)——server 侧 canary 选定会话版本后,
+// session.go 以此强制 hello 与选择一致,不符即收线,绝不混版续流。
 type HelloInfo struct {
 	Gen      uint32
 	W, H     uint32
 	Fps      uint32
 	MaxSubs  uint32
 	Displays []Display
+	// MediaProtocol:HOST_HELLO 尾随 u32(desktoppipe.HelloInfo 同名镜像;
+	// 0 = v1)。
+	MediaProtocol uint32
 }
 
 // Display 是 HOST_HELLO displays[] 一项的镜像(M2-S3 Task 5)。
