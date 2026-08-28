@@ -554,8 +554,8 @@ known-gap, not a P0).
 
 `runresult.json`: `UnrecoveredFreezes=0`, `OldFrameRegressions=0`, `EpochRegressions=0`;
 `CaptureToAUP95Ms=593.568` (gate 15 FAIL), `QueueP95Ms=72.52` (gate 50 FAIL), `QueueMaxMs=101.92`
-(gate 100 PASS), `WorkingSetMB=413.9` (gate 350 FAIL), `CPUPercent=0.221`, `Verdict: FAIL`
-(latency/memory only).
+(gate 100 FAIL — 101.92 ms > 100 ms, the gate is exclusive), `WorkingSetMB=413.9` (gate 350 FAIL),
+`CPUPercent=0.221`, `Verdict: FAIL` (latency/memory only).
 
 `stats.json`: **`encoder_backend=hardware`**, captured=70845, encoded=74359, keyframes=306,
 `resets=0`, `rebuilds=0`, `cpu_readbacks=0`; terminal native line
@@ -655,7 +655,7 @@ zero `SELFTEST FAIL` lines**, terminal `selftest ok`. Citations (verbatim NOTE l
 | Smoke: latency/memory gates | **FAIL** (non-P0, known-gap) | CaptureToAUP95 241.2 ms (gate 15), QueueP95 64.8 (gate 50), WS 413.6 (gate 350) |
 | 60-min v2 soak: zero unrecovered freezes | **PASS** | §12.4 `UnrecoveredFreezes=0` |
 | 60-min v2 soak: zero contentId/hash/epoch regressions | **PASS** | §12.4 all viewer + runresult counters 0 |
-| 60-min v2 soak: latency/memory gates | **FAIL** (non-P0, known-gap) | CaptureToAUP95 593.6, QueueP95 72.5, WS 413.9; QueueMax 101.9 PASSES gate 100 |
+| 60-min v2 soak: latency/memory gates | **FAIL** (non-P0, known-gap) | CaptureToAUP95 593.6, QueueP95 72.5, QueueMax 101.9 (FAIL — 101.9 ms > 100 ms exclusive), WS 413.9 |
 | Paced capture→AU percentiles (Task-3 known-gap data) | **MEASURED** — p95 241–594 ms, fails the 15 ms gate ~16–40x | §12.6 table |
 | 10-min v1 rollback soak | **DOCUMENTED** — `Verdict: NO-EVIDENCE` on CaptureToAUP95 as expected (fail-closed); rollback counters recorded (freezes 363, 1 regression, WS 1104) | §12.5 |
 | 100 cycles: epoch increment exactly 1 | **PASS 100/100** | §12.7 |
@@ -664,7 +664,7 @@ zero `SELFTEST FAIL` lines**, terminal `selftest ok`. Citations (verbatim NOTE l
 | ACCESS_LOST injection cycles | **NOT POSSIBLE on Win11 26200** (standing finding §5); covered by selftest rsD (injected backend, PASS §12.8) | §5, §12.8 |
 | Console v2 selftest (current build) | **PASS** (exit 0, 0 FAIL, new pins green on hardware) | §12.8 |
 | 8 h soak completion | **PENDING** — exact command: `powershell -NoProfile -ExecutionPolicy Bypass -File C:\xnc-m4\scripts\desktop-media\run-soak.ps1 -DurationSec 28800 -Pipeline v2 -Fps 30` (from the repo: `run-soak.ps1 -DurationSec 28800 -Pipeline v2 -Fps 30`); not started in this suite | — |
-| Lock/unlock + UAC transitions | **PENDING** (manual, interactive console; not automatable unattended) | — |
+| Lock/unlock + UAC transitions | **PENDING** (manual, interactive console; not automatable unattended; manual procedure: trigger Win+L lock and a UAC elevation prompt on the console, expect capture_reset_start/done with reason desktop_switch/access_lost in the native log + epoch advance + viewer recovery — the cycle driver's observation channels) | — |
 
 ### 12.10 Artifacts (git-ignored)
 
