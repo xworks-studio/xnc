@@ -469,7 +469,10 @@ PullResult PullOneOutput(Unit& u, std::vector<UnitAu>* outs,
   for (int round = 0; round < 3; ++round) {
     if (!u.provides_samples) {
       ComPtr<IMFMediaBuffer> client_buffer;
-      HRESULT hrb = MFCreateSample(client_sample.GetAddressOf());
+      // ReleaseAndGetAddressOf: on a stream-change retry round the ComPtr still
+      // holds the previous round's sample (ob.pSample only aliases it) - a bare
+      // GetAddressOf would let MFCreateSample overwrite the pointer and leak it.
+      HRESULT hrb = MFCreateSample(client_sample.ReleaseAndGetAddressOf());
       if (SUCCEEDED(hrb))
         hrb = MFCreateMemoryBuffer(static_cast<DWORD>(u.out_buf_size),
                                    client_buffer.GetAddressOf());

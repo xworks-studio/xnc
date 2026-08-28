@@ -4,18 +4,10 @@
 the repaired hardware path (0001b94): smoke 5-min v2 and 60-min v2 soak both `UnrecoveredFreezes=0`
 with all content regressions 0 and `encoder_backend=hardware`; 100/100 reset cycles pass all three
 recovery gates; console v2 selftest exit 0 with the new pump-stress/idle-flush pins green on real
-hardware. The latency/memory gates (CaptureToAUP95 / QueueP95 / WorkingSet) still FAIL — non-P0,
-recorded as the Task-3 known-gap data. 8 h soak and lock/UAC transitions remain PENDING (exact
+hardware. The latency/memory gates (CaptureToAUP95 / QueueP95 / QueueMax / WorkingSet) still FAIL —
+non-P0, recorded as the Task-3 known-gap data (QueueMax 101.9 ms in the 60-min soak, over the
+exclusive 100 ms gate — §12.4). 8 h soak and lock/UAC transitions remain PENDING (exact
 command / manual). §3–§11 are retained history (previous attempts' P0s and the QSV repair).**
-
-**Previous attempt summary (BLOCKED — the bounded-soak gate FAILED on a P0 counter and the suite
-stopped per the STOP rule).** The run executed on labs-xiaoxin console session 5 (the designated
-validation node, interactive desktop attached). The harness pipe bug from the first attempt is confirmed fixed by
-commit `6f61605` (full `\\.\pipe\...` path: the rt server appeared, all viewer events dialed,
-`from-diag` produced real verdicts). A second, previously-unknown harness-side defect was found and
-fixed DURING this rerun (uncommitted in the worktree — see §7): `FormatStagesJson` emitted a
-trailing comma in the `stages` object, so every v2 `stats.json` was invalid JSON and `from-diag`
-rejected it. The binary validated here includes that fix.
 
 **Previous attempt summary (BLOCKED — the bounded-soak gate FAILED on a P0 counter and the suite
 stopped per the STOP rule).** The run executed on labs-xiaoxin console session 5 (the designated
@@ -846,3 +838,117 @@ viewers (e2eviewer's `--input-script` is server-mode only).
 5. Browser session gates hinge on the same core-pipe elevation wall as 13.4; any follow-up should
    schedule the interactive UAC once (or use the labs-xiaoxin SYSTEM exec channel) to unlock both
    the combined TURN row and the browser rVFC evidence.
+
+## 14. Canary rollout runbook (M4 Task 4 — landed `2083c3b`)
+
+Everything below is verifiable against the committed code (citations are `file:symbol` against
+`2083c3b`). The production control point is the SERVER: the node-local
+`XNC_DESKTOP_PIPELINE_V2` env is a host-side dev/self-test force, not the rollout path.
+
+### 14.1 The three knobs (env → config → selection input)
+
+| Env | Shape | Config field (`server/internal/config/config.go`) | Parsing |
+|---|---|---|---|
+| `XNC_DESKTOP_MEDIA_V2_PERCENT` | int `0`–`100`, e.g. `XNC_DESKTOP_MEDIA_V2_PERCENT=25` | `Config.DesktopMediaV2Percent` | `envInt` → `strconv.Atoi`; missing/invalid → default `0` (all v1) |
+| `XNC_DESKTOP_MEDIA_V2_ALLOWLIST` | comma-separated node UUIDs, e.g. `XNC_DESKTOP_MEDIA_V2_ALLOWLIST=11111111-1111-1111-1111-111111111111,22222222-2222-2222-2222-222222222222` | `Config.DesktopMediaV2Allowlist` | `envList` → comma-split, per-entry `TrimSpace`, empties dropped; match is case-insensitive |
+| `XNC_DESKTOP_MEDIA_V2_ROLLBACK` | bool via `strconv.ParseBool` (`1`/`t`/`true`/…), e.g. `XNC_DESKTOP_MEDIA_V2_ROLLBACK=1` | `Config.DesktopMediaV2Rollback` | `envBool`; missing/invalid → `false` (fail closed to v1) |
+
+All three are read once at server start (`config.Load`); applying a change restarts the server.
+`desktop_handlers.go:desktopMediaRollout` folds them into the pure unit's input:
+
+```go
+// server/internal/api/desktop_media_select.go — the pure selection unit's inputs:
+type MediaRollout struct {
+    Percent   int      // ∈ [0,100]; out-of-range is fail-closed to v1
+    Allowlist []string // node UUIDs; case-insensitive match (mediaNodeAllowlisted)
+    Rollback  bool     // true = ALL new sessions pinned to v1 (beats allowlist + percent)
+}
+selectMediaProtocol(roll MediaRollout, nodeID string) string  // returns "v1" | "v2"
+```
+
+Priority (high→low, `desktop_media_select.go:selectMediaProtocol`): ① `Rollback` → v1 for every
+new session (including allowlisted nodes); ② allowlist hit → v2 (beats the percentage, even at
+percent 0); ③ percent bucket — out-of-range (<0 or >100) fails closed to v1, else
+`desktop_media_select.go:mediaBucketProtocol`: `fnv.New32a()` over the **lowercased node UUID**,
+`Sum32()%100 < Percent` → v2.
+
+### 14.2 Node-keyed bucket semantics
+
+- **Cohorts are keyed by node UUID, not by session.** The rt-pipe host is one process per node
+  serving up to `max_subs=4` concurrent viewer sessions, and its pipeline version is fixed at host
+  process start — every concurrent session on a node must receive the same verdict, or the agent's
+  per-session pin would contradict its neighbor sessions (`desktop_media_select.go` header comment).
+- **Restart-stable.** The bucket is a pure FNV-1a hash of the node UUID: server restarts never
+  reshuffle cohorts; only changing `Percent`/`Allowlist`/`Rollback` moves a node, and a percent
+  move flips whole nodes (all their *new* sessions), never half a node.
+- **Cohort flips fail loudly — no silent mixed-version streaming.** The selection is enforced
+  against the host's wire reality: `agent/desktop/session.go:Handle` compares the pinned version
+  with the `HOST_HELLO` trailing `u32 media_protocol` (`0` = v1, `2` = v2;
+  `agent/desktop/session.go:mediaProtocolWireVersion`) at open AND on every reattach
+  (`onPublish`). Mismatch in EITHER direction → error frame
+  `code="media_protocol_mismatch"` (`agent/desktop/session.go:mediaProtocolMismatchCode`) and WS
+  close. So a node whose host (re)starts on the other version — cohort moved, or a conflicting
+  local force — kills its new/mismatched sessions loudly instead of mixing versions on one stream.
+- **Pinned live sessions never change.** The selection runs once inside
+  `server/internal/api/desktop_handlers.go:desktopStart`, BEFORE `startSession` (i.e. before any
+  Host/Publisher starts), and is snapshotted into the session params; there is no re-selection path
+  for a live session. The loopback test asserts the manager's stored params are byte-identical to
+  the SESSION_OPEN params (`desktop_handlers_test.go:TestDesktopMediaProtocolRollout`), and
+  `desktop_media_select_test.go:TestSelectMediaProtocolReselectChanges` pins the flip-only-on-
+  reselect contract from the unit side.
+
+### 14.3 Where the selection lands (JSON shapes, from the landed code)
+
+- **SESSION_OPEN params** (`proto/session.go:DesktopParams.MediaProtocol`,
+  `json:"mediaProtocol,omitempty"`, values `proto.MediaProtocolV1`=`"v1"` / `"v2"`): absent/`"v1"`
+  is the fail-closed default — old servers keep working (`agent/desktop/session.go` treats
+  unknown/empty as v1).
+- **REST 202** (`POST /api/nodes/{id}/desktop`): response body carries `"mediaProtocol":"v1"|"v2"`
+  (merged via `startSession`'s `extra` map; test mirror `desktop_handlers_test.go:
+  desktopOpenResp.MediaProtocol`). A client-submitted `mediaProtocol` in the request body is NOT in
+  the `desktopReq` whitelist and is silently stripped — the server is the only control point.
+- **Audit**: `desktop.open` metadata carries `"mediaProtocol":"v1"|"v2"` (`startSession`
+  `auditExtra` map) — the per-session canary evidence row.
+- **Failure shape** (viewer-visible, on pin/host mismatch): error frame
+  `{"type":"error","code":"media_protocol_mismatch","message":"server selected media protocol …
+  but host hello reports wire v…"}` (open) or the same code after reattach.
+
+### 14.4 Caveat: a node with `XNC_DESKTOP_PIPELINE_V2=1` hard-fails under a default server
+
+`XNC_DESKTOP_PIPELINE_V2` is read ONCE at host startup (`native/desktop/xnc-desktop.cpp:
+DesktopPipelineV2Enabled`, `"1"`/`"true"` enable) and forces the v2 wire for ALL sessions of that
+host. Under a default server (no allowlist, percent 0) every node selects v1 → **every desktop
+session on that node fails at open** with `media_protocol_mismatch` (and fails again on each
+reattach). Remedies, pick one:
+
+1. allowlist the node: `XNC_DESKTOP_MEDIA_V2_ALLOWLIST=<node-uuid>` (allowlist beats percent 0);
+2. `XNC_DESKTOP_MEDIA_V2_PERCENT=100`;
+3. clear `XNC_DESKTOP_PIPELINE_V2` on the node (and restart its host).
+
+`XNC_DESKTOP_MEDIA_V2_ROLLBACK=1` does NOT help — rollback beats the allowlist and pins all new
+sessions to v1, reproducing the mismatch.
+
+### 14.5 Caveat: the allowlist path is proven at unit level only
+
+The allowlist rules (explicit v2 at any percent, case-insensitive UUID matching, no match for other
+nodes, rollback-beats-allowlist) are proven by the pure unit table
+(`server/internal/api/desktop_media_select_test.go:TestSelectMediaProtocol`) plus the env-list
+plumbing (`config.go:envList`). The loopback handler tests exercise percent=100 and rollback, NOT
+an env-entered allowlist entry on an enrolled fleet (`desktop_handlers_test.go:
+TestDesktopMediaProtocolRollout` / `TestDesktopMediaProtocolDefaultAndRollback`), and the agent-side
+mismatch enforcement is proven by the synthetic-session tests
+(`agent/desktop/session_media_test.go:TestDesktopMediaProtocolMismatchAtOpen` /
+`MismatchOnReattach` / `MatchAndFailClosed`). No end-to-end allowlist canary on real nodes exists
+in this milestone — the first real allowlist use must verify one node flips (its next session's
+audit row reads `mediaProtocol=v2`, 202 body agrees) before broadening.
+
+### 14.6 Procedures
+
+- **Start the canary (one node):** set `XNC_DESKTOP_MEDIA_V2_ALLOWLIST=<uuid>`, restart the
+  server. New sessions on that node open v2; live sessions keep their pinned version.
+- **Expand:** raise `XNC_DESKTOP_MEDIA_V2_PERCENT` (e.g. 10 → 25 → 50 → 100). Each change moves
+  whole nodes; newly-v2 nodes flip on their NEXT session.
+- **Roll back:** `XNC_DESKTOP_MEDIA_V2_ROLLBACK=1`, restart the server — every NEW session
+  (allowlisted included) pins to v1. Live v2 sessions run to their natural end; if one reattaches
+  to a host now serving v1 wire it fails loudly (`media_protocol_mismatch`) — by design, never a
+  mixed-version stream. Clear the rollback flag to resume the canary.
