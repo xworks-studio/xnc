@@ -1552,6 +1552,15 @@ class Loop {
     im_.warmup_started_ms = 0;
     im_.warmup_gen_feeds = 0;
     im_.warmup_phase_logged = false;
+    // The rebuild is a content-episode boundary for the idle park flush
+    // too (review IMPORTANT 2, 2026-08-28). Defense-in-depth rather than
+    // load-bearing today: phase 3 below tears the SESSION down, so a
+    // post-rebuild flush always requires the new base kFrame - which
+    // already replenishes via AcquireOnce's kFrame branch (measured: the
+    // v2t selftest pin passes with this line removed). Kept so the budget
+    // is correct by construction at every episode boundary, independent
+    // of the re-init path's shape.
+    im_.flush_feeds = 0;
 
     // Phase 6 - config: a pending reconfigure request SURVIVES the reset
     // (the loop consumes it only with a live session) and applies to the

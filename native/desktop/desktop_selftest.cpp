@@ -3053,6 +3053,56 @@ int SelftestMain(bool desktop_pipeline_v2) {
         CHECK("gpu-shutdown-zero-live",
               pool.LiveLeases() == 0 &&
                   pool.FreeCount() == xnc::Nv12SurfacePool::kSlotCount);
+
+        // ---- pump teardown stress pin (2026-08-28 fix round) ----
+        // The two GpuEventPump lifetime fixes (127dae8: Stop/Invoke re-arm
+        // race; d9da3ce: unit-owned reference vs MF's pending-op drop) were
+        // found as FLAKY teardown segfaults - this pin keeps the exact
+        // arming/teardown shapes under repetition. Each Init runs the full
+        // ladder (probe unit configure->arm->ReleaseUnit + live unit
+        // configure->arm) and each Shutdown tears it down: 12 iterations =
+        // 24 arming/teardown cycles. Measured pre-fix (729bfaf pump, this
+        // box): 8 crashes / 20 --qsv-probe-diag runs (~3 cycles each, 40%
+        // per run); post-fix: 0 / 20. A regression here segfaults the
+        // process (the strongest possible failure signal).
+        {
+          constexpr int kPumpStressIters = 12;
+          int inits_ok = 0;
+          const ULONGLONG stress_t0 = GetTickCount64();
+          for (int i = 0; i < kPumpStressIters; ++i) {
+            xnc::MfGpuEncoder stress;
+            std::string serr;
+            if (!stress.Init(dev.Get(), &pool, sw, sh, 30, 2000000, &serr))
+              break;  // a transient probe failure ends the count cleanly
+            ++inits_ok;
+            // A couple of submits keep the live unit's event pump busy at
+            // teardown (in-flight credits), alternating shutdown flavors.
+            xnc::SurfaceLease* lease = pool.Acquire();
+            if (lease != nullptr) {
+              const xnc::FrameIdentity sid{
+                  1, 1, static_cast<uint64_t>(700 + i),
+                  static_cast<uint64_t>(900 + i), 0, 0};
+              if (stress.Submit(sid, std::move(*lease), i == 0) ==
+                  xnc::SubmitResult::kOk) {
+                xnc::EncoderOutput so;
+                stress.TakeOutput(&so, 0);  // opportunistic collect
+              }
+            }
+            stress.Shutdown(i % 2 == 0 ? xnc::ShutdownMode::kDrain
+                                       : xnc::ShutdownMode::kImmediate);
+            pool.FreeRetired();
+            if (pool.LiveLeases() != 0) break;  // lease leak: stop, assert
+          }
+          CHECK("gpu-pump-stress-inits", inits_ok >= kPumpStressIters - 1);
+          CHECK("gpu-pump-stress-no-live-leases",
+                pool.LiveLeases() == 0 &&
+                    pool.FreeCount() == xnc::Nv12SurfacePool::kSlotCount);
+          std::printf("SELFTEST NOTE: gpu-pump-stress iters=%d ok=%d "
+                      "dt=%ums (pre-fix 729bfaf: 8 crashes/20 qsvdiag runs; "
+                      "post-fix 0/20)\n",
+                      kPumpStressIters, inits_ok,
+                      static_cast<unsigned>(GetTickCount64() - stress_t0));
+        }
       }
     }
   }
@@ -8210,6 +8260,15 @@ int SelftestMain(bool desktop_pipeline_v2) {
       }
       return pred();
     };
+    // The idle-flush gate's process env state (mirrors IdleFlushEnabled in
+    // media_pipeline_v2.cpp: default ON, XNC_QSV_IDLE_FLUSH=0 disables) -
+    // printed with the flush pins' notes so RED runs are self-describing.
+    auto flush_env_state = []() -> const char* {
+      char buf[8]{};
+      const DWORD n = GetEnvironmentVariableA("XNC_QSV_IDLE_FLUSH", buf,
+                                              sizeof(buf));
+      return (n > 0 && buf[0] == '0') ? "off" : "on";
+    };
 
     // ---- shared fakes (the DeviceSurfaceCapture shape + a script) ----
 
@@ -8249,12 +8308,20 @@ int SelftestMain(bool desktop_pipeline_v2) {
     class ScriptedDeviceCapture final : public xnc::ICapture,
                                          public xnc::ICaptureSurface {
      public:
-      enum class Step : uint8_t { kFrame, kAccessLost };
+      enum class Step : uint8_t { kFrame, kAccessLost, kGap };
+      // kGap: a STATIC-screen response. With gap_ms == 0 it is one
+      // kNoChange pass; with gap_ms > 0 the ONE kGap step holds kNoChange
+      // for that wall-clock window (time-based static episode - loop pass
+      // rate under the fakes is not time-deterministic, so a count of
+      // single-pass gaps cannot bound an episode). Used to exhaust the
+      // idle park flush budget mid-episode before a scripted kAccessLost
+      // (the 2026-08-28 fix-round flush/reset pin).
       ScriptedDeviceCapture(ID3D11Device* dev, ID3D11DeviceContext* ctx,
                             std::vector<Step> script, uint32_t w, uint32_t h,
-                            bool use_bright = false)
+                            bool use_bright = false, uint32_t gap_ms = 0)
           : dev_(dev), ctx_(ctx), script_(std::move(script)), w_(w), h_(h),
-            bars_(w, h), bright_(w, h), use_bright_(use_bright) {
+            bars_(w, h), bright_(w, h), use_bright_(use_bright),
+            gap_ms_(gap_ms) {
         D3D11_TEXTURE2D_DESC td{};
         td.Width = w;
         td.Height = h;
@@ -8304,6 +8371,22 @@ int SelftestMain(bool desktop_pipeline_v2) {
             if (err) *err = "err_access_lost";
             if (id) *id = last_id_;
             return xnc::CaptureStatus::kAccessLost;
+          }
+          if (st == Step::kGap) {  // a static-screen window (see Step)
+            if (gap_ms_ > 0) {
+              if (gap_until_ == 0) gap_until_ = GetTickCount64() + gap_ms_;
+              if (GetTickCount64() < gap_until_) {
+                --next_;  // window open: the step is not consumed yet
+                if (err) *err = "err_timeout";
+                if (id) *id = last_id_;
+                Sleep(2);  // no hot spin inside the scripted static window
+                return xnc::CaptureStatus::kNoChange;
+              }
+              gap_until_ = 0;  // window elapsed: consume the step
+            }
+            if (err) *err = "err_timeout";
+            if (id) *id = last_id_;
+            return xnc::CaptureStatus::kNoChange;
           }
           // Distinct content per script index (stripe moves).
           const uint32_t fi = static_cast<uint32_t>(next_ - 1);
@@ -8390,6 +8473,8 @@ int SelftestMain(bool desktop_pipeline_v2) {
       std::atomic<size_t> frames_{0};
       uint32_t rebuilds_ = 0;
       xnc::FrameIdentity last_id_{};
+      uint32_t gap_ms_ = 0;        // kGap window (0 = single pass)
+      ULONGLONG gap_until_ = 0;    // active kGap window deadline
     };
 
     // Recording IEncoderSession factory target: log survives session
@@ -10295,6 +10380,122 @@ int SelftestMain(bool desktop_pipeline_v2) {
         std::printf("SELFTEST NOTE: v2r-rt frames=%llu keys=%llu rc=%d\n",
                     static_cast<unsigned long long>(a.v2_frames_),
                     static_cast<unsigned long long>(a.keys_), rc);
+      }
+    }
+
+    // ---- 2026-08-28 fix round: idle park flush pins ----
+    // v2s: static content after two frames - the parked tail (modeled by
+    // the LogSession's delay=5 emit depth, the QSV shape) must be flushed
+    // by bounded same-surface re-feeds while the flush is enabled (the
+    // landed default; XNC_QSV_IDLE_FLUSH=0 is the documented A/B gate and
+    // makes the growth assertions fail - the RED check).
+    {
+      const uint32_t w = 320, h = 240;
+      std::vector<ScriptedDeviceCapture::Step> script{
+          ScriptedDeviceCapture::Step::kFrame,
+          ScriptedDeviceCapture::Step::kFrame};
+      ScriptedDeviceCapture cap(v2_dev.Get(), v2_ctx.Get(), script, w, h);
+      SessionLog log;
+      log.delay = 5;  // park shape: outputs lag 5 submissions (never drain)
+      V2RecordingSink sink;
+      xnc::MediaPipelineV2::Config cfg;
+      cfg.cap = &cap;
+      cfg.surf = &cap;
+      cfg.sink = &sink;
+      cfg.fps = 30;
+      cfg.duration_s = 30;
+      cfg.session_factory = [](void* ctx, xnc::Nv12SurfacePool* pool) ->
+          xnc::IEncoderSession* {
+            return new LogSession(static_cast<SessionLog*>(ctx), pool);
+      };
+      cfg.session_ctx = &log;
+      xnc::MediaPipelineV2 pipe;
+      CHECK("v2s-start", pipe.Start(cfg));
+      if (pipe.running()) {
+        // First published key AU = warmup done (have_key): the baseline.
+        CHECK("v2s-first-au", wait_for([&] { return sink.CopyAus().size() >= 1; }, 8000));
+        CHECK("v2s-captured-frames", cap.frames() == 2);
+        const size_t s0 = log.submits.load();
+        const size_t aus0 = sink.CopyAus().size();
+        // Static from here: the flush must re-feed the surface (parked
+        // tail emits) BOUNDED by the per-episode budget (kFlushFeedBound).
+        CHECK("v2s-flush-fed", wait_for([&] { return log.submits.load() >= s0 + 4; }, 6000));
+        Sleep(1500);  // let any runaway feeding surface
+        const size_t s1 = log.submits.load();
+        CHECK("v2s-flush-bounded", s1 - s0 <= 8);
+        // Every feed flushed one parked output through the sink.
+        CHECK("v2s-flush-emits", sink.CopyAus().size() > aus0);
+        const xnc::MediaPipelineV2::Result res = pipe.Stop();
+        CHECK("v2s-ok", res.ok);
+        CHECK("v2s-no-resets", res.resets == 0);
+        std::printf("SELFTEST NOTE: v2s idle-flush subs=%zu->%zu aus=%zu->%zu "
+                    "(delay=5 park; flush env=%s)\n",
+                    s0, s1, aus0, sink.CopyAus().size(),
+                    flush_env_state());
+      } else {
+        CHECK("v2s-start-running", false);
+      }
+    }
+
+    // v2t: rebuild (scripted kAccessLost) landing MID-static-episode - the
+    // flush budget must be replenished by the reset (media_pipeline_v2
+    // RunReset phase 5; without it the post-rebuild parked tail re-freezes
+    // - review IMPORTANT 2). Script: 2 frames, a 1.5 s static episode (the
+    // flush budget exhausts ~0.4 s in - deterministic, time-based gap),
+    // access-lost (reset), one re-init frame, then static forever.
+    {
+      const uint32_t w = 320, h = 240;
+      std::vector<ScriptedDeviceCapture::Step> script{
+          ScriptedDeviceCapture::Step::kFrame,
+          ScriptedDeviceCapture::Step::kFrame,
+          ScriptedDeviceCapture::Step::kGap,       // held 1500 ms (gap_ms)
+          ScriptedDeviceCapture::Step::kAccessLost,
+          ScriptedDeviceCapture::Step::kFrame};    // re-init base frame
+      ScriptedDeviceCapture cap(v2_dev.Get(), v2_ctx.Get(), script, w, h,
+                                /*use_bright=*/false, /*gap_ms=*/1500);
+      SessionLog log;
+      log.delay = 5;
+      V2RecordingSink sink;
+      xnc::MediaPipelineV2::Config cfg;
+      cfg.cap = &cap;
+      cfg.surf = &cap;
+      cfg.sink = &sink;
+      cfg.fps = 30;
+      cfg.duration_s = 60;
+      cfg.session_factory = [](void* ctx, xnc::Nv12SurfacePool* pool) ->
+          xnc::IEncoderSession* {
+            return new LogSession(static_cast<SessionLog*>(ctx), pool);
+      };
+      cfg.session_ctx = &log;
+      xnc::MediaPipelineV2 pipe;
+      CHECK("v2t-start", pipe.Start(cfg));
+      if (pipe.running()) {
+        CHECK("v2t-first-au", wait_for([&] { return sink.CopyAus().size() >= 1; }, 8000));
+        // The scripted 1.5 s static episode exhausts the flush budget,
+        // THEN the access-lost drives the reset; the final scripted frame
+        // re-inits the stream (one submission past the rebuild).
+        CHECK("v2t-rebuild-ran",
+              wait_for([&] { return cap.rebuilds() >= 1; }, 15000));
+        const size_t s_pre = log.submits.load();
+        CHECK("v2t-post-rebuild-base",
+              wait_for([&] { return log.submits.load() > s_pre; }, 8000));
+        const size_t s1 = log.submits.load();
+        // Post-rebuild STATIC: the replenished budget must flush the new
+        // parked tail (this is the assertion the pre-fix code fails -
+        // flush_feeds stayed exhausted across the rebuild).
+        CHECK("v2t-post-rebuild-flush",
+              wait_for([&] { return log.submits.load() >= s1 + 4; }, 6000));
+        Sleep(1500);
+        const size_t s2 = log.submits.load();
+        CHECK("v2t-post-rebuild-bounded", s2 - s1 <= 8);
+        const xnc::MediaPipelineV2::Result res = pipe.Stop();
+        CHECK("v2t-ok", res.ok);
+        CHECK("v2t-resets", res.resets >= 1);
+        std::printf("SELFTEST NOTE: v2t flush-reset subs=%zu(pre)%zu(rebuild)"
+                    "%zu(post) rebuilds=%u resets=%u flush_env=%s\n",
+                    s_pre, s1, s2, cap.rebuilds(), res.resets, flush_env_state());
+      } else {
+        CHECK("v2t-start-running", false);
       }
     }
   }
