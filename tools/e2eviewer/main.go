@@ -1279,15 +1279,48 @@ func runDirect(c *config) (*summary, error) {
 		return nil, err
 	}
 
-	// 帧泵:pipe → publisher(agent 会话同款语义)。
+	// 帧泵:pipe → publisher(agent 会话同款语义)。M4 jitter 分析:记录
+	// pipe 到达时刻(= host emit 节奏的观测点),run 结束打印到达间隔分
+	// 布 —— 与 viewer auTimes 对照即可把抖动源切到 host emit 或
+	// sender/network 侧。
 	pumpDone := make(chan struct{})
+	var pumpMu sync.Mutex
+	var pumpAts []time.Time
 	go func() {
 		defer close(pumpDone)
 		for f := range sub.FrameCh() {
+			now := time.Now()
+			pumpMu.Lock()
+			pumpAts = append(pumpAts, now)
+			pumpMu.Unlock()
 			if err := pub.WriteFrame(desktop.Frame{Key: f.Key, PresentMonoUs: f.PresentMonoUs, AU: f.AU}); err != nil {
 				log.Warn("frame pump stopped", "err", err)
 				return
 			}
+		}
+	}()
+	defer func() {
+		pumpMu.Lock()
+		ats := append([]time.Time(nil), pumpAts...)
+		pumpMu.Unlock()
+		if len(ats) > 30 {
+			d := make([]float64, len(ats)-1)
+			for i := range d {
+				d[i] = ats[i+1].Sub(ats[i]).Seconds() * 1000
+			}
+			sort.Float64s(d)
+			mean := 0.0
+			for _, x := range d {
+				mean += x
+			}
+			mean /= float64(len(d))
+			v := 0.0
+			for _, x := range d {
+				v += (x - mean) * (x - mean)
+			}
+			log.Info("pipe arrival intervals",
+				"n", len(d), "min", d[0], "p50", d[len(d)/2], "p95", d[int(float64(len(d))*0.95)],
+				"max", d[len(d)-1], "mean", mean, "std", math.Sqrt(v/float64(len(d))))
 		}
 	}()
 

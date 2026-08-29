@@ -74,6 +74,16 @@ class TimePeriodGuard {
 };
 
 constexpr DWORD kIdleSleepMs = 15;
+// 2026-08-29 M4 jitter: while the encoder rung OWES outputs (submissions
+// not yet emitted - the QSV depth parks ~2-5 AUs at any time), the loop
+// observes ready AUs at this fine cadence instead of the idle 15ms. Emit
+// quantization otherwise beats with the content cadence: measured on the
+// local loop (QSV, 30fps target, ~21fps content), capture stamps are
+// smooth (interval p50 46.9ms, p95 48.8ms) while pipe arrivals carry
+// std ~5.2ms in two alternating clusters (~34ms / ~60ms) - each AU's
+// publication waits for the next 15ms gate slice (or loop top), landing
+// up to one slice late, then the next lands early.
+constexpr DWORD kOwedPollMs = 5;
 // Warm-up wall bound (spec 7.4; mirrors pipeline.cpp).
 constexpr uint64_t kWarmupWallBoundMs = 2000ull;
 // 2026-08-28 QSV static-idle park: the idle flush's trigger and budget.
@@ -855,9 +865,16 @@ class Loop {
     std::string aerr;
     // Task 6: the capture stage's wall cost, measured around the WHOLE
     // AcquireSurface call (see StageHists: compositor wait + copy enqueue).
+    // M4 jitter: while outputs are owed the compositor wait is sliced at
+    // kOwedPollMs (not a full spf) - a ready AU must not park behind a
+    // blocking capture wait; the retry loop is semantically identical
+    // (kNoChange just re-enters AcquireOnce via the run loop).
+    uint32_t acquire_wait_ms = im_.spf_ms;
+    if (OutputsOwed() && acquire_wait_ms > kOwedPollMs)
+      acquire_wait_ms = kOwedPollMs;
     const uint64_t acq_t0 = NowMonoUs();
     const CaptureStatus st =
-        im_.cfg.surf->AcquireSurface(im_.latest, im_.spf_ms, &spec, &aerr);
+        im_.cfg.surf->AcquireSurface(im_.latest, acquire_wait_ms, &spec, &aerr);
     if (st == CaptureStatus::kFrame)
       im_.stages.gpu_copy.Add(NowMonoUs() - acq_t0);
     switch (st) {
@@ -930,6 +947,14 @@ class Loop {
         im_.sink().OnState("capture_fatal", false);
         return false;
     }
+  }
+
+  // M4 jitter: the encoder rung owes outputs (submissions the rung has
+  // parked in its emit depth but not yet emitted). While true, the run
+  // loop polls CollectOutputs at kOwedPollMs instead of the idle cadence
+  // (see kOwedPollMs) - the same predicate the park flush uses.
+  bool OutputsOwed() const {
+    return im_.res.encoded > im_.res.aus_written;
   }
 
   // Idle re-feed (spec 7.4/7.5; the M0 timeout-path semantics): on a
@@ -1045,7 +1070,10 @@ class Loop {
       const uint64_t now = NowMs();
       if (now >= deadline) break;
       uint64_t remain = deadline - now;
-      if (remain > kIdleSleepMs) remain = kIdleSleepMs;
+      // M4 jitter: owed outputs get a fine slice so a ready AU publishes
+      // within kOwedPollMs instead of the idle 15ms (see kOwedPollMs).
+      const DWORD slice = OutputsOwed() ? kOwedPollMs : kIdleSleepMs;
+      if (remain > slice) remain = slice;
       Sleep(static_cast<DWORD>(remain));
       CollectOutputs();
       if (!im_.res.ok || im_.Abort()) return;
