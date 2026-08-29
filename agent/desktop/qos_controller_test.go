@@ -626,3 +626,135 @@ func TestQoSPausedSpectatorNotPromotedToController(t *testing.T) {
 		t.Fatalf("vacant seat expected, got %q", got)
 	}
 }
+
+// ---- fps 天花板(M4 模糊修正:XNC_DESKTOP_QOS_MAX_FPS)----
+
+// newQoSTestControllerMaxFPS 建带天花板的控制器(1920x1080 流形态,
+// initial fps 可注入 —— 60 = host 高帧率起流的形态)。
+func newQoSTestControllerMaxFPS(initialFPS, maxFPS uint32) (*QoSController, *manualClock) {
+	clk := newManualClock()
+	c := newQoSController(QoSControllerConfig{
+		Initial: VideoConfig{Bitrate: bitrateForWidth(1920), FPS: initialFPS, MaxW: 1920},
+		MaxFPS:  maxFPS,
+		AspectW: 1920,
+		AspectH: 1080,
+		Now:     clk.Now,
+	})
+	return c, clk
+}
+
+// 天花板 30 钳掉阶梯顶:60 档消失,首份下发配置把 60 起流的 host 钉到
+// 30(升档上限 = 钳后初始值)。
+func TestQoSMaxFPSCeilingClampsLadderAndInitial(t *testing.T) {
+	c, _ := newQoSTestControllerMaxFPS(60, 30)
+	if got := fpsLadderFor(30); len(got) != 5 || got[0] != 30 {
+		t.Fatalf("ceiling 30 ladder = %v, want top 30 with 5 steps", got)
+	}
+	if got := fpsLadderFor(0); len(got) != 6 || got[0] != 60 {
+		t.Fatalf("ceiling 0 (off) ladder must be today's, got %v", got)
+	}
+	cfg, ok := configOf(t, c.Observe(fb("s1", true, 8_000_000, 5)))
+	if !ok || cfg.FPS != 30 {
+		t.Fatalf("first emitted config must lock a 60fps stream to the 30 ceiling: got %+v ok=%v", cfg, ok)
+	}
+	if c.Current().FPS != 30 {
+		t.Fatalf("controller state must run at 30, got %d", c.Current().FPS)
+	}
+}
+
+// 升档富余流向画质而非帧率:est 充裕时,天花板 30 的控制器沿 bitrate
+// 爬到 15M 上限,期间与之后 fps 恒 30(60 不在阶梯上);bitrate 到顶后
+// 走 height 阶梯 —— 绝不出现 fps>30 的决策。
+func TestQoSMaxFPSUpshiftSpendsHeadroomOnBitrateNotFps(t *testing.T) {
+	c, clk := newQoSTestControllerMaxFPS(60, 30)
+	c.Observe(fb("s1", true, 8_000_000, 5)) // initial emit(已钳 30)
+	clk.advance(10 * time.Second)          // 稳定窗
+	prev := uint32(2_300_000)
+	for i := 0; i < 40; i++ {
+		clk.advance(3100 * time.Millisecond)
+		acts := c.Observe(fb("s1", true, 100_000_000, 5)) // est=100M:一切皆可升
+		cfg, ok := configOf(t, acts)
+		if !ok {
+			continue // 窗口内抑制
+		}
+		if cfg.FPS != 30 {
+			t.Fatalf("step %d: fps must stay at the ceiling, got %+v", i, cfg)
+		}
+		if cfg.MaxW != 1920 {
+			t.Fatalf("step %d: height must not move before bitrate tops out, got %+v", i, cfg)
+		}
+		if cfg.Bitrate <= prev {
+			t.Fatalf("step %d: bitrate must climb, %d -> %d", i, prev, cfg.Bitrate)
+		}
+		prev = cfg.Bitrate
+		if prev == 15_000_000 {
+			break
+		}
+	}
+	if prev != 15_000_000 {
+		t.Fatalf("bitrate must reach the 15M cap under the fps ceiling, got %d", prev)
+	}
+	// bitrate 到顶后的下一步:fps 无档(30 已是阶梯顶)→ height 恢复
+	// 1920x1080 流上 height 阶梯本就无更高档 → 无动作(全顶)。降档
+	// 反向验证:拥塞到底后 fps 沿钳后阶梯 30→20(不是 60→30)。
+	for i := 0; i < 12; i++ {
+		c.Observe(fb("s1", true, 100_000_000, 300))
+	}
+	clk.advance(1100 * time.Millisecond)
+	for i := 0; i < 6; i++ { // 码率到底后 fps 连降
+		acts := c.Observe(fb("s1", true, 100_000_000, 300))
+		cfg, ok := configOf(t, acts)
+		if !ok {
+			continue
+		}
+		if cfg.FPS != 30 && cfg.FPS != 20 && cfg.FPS != 15 && cfg.FPS != 10 && cfg.FPS != 5 {
+			t.Fatalf("fps downshift must walk the clamped ladder, got %+v", cfg)
+		}
+		if cfg.Bitrate != qosMinBitrateBps {
+			t.Fatalf("fps steps only after bitrate bottoms out, got %+v", cfg)
+		}
+	}
+}
+
+// 对照:无天花板时同一路径 fps 升到 60(M3 行为不变 = 缺省回归测试)。
+func TestQoSNoCeilingKeepsFpsUpshiftTo60(t *testing.T) {
+	c, clk := newQoSTestControllerMaxFPS(60, 0)
+	c.Observe(fb("s1", true, 8_000_000, 5))
+	clk.advance(10 * time.Second)
+	prev := uint32(2_300_000)
+	saw60 := false
+	for i := 0; i < 40 && !saw60; i++ {
+		clk.advance(3100 * time.Millisecond)
+		acts := c.Observe(fb("s1", true, 100_000_000, 5))
+		if cfg, ok := configOf(t, acts); ok {
+			if cfg.FPS == 60 {
+				saw60 = true
+			}
+			prev = cfg.Bitrate
+		}
+	}
+	if !saw60 {
+		t.Fatalf("no ceiling: fps upshift to 60 must still exist (bitrate=%d)", prev)
+	}
+}
+
+// env 解析:空/0 = 无;坏值与 >240 拒绝(0 + err);合法值直通。
+func TestQoSParseMaxFPS(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want uint32
+		ok   bool
+	}{
+		{"", 0, true}, {"  ", 0, true}, {"0", 0, false},
+		{"30", 30, true}, {"60", 60, true}, {"240", 240, true},
+		{"241", 0, false}, {"-1", 0, false}, {"abc", 0, false}, {"65536", 0, false},
+	} {
+		got, err := qosParseMaxFPS(tc.in)
+		if tc.ok && (err != nil || got != tc.want) {
+			t.Fatalf("qosParseMaxFPS(%q) = %d,%v; want %d,nil", tc.in, got, err, tc.want)
+		}
+		if !tc.ok && err == nil {
+			t.Fatalf("qosParseMaxFPS(%q) must error, got %d", tc.in, got)
+		}
+	}
+}

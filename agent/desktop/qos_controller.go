@@ -25,6 +25,13 @@
 //     fps → height(先恢复最便宜的 knob,再动需要 codec epoch 重建的
 //     height),码率每步至多 +15% 或 +1Mbps(spec §14.2 ramp;远目标
 //     85%×est 需多个 3s 步逼近),且 fps/height 不越过初始值。
+//   - fps 天花板(M4 模糊修正):XNC_DESKTOP_QOS_MAX_FPS(0=无,缺省)
+//     同时钳住 fps 阶梯顶端与初始 fps —— host 以 60fps 起流时,天花板
+//     30 把控制器与首份下发配置都钉在 30;60fps 下 QSV 的 VBV/每帧预算
+//     = 码率/fps 直接减半(AU 被 ~半尺寸钳制 → 运动期粗量化 = 模糊,
+//     2026-08-29 本地环测:2.3Mbps 下 fps60 的 IDR 全被钳在 9.9KB,
+//     fps30 IDR 15.7-17.2KB)。fps 升不上去后,升档的富余自然流向
+//     bitrate(升档顺序首位)与 height —— 画质优先于帧率。
 //   - 旁观者暂停:旁观者 est < 35%×controller est → PauseSpectator(恰一
 //     次,幂等;无自动恢复——恢复通道是后续任务)。controller 自身与隐藏
 //     旁观者不受此规则约束。
@@ -144,6 +151,11 @@ type QoSControllerConfig struct {
 	// Initial 是建流基线:Bitrate = bitrateForWidth(W),FPS = hello fps,
 	// MaxW = 流宽(native 只缩不放,等价无约束)。升档不会越过它。
 	Initial VideoConfig
+	// MaxFPS 是 fps 天花板(M4 模糊修正;0 = 无 = M3 行为)。>0 时:
+	// fps 阶梯顶端与 Initial.FPS 一并钳到 ≤MaxFPS —— host 60fps 起流也
+	// 被钉死在 MaxFPS(首份下发配置即生效),升档富余流向 bitrate/
+	// height。生产接线:env XNC_DESKTOP_QOS_MAX_FPS(qosManager)。
+	MaxFPS uint32
 	// AspectW/AspectH:height 阶梯 → max_w 的推导宽高比(HOST_HELLO W/H)。
 	AspectW, AspectH uint32
 	// Now 是时钟注入点(默认 time.Now;单测注入 manualClock)。
@@ -160,12 +172,13 @@ type qosViewer struct {
 
 // QoSController 见文件头。零时钟缺省 time.Now;Observe 可从任意 goroutine
 // 并发(内部无锁时由外层 streamQoS 串行——本类型自身非线程安全,保持纯
-// 粋以利单测)。
+// 粹以利单测)。
 type QoSController struct {
 	now              func() time.Time
 	cur              VideoConfig
 	initial          VideoConfig
 	aspectW, aspectH uint32
+	fpsSteps         []uint32 // fps 阶梯(实例副本;MaxFPS>0 时顶端被钳)
 
 	viewers       map[string]*qosViewer
 	controllerID  string
@@ -199,14 +212,38 @@ func newQoSController(cfg QoSControllerConfig) *QoSController {
 	if now == nil {
 		now = time.Now
 	}
-	return &QoSController{
-		now:     now,
-		cur:     cfg.Initial,
-		initial: cfg.Initial,
-		aspectW: cfg.AspectW,
-		aspectH: cfg.AspectH,
-		viewers: make(map[string]*qosViewer),
+	// fps 天花板(M4 模糊修正):初始 fps(=升档上限 + 起步值)与阶梯
+	// 顶端一并钳到 ≤MaxFPS —— 60 起流的 host 在首份下发配置(首个
+	// controller 反馈即发)就被降到天花板;阶梯同理没有 >MaxFPS 的档。
+	init := cfg.Initial
+	if cfg.MaxFPS > 0 && init.FPS > cfg.MaxFPS {
+		init.FPS = cfg.MaxFPS
 	}
+	return &QoSController{
+		now:      now,
+		cur:      init,
+		initial:  init,
+		aspectW:  cfg.AspectW,
+		aspectH:  cfg.AspectH,
+		fpsSteps: fpsLadderFor(cfg.MaxFPS),
+		viewers:  make(map[string]*qosViewer),
+	}
+}
+
+// fpsLadderFor 返回 fps 阶梯的实例副本:ceiling=0 原样({60,30,20,15,10,5});
+// ceiling=30 → {30,20,15,10,5}(60 档消失 —— 升档不再有 fps 去处,富余
+// 由升档顺序自然流向 bitrate → height;降档从 30 起步沿钳后阶梯下行)。
+func fpsLadderFor(ceiling uint32) []uint32 {
+	if ceiling == 0 {
+		return fpsLadder
+	}
+	out := make([]uint32, 0, len(fpsLadder))
+	for _, v := range fpsLadder {
+		if v <= ceiling {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // Current 返回当前生效的编码参数(应用侧观测点)。
@@ -380,7 +417,7 @@ func (c *QoSController) stepDown() VideoConfig {
 		next.Bitrate = qosMinBitrateBps
 		return next
 	}
-	if fps, ok := ladderBelow(fpsLadder, next.FPS); ok {
+	if fps, ok := ladderBelow(c.fpsSteps, next.FPS); ok {
 		next.FPS = fps
 		return next
 	}
@@ -408,7 +445,7 @@ func (c *QoSController) stepUp(target uint32) VideoConfig {
 		next.Bitrate = step
 		return next
 	}
-	if fps, ok := ladderAbove(fpsLadder, next.FPS, c.initial.FPS); ok {
+	if fps, ok := ladderAbove(c.fpsSteps, next.FPS, c.initial.FPS); ok {
 		next.FPS = fps
 		return next
 	}

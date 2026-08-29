@@ -19,6 +19,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -59,6 +62,30 @@ func (h *Handler) serverLeases() *serverLease {
 // 此,session/qos 侧保持平台无关)。
 var errVideoConfigUnsupported = errors.New("desktop: host does not support SET_VIDEO_CONFIG")
 
+// qosMaxFPSEnv 是 agent 侧 fps 天花板的环境变量名(M4 模糊修正;节点
+// 服务 env 设置 —— 生产金丝雀与 XNC_DESKTOP_FPS=30 一同开启,把控制器
+// 的升档上限钉在 30:60fps 下编码器每帧预算 = 码率/fps 减半 → 运动期
+// 粗量化 = 高帧率模糊)。
+const qosMaxFPSEnv = "XNC_DESKTOP_QOS_MAX_FPS"
+
+// qosParseMaxFPS 解析天花板原始值(纯函数,单测钉死)。空/0 = 无天花板
+//(M3 行为);1..240 = 天花板(host --fps 合法域;>240 视为误配拒绝,
+// 防一个 65535 把整个 fps 阶梯钳空)。
+func qosParseMaxFPS(s string) (uint32, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseUint(s, 10, 32)
+	if err != nil || n == 0 {
+		return 0, fmt.Errorf("bad %s value %q", qosMaxFPSEnv, s)
+	}
+	if n > 240 {
+		return 0, fmt.Errorf("%s value %d above the 240 host fps domain", qosMaxFPSEnv, n)
+	}
+	return uint32(n), nil
+}
+
 // qosManager 惰性建共享 QoS(种子 = 首个会话的 HOST_HELLO:初始码率按
 // 流宽镜像 native 缺省、fps/max_w/aspect 取流几何)。hello 为 nil(测试
 // fake 允许)→ 不建:viewer_feedback 解析后安全忽略,预算保持缺省。
@@ -75,8 +102,15 @@ func (h *Handler) qosManager(hello *HelloInfo) *streamQoS {
 		if log == nil {
 			log = slog.Default()
 		}
+		maxFPS, err := qosParseMaxFPS(os.Getenv(qosMaxFPSEnv))
+		if err != nil {
+			log.Warn("desktop qos: ignoring invalid fps ceiling", "err", err)
+		} else if maxFPS > 0 {
+			log.Info("desktop qos: fps ceiling armed", "max_fps", maxFPS)
+		}
 		h.qos = newStreamQoS(QoSControllerConfig{
 			Initial: VideoConfig{Bitrate: bitrateForWidth(hello.W), FPS: fps, MaxW: hello.W},
+			MaxFPS:  maxFPS,
 			AspectW: hello.W,
 			AspectH: hello.H,
 		}, log)
