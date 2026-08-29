@@ -56,9 +56,33 @@ const (
 	// maxQueueAge 是发送侧排队的硬上限(全局约束:目标 50ms/硬上限
 	// 100ms)。超过即冲刷 + waitIDR + 恰一次合并关键帧请求。
 	maxQueueAge = 100 * time.Millisecond
-	// pacingBudgetFraction:令牌桶速率 = 当前预算的 85%(15% 余量留给
-	// 重传等带外流量,同时把帧内突发铺开成平稳速率)。
-	pacingBudgetFraction = 0.85
+	// pacingBudgetFraction(M4 pacing 修正):令牌桶速率 = 预算 × 1.05。
+	//
+	// 历史:曾是 0.85(15% 余量留给重传)。这在「预算 = 缺省 20M」时无害,
+	// 但 M3 起 SetBudget 的预算来源 = QoS 决策码率(qosTargetBitrate 已经
+	// 是 0.85×est —— 15% 余量在那里已经记过一次),而同一码率也是编码器
+	// 目标:编码器在持续运动下按目标产出时,令牌桶只以 0.85×目标 的速率
+	// 放行 → 结构性欠载。令牌债务每帧加深 ~15%,数帧内撞上 100ms 入队门
+	// → 增量帧整帧拒收 → waitIDR → 合并关键帧请求 → 恢复 IDR(豁免入队
+	// 门、债务钳回 50ms 地板)→ 再数帧又撞门,循环往复:
+	//
+	//   确定性复现(manualClock 全链驱动,2.3Mbps/30fps、编码器按目标
+	//   9583B/帧):330 帧内 36 次入队门拒收 + 36 个恢复 IDR(每第 9 帧
+	//   一丢);帧完成间隔 33×7+67ms 的丢帧节拍;接收侧帧尾包经「合帧
+	//   冲刷」成批突发(本机直连复测:549 个 0ms 到达间隔 + 17 个 >500ms
+	//   饥饿间隙),正常间隔被拉成 34/62ms 交替对 —— 观众端 ?framediag
+	//   读到的「间隔对交替 (n,n+1) 且档位随时间爬升」的突发-饥饿源。
+	//   QoS 拥塞通道(queueMs>100)对这种自伤排队再砍码率/fps 沿
+	//   {30,20,15,10,5} 下行,交替对档位随之爬升(复测 fps10 档:完成
+	//   间隔 70/119/211ms 循环)。
+	//
+	// 修正:令牌桶按预算全额 × 1.05 放行 —— 15% 链路余量保留在 QoS 目标
+	// (0.85×est)里不再双扣;×1.05 覆盖逐包线缆开销(令牌桶按
+	// MarshalSize 计费,含 12B RTP 头 + FU 头 ≈1.2%,另有拦截器后盖的
+	// transport-cc 扩展字节不在计费内)与编码器 VBV 窗口的过冲抖动。
+	// 全额+开销余量下:债务不再结构性增长(0 拒收/0 IDR,间隔平整
+	// 33ms),wire 速率 ≤ 1.05×0.85×est < est,不越估计带宽。
+	pacingBudgetFraction = 1.05
 	// pacingBurstBytes 是令牌桶容量(3×MTU):每帧首批包立即送出,余下
 	// 按速率铺开——首包延迟为零,整帧有界。
 	pacingBurstBytes = 3 * rtpMTU
@@ -206,11 +230,12 @@ type ViewerStats struct {
 	QueueBytes      int
 }
 
-// tokenBucket 是 per-viewer 令牌桶:速率恒为预算的 85%,容量 pacingBurstBytes。
+// tokenBucket 是 per-viewer 令牌桶:速率恒为预算的 pacingBudgetFraction 倍
+// (M4 起 ×1.05,见其注释),容量 pacingBurstBytes。
 // 债务语义:reserve 可把 tokens 打为负(按赤字折算截止时刻),refill 按
 // 耗时偿还并对容量封顶。
 type tokenBucket struct {
-	rate   float64 // bytes/s(已含 85% 折扣)
+	rate   float64 // bytes/s(预算 × pacingBudgetFraction)
 	burst  float64 // 容量 bytes
 	tokens float64
 	last   time.Time

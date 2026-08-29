@@ -40,7 +40,8 @@ type PublisherConfig struct {
 	// DefaultDuration 仅为旧调用方的源码兼容字段；RTP 时间轴不使用它。
 	DefaultDuration time.Duration
 	// PacingBudgetBps 是 viewer 发送器的 pacing 预算(bits/s;0 →
-	// defaultPacingBudgetBps)。令牌桶按其 85% 铺开帧内突发。
+	// defaultPacingBudgetBps)。令牌桶按其 pacingBudgetFraction(M4 起
+	// ×1.05)铺开帧内突发。
 	PacingBudgetBps int
 	Log             *slog.Logger
 }

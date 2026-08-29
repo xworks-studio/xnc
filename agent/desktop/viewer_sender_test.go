@@ -957,3 +957,90 @@ func TestViewerSenderEntryDrainWriteErrorPropagates(t *testing.T) {
 	}
 	vs.Close() // 幂等,无泵也能安全收线
 }
+
+// TestViewerSenderPacingSustainedMotionKeepsUp 钉死 M4 pacing 修正
+//(pacingBudgetFraction 0.85 → 1.05)所治的窗口:生产形态下 pacing 预算
+//= QoS 决策码率 = 编码器目标(session.go SetPacingBudget 接线),持续
+//运动令编码器按目标产出(≈ bitrate/fps 每帧)。旧 0.85 折扣令令牌桶
+//结构性欠载 15%:债务逐帧加深,数帧内撞 100ms 入队门 → 拒收 → waitIDR
+//→ 恢复 IDR 循环(直连复测:66 帧被抑制、27 个恢复 IDR/45s、549 个
+// 0ms 到达突发 + 17 个 >500ms 饥饿间隙 —— ?framediag 读到的「间隔对
+//交替且档位爬升」)。修正后令牌桶按预算 ×1.05 放行:持续运动下零拒收、
+//零恢复 IDR、每帧在帧周期内完整铺出。
+//
+// 驱动形态 = 生产:manualClock 逐毫秒 drainNow(与常驻泵同一入口),
+//帧以精确 spf 到达;帧大小 = bitrate/8/fps(编码器按目标)+ 初始 IDR
+//(1.67×,本机 QSV 实测 IDR/增量比)。leg B 用缩放预算(×85/105)复现
+//旧折扣的排放速率,钉死失败模式本身。
+func TestViewerSenderPacingSustainedMotionKeepsUp(t *testing.T) {
+	const (
+		bps = 2_300_000 // 1920 宽档位(bitrateForWidth)—— 生产 pacing 预算
+		fps = 30
+	)
+	spf := time.Second / time.Duration(fps)
+	frameAU := func(key bool, i int) Frame {
+		n := int(bps / 8 / fps)
+		if key {
+			n = n * 5 / 3
+		}
+		au := make([]byte, n)
+		copy(au, []byte{0x00, 0x00, 0x00, 0x01, 0x65})
+		for j := 5; j < n; j++ {
+			au[j] = 0xa5
+		}
+		return Frame{Key: key, PresentMonoUs: uint64(i) * uint64(spf.Microseconds()), AU: au}
+	}
+	run := func(budget int) (drops uint64, keysSent uint64, incompleteArrivals int) {
+		f := newFakeViewerSenderWithBudget(budget)
+		defer f.vs.Close()
+		var completed uint64
+		f.vs.makeMeta = func(Frame, uint32) *FrameMetaV1 { return &FrameMetaV1{} }
+		f.vs.onFrameSnt = func(*FrameMetaV1) { completed++ }
+		for i := 0; i < 120; i++ {
+			tArr := f.clk.Now().Add(spf)
+			for f.clk.Now().Before(tArr) {
+				f.clk.advance(time.Millisecond)
+				_ = f.vs.drainNow()
+			}
+			f.clk.advance(tArr.Sub(f.clk.Now()))
+			// 上一帧是否在本帧到达前完整送出。初始 IDR 的令牌债务在数
+			// 帧内偿还(每帧 ~5% 盈余),恢复窗之后必须帧帧清空 —— 只
+			// 统计稳态窗(前 50 帧的恢复尾不算)。
+			if i >= 50 && f.vs.Stats().QueuePackets > 0 {
+				incompleteArrivals++
+			}
+			key := i == 0 // 初态 waitIDR:首帧必须 IDR
+			if err := f.Enqueue(frameAU(key, i)); err != nil {
+				t.Fatalf("frame %d: %v", i, err)
+			}
+		}
+		// 尾段:末帧的余包按节奏送完(生产中下一帧到达前完成;此处
+		// 给足一个 maxQueueAge 视界,避免末帧滞队误计)。
+		for i := 0; i < 120 && f.vs.Stats().QueuePackets > 0; i++ {
+			f.clk.advance(time.Millisecond)
+			_ = f.vs.drainNow()
+		}
+		st := f.vs.Stats()
+		return st.DeadlineDropped, completed, incompleteArrivals
+	}
+
+	// leg A:生产预算(pacingBudgetFraction ×1.05)—— 持续运动零拒收、
+	// 零恢复关键帧、每帧帧周期内完整铺出(120/120)。
+	drops, sent, incomplete := run(bps)
+	if drops != 0 {
+		t.Fatalf("production budget: deadlineDropped=%d, want 0 (sustained motion must not trip the enqueue gate)", drops)
+	}
+	if sent != 120 {
+		t.Fatalf("frames completed=%d, want 120", sent)
+	}
+	if incomplete != 0 {
+		t.Fatalf("frames still queued at next arrival=%d, want 0 (pacing keeps up with the frame period)", incomplete)
+	}
+
+	// leg B:旧 0.85 折扣的排放速率(预算 ×85/105)—— 同内容必须复现
+	// 入队门拒收(修正前的失败模式;数字形态见 pacingBudgetFraction 注释)。
+	legacyDrops, _, _ := run(bps * 85 / 105)
+	if legacyDrops == 0 {
+		t.Fatal("legacy 0.85 drain rate: expected deadline drops under sustained at-target motion (failure mode gone missing)")
+	}
+}

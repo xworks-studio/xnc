@@ -66,6 +66,7 @@ type config struct {
 	turnURLs            []string // 显式 URL 覆盖(可重复;凭据仍取 --turn)
 	directPipe          string
 	directSecretHex     string
+	directBudget        int // >0: direct mode paces the publisher at this bps (production QoS shape; 0 = default)
 	out                 string
 	duration            time.Duration
 	expectFirstFrameMs  int
@@ -98,6 +99,8 @@ func parseFlags() *config {
 	flag.StringVar(&c.turn, "turn", "", "TURN creds user:pass@host:port (e.g. xncdev:xncdev-secret@192.168.1.12:3478)")
 	flag.Var(&stringList{&c.turnURLs}, "turn-url", "explicit TURN URL (repeatable; overrides --turn host:port form)")
 	flag.StringVar(&c.directPipe, "direct-pipe", "", "direct mode: xnc-desktop rt pipe name")
+	flag.IntVar(&c.directBudget, "direct-budget", 0,
+		"direct mode: pace the in-process publisher at this bps (production QoS wiring shape; 0 = sender default) — the pacing A/B instrument (M4 pacing-alternation)")
 	flag.StringVar(&c.directSecretHex, "direct-secret", "", "direct mode: pipe secret (64 hex chars)")
 	flag.StringVar(&c.out, "out", "", "dump received Annex-B stream to file")
 	flag.DurationVar(&c.duration, "duration", 30*time.Second, "run duration")
@@ -1243,6 +1246,14 @@ func runDirect(c *config) (*summary, error) {
 		return nil, err
 	}
 	pub.OnKeyRequest(func(reason string) { _ = sub.RequestKeyframe(reason) })
+	// Pacing A/B instrument (M4 pacing-alternation): production QoS drives the
+	// pacing budget from the encoder-bitrate decision (session.go SetPacingBudget
+	// -> Publisher.SetPacingBudget); direct mode defaults to the sender's 20Mbps
+	// placeholder. This flag reproduces the production shape at a chosen budget.
+	if c.directBudget > 0 {
+		pub.SetPacingBudget(c.directBudget)
+		log.Info("direct pacing budget armed", "bps", c.directBudget)
+	}
 
 	v, err := newViewer(c, ice, relay, log)
 	if err != nil {
