@@ -952,3 +952,146 @@ audit row reads `mediaProtocol=v2`, 202 body agrees) before broadening.
   (allowlisted included) pins to v1. Live v2 sessions run to their natural end; if one reattaches
   to a host now serving v1 wire it fails loudly (`media_protocol_mismatch`) — by design, never a
   mixed-version stream. Clear the rollback flag to resume the canary.
+
+## 15. 2026-08-29 — production feedback round: high-fps BLUR (root-caused + fixed) and frame jitter (smoothed at the source)
+
+User feedback from live production: (1) the picture blurs at high frame rate; (2) lock fps at 30
+without sacrificing quality; (3) occasional frame jitter remains — smooth it. All measurements
+below are from the LOCAL direct-pipe loop on the dev RDP box (3440x1440 desktop, QSV hardware
+rung `Intel Quick Sync Video H.264 Encoder MFT`, v2 pipeline, stream 1920x804 @ max_w=1920,
+bitrate 2.3Mbps = the production spawn defaults; e2eviewer direct mode = full host v2 pipeline +
+agent Publisher/ViewerSender + wire). Motion source: an Edge app window (~2000x1240) playing a
+deterministic canvas animation (rotating gradient + scrolling stripes + 320 teleporting confetti
+rects per frame) — documented in `artifacts/desktop-media/fps-jitter/motion.html`. Environment
+limit (honest): this RDP session's compositor delivers only ~21-33 content frames/s, so the
+60fps-leg runs at ~31fps emitted cadence rather than a true 60fps content feed.
+
+### 15.1 Blur root cause — measured
+
+Two 60s runs, identical motion and bitrate, only the encoder fps config differs
+(`xnc-desktop --console-rt --fps 30|60`, the same 0x0129 SET_VIDEO_CONFIG the QoS controller
+would send):
+
+| run | emitted fps | total | non-IDR AU p50 / p95 | IDR AUs |
+|---|---|---|---|---|
+| fps=30, 2.3Mbps | 21.3 | 11.57MB (1.50Mbps) | 9,001 / 9,631 B | 15,717 / 15,886 / 16,306 / 16,571 / 17,158 B |
+| fps=60, 2.3Mbps | 30.7 | 18.09MB (**2.33Mbps = budget cap**) | 9,750 / 9,987 B | **9,939 / 9,939 / 9,939 / 10,012 B (hard clip)** |
+
+- The fps=60 encoder drives the stream into its 2.3Mbps per-second cap and clips EVERY access
+  unit at ~9.94KB (four IDRs pinned at 9,939-10,012B — a rate-control ceiling, not content); the
+  fps=30 run spends 1.5Mbps on demand with IDRs free to 15.7-17.2KB.
+- Host log confirms the mechanism at the driver level: QSV's VBV window scales with fps at equal
+  bitrate — `gpu_tuning buf_mode=0 buf_value=19166` (fps=30) vs `buf_value=9583` (fps=60),
+  exactly 2.0x. Per-frame bit budget = bitrate / fps; the M3 QoS ladder tops at 60, so an
+  upshift-happy controller (est above target, bitrate already at 85%×est or the 15M cap) doubles
+  fps while bitrate stays — halving bits per frame → coarser quantization during motion → blur.
+- Production extrapolation (60Hz display content): 2.3Mbps/60 = 38Kbit/frame vs
+  2.3Mbps/30 = 77Kbit/frame; at 15Mbps: 31 vs 62.5KB/frame.
+
+### 15.2 The fix — agent-side fps ceiling (`19bcc5b`)
+
+Env `XNC_DESKTOP_QOS_MAX_FPS` (0/absent = M3 behavior; 1..240 = ceiling, larger/bad values
+rejected with a WARN) is read in `qosManager` where the controller is built and threads into
+`QoSControllerConfig.MaxFPS`. The ceiling clamps BOTH the initial fps (a 60fps-booted stream is
+locked to the ceiling by the FIRST emitted config — the controller emits on the first controller
+feedback) and the ladder top: `{60,30,20,15,10,5}` + ceiling 30 → `{30,20,15,10,5}`. With 60 off
+the ladder, upshift headroom flows to bitrate (first in the step order, verified by test to
+reach the 15M cap with fps pinned at 30) and then height — quality over frame rate. Node-side
+pairing: keep `XNC_DESKTOP_FPS=30` (initial value) and set `XNC_DESKTOP_QOS_MAX_FPS=30` (agent
+service env) so the ceiling holds even against a host whose HOST_HELLO fps has drifted upward
+(a 0x0129 fps update persists into subsequent HOST_HELLOs, which would otherwise re-seed a new
+controller's initial cap at 60).
+
+Tests (all in `agent/desktop/qos_controller_test.go`): ceiling clamps ladder + initial; upshift
+under a 30 ceiling walks bitrate to 15M with fps=30 and height untouched; congestion downshift
+walks the CLAMPED ladder; the no-ceiling counter-case still reaches fps 60; env parse matrix.
+`go test ./agent/desktop ./agent/desktoppipe` green.
+
+### 15.3 Per-frame timing at locked 30fps — jitter analysis (three hops)
+
+Hop instrumentation: (a) host capture stamps = the Publisher's `desktop frame interval` log
+(PresentMonoUs deltas); (b) NEW: e2eviewer direct mode logs `pipe arrival intervals` (host emit
+cadence as received from the rt pipe — `ad14a96`); (c) viewer receive = summary `auTimesMs`
+deltas. 60s locked-30fps runs with motion:
+
+| hop | p50 | p95 | min | max | std |
+|---|---|---|---|---|---|
+| (a) capture stamps (n=300 window) | 46.9ms | 48.8ms | 44.0 | 49.8 | ~1ms |
+| (b) pipe arrivals (n=1279, BEFORE) | 46.9ms | 59.1ms | 21.7 | 71.9 | 5.16ms |
+| (c) viewer arrivals (n=1278, BEFORE) | 47ms | 60ms | 27 | 72 | **5.22ms** |
+
+(b) ≈ (c): the sender pacing, WebRTC transport and receive add NOTHING — 100% of the
+end-to-end jitter is born in the host emit path, between the (smooth) capture stamp and the
+pipe write. Distribution signature: two alternating clusters (68 intervals in [30,40), 72 in
+[55,70)) and 65 short→long transitions vs 4 long→short — a beat pattern, not burst trains.
+
+Root cause (candidate (i) refined, from the loop code + data): the QSV rung parks ~2-5 AUs in
+its emit depth at any time (`OutputsOwed`), but the media loop only observes encoder outputs at
+loop top, post-submit, and inside `TrySubmit`'s FPS-gate sleep slices (`kIdleSleepMs` = 15ms),
+and `AcquireOnce` can block a full spf (33ms) in the compositor wait — a ready AU waits for the
+next poll instant, quantization that beats with the 47ms content cadence and lands AUs
+alternately one-slice late / early. Candidates (ii) idle-flush cadence — inert in this regime
+(content-rich, no starvation; the flush is change-driven and bounded); (iii) ViewerSender token
+bucket — inert (direct-mode budget 2.125MB/s spreads a 9.5KB frame by ~4.5ms; measured queue-age
+p50 18ms, well inside bounds); (iv) a 500ms reorder hold — does not exist on this path
+(e2eviewer's samplebuilder has no time-based flush; the host reorder window holds only
+out-of-order outputs and the software rung, not the in-order QSV stream).
+
+### 15.4 The smoothing — poll owed outputs at 5ms (`ad14a96`)
+
+Smallest change AT THE SOURCE (no jitter buffer, no added latency): while outputs are owed
+(`encoded > aus_written`, the same predicate the park flush uses), `TrySubmit`'s gate slices
+shrink 15ms → `kOwedPollMs` (5ms) and `AcquireOnce` caps its compositor wait at the same 5ms
+(a shorter AcquireNextFrame timeout is semantically identical — kNoChange re-enters the run
+loop). A/B, same 60s workload:
+
+| metric | before | after |
+|---|---|---|
+| viewer inter-frame std | 5.22ms | **3.12ms (-40%)** |
+| viewer inter-frame p95 / p99 | 60 / 63ms | 50 / 58ms |
+| worst cluster [62-70ms) | 45 frames | **1** |
+| short→long alternations | 67 | 30 |
+| receive queue age p50/p95/max | 18.2 / 20.6 / 51.8ms | 12.3 / 14.8 / 42.2ms |
+| host capture→AU p50 | ~110ms | ~60-100ms (AUs publish EARLIER — no added latency) |
+| frames / bytes / keyframes | 1279 / 11.57MB / 5 | 1278 / 11.58MB / 5 |
+
+Hard constraints hold: queue bounds (<50ms target/100ms hard) respected, zero recovery
+violations and zero RTP-timestamp regressions in both runs. Native selftests: plain +
+`--desktop-pipeline-v2` both `selftest ok`. Go suites green (`./agent/desktop`, `./agent/desktoppipe`,
+`./tools/e2eviewer`).
+
+### 15.5 Updater analysis (parallel, no code) — why a canary apply can flap on the OLD version
+
+Observed in prod: `phase=downloading err=""` cycles, node flaps offline, comes back still
+`0.0.0-dev`. From `agent/updater/apply_windows.go` + `updater.go`:
+
+1. **No pre-commit version verification (primary suspect).** `RunApply`'s `swap()` proves the
+   new agent is ALIVE (the `update-connected.ok` marker, written by `agent.go` on first control
+   connect) but never checks the new binary's SELF-VERSION. `machineinfo.Version` defaults to
+   `0.0.0-dev` when the build lacks the version ldflags stamp. If a bundle ships an unstamped agent exe (manifest says 0.5.10-m4canary.3, binary
+   reports 0.0.0-dev): sha256 + manifest checks pass (they only verify file integrity), the new
+   agent runs and connects (marker written), apply "succeeds" and deletes .old — yet the node
+   reports 0.0.0-dev, the server keeps offering, `Handle` does not dedupe
+   (`offer.Version != u.Version`), so: download, apply, services stop for the apply window,
+   flap, back on the same unstamped binary. An infinite loop whose signature is exactly the
+   observation: repeated downloading cycles with EMPTY err and the version never advancing.
+2. **Rollback restores the old binary, same re-offer loop (secondary).** Any
+   `waitConnectedMarker` timeout (3 min: server unreachable, new agent boot-loop) or
+   `startService` failure (e.g. SCM recovery already restarted the agent:
+   ERROR_SERVICE_ALREADY_RUNNING makes `swap()` fail and the rollback kill a HEALTHY new agent)
+   rolls back to .old: the node returns on the old version, the server re-offers, the cycle
+   repeats with a services-stop flap each time. `ensureAgentStopped` failure is only logged and
+   the file dance proceeds anyway — `os.Remove(dst)` on a still-running exe fails and the
+   `.old -> dst` rename fails (dst exists), leaving the new exe in place with rollbackErr set
+   (the 2026-08-25 incident family; worse shapes can leave the exe missing if the stop truly
+   failed).
+3. **The `.old` mechanism keeps one generation** — benign within one cycle; across the flapping
+   loop each apply's `removeOld` overwrites the previous backup, so a crash mid-dance can leave
+   `agent.exe` and `agent.exe.old` from DIFFERENT generations with no recovery path other than
+   the rollback's best-effort renames.
+
+Shipping decision for canary.3: the bundle's `xnc-agent.exe` MUST be built with the version
+ldflags stamp (done locally for `bin/xnc-agent-m4.exe` at `0.5.10-m4canary.3`; the packaging
+step must stamp it). Two small hardening follow-ups identified: `apply` should verify the
+staged exe's reported version matches the offer before committing, and the connected marker
+could carry the new version so the verify step proves VERSION, not just liveness.
