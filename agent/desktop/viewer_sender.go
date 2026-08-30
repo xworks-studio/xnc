@@ -267,14 +267,18 @@ func (b *tokenBucket) refill(now time.Time) {
 	}
 }
 
-// debtMs 报告当前债务折算的毫秒数(负余额 ÷ 速率;无债务 = 0)。这是
-// 发送面结构性落后的直接测量(Fix 2 的拥塞证据):债务本身就是排队
-// 年龄。
-func (b *tokenBucket) debtMs() float64 {
-	if b.tokens >= 0 || b.rate <= 0 {
+// paceLagMsLocked 报告 pacing 泵的实际落后(调用方持 mu):队首包的
+// 计划时刻已过却仍在队 = 发送面真的写不动。这是 Fix 2 拥塞证据
+// DebtMs 的正确语义(2026-08-30 网页实测修正):修前用令牌桶负余额
+// 折算(debtMs),而锚保持下一个完整铺开的关键帧天然带着数百 ms 的
+// 「计划内」欠债 —— QoS 把正常铺开判成拥塞(BucketDebtMs>200ms),
+// 每个刷新 IDR 都砍一刀 fps,棱梯在相邻档间振荡(fps=10↔15 实测)。
+// 计划性的未来铺开(sendAt ≥ now)不是落后,不计。
+func (s *ViewerSender) paceLagMsLocked(now time.Time) float64 {
+	if len(s.queue) == 0 || s.queue[0].sendAt.After(now) {
 		return 0
 	}
-	return -b.tokens / b.rate * 1000
+	return float64(now.Sub(s.queue[0].sendAt)) / float64(time.Millisecond)
 }
 
 // plan 为一帧的全部包计算计划发送时刻(不改余额;返回影子余额)。
@@ -602,7 +606,7 @@ func (s *ViewerSender) Stats() ViewerStats {
 		KeyRequests:     s.stats.keyRequests,
 		QueuePackets:    len(s.queue),
 		QueueBytes:      s.queueBytes,
-		DebtMs:          s.bucket.debtMs(),
+		DebtMs:          s.paceLagMsLocked(s.nowFn()),
 	}
 }
 
@@ -738,7 +742,7 @@ func (s *ViewerSender) writeLocked(q queuedPacket) error {
 }
 
 // drainLocked 送出截止时刻已到的在队包;若当前在队帧年龄超过其准入视界
-//(Fix 5:queueDeadline,与入队门同一视界)则先走 ageOverflow 转移。
+// (Fix 5:queueDeadline,与入队门同一视界)则先走 ageOverflow 转移。
 // 返回(待触发的合并请求 reason,首个写错误)。写错误视为发送面死亡:
 // 弃队列并转入 closed。
 func (s *ViewerSender) drainLocked(now time.Time) (string, error) {

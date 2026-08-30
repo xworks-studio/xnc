@@ -1208,3 +1208,34 @@ func TestViewerSenderPacingSustainedMotionKeepsUp(t *testing.T) {
 		t.Fatal("legacy 0.85 drain rate: expected deadline drops under sustained at-target motion (failure mode gone missing)")
 	}
 }
+
+// TestViewerSenderPaceLagNotPlannedSpread(2026-08-30 网页实测修正):
+// DebtMs 的语义是 pacing 泵的实际落后(队首包到期未写出),不是令牌桶
+// 负余额的计划内铺开 —— 锚保持下一个完整铺开的关键帧天然带数百 ms 的
+// 计划性欠债,修前每个刷新 IDR 都被 QoS 当拥塞证据(BucketDebtMs>200ms)
+// 砍一刀 fps,棱梯在相邻档间振荡(生产实测 fps=10↔15)。
+func TestViewerSenderPaceLagNotPlannedSpread(t *testing.T) {
+	s := newFakeViewerSenderWithBudget(500_000) // 500k:12KB IDR 铺开 ~183ms
+	// 关键帧准入,余包按计划铺开(此刻计划性欠债 ~180ms,但无落后)。
+	if err := s.Enqueue(Frame{Key: true, PresentMonoUs: vsMono(1), AU: vsNAL(true, 1, 12_000)}); err != nil {
+		t.Fatalf("idr: %v", err)
+	}
+	if st := s.vs.Stats(); st.DebtMs != 0 {
+		t.Fatalf("planned spread must not read as lag: DebtMs=%v, want 0", st.DebtMs)
+	}
+	// 泵停摆 300ms:队首包(计划时刻在 now 之前)仍未写出 → 落后增长。
+	s.clk.advance(300 * time.Millisecond)
+	if st := s.vs.Stats(); st.DebtMs < 250 {
+		t.Fatalf("stalled pump must read as lag: DebtMs=%v, want >=250", st.DebtMs)
+	}
+	// 恢复排出后:落后清零(余下包仍在计划未来 → 非落后)。
+	for i := 0; i < 200 && s.vs.Stats().QueuePackets > 0; i++ {
+		s.clk.advance(5 * time.Millisecond)
+		if err := s.vs.drainNow(); err != nil {
+			t.Fatalf("drain: %v", err)
+		}
+	}
+	if st := s.vs.Stats(); st.DebtMs != 0 || st.QueuePackets != 0 {
+		t.Fatalf("after drain: DebtMs=%v queue=%d, want 0/0", st.DebtMs, st.QueuePackets)
+	}
+}
