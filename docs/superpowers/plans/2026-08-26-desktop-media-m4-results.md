@@ -1095,3 +1095,100 @@ ldflags stamp (done locally for `bin/xnc-agent-m4.exe` at `0.5.10-m4canary.3`; t
 step must stamp it). Two small hardening follow-ups identified: `apply` should verify the
 staged exe's reported version matches the offer before committing, and the connected marker
 could carry the new version so the verify step proves VERSION, not just liveness.
+
+## 16. 2026-08-30 — sparse-stream congestion false positive: browser queueMs cadence guard (§M3-final-review deferred gap)
+
+Commit `deb5694` `fix(agent): gate browser queue congestion on frame cadence` (agent canary
+`0.5.10-m4canary.4`, built with the version ldflags stamp per §15's shipping rule).
+
+### 16.1 Live production evidence
+
+Mostly-STATIC desktop session, idle-flush cadence ~5 submissions/s. Node diag counters:
+`w=1152 h=720` (resolution walked down from 1920x1200 — MULTIPLE MaxW downshifts), `keyframes=275`
+climbing at exactly ~1/s (one IDR per second), `resets=3`. The user's browser is the
+controller-viewer; its 1s `viewer_feedback` carries `queueMs` = Chrome `jitterBufferDelay`
+proxy — on a 5fps sparse stream that metric is inherently ~half the inter-frame period
+(100-200ms+), so the controller's congestion branch (`queueMs > 100`, qos_controller.go) fired
+on EVERY feedback: immediate 30% cuts per second → bitrate to the 500k floor → fps ladder to 5
+→ height ladder → each MaxW change = host resolution reset = new codec epoch = recovery IDR →
+the ~1/s IDR storm the viewer decodes ("帧数很低", ~1fps). The M3 final review flagged exactly
+this as a deferred gap ("queueMs on sparse streams reads as congestion — garbage-in; needs a
+guard"); the web ALREADY sends `presentedFps` (DesktopLive.tsx, rvfc/getStats) but the agent's
+`viewerFeedbackFrame` (signaling.go) did not parse it — the controller was cadence-blind.
+
+### 16.2 Mechanism (code, verified)
+
+- `agent/desktop/signaling.go` `viewerFeedbackFrame`: fields type/visible/estimatedBps/queueMs/
+  decodeQueue/rttMs — no presentedFps → dropped on the floor at `json.Unmarshal`.
+- `agent/desktop/qos_controller.go` `decide()`: `if fb.QueueMs > qosQueueAgeMs` = the immediate
+  30% channel (bypasses the 1/s limiter and the stability window).
+- `DecodeQueue` is record-only (never a criterion) — no guard needed there.
+- The AGENT-side queue-age path (`agent/desktop/viewer_sender.go` `maxQueueAge` = 100ms frame
+  drop gate) measures the SENDER's real send-queue pressure, not the browser proxy — untouched.
+
+### 16.3 The rule (smallest change; no controller redesign)
+
+Parse `presentedFps` (float; 0 = absent/old web). Congestion-by-queueMs now additionally
+requires `queueCongestionReal`:
+- `presentedFps = 0` (old web) → **true** — fall back to today's behavior. Chosen deliberately:
+  an agent-first tightening would silently put every old-web deployment into "queueMs never
+  counts" mode (weaker congestion control); inheriting the false positive until the web upgrade
+  carries presentedFps is the safe default, and it also gives a single binary that reproduces
+  both behaviors for A/B (below).
+- `presentedFps >= 8` (qosCadenceFloorFps) → true: frame interval ≪ the 100ms line, the jitter
+  proxy reads real queueing.
+- else (sparse cadence): true only when `queueMs > 3 × max(1000/current target fps, 250ms)`
+  (qosQueueEscapeFactor/qosQueueEscapeFloorMs) — genuine catastrophic queueing trips at ANY
+  cadence (at a 30fps target the escape line is 750ms; at the 5fps ladder floor it is 750ms too
+  since max(200,250)=250).
+- Suppressed samples: `queueMs` still recorded with the feedback; a `cadenceHolds` counter
+  (`CadenceHolds()`) + a DEBUG log line in `streamQoS.observe` (DEBUG not INFO: a static
+  session logs one per second) provide observability. Suppressed feedback continues through the
+  bandwidth-evidence (C1 hysteresis) and stability-window paths — only the queue channel is
+  gated.
+
+### 16.4 Verification
+
+Unit (`go test ./agent/desktop ./agent/desktoppipe ./tools/e2eviewer` green; decision-table
+tests unchanged):
+- `TestQoSSparseCadenceQueueMsNotCongestion` — presentedFps=5, queueMs=180, 30fps target, 30
+  observations at 1s: zero downshifts, config pinned at 2.3M/30/1920, cadenceHolds=30.
+- `TestQoSHealthyCadenceQueueMsStillCongestion` — presentedFps=25, queueMs=180: immediate 30%
+  cut, second cut at +100ms still bypasses the limiter (today's semantics).
+- `TestQoSCatastrophicQueueEscapesCadenceGuard` — presentedFps=2: queueMs=700 (< 750ms line)
+  suppressed, queueMs=1500 cuts; the escape itself does not count as a hold.
+- `TestQoSAbsentPresentedFpsKeepsLegacyBehavior` — presentedFps=0: immediate cut (bit-identical
+  to the M3 `TestQoSImmediateDownshiftOnQueueAge` path).
+- `TestViewerFeedbackJSONShape` extended: presentedFps parses (4.9); absent field parses to 0.
+
+e2eviewer: new `-fb-presented-fps` flag includes the field in the synthetic viewer_feedback
+(0 = omit = old-web shape, so all prior matrix invocations are bit-identical).
+
+Live (dev stack had to be rebuilt this session — docker engine was down; stack at
+http://192.168.1.12:18080 from THIS worktree incl. M4 Task-4 media pinning with
+`XNC_DESKTOP_MEDIA_V2_PERCENT=100`, coturn relay range moved 49160-49200 → 52000-52100 via a
+local-only compose overlay because Hyper-V excluded 49152-49551; agent canary.4 deployed to
+labs-xiaoxin over WinRM via the XNCCore service pipe + scheduled task (S4U/Highest), dev
+identity `run-dev-console`, agent restarted per case so the shared per-agent controller state
+starts clean; viewer = e2eviewer server mode from the dev box, relay path, est=8Mbps, 45s):
+
+| case (feedback every 1s) | agent decisions (INFO log) | viewer outcome |
+|---|---|---|
+| `-fb-queue-ms 180 -fb-presented-fps 5` (sparse, NEW web) | ONE initial config 2.3M/30/1920, then ZERO congestion cuts — after the 10s stable window UPSHIFTS 3.3→4.3→5.3→6.3→6.8M (85%×est) | 950 frames/45s, 8.5MB, continuous AUs |
+| `-fb-queue-ms 180` (field absent = OLD web = pre-fix behavior) | cuts every second: 2.3M→…→500k floor, fps 30→…→5, then max_w 1920→1728→1440→**1152** (each held by the reset-recovery grace, confirmed by frame flow) | 72 frames/45s, 26 keyframes — the production ~1fps shape, resolution landing exactly on the user's 1152x720 |
+| `-fb-queue-ms 180 -fb-presented-fps 25` (healthy cadence) | congestion cuts fire exactly as today (reached 500k/5fps/1152 within the 20s run) | cuts unaffected by the guard |
+
+The first two rows are the before/after pair ON THE SAME BINARY (the absent-field default
+reproduces the old behavior); the third row proves real congestion on a healthy cadence is
+still honored. Artifacts: `artifacts/desktop-media/sparse-qos/` (viewer JSON per case) —
+git-ignored.
+
+### 16.5 Notes / follow-ups
+
+- The false positive is only reachable through the BROWSER proxy; the sender-side queue-age
+  gate (maxQueueAge frame drops) kept unchanged and remains the real send-queue protection.
+- Old-web sessions keep today's behavior until the web bundle with presentedFps ships; after
+  both ends are current, `cadenceHolds` (plus the DEBUG line) is the field signal that the guard
+  is absorbing sparse-stream noise.
+- fps<=5 ladder-bottom IDR-only degenerate stream (§15 follow-up) is unchanged — with the guard,
+  healthy sessions simply no longer FALL to the ladder bottom from phantom congestion.
