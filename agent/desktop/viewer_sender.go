@@ -291,6 +291,15 @@ func (b *tokenBucket) plan(sizes []int, now time.Time) (deadlines []time.Time, t
 	return deadlines, tokens
 }
 
+// forgiveDebt 抹平令牌桶欠债(仅负余额归零;正余额不动)。关键帧准入后
+// 调用:见 Enqueue 的 2026-08-30 注释 —— IDR 铺开期的债务不继承给后续
+// delta,否则低预算下形成「拒 delta → 重钥 → 更深债务」的结构性循环。
+func (b *tokenBucket) forgiveDebt() {
+	if b.tokens < 0 {
+		b.tokens = 0
+	}
+}
+
 // reserve(尺寸分级入队门,Fix 5)为一帧的全部包计算计划发送时刻。
 // 若最后一包的截止超过 now+deadline(该帧的准入视界,见
 // ViewerSender.admissionDeadline),则整帧拒收(不消耗任何令牌)——
@@ -459,6 +468,17 @@ func (s *ViewerSender) Enqueue(f Frame) error {
 		return nil
 	}
 	s.stats.admitted++
+	// 关键帧免除令牌欠债(2026-08-30 XIAOXIN 事故):IDR 的准入视界随
+	// 自身尺寸放大,总能准入并按 pacing 铺开 —— 但铺开期累积的 ~秒级
+	// 欠债由后续 delta 继承,而 delta 的视界只有 ~maxQueueAge。低预算
+	// 下这构成结构性整帧拒收:拒 delta → waitIDR → 恢复 IDR(更大欠债)
+	// → 再拒 —— 事故稳态即此循环(admission_pass_rate 78%,每秒一次
+	// client_reason=pacer 重钥,viewer 实际 ~1fps)。关键帧是刷新事件:
+	// 其后的 delta 从零债务重新起拍;真实链路过载仍由 est/queueMs 反馈
+	// 剪预算,不靠这里饿死画面。
+	if f.Key {
+		s.bucket.forgiveDebt()
+	}
 	// frame-meta(M3 Task 4,修正轮):身份在本帧 admitted 入队时绑定
 	//(此刻 per-viewer 时戳已定),随队列槽位携带——任何写出顺序(入口
 	// drain/合帧冲刷/pacing 泵)下归属都不可能错位;只有最后一包真正

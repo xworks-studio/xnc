@@ -122,6 +122,13 @@ const (
 	qosStableWindow    = 10 * time.Second
 	qosDownMinInterval = 1 * time.Second
 	qosUpMinInterval   = 3 * time.Second
+	// qosColdStartGuard(2026-08-30 XIAOXIN 事故):controller 就位后的
+	// 冷启动保护窗 —— 窗内任何降档证据都不行动。transport-cc 在 ICE/TURN
+	// relay 刚建立的头几秒系统性低估可用带宽(爬坡中途),且首个 IDR 的
+	// 令牌桶欠债会污染发送侧证据;事故时间线上第一条反馈(同毫秒)即把
+	// 2.3M 砍到 1.09M,4 拍到 500k 地板。真拥塞的证据在窗后仍然持续,
+	// 1/s 限速的阶梯照常响应 —— 代价只是约 8s 的决策延迟。
+	qosColdStartGuard = 8 * time.Second
 	// qosViewerTTL:viewer 表项的修剪窗;qosMaxViewers:表大小上限。
 	qosViewerTTL  = 2 * time.Minute
 	qosMaxViewers = 64
@@ -249,6 +256,11 @@ type QoSController struct {
 	lastDownAt  time.Time
 	lastUpAt    time.Time
 
+	// controllerSince(2026-08-30):当前 controller 的就位时刻,锚定
+	// qosColdStartGuard 冷启动保护窗(选举变化时重置 —— 新 viewer 接任
+	// 意味着新的 transport-cc 会话在爬坡)。零值 = 无 controller。
+	controllerSince time.Time
+
 	// reset-recovery grace(M4 修正,见文件头):resetPending = 一条改变
 	// max_w 的配置已下发、尚未被新代帧流确认(host 重置编码器期间)。此
 	// 间拥塞剪码挂起。heldCuts 记数挂起次数(可观测性:streamQoS 观测并
@@ -341,7 +353,13 @@ func (c *QoSController) Observe(fb ViewerFeedback) []Action {
 	v.bps = fb.EstimatedBps
 
 	c.prune(now)
+	prevController := c.controllerID
 	c.promote()
+	if c.controllerID != prevController && c.controllerID != "" {
+		// 选举变化:重锚冷启动保护窗(新 controller = 新 transport-cc
+		// 会话,est 又要从爬坡开始)。
+		c.controllerSince = now
+	}
 
 	var acts []Action
 	if !c.emitted && c.controllerID != "" {
@@ -387,20 +405,29 @@ func (c *QoSController) decide(fb ViewerFeedback, now time.Time) []Action {
 	c.lastEstBps, c.lastRefBps, c.estRefKnown = fb.EstimatedBps, c.cur.Bitrate, true
 
 	target := qosTargetBitrate(fb.EstimatedBps)
+	// 冷启动保护(2026-08-30 XIAOXIN 事故):窗内不降档 —— est 低估与
+	// 首个 IDR 的桶欠债在头几秒都是噪声而非拥塞。窗后证据照常驱动
+	// 1/s 阶梯;保护窗内的拍继续累计稳定窗(est 低时升档本就无目标
+	// 富余,不会误升)。
+	coldStart := !c.controllerSince.IsZero() &&
+		now.Sub(c.controllerSince) < qosColdStartGuard
 	// 发送侧证据优先(Fix 2):DeadlineDroppedRate/桶债务是本机测量,先于
 	// 任何浏览器代理看到真排队;它单独即可构成拥塞(浏览器 queueMs 不越
 	// 线也剪 —— 发送器已在丢帧,等代理确认只会多丢一拍)。浏览器代理在
 	// 节奏未知时降为「需发送侧确认」(queueCongestionReal)。
 	senderReal := fb.Sender.real()
-	if senderReal || (fb.QueueMs > qosQueueAgeMs && c.queueCongestionReal(fb, senderReal)) {
-		// 拥塞:稳定窗作废;立即 30% 通道 —— 「立即」= 窗口内的第一次
-		// 剪码不要求稳定窗(M4 架构修正 Fix 3:不再绕过 qosDownMinInterval
+	if !coldStart &&
+		(senderReal || (fb.QueueMs > qosQueueAgeMs && c.queueCongestionReal(fb, senderReal))) {
+		// 拥塞:立即 30% 通道 —— 「立即」= 窗口内的第一次剪码不要求
+		// 稳定窗(M4 架构修正 Fix 3:不再绕过 qosDownMinInterval
 		// —— 不限速的立即通道对 1/s 反馈节奏就是每秒 30% 棘轮,直到
 		// max_w 触发重置风暴)。
 		// M4 节奏门:queueMs 越线但呈现节奏稀疏(假拥塞,见
 		// queueCongestionReal)→ 不进此通道,反馈照常走带宽证据/
 		// 稳定窗路径(queueMs 已随反馈记录,仅不驱动降档)。
-		c.stableSince = time.Time{}
+		// 稳定窗只在降档实际执行时作废(2026-08-30):修前证据存在即
+		// 清零 —— 全底后无动作可能的拍也在清,稳定窗永不成形,底部
+		// 死锁(升档饿死)。
 		// reset-recovery grace:重置在途期间挂起(编码器重启本身就会推
 		// 高排队年龄——此刻的拥塞证据是垃圾;剪码只会再触发一次重置,
 		// 把上一代的恢复 IDR 作废)。挂起不累积:阶梯是状态机,确认后
@@ -413,6 +440,7 @@ func (c *QoSController) decide(fb ViewerFeedback, now time.Time) []Action {
 			return nil // 同一 1/s 限速(与常规降档通道共用 lastDownAt)
 		}
 		if next := c.stepDown(); next != c.cur {
+			c.stableSince = time.Time{}
 			c.noteMaxWChange(next)
 			c.cur = next
 			c.lastDownAt = now
@@ -421,15 +449,16 @@ func (c *QoSController) decide(fb ViewerFeedback, now time.Time) []Action {
 		return nil
 	}
 
-	if target < c.cur.Bitrate && (decay || deep) {
+	if !coldStart && target < c.cur.Bitrate && (decay || deep) {
 		// 带宽估计跌落(尚未排队):常规降档,≤1/s;仅当有降档证据
 		//(比率衰减或深亏)—— 恒平的 goodput 形反馈不再触发。
-		c.stableSince = time.Time{}
+		// 稳定窗同样只在降档实际执行时作废(与拥塞通道对称)。
 		if now.Sub(c.lastDownAt) < qosDownMinInterval {
 			return nil
 		}
 		next := c.cur
 		next.Bitrate = target
+		c.stableSince = time.Time{}
 		c.cur = next
 		c.lastDownAt = now
 		return []Action{{Kind: actionSetVideoConfig, Config: c.cur}}

@@ -1062,6 +1062,12 @@ func runNetworkCase(t *testing.T, tc netCase, dir string) {
 	// final-fixwave C1 后 est 路径带迟滞(flat est 不再触发降档),拥塞
 	// 立即通道是本相位唯一的降档来源,≤700k 只能由它到达;<100 → 无降档
 	//(升档需 10s 稳定窗,本用例内不触发)。
+	// 冷启动保护窗(2026-08-30):controller 就位后 ~8s 内降档证据一律
+	// 不行动(桌面端 qosColdStartGuard;relay transport-cc 爬坡期的 est
+	// 与首 IDR 桶欠债是噪声)。拥塞档必须先过窗再驱动。
+	if tc.congest {
+		time.Sleep(8300 * time.Millisecond)
+	}
 	ctrl.sendFeedback(tc.bps, tc.queueMs, tc.rttMs)
 	if tc.congest {
 		// 1M 档连降 4 拍:2.3M→1.61M→1.127M→789k→552k(≤700k 达标,
@@ -1168,5 +1174,92 @@ func runNetworkCase(t *testing.T, tc netCase, dir string) {
 		tc.name, path, len(rep.VideoConfigs), ctrlSum.Frames, specSum.Frames, specSum.PausedMs, ctrlSum.QueueAgeMaxMs)
 	for _, f := range failures {
 		t.Errorf("case %s: %s", tc.name, f)
+	}
+}
+
+// TestDesktopQoSColdStartRampHoldsConfig — 2026-08-30 XIAOXIN 生产事故的
+// 端到端回归(冷启动保护窗)。事故时间线:TURN relay 冷启动的 transport-cc
+// 爬坡形态(首拍 est=1.29M、随发送量下探继续跌)在会话头几秒把 2.3M 砍到
+// 500k 地板,fps/height 棱梯走底(3 次 resolution 重置 = capture rebuilt
+// 提示),配合首 IDR 的桶欠债拒帧循环,观众看到 ~1fps。保护窗内(≈8s)
+// 爬坡形态的 est 反馈不得触发任何降档;窗后持续低 est 收敛到 85% 目标
+//(只动码率,fps/分辨率不动)。
+func TestDesktopQoSColdStartRampHoldsConfig(t *testing.T) {
+	log := slog.Default()
+	st := &matrixStarter{}
+	h := &desktop.Handler{Log: log, Starter: st}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	handlerDone := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		c.SetReadLimit(1 << 20)
+		h.Handle(ctx, c, r.URL.Query().Get("s"), json.RawMessage(`{"signaling":"webrtc","iceTransportPolicy":"all"}`))
+	}))
+	defer srv.Close()
+	go func() {
+		<-ctx.Done()
+		close(handlerDone)
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-handlerDone:
+		case <-time.After(5 * time.Second):
+			t.Log("handler goroutines did not return within 5s of ctx cancel")
+		}
+	}()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/?s="
+
+	ctrl := startLoopPeer(t, ctx, wsURL+"cold-ctrl", "cold-ctrl", log)
+	defer ctrl.close()
+	src := st.sources()[0]
+
+	// controller 定身(初始 2.3M 配置落源)。
+	pollUntil(t, 15*time.Second, "controller first frames", func() bool { return ctrl.v.frames.Load() >= 10 })
+	ctrl.sendFeedback(8_000_000, 5, 30)
+	pollUntil(t, 5*time.Second, "controller seated", func() bool {
+		for _, c := range src.videoConfigs() {
+			if c.Bitrate == matrixCaseInitialBitrate {
+				return true
+			}
+		}
+		return false
+	})
+
+	// 冷启动爬坡(事故形态):est 1.29M 起步、逐拍下探,1s 反馈节奏。
+	for _, est := range []uint64{1_290_000, 900_000, 630_000, 700_000, 800_000} {
+		time.Sleep(1050 * time.Millisecond)
+		ctrl.sendFeedback(est, 5, 30)
+	}
+	time.Sleep(300 * time.Millisecond)
+	for _, c := range src.videoConfigs() {
+		if c != (desktop.VideoConfig{Bitrate: matrixCaseInitialBitrate, FPS: 30, MaxW: 1920}) {
+			t.Fatalf("cold-start est ramp must not downshift within the guard window, saw %+v", c)
+		}
+	}
+
+	// 窗后(总时序 ~6s 反馈 + 本拍跨过 8s 线):持续低 est 收敛到 85% 目标
+	// —— 只动码率;fps/max_w 纹丝不动(事故里它们被踩到底)。
+	deadline := time.Now().Add(6 * time.Second)
+	converged := false
+	for time.Now().Before(deadline) {
+		time.Sleep(1050 * time.Millisecond)
+		ctrl.sendFeedback(1_100_000, 5, 30)
+		for _, c := range src.videoConfigs() {
+			if c.Bitrate == 935_000 && c.FPS == 30 && c.MaxW == 1920 {
+				converged = true
+			}
+		}
+		if converged {
+			break
+		}
+	}
+	if !converged {
+		t.Fatalf("post-guard sustained est=1.1M must converge to 935k/30fps/1920w, configs=%+v", src.videoConfigs())
 	}
 }

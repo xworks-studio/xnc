@@ -297,11 +297,13 @@ func TestFrameMetaZeroWrittenPacketsSupersedeWindow(t *testing.T) {
 	if err := vs.Enqueue(a); err != nil {
 		t.Fatalf("enqueue A: %v", err)
 	}
-	if c := sink.count(); c != totalZ {
-		t.Fatalf("after Enqueue(A): wrote %d, want %d (Z fully flushed)", c, totalZ)
+	if c := sink.count(); c < totalZ {
+		t.Fatalf("after Enqueue(A): wrote %d, want >= %d (Z fully flushed)", c, totalZ)
 	}
-	if q := vs.Stats().QueuePackets; q != totalA {
-		t.Fatalf("A queue = %d packets, want %d (all queued, none written)", q, totalA)
+	// 关键帧债务免除(2026-08-30):A 不再背 Z 的 pacing 债务 —— 其
+	// refill 覆盖的首批包在入队 drain 即写出;余包仍排队(制造赤字)。
+	if q := vs.Stats().QueuePackets; q >= totalA || q == 0 {
+		t.Fatalf("A queue = %d packets, want 0 < q < %d (partial remainder)", q, totalA)
 	}
 	if got := ms.metas(); len(got) != 1 || got[0].ContentID != z.ContentID {
 		t.Fatalf("metas after Enqueue(A) = %+v, want exactly [Z]", got)
@@ -312,13 +314,11 @@ func TestFrameMetaZeroWrittenPacketsSupersedeWindow(t *testing.T) {
 	b := metaFrame(false, 3, 600)
 	totalB := expectedPacketCount(t, b.AU)
 	clk.advance(2 * time.Millisecond)
-	before := sink.count()
 	if err := vs.Enqueue(b); err != nil {
 		t.Fatalf("enqueue B: %v", err)
 	}
-	if c := sink.count(); c != before+totalA {
-		t.Fatalf("supersede flush: wrote %d, want %d (A fully flushed)", c-before, totalA)
-	}
+	// A 整帧冲刷的证明 = A 的 meta 已汇出(meta 只在末包写出时汇出,
+	// 见下方 len(got)==2 断言);B 自身的尾包按节奏在队是正常 pacing。
 	got := ms.metas()
 	if len(got) != 2 {
 		t.Fatalf("metas after window = %d (%+v), want 2 (Z, A)", len(got), got)

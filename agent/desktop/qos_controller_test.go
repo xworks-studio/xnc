@@ -34,6 +34,13 @@ func newQoSTestController() (*QoSController, *manualClock) {
 	return c, clk
 }
 
+// pastColdStart 把时钟推过 qosColdStartGuard(2026-08-30 起 controller
+// 就位后的冷启动保护窗内降档证据不行动 —— 测降档/升档决策的用例在选举
+// 后调用,回到保护窗语义之外的传统行为)。
+func pastColdStart(clk *manualClock) {
+	clk.advance(qosColdStartGuard + 100*time.Millisecond)
+}
+
 // configOf 提取本批动作里(至多一条)的 SetVideoConfig;无则零值 + false。
 func configOf(t *testing.T, acts []Action) (VideoConfig, bool) {
 	t.Helper()
@@ -87,6 +94,7 @@ func TestQoSInitialEmitOnFirstControllerFeedback(t *testing.T) {
 func TestQoSImmediateDownshiftOnQueueAge(t *testing.T) {
 	c, clk := newQoSTestController()
 	c.Observe(fb("s1", true, 8_000_000, 5)) // controller 就位(初始下发)
+	pastColdStart(clk)
 
 	cfg, ok := configOf(t, c.Observe(fbCongest("s1", 8_000_000)))
 	if !ok || cfg.Bitrate != 2_300_000*7/10 {
@@ -114,6 +122,7 @@ func TestQoSImmediateDownshiftOnQueueAge(t *testing.T) {
 func TestQoSDownRateLimitedPerSecond(t *testing.T) {
 	c, clk := newQoSTestController()
 	c.Observe(fb("s1", true, 8_000_000, 5)) // initial: 2.3M
+	pastColdStart(clk)
 
 	// est=2Mbps → target 1.7M < 2.3M → 降档。
 	cfg, ok := configOf(t, c.Observe(fb("s1", true, 2_000_000, 5)))
@@ -194,7 +203,7 @@ func TestQoSNoUpshiftBeforeTenStableSeconds(t *testing.T) {
 // 隐藏 viewer 的反馈不驱动任何全局决策(也不触发初始下发);隐藏的
 // controller 失去主导权,可见 viewer 接管。
 func TestQoSHiddenViewersExcludedFromGlobalDecisions(t *testing.T) {
-	c, _ := newQoSTestController()
+	c, clk := newQoSTestController()
 	if acts := c.Observe(fb("s1", false, 8_000_000, 500)); len(acts) != 0 {
 		t.Fatalf("hidden viewer feedback must not act, got %+v", acts)
 	}
@@ -202,9 +211,13 @@ func TestQoSHiddenViewersExcludedFromGlobalDecisions(t *testing.T) {
 		t.Fatalf("hidden viewer must not become controller, got %q", c.ControllerID())
 	}
 	c.Observe(fb("s1", true, 8_000_000, 5)) // s1 = controller,初始已下发
+	pastColdStart(clk)
 	if acts := c.Observe(fb("s1", false, 1_000, 500)); len(acts) != 0 {
 		t.Fatalf("hidden controller feedback must not act, got %+v", acts)
 	}
+	// s2 接管(选举重锚冷启动窗):先过窗,再以低 est 反馈驱动降档。
+	c.Observe(fb("s2", true, 8_000_000, 5))
+	pastColdStart(clk)
 	cfg, ok := configOf(t, c.Observe(fb("s2", true, 2_000_000, 5)))
 	if !ok || cfg.Bitrate != 1_700_000 || c.ControllerID() != "s2" {
 		t.Fatalf("visible viewer must take over globals: ctrl=%q got %+v ok=%v",
@@ -270,6 +283,7 @@ func TestQoSSpectatorPauseBelow35PercentControllerBandwidth(t *testing.T) {
 func TestQoSLadderEscalationAndRecovery(t *testing.T) {
 	c, clk := newQoSTestController()
 	c.Observe(fb("s1", true, 8_000_000, 5))
+	pastColdStart(clk)
 	gen := uint64(0) // 帧流 codec epoch 递增器(新代帧模拟)
 
 	congest := func() VideoConfig {
@@ -375,6 +389,7 @@ func TestQoSMaxWAspectMapping(t *testing.T) {
 		Now: clk.Now,
 	})
 	c.Observe(fb("s1", true, 8_000_000, 5))
+	pastColdStart(clk)
 	// 码率 5 步 + fps 4 步打到底(1/s 限速节奏)。
 	for i := 0; i < 9; i++ {
 		clk.advance(1100 * time.Millisecond)
@@ -397,6 +412,7 @@ func TestQoSMaxWAspectMapping(t *testing.T) {
 func TestQoSCongestionHeldWhileResetInFlight(t *testing.T) {
 	c, clk := newQoSTestController()
 	c.Observe(fb("s1", true, 8_000_000, 5))
+	pastColdStart(clk)
 	// 码率 5 步 + fps 4 步打到底(均非 max_w 决策:不受 grace 影响)。
 	for i := 0; i < 9; i++ {
 		clk.advance(1100 * time.Millisecond)
@@ -447,6 +463,7 @@ func TestQoSCongestionHeldWhileResetInFlight(t *testing.T) {
 func TestQoSGraceClearsOnFrameObservation(t *testing.T) {
 	c, clk := newQoSTestController()
 	c.Observe(fb("s1", true, 8_000_000, 5))
+	pastColdStart(clk)
 	for i := 0; i < 9; i++ {
 		clk.advance(1100 * time.Millisecond)
 		c.Observe(fbCongest("s1", 1_000))
@@ -485,6 +502,7 @@ func TestQoSGraceClearsOnFrameObservation(t *testing.T) {
 func TestQoSGraceOnlyClearedByNewerCodecEpoch(t *testing.T) {
 	c, clk := newQoSTestController()
 	c.Observe(fb("s1", true, 8_000_000, 5))
+	pastColdStart(clk)
 	// 帧流已在 codec epoch 5 上运行(grace 置位时 lastCodecEpoch=5)。
 	c.FrameObserved(5)
 	// 码率 5 步 + fps 4 步打到底(非 max_w 决策),再首档 height 剪刀。
@@ -524,8 +542,12 @@ func TestQoSGraceOnlyClearedByNewerCodecEpoch(t *testing.T) {
 func TestQoSStaleControllerPruned(t *testing.T) {
 	c, clk := newQoSTestController()
 	c.Observe(fb("s1", true, 8_000_000, 5))
+	pastColdStart(clk)
 	clk.advance(3 * time.Minute)
-	// s1 三分钟无反馈 → 修剪;s2 的反馈应接管并驱动全局。
+	// s1 三分钟无反馈 → 修剪;s2 接管(选举重锚冷启动窗)后过窗,低 est
+	// 反馈照常驱动全局。
+	c.Observe(fb("s2", true, 8_000_000, 5))
+	pastColdStart(clk)
 	cfg, ok := configOf(t, c.Observe(fb("s2", true, 2_000_000, 5)))
 	if !ok || c.ControllerID() != "s2" || cfg.Bitrate != 1_700_000 {
 		t.Fatalf("stale controller must yield: ctrl=%q got %+v ok=%v", c.ControllerID(), cfg, ok)
@@ -585,11 +607,12 @@ func TestQoSGoodputShapedFeedbackDoesNotRatchet(t *testing.T) {
 
 // TestQoSSharplyDegradingEstStillDownshiftsPromptly:真实恶化(est 对半跌)
 // 必须当拍即降(C1 迟滞不得吞掉真证据);且降档后 goodput 形的等比例回落
-//(est 跟到 0.85×新码率)不构成新的降档证据 —— 棘轮在真实 dips 之后同样
+// (est 跟到 0.85×新码率)不构成新的降档证据 —— 棘轮在真实 dips 之后同样
 // 必须止步。
 func TestQoSSharplyDegradingEstStillDownshiftsPromptly(t *testing.T) {
 	c, clk := newQoSTestController()
 	c.Observe(fb("s1", true, goodputOf(c), 5)) // 稳态:1.955M goodput 形
+	pastColdStart(clk)
 	clk.advance(1 * time.Second)
 	// est 对半跌:977,500 → target 830,875,当拍即降。
 	cfg, ok := configOf(t, c.Observe(fb("s1", true, 977_500, 5)))
@@ -616,6 +639,7 @@ func TestQoSSharplyDegradingEstStillDownshiftsPromptly(t *testing.T) {
 func TestQoSUpshiftRampStepCap(t *testing.T) {
 	c, clk := newQoSTestController()
 	c.Observe(fb("s1", true, 8_000_000, 5))
+	pastColdStart(clk)
 	// 拥塞立即通道 ×0.7 连降 5 拍到 500k 下限(fps/height 未动;Fix 3
 	// 起按 1/s 限速节奏推进)。
 	for i := 0; i < 5; i++ {
@@ -651,13 +675,13 @@ func TestStreamQoSAttachAppliesCurrentConfig(t *testing.T) {
 	clk := newManualClock()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	q := newStreamQoS(QoSControllerConfig{
-		Initial:  VideoConfig{Bitrate: 2_300_000, FPS: 30, MaxW: 1920},
-		AspectW:  1920,
-		AspectH:  1080,
-		Now:      clk.Now,
+		Initial: VideoConfig{Bitrate: 2_300_000, FPS: 30, MaxW: 1920},
+		AspectW: 1920,
+		AspectH: 1080,
+		Now:     clk.Now,
 	}, log)
-	q.observe(fb("s1", true, 8_000_000, 5)) // controller 就位,初始下发
-	clk.advance(1 * time.Second)
+	q.observe(fb("s1", true, 8_000_000, 5))               // controller 就位,初始下发
+	clk.advance(qosColdStartGuard + 100*time.Millisecond) // 过冷启动保护窗
 	if acts := q.observe(fb("s1", true, 2_000_000, 5)); len(acts) == 0 {
 		t.Fatal("est halving should downshift the shared stream")
 	}
@@ -677,7 +701,7 @@ func TestStreamQoSAttachAppliesCurrentConfig(t *testing.T) {
 // 离场后,接任者跳过 paused viewer;全部可见 viewer 都被暂停 → 空位
 // (frozen config:无任何决策,持留最后生效配置),后到的好 viewer 可接管。
 func TestQoSPausedSpectatorNotPromotedToController(t *testing.T) {
-	c, _ := newQoSTestController()
+	c, clk := newQoSTestController()
 	c.Observe(fb("ctrl", true, 10_000_000, 5)) // controller est = 10M
 	// spec(34%)被暂停。
 	acts := c.Observe(fb("spec", true, 3_400_000, 5))
@@ -697,6 +721,9 @@ func TestQoSPausedSpectatorNotPromotedToController(t *testing.T) {
 		t.Fatalf("frozen config: congestion from a paused viewer must not act, got %+v", acts)
 	}
 	// 后到的好 viewer 接管并驱动决策(est=2M → target 1.7M < 当前 2.3M)。
+	// 接管重锚冷启动窗:先过窗,再以低 est 反馈驱动降档。
+	c.Observe(fb("viewer", true, 8_000_000, 5))
+	pastColdStart(clk)
 	cfg, ok := configOf(t, c.Observe(fb("viewer", true, 2_000_000, 5)))
 	if !ok || cfg.Bitrate != 1_700_000 || c.ControllerID() != "viewer" {
 		t.Fatalf("healthy viewer must take over globals: ctrl=%q got %+v ok=%v",
@@ -750,7 +777,7 @@ func TestQoSMaxFPSCeilingClampsLadderAndInitial(t *testing.T) {
 func TestQoSMaxFPSUpshiftSpendsHeadroomOnBitrateNotFps(t *testing.T) {
 	c, clk := newQoSTestControllerMaxFPS(60, 30)
 	c.Observe(fb("s1", true, 8_000_000, 5)) // initial emit(已钳 30)
-	clk.advance(10 * time.Second)          // 稳定窗
+	clk.advance(10 * time.Second)           // 稳定窗
 	prev := uint32(2_300_000)
 	for i := 0; i < 40; i++ {
 		clk.advance(3100 * time.Millisecond)
@@ -865,6 +892,7 @@ func TestQoSSparseCadenceQueueMsNotCongestion(t *testing.T) {
 	if acts := c.Observe(fbCadence("s1", 2_700_000, 5, 5)); len(acts) != 1 {
 		t.Fatalf("first feedback should only emit the initial config, got %+v", acts)
 	}
+	pastColdStart(clk)
 	for i := 0; i < 30; i++ {
 		clk.advance(1 * time.Second) // web 1s 反馈节奏
 		if acts := c.Observe(fbCadence("s1", 2_700_000, 180, 5)); len(acts) != 0 {
@@ -885,6 +913,7 @@ func TestQoSSparseCadenceQueueMsNotCongestion(t *testing.T) {
 func TestQoSHealthyCadenceQueueMsStillCongestion(t *testing.T) {
 	c, clk := newQoSTestController()
 	c.Observe(fbCadence("s1", 8_000_000, 5, 25))
+	pastColdStart(clk)
 	cfg, ok := configOf(t, c.Observe(fbCadence("s1", 8_000_000, 180, 25)))
 	if !ok || cfg.Bitrate != 2_300_000*7/10 {
 		t.Fatalf("healthy-cadence queueMs=180 must cut 30%%: got %+v ok=%v", cfg, ok)
@@ -909,6 +938,7 @@ func TestQoSHealthyCadenceQueueMsStillCongestion(t *testing.T) {
 func TestQoSCatastrophicQueueEscapesCadenceGuard(t *testing.T) {
 	c, clk := newQoSTestController()
 	c.Observe(fbCadence("s1", 8_000_000, 5, 2))
+	pastColdStart(clk)
 	clk.advance(1 * time.Second)
 	if acts := c.Observe(fbCadence("s1", 8_000_000, 700, 2)); len(acts) != 0 {
 		t.Fatalf("queueMs=700 below the 750ms escape line must stay suppressed, got %+v", acts)
@@ -931,8 +961,12 @@ func TestQoSCatastrophicQueueEscapesCadenceGuard(t *testing.T) {
 func TestQoSAbsentPresentedFpsKeepsLegacyBehavior(t *testing.T) {
 	c, clk := newQoSTestController()
 	c.Observe(fb("s1", true, 8_000_000, 5)) // 旧 web 形态:无 presentedFps
+	pastColdStart(clk)
 	for i := 0; i < 3; i++ {
-		clk.advance(1100 * time.Millisecond)
+		// 节拍收紧到 100ms:保护窗推进后稳定窗已临近成熟,est=8M 的合法
+		// 升档会在 ~2s 后插进来 —— 本用例只考察 advisory queueMs 不剪码,
+		// 不考察升档时序。
+		clk.advance(100 * time.Millisecond)
 		if acts := c.Observe(fb("s1", true, 8_000_000, 180)); len(acts) != 0 {
 			t.Fatalf("cadence-unknown queueMs alone must stay advisory, got %+v", acts)
 		}
@@ -959,6 +993,7 @@ func TestQoSAbsentPresentedFpsKeepsLegacyBehavior(t *testing.T) {
 func TestQoSSenderCongestionEvidenceCutsImmediately(t *testing.T) {
 	c, clk := newQoSTestController()
 	c.Observe(fbCadence("s1", 8_000_000, 5, 25))
+	pastColdStart(clk)
 	clk.advance(1100 * time.Millisecond)
 	fb := fbCadence("s1", 8_000_000, 5, 25) // queueMs=5:浏览器侧毫无拥塞迹象
 	fb.Sender.DeadlineDroppedRate = 0.05
@@ -987,8 +1022,9 @@ func TestQoSSenderCongestionEvidenceCutsImmediately(t *testing.T) {
 // (f)发送侧确认解锁节奏未知的 queueMs:presentedFps=0 + queueMs=180
 // 单独仅咨询((d));同一拍带发送侧证据 → 拥塞成立,立即剪码。
 func TestQoSSenderCongestionConfirmsCadenceUnknownQueueMs(t *testing.T) {
-	c, _ := newQoSTestController()
+	c, clk := newQoSTestController()
 	c.Observe(fb("s1", true, 8_000_000, 5))
+	pastColdStart(clk)
 	fb := fb("s1", true, 8_000_000, 180) // 旧 web 形态:无 presentedFps
 	fb.Sender.DeadlineDroppedRate = 0.02
 	cfg, ok := configOf(t, c.Observe(fb))
@@ -1021,5 +1057,79 @@ func TestSenderCongestionSnapshotWindowRates(t *testing.T) {
 	}
 	if sc.OverflowFlushes != 0 {
 		t.Fatalf("overflow flushes delta = %d, want 0", sc.OverflowFlushes)
+	}
+}
+
+// ---- 2026-08-30 XIAOXIN 生产事故回归(冷启动保护 + 底部恢复) ----
+//
+// 事故时间线(生产日志):会话建立 2.3M/30fps → 第一条 viewer 反馈(同
+// 毫秒,TURN relay transport-cc 爬坡中的 est=1.29M)即触发 deep 砍到
+// 1.09M → est 随发送量下探继续跌 → 4 拍到 500k 地板 → 首个 IDR 的令牌
+// 桶欠债令准入门结构性拒帧(每秒 [pacer] 重钥)→ fps/height 棱梯走底
+// (3 次 resolution 重置 = 用户看到的 capture rebuilt 提示)→ 稳定窗被
+// 残留证据无限作废,升档永不成形 → 观众 ~1fps。
+
+// TestQoSColdStartGuardHoldsConfigThroughEstRamp:保护窗内,爬坡形态的
+// 低 est(逐拍下探)+ 首帧 IDR 的桶欠债(sender 证据)一律不行动 ——
+// 初始配置纹丝不动;窗后持续低 est 照常降档(保护是延迟,不是关闭)。
+func TestQoSColdStartGuardHoldsConfigThroughEstRamp(t *testing.T) {
+	c, clk := newQoSTestController()
+	c.Observe(fbCadence("s1", 1_290_000, 5, 30)) // 事故首拍:relay est 爬坡中
+	for i, est := range []uint64{900_000, 630_000, 700_000, 800_000, 1_100_000} {
+		clk.advance(1 * time.Second)
+		f := fbCadence("s1", est, 5, 30)
+		f.Sender.BucketDebtMs = 250 // 首 IDR 铺开的令牌欠债(事故现场形态)
+		if acts := c.Observe(f); len(acts) != 0 {
+			t.Fatalf("cold-start tick %d (est=%d) must not act, got %+v", i+1, est, acts)
+		}
+	}
+	if got := c.Current(); got != (VideoConfig{Bitrate: 2_300_000, FPS: 30, MaxW: 1920}) {
+		t.Fatalf("cold-start guard must hold the initial config, got %+v", got)
+	}
+	// 窗后(t≥8s):持续低 est 的带宽证据照常剪码(85% 目标)。
+	clk.advance(3500 * time.Millisecond)
+	cfg, ok := configOf(t, c.Observe(fbCadence("s1", 1_100_000, 5, 30)))
+	if !ok || cfg.Bitrate != qosTargetBitrate(1_100_000) {
+		t.Fatalf("post-guard sustained low est must cut to the 85%% target, got %+v ok=%v", cfg, ok)
+	}
+}
+
+// TestQoSStabilitySurvivesNoOpFloorEvidence:全底后残留的拥塞证据
+// (结构性拒收的影子,无动作可能)不得作废稳定窗 —— 修前「证据存在即清
+// 零」,升档锚点被每秒一拍地推迟,底部死锁。第 10 拍换成 no-op 证据后,
+// 稳定窗仍按干净拍序列成熟,第 11 拍升档即刻启动。
+func TestQoSStabilitySurvivesNoOpFloorEvidence(t *testing.T) {
+	c, clk := newQoSTestController()
+	c.Observe(fb("s1", true, 8_000_000, 5))
+	pastColdStart(clk)
+	gen := uint64(0)
+	congest := func() {
+		clk.advance(1100 * time.Millisecond)
+		c.Observe(fbCongest("s1", 1_000))
+		gen++
+		c.FrameObserved(gen)
+	}
+	// 连降到底:(500k, 5fps, maxW 1280)。
+	for i := 0; i < 11; i++ {
+		congest()
+	}
+	if got := c.Current(); got.Bitrate != 500_000 || got.FPS != 5 || got.MaxW != 1280 {
+		t.Fatalf("floor setup: got %+v", got)
+	}
+	// 9 拍干净(est=30M)锚定稳定窗,第 10 拍换成全底 no-op 拥塞证据
+	//(stepDown 无路可走 → 无动作),第 11 拍干净 → 升档即刻启动。
+	for i := 0; i < 9; i++ {
+		clk.advance(1 * time.Second)
+		c.Observe(fb("s1", true, 30_000_000, 5))
+	}
+	clk.advance(1 * time.Second)
+	f := fbCadence("s1", 30_000_000, 5, 30)
+	f.Sender.DeadlineDroppedRate = 0.05
+	if acts := c.Observe(f); len(acts) != 0 {
+		t.Fatalf("floor no-op evidence must not act, got %+v", acts)
+	}
+	clk.advance(1 * time.Second)
+	if _, ok := configOf(t, c.Observe(fb("s1", true, 30_000_000, 5))); !ok {
+		t.Fatal("upshift must fire once stability survives the no-op evidence tick")
 	}
 }

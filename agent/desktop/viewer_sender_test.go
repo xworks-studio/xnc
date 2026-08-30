@@ -583,25 +583,28 @@ func TestViewerSenderRecoveryIDRAlwaysDelivableAtFloor(t *testing.T) {
 	if st := s.vs.Stats(); st.DeadlineDropped != 0 {
 		t.Fatalf("recovery IDR was rejected: deadlineDropped=%d", st.DeadlineDropped)
 	}
-	// P1 同钟到达(IDR 债务在身):如实拒收 → waitIDR + 恰一次 [pacer]。
+	// P1 同钟到达:关键帧免除债务(2026-08-30)—— 修前它背着 IDR 的
+	// pacing 债务被整帧拒收 → waitIDR → 重钥 → 更深债务的循环(生产事故
+	// diag:admission_pass_rate 78%、每秒一次 [pacer] 重钥、观众 ~1fps)。
+	// delta 从零债务起拍:准入、保持 live、零请求。
 	if err := s.Enqueue(big(false, 2)); err != nil {
 		t.Fatalf("p1: %v", err)
 	}
-	if s.state() != stateWaitIDR {
-		t.Fatalf("p1: state=%v, want waitIDR (debt-laden frame rejected whole)", s.state())
+	if s.state() != stateLive {
+		t.Fatalf("p1: state=%v, want live (keyframe debt forgiven)", s.state())
 	}
-	if reqs := s.keyRequests(); len(reqs) != 1 || reqs[0] != "pacer" {
-		t.Fatalf("key requests = %v, want exactly [pacer]", reqs)
+	if reqs := s.keyRequests(); len(reqs) != 0 {
+		t.Fatalf("key requests = %v, want none (no pacer cycle)", reqs)
 	}
-	// IDR 在视界内完整送出(拒收不冲刷在队 IDR —— 它是当前帧)。
-	s.clk.advance(150 * time.Millisecond)
+	// IDR 与 P1 都在各自视界内完整送出。
+	s.clk.advance(300 * time.Millisecond)
 	if err := s.vs.drainNow(); err != nil {
 		t.Fatalf("drain: %v", err)
 	}
-	if got := s.sent(); got != pktIDR {
-		t.Fatalf("recovery IDR packets=%d, want %d (delivered within its horizon)", got, pktIDR)
+	if got := s.sent(); got != 2*pktIDR {
+		t.Fatalf("idr+p1 packets=%d, want %d (both delivered within their horizons)", got, 2*pktIDR)
 	}
-	// 下一个恢复 IDR(债务已偿):再次准入,流恢复 live —— 无永久冻结。
+	// 后续恢复 IDR:照常再次准入 —— 无永久冻结。
 	s.clk.advance(150 * time.Millisecond)
 	if err := s.Enqueue(big(true, 3)); err != nil {
 		t.Fatalf("second recovery idr: %v", err)
@@ -609,8 +612,8 @@ func TestViewerSenderRecoveryIDRAlwaysDelivableAtFloor(t *testing.T) {
 	if s.state() != stateLive {
 		t.Fatalf("state=%v, want live (next IDR re-admitted; no permanent freeze)", s.state())
 	}
-	if st := s.vs.Stats(); st.DeadlineDropped != 1 {
-		t.Fatalf("deadlineDropped=%d, want 1 (only the debt-laden P1)", st.DeadlineDropped)
+	if st := s.vs.Stats(); st.DeadlineDropped != 0 {
+		t.Fatalf("deadlineDropped=%d, want 0 (no rejection cycle at floor)", st.DeadlineDropped)
 	}
 }
 
@@ -835,11 +838,13 @@ func TestViewerSenderOneFrameQueueCoalesces(t *testing.T) {
 	}
 	s.clk.advance(10 * time.Millisecond)
 	// 新 delta 到达:旧帧余包全部冲刷(立即写出)+ delta 入队,无溢出无请求。
+	// 关键帧债务免除(2026-08-30)后,delta 不再背旧帧的 pacing 债务 ——
+	// 其 burst 覆盖的首包在入队 drain 即写出(+1)。
 	if err := s.Enqueue(delta(2)); err != nil {
 		t.Fatalf("coalescing delta: %v", err)
 	}
-	if s.sent() != total {
-		t.Fatalf("old frame remainder not flushed on coalesce: sent=%d, want %d", s.sent(), total)
+	if s.sent() != total+1 {
+		t.Fatalf("old frame remainder + delta burst packet: sent=%d, want %d", s.sent(), total+1)
 	}
 	// delta 的包按令牌桶节奏在大帧债务之后送出(40ms 预算内)。
 	s.clk.advance(50 * time.Millisecond)
