@@ -505,18 +505,24 @@ func TestViewerSenderSizeClassGateStillRejectsUnderDebt(t *testing.T) {
 	if sentAfterFirst >= sent0+totalBig {
 		t.Fatalf("expected in-flight remainder after first big frame: %d/%d", sentAfterFirst-sent0, totalBig)
 	}
-	// 同钟第二个大帧:债务 ≈ 1.3s + 自身 1.6s > 视界 2.4s → 拒收。其
-	// 入队路径先整帧冲刷了第一个帧的余包(superseded),被拒的它自己
-	// 一个包都不发。
+	// 同钟第二个大帧:债务 ≈ 1.3s + 自身 1.6s > 视界 2.4s → 拒收。
+	// 准入先行(2026-08-30):被拒的帧零副作用 —— 第一个帧的余包不被
+	// 冲刷,按自身节奏铺完;被拒帧自己一个包都不发。
 	if err := s.Enqueue(Frame{PresentMonoUs: vsMono(3), AU: vsBigIDRAU(20_000)}); err != nil {
 		t.Fatalf("debt-laden frame: %v", err)
 	}
-	if s.sent() != sent0+totalBig {
-		t.Fatalf("rejected frame leaked partial packets: %d, want %d (prior frame flushed, none of this one)",
-			s.sent()-sent0, totalBig)
-	}
 	if s.state() != stateWaitIDR {
-		t.Fatalf("state=%v, want waitIDR (suppression, never sampling)", s.state())
+		t.Fatalf("state=%v, want wait_IDR (suppression, never sampling)", s.state())
+	}
+	// 第一个帧在自身视界(~2.3s)内完整送出:修前它的余包在拒收判定
+	// 前就被合帧冲刷成突发。
+	s.clk.advance(2200 * time.Millisecond)
+	if err := s.vs.drainNow(); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if s.sent() != sent0+totalBig {
+		t.Fatalf("prior frame must complete whole after the rejection: %d, want %d",
+			s.sent()-sent0, totalBig)
 	}
 	if reqs := s.keyRequests(); len(reqs) != 1 || reqs[0] != "pacer" {
 		t.Fatalf("key requests = %v, want exactly [pacer]", reqs)
@@ -562,10 +568,11 @@ func TestViewerSenderSizeClassGateStillRejectsUnderDebt(t *testing.T) {
 // TestViewerSenderRecoveryIDRAlwaysDelivableAtFloor:生产事故形态(0.5.10
 // 前 fps=2、preKeyDropped=656)的根因是恢复 IDR 本身被 100ms 平顶门整帧
 // 拒收 → waitIDR 棘轮。Fix 5 下 500k 下限预算的 ~12KB 恢复 IDR(铺开
-// ~135ms、视界 ~285ms)永远可准入;紧随其后的同尺寸增量背着 ~135ms 债
-// 务,计划铺完 ~325ms > 自身视界 → 如实拒收转 waitIDR(链路确实送不完,
-// 该剪的是预算 —— QoS 的发送侧证据会看到 DeadlineDroppedRate)。下一个
-// 恢复 IDR(债务已偿)再次准入 —— 绝无「IDR 被拒 → 永久冻结」的腿。
+// ~135ms、视界 ~285ms)永远可准入;紧随其后的同尺寸增量不再走「拒收 →
+// 重钥」—— 2026-08-30 起在铺关键帧期间 delta 走锚保持(静默跳过,锚按
+// 自身节奏完整铺完,铺开期的债务随 refill 自然偿清),锚释放后 delta
+// 流恢复、下一个恢复 IDR 也照常准入 —— 绝无「IDR 被拒/被撕裂 → 永久
+// 冻结」的腿。
 func TestViewerSenderRecoveryIDRAlwaysDelivableAtFloor(t *testing.T) {
 	s := newFakeViewerSenderWithBudget(500_000) // 事故现场:QoS 码率下限
 	big := func(key bool, i uint64) Frame {
@@ -583,30 +590,48 @@ func TestViewerSenderRecoveryIDRAlwaysDelivableAtFloor(t *testing.T) {
 	if st := s.vs.Stats(); st.DeadlineDropped != 0 {
 		t.Fatalf("recovery IDR was rejected: deadlineDropped=%d", st.DeadlineDropped)
 	}
-	// P1 同钟到达:关键帧免除债务(2026-08-30)—— 修前它背着 IDR 的
-	// pacing 债务被整帧拒收 → waitIDR → 重钥 → 更深债务的循环(生产事故
-	// diag:admission_pass_rate 78%、每秒一次 [pacer] 重钥、观众 ~1fps)。
-	// delta 从零债务起拍:准入、保持 live、零请求。
+	// P1 同钟到达(锚保持,2026-08-30):在铺的 IDR 是解码锚,delta 依赖
+	// 其参考帧 —— 修前合帧冲刷先撕掉 IDR 余包再谈准入/拒收,viewer 永远
+	// 收不到完整 IDR(生产事故第二形态:PLI 循环、流面断)。锚保持下
+	// delta 被静默跳过:不冲刷、不重钥、状态不变。
 	if err := s.Enqueue(big(false, 2)); err != nil {
 		t.Fatalf("p1: %v", err)
 	}
 	if s.state() != stateLive {
-		t.Fatalf("p1: state=%v, want live (keyframe debt forgiven)", s.state())
+		t.Fatalf("p1: state=%v, want live (anchor hold is not a state change)", s.state())
 	}
 	if reqs := s.keyRequests(); len(reqs) != 0 {
 		t.Fatalf("key requests = %v, want none (no pacer cycle)", reqs)
 	}
-	// IDR 与 P1 都在各自视界内完整送出。
-	s.clk.advance(300 * time.Millisecond)
+	if st := s.vs.Stats(); st.AnchorHeld != 1 || st.DeadlineDropped != 0 {
+		t.Fatalf("anchorHeld=%d deadlineDropped=%d, want 1/0 (held, not rejected)", st.AnchorHeld, st.DeadlineDropped)
+	}
+	// IDR 在自身视界(274ms)内完整送出(余包不被 delta 撕裂;注意
+	// 在视界内 drain —— 超龄会走 ageOverflow,混淆锚完成语义)。
+	s.clk.advance(200 * time.Millisecond)
 	if err := s.vs.drainNow(); err != nil {
 		t.Fatalf("drain: %v", err)
 	}
-	if got := s.sent(); got != 2*pktIDR {
-		t.Fatalf("idr+p1 packets=%d, want %d (both delivered within their horizons)", got, 2*pktIDR)
+	if got := s.sent(); got != pktIDR {
+		t.Fatalf("recovery IDR packets=%d, want %d (delivered whole within its horizon)", got, pktIDR)
 	}
-	// 后续恢复 IDR:照常再次准入 —— 无永久冻结。
+	// 锚释放后:delta 流恢复(铺开债务已随 refill 偿清,干净起拍),
+	// 后续恢复 IDR 也照常 —— 无永久冻结。
+	if err := s.Enqueue(big(false, 4)); err != nil {
+		t.Fatalf("post-anchor delta: %v", err)
+	}
+	if s.state() != stateLive {
+		t.Fatalf("state=%v, want live (delta flows after the anchor completes)", s.state())
+	}
+	s.clk.advance(260 * time.Millisecond)
+	if err := s.vs.drainNow(); err != nil {
+		t.Fatalf("drain2: %v", err)
+	}
+	if got := s.sent(); got != 2*pktIDR {
+		t.Fatalf("idr+delta packets=%d, want %d", got, 2*pktIDR)
+	}
 	s.clk.advance(150 * time.Millisecond)
-	if err := s.Enqueue(big(true, 3)); err != nil {
+	if err := s.Enqueue(big(true, 5)); err != nil {
 		t.Fatalf("second recovery idr: %v", err)
 	}
 	if s.state() != stateLive {
@@ -837,22 +862,32 @@ func TestViewerSenderOneFrameQueueCoalesces(t *testing.T) {
 		t.Fatalf("expected pending remainder, sent=%d/%d", s.sent(), total)
 	}
 	s.clk.advance(10 * time.Millisecond)
-	// 新 delta 到达:旧帧余包全部冲刷(立即写出)+ delta 入队,无溢出无请求。
-	// 关键帧债务免除(2026-08-30)后,delta 不再背旧帧的 pacing 债务 ——
-	// 其 burst 覆盖的首包在入队 drain 即写出(+1)。
+	// 新 delta 到达:在铺的是关键帧(解码锚)→ 锚保持 —— 静默跳过,
+	// 余包不冲刷(2026-08-30)。
 	if err := s.Enqueue(delta(2)); err != nil {
 		t.Fatalf("coalescing delta: %v", err)
 	}
-	if s.sent() != total+1 {
-		t.Fatalf("old frame remainder + delta burst packet: sent=%d, want %d", s.sent(), total+1)
+	if st := s.vs.Stats(); st.AnchorHeld != 1 || s.sent() >= total {
+		t.Fatalf("anchor hold: anchorHeld=%d sent=%d/%d (IDR remainder must not flush)", st.AnchorHeld, s.sent(), total)
 	}
-	// delta 的包按令牌桶节奏在大帧债务之后送出(40ms 预算内)。
-	s.clk.advance(50 * time.Millisecond)
+	// 锚(20KB IDR @ ~318KB/s ≈ 63ms 铺开)完整送出。
+	s.clk.advance(60 * time.Millisecond)
 	if err := s.vs.drainNow(); err != nil {
 		t.Fatalf("drain: %v", err)
 	}
+	if s.sent() != total {
+		t.Fatalf("anchor completed: sent=%d, want %d (IDR delivered whole)", s.sent(), total)
+	}
+	// 锚释放后 delta 流恢复:准入并按节奏送出。
+	if err := s.Enqueue(delta(3)); err != nil {
+		t.Fatalf("post-anchor delta: %v", err)
+	}
+	s.clk.advance(10 * time.Millisecond)
+	if err := s.vs.drainNow(); err != nil {
+		t.Fatalf("drain2: %v", err)
+	}
 	if s.sent() != total+1 {
-		t.Fatalf("after coalesce sent=%d, want %d (old frame + delta)", s.sent(), total+1)
+		t.Fatalf("post-anchor delta: sent=%d, want %d", s.sent(), total+1)
 	}
 	if s.state() != stateLive {
 		t.Fatalf("state=%v, want live (coalescing is not overflow)", s.state())
@@ -1117,7 +1152,7 @@ func TestViewerSenderPacingSustainedMotionKeepsUp(t *testing.T) {
 		}
 		return Frame{Key: key, PresentMonoUs: uint64(i) * uint64(spf.Microseconds()), AU: au}
 	}
-	run := func(budget int) (drops uint64, keysSent uint64, incompleteArrivals int) {
+	run := func(budget int) (drops uint64, keysSent uint64, incompleteArrivals int, anchorHeld uint64) {
 		f := newFakeViewerSenderWithBudget(budget)
 		defer f.vs.Close()
 		var completed uint64
@@ -1148,17 +1183,19 @@ func TestViewerSenderPacingSustainedMotionKeepsUp(t *testing.T) {
 			_ = f.vs.drainNow()
 		}
 		st := f.vs.Stats()
-		return st.DeadlineDropped, completed, incompleteArrivals
+		return st.DeadlineDropped, completed, incompleteArrivals, st.AnchorHeld
 	}
 
 	// leg A:生产预算(pacingBudgetFraction ×1.05)—— 持续运动零拒收、
-	// 零恢复关键帧、每帧帧周期内完整铺出(120/120)。
-	drops, sent, incomplete := run(bps)
+	// 零恢复关键帧、每帧帧周期内完整铺出。初始 IDR 铺开(约一个帧周期)
+	// 期间的首个 delta 走锚保持(2026-08-30):静默跳过而非撕裂在铺的
+	// 解码锚 —— completed+anchorHeld 必须 == 120。
+	drops, sent, incomplete, held := run(bps)
 	if drops != 0 {
 		t.Fatalf("production budget: deadlineDropped=%d, want 0 (sustained motion must not trip the enqueue gate)", drops)
 	}
-	if sent != 120 {
-		t.Fatalf("frames completed=%d, want 120", sent)
+	if sent+held != 120 {
+		t.Fatalf("frames completed=%d anchorHeld=%d, want sum 120", sent, held)
 	}
 	if incomplete != 0 {
 		t.Fatalf("frames still queued at next arrival=%d, want 0 (pacing keeps up with the frame period)", incomplete)
@@ -1166,7 +1203,7 @@ func TestViewerSenderPacingSustainedMotionKeepsUp(t *testing.T) {
 
 	// leg B:旧 0.85 折扣的排放速率(预算 ×85/105)—— 同内容必须复现
 	// 入队门拒收(修正前的失败模式;数字形态见 pacingBudgetFraction 注释)。
-	legacyDrops, _, _ := run(bps * 85 / 105)
+	legacyDrops, _, _, _ := run(bps * 85 / 105)
 	if legacyDrops == 0 {
 		t.Fatal("legacy 0.85 drain rate: expected deadline drops under sustained at-target motion (failure mode gone missing)")
 	}

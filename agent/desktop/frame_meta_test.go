@@ -279,19 +279,33 @@ func metaFrame(key bool, i uint64, n int) Frame {
 func TestFrameMetaZeroWrittenPacketsSupersedeWindow(t *testing.T) {
 	vs, sink, clk, ms := newMetaSender(4_000_000) // 85% → ~425KB/s:20KB 帧铺 ~46ms
 
-	// Z:大 IDR,即刻只出 burst 部分,余包在队(制造赤字)。
-	z := metaFrame(true, 1, 20_000)
+	// K:小关键帧,即刻完整送出(建立 live + 解码锚;2026-08-30 起在铺
+	// 关键帧期间 delta 走锚保持,本用例改用大 delta 制造赤字)。
+	k := metaFrame(true, 1, 600)
+	if err := vs.Enqueue(k); err != nil {
+		t.Fatalf("enqueue K: %v", err)
+	}
+	clk.advance(10 * time.Millisecond)
+	if err := vs.drainNow(); err != nil {
+		t.Fatalf("drain K: %v", err)
+	}
+	if c := sink.count(); c == 0 {
+		t.Fatalf("K must be fully written, got %d packets", c)
+	}
+
+	// Z:大 delta,即刻只出 refill 部分,余包在队(制造赤字)。
+	z := metaFrame(false, 2, 20_000)
 	totalZ := expectedPacketCount(t, z.AU)
 	if err := vs.Enqueue(z); err != nil {
 		t.Fatalf("enqueue Z: %v", err)
 	}
-	if c := sink.count(); c == 0 || c >= totalZ {
-		t.Fatalf("Z pacing shape: wrote %d/%d, want 0 < n < total", c, totalZ)
+	if c := sink.count(); c == 0 {
+		t.Fatalf("Z pacing shape: wrote 0 packets, want some refill-covered burst")
 	}
 
 	// A(33ms 后):入口 drain 写出到期的 Z 余包,合帧冲刷送完 Z(→
-	// metaZ);A 全部入队且零包写出(首包截止 ~15ms 外)。
-	a := metaFrame(false, 2, 20_000)
+	// metaZ);A 全部入队且零包写出(首包截止在 refill 之外)。
+	a := metaFrame(false, 3, 20_000)
 	totalA := expectedPacketCount(t, a.AU)
 	clk.advance(33 * time.Millisecond)
 	if err := vs.Enqueue(a); err != nil {
@@ -300,18 +314,18 @@ func TestFrameMetaZeroWrittenPacketsSupersedeWindow(t *testing.T) {
 	if c := sink.count(); c < totalZ {
 		t.Fatalf("after Enqueue(A): wrote %d, want >= %d (Z fully flushed)", c, totalZ)
 	}
-	// 关键帧债务免除(2026-08-30):A 不再背 Z 的 pacing 债务 —— 其
-	// refill 覆盖的首批包在入队 drain 即写出;余包仍排队(制造赤字)。
-	if q := vs.Stats().QueuePackets; q >= totalA || q == 0 {
-		t.Fatalf("A queue = %d packets, want 0 < q < %d (partial remainder)", q, totalA)
+	// A 的全部包入队、零包写出(其计划铺开全部落在 refill 之外 ——
+	// Z 的令牌赤字之下)。这正是本用例要制造的「零写出窗口」形态。
+	if q := vs.Stats().QueuePackets; q != totalA {
+		t.Fatalf("A queue = %d packets, want exactly %d (all queued, none written)", q, totalA)
 	}
-	if got := ms.metas(); len(got) != 1 || got[0].ContentID != z.ContentID {
-		t.Fatalf("metas after Enqueue(A) = %+v, want exactly [Z]", got)
+	if got := ms.metas(); len(got) != 2 || got[1].ContentID != z.ContentID {
+		t.Fatalf("metas after Enqueue(A) = %+v, want [K, Z]", got)
 	}
 
 	// 窗口时刻:2ms 后 B 到达——A 零包已写出,B 的 Enqueue 合帧冲刷 A
 	// 整帧。汇出的必须是 A(身份 + 时戳),绝不是 B。
-	b := metaFrame(false, 3, 600)
+	b := metaFrame(false, 4, 600)
 	totalB := expectedPacketCount(t, b.AU)
 	clk.advance(2 * time.Millisecond)
 	if err := vs.Enqueue(b); err != nil {
@@ -320,19 +334,20 @@ func TestFrameMetaZeroWrittenPacketsSupersedeWindow(t *testing.T) {
 	// A 整帧冲刷的证明 = A 的 meta 已汇出(meta 只在末包写出时汇出,
 	// 见下方 len(got)==2 断言);B 自身的尾包按节奏在队是正常 pacing。
 	got := ms.metas()
-	if len(got) != 2 {
-		t.Fatalf("metas after window = %d (%+v), want 2 (Z, A)", len(got), got)
+	if len(got) != 3 {
+		t.Fatalf("metas after window = %d (%+v), want 3 (K, Z, A)", len(got), got)
 	}
-	ma := got[1]
+	ma := got[2]
 	if ma.ContentID != a.ContentID || ma.EncodeSeq != a.EncodeSeq ||
 		ma.CodecEpoch != a.CodecEpoch || ma.SourceMonoUs != a.SourceMonoUs {
 		t.Fatalf("window meta identity = %+v, want A's (ContentID=%d)", ma, a.ContentID)
 	}
 	// 归属铁证:metaA 的时戳 == A 的实际包突发(sink 中 [totalZ,totalZ+totalA)
 	// 区段)盖章的时戳;B 的时戳严格在其后。
+	totalK := expectedPacketCount(t, k.AU)
 	pktsEarly := sink.snapshot()
-	tsA := pktsEarly[totalZ].Timestamp
-	for i := totalZ; i < totalZ+totalA; i++ {
+	tsA := pktsEarly[totalK+totalZ].Timestamp
+	for i := totalK + totalZ; i < totalK+totalZ+totalA; i++ {
 		if pktsEarly[i].Timestamp != tsA {
 			t.Fatalf("packet %d ts=%d, want %d (same frame)", i, pktsEarly[i].Timestamp, tsA)
 		}
@@ -340,26 +355,26 @@ func TestFrameMetaZeroWrittenPacketsSupersedeWindow(t *testing.T) {
 	if ma.RTPTimestamp != tsA {
 		t.Fatalf("window meta ts=%d, want A's stamped ts=%d (never B's)", ma.RTPTimestamp, tsA)
 	}
-	if ma.RTPTimestamp == got[0].RTPTimestamp {
+	if ma.RTPTimestamp == got[1].RTPTimestamp {
 		t.Fatal("Z and A share an RTP timestamp")
 	}
 
 	// B 的余包按节奏送出后:恰第三条 meta,身份 B、时戳 = B 的包时戳。
-	for i := 0; i < 20 && sink.count() < totalZ+totalA+totalB; i++ {
+	for i := 0; i < 20 && sink.count() < totalK+totalZ+totalA+totalB; i++ {
 		clk.advance(10 * time.Millisecond)
 		if err := vs.drainNow(); err != nil {
 			t.Fatalf("drain: %v", err)
 		}
 	}
-	if c := sink.count(); c != totalZ+totalA+totalB {
-		t.Fatalf("final wrote %d, want %d", c, totalZ+totalA+totalB)
+	if c := sink.count(); c != totalK+totalZ+totalA+totalB {
+		t.Fatalf("final wrote %d, want %d", c, totalK+totalZ+totalA+totalB)
 	}
 	got = ms.metas()
-	if len(got) != 3 {
-		t.Fatalf("metas = %d, want 3 (Z, A, B)", len(got))
+	if len(got) != 4 {
+		t.Fatalf("metas = %d, want 4 (K, Z, A, B)", len(got))
 	}
-	mb := got[2]
-	if mb.ContentID != b.ContentID || mb.RTPTimestamp != sink.snapshot()[totalZ+totalA].Timestamp {
+	mb := got[3]
+	if mb.ContentID != b.ContentID || mb.RTPTimestamp != sink.snapshot()[totalK+totalZ+totalA].Timestamp {
 		t.Fatalf("B meta = %+v, want identity B with its stamped ts", mb)
 	}
 	if mb.RTPTimestamp == ma.RTPTimestamp {

@@ -182,6 +182,7 @@ type ViewerSender struct {
 	queueEnqueued time.Time     // 当前在队帧的入队时刻(年龄判据)
 	queueDeadline time.Duration // 当前在队帧的准入视界(年龄界 = 入队门,Fix 5)
 	queueBytes    int           // 在队帧的 AU 字节累计
+	queueKey      bool          // 在队帧是关键帧(解码锚;铺开期间 delta 走锚保持,见 Enqueue)
 	stats         viewerStatsN
 	pumpStarted   bool
 
@@ -211,6 +212,7 @@ type viewerStatsN struct {
 	closedDropped   uint64
 	admitted        uint64 // 过入队门被接受的帧(与 deadlineDropped 对偶)
 	deadlineDropped uint64 // 截止超准入线未入队的帧(整帧拒收)
+	anchorHeld      uint64 // 在铺关键帧(解码锚)期间静默跳过的 delta(2026-08-30)
 	overflowFlushes uint64 // 队列年龄超限冲刷次数
 	keyRequests     uint64 // 合并关键帧请求触发次数
 }
@@ -227,6 +229,7 @@ type ViewerStats struct {
 	ClosedDropped   uint64
 	Admitted        uint64
 	DeadlineDropped uint64
+	AnchorHeld      uint64 // 在铺解码锚(关键帧)期间静默跳过的 delta
 	OverflowFlushes uint64
 	KeyRequests     uint64
 	QueuePackets    int
@@ -289,15 +292,6 @@ func (b *tokenBucket) plan(sizes []int, now time.Time) (deadlines []time.Time, t
 		tokens -= float64(n)
 	}
 	return deadlines, tokens
-}
-
-// forgiveDebt 抹平令牌桶欠债(仅负余额归零;正余额不动)。关键帧准入后
-// 调用:见 Enqueue 的 2026-08-30 注释 —— IDR 铺开期的债务不继承给后续
-// delta,否则低预算下形成「拒 delta → 重钥 → 更深债务」的结构性循环。
-func (b *tokenBucket) forgiveDebt() {
-	if b.tokens < 0 {
-		b.tokens = 0
-	}
 }
 
 // reserve(尺寸分级入队门,Fix 5)为一帧的全部包计算计划发送时刻。
@@ -418,6 +412,19 @@ func (s *ViewerSender) Enqueue(f Frame) error {
 		return nil
 	}
 
+	// 锚保持(2026-08-30 XIAOXIN 事故第二形态):在铺的关键帧是解码锚,
+	// 后续 delta 依赖其参考帧 —— 冲掉余包换 delta 是自伤(撕裂的 IDR 尾
+	// 包突发打爆 relay,而 delta 本身没有参考也解不开;viewer 因此永远
+	// 收不到完整 IDR,PLI 每 ~3s 一发,流面断)。铺开期间静默跳过 delta
+	//(不冲刷/不重钥/状态不变):关键帧按自身节奏铺完,令牌债务随铺开
+	// 的 refill 自然偿清,之后的 delta 从干净余额起拍 —— 无需豁免债务。
+	// 新关键帧不受此限(新锚取代旧锚,superseded 语义不变)。
+	if len(s.queue) > 0 && s.queueKey && !f.Key {
+		s.stats.anchorHeld++
+		s.mu.Unlock()
+		return nil
+	}
+
 	// 90kHz 时戳(严格单调)。
 	hadPrev := s.clock.started
 	prevMono := s.clock.last
@@ -442,15 +449,15 @@ func (s *ViewerSender) Enqueue(f Frame) error {
 
 	// 单帧队列:上一帧余包(若已超龄则 drainLocked 已冲刷并转入
 	// waitIDR,本帧不会走到这里)此刻整帧冲刷出让队列。
-	if len(s.queue) > 0 {
-		_ = s.flushQueueLocked("superseded")
-	}
-
 	// 入队门 = 尺寸分级准入(Fix 5,见文件头):最后一包的计划时刻超过
 	// 本帧准入视界 → 整帧不入队(抑制只丢不采样:进入 waitIDR 并恰一次
 	// 合并请求,绝无「丢 P 帧后继续发后续 P 帧」)。关键帧同一门 ——
 	// 其视界随自身铺开时间放大,恢复 IDR 永远可交付,而链路确实送不完
 	// 的过载由拒收如实暴露(QoS 发送侧证据先一步剪预算)。
+	// 准入判定先于合帧冲刷(2026-08-30):被拒的帧不得有副作用 —— 修前
+	// delta 一到达就先冲掉在铺 IDR 的余包再被拒,恢复 IDR 每 33ms 被
+	// 撕裂一次(突发把尾部包打爆 relay,viewer 永远收不到完整 IDR,PLI
+	// 循环)。拒收时在队帧保持原节奏铺完。
 	wireBytes := 0
 	for _, n := range sizes {
 		wireBytes += n
@@ -467,18 +474,12 @@ func (s *ViewerSender) Enqueue(f Frame) error {
 		s.fireKey(keyReason)
 		return nil
 	}
-	s.stats.admitted++
-	// 关键帧免除令牌欠债(2026-08-30 XIAOXIN 事故):IDR 的准入视界随
-	// 自身尺寸放大,总能准入并按 pacing 铺开 —— 但铺开期累积的 ~秒级
-	// 欠债由后续 delta 继承,而 delta 的视界只有 ~maxQueueAge。低预算
-	// 下这构成结构性整帧拒收:拒 delta → waitIDR → 恢复 IDR(更大欠债)
-	// → 再拒 —— 事故稳态即此循环(admission_pass_rate 78%,每秒一次
-	// client_reason=pacer 重钥,viewer 实际 ~1fps)。关键帧是刷新事件:
-	// 其后的 delta 从零债务重新起拍;真实链路过载仍由 est/queueMs 反馈
-	// 剪预算,不靠这里饿死画面。
-	if f.Key {
-		s.bucket.forgiveDebt()
+	// 准入成功:上一帧余包(若已超龄则 drainLocked 已冲刷并转入 waitIDR,
+	// 本帧不会走到这里)此刻整帧冲刷出让队列。
+	if len(s.queue) > 0 {
+		_ = s.flushQueueLocked("superseded")
 	}
+	s.stats.admitted++
 	// frame-meta(M3 Task 4,修正轮):身份在本帧 admitted 入队时绑定
 	//(此刻 per-viewer 时戳已定),随队列槽位携带——任何写出顺序(入口
 	// drain/合帧冲刷/pacing 泵)下归属都不可能错位;只有最后一包真正
@@ -499,6 +500,7 @@ func (s *ViewerSender) Enqueue(f Frame) error {
 	}
 	if len(s.queue) == len(pkts) {
 		s.queueEnqueued = now
+		s.queueKey = f.Key // 队列从此帧起(锚保持判据)
 	}
 	s.queueBytes += len(f.AU)
 
@@ -595,6 +597,7 @@ func (s *ViewerSender) Stats() ViewerStats {
 		ClosedDropped:   s.stats.closedDropped,
 		Admitted:        s.stats.admitted,
 		DeadlineDropped: s.stats.deadlineDropped,
+		AnchorHeld:      s.stats.anchorHeld,
 		OverflowFlushes: s.stats.overflowFlushes,
 		KeyRequests:     s.stats.keyRequests,
 		QueuePackets:    len(s.queue),
@@ -679,6 +682,7 @@ func (s *ViewerSender) dropQueueLocked() {
 	s.queue = nil
 	s.queueDeadline = 0
 	s.queueBytes = 0
+	s.queueKey = false
 }
 
 // flushQueueLocked 把在队包立即写出(非 paced 冲刷)并清空队列;调用方
@@ -765,6 +769,7 @@ func (s *ViewerSender) drainLocked(now time.Time) (string, error) {
 		s.queue = append([]queuedPacket(nil), s.queue[i:]...)
 		if len(s.queue) == 0 {
 			s.queueBytes = 0
+			s.queueKey = false // 在铺帧完整送出:锚释放,delta 流恢复
 		}
 		if d := time.Since(t0); d > 20*time.Millisecond {
 			s.log.Info("desktop write_rtp slow", "ms", d.Milliseconds(), "packets", sent, "bytes", sentBytes)
