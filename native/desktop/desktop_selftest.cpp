@@ -8413,7 +8413,15 @@ int SelftestMain(bool desktop_pipeline_v2) {
                                         uint32_t timeout_ms,
                                         xnc::FrameIdentity* id,
                                         std::string* err) override {
-        (void)timeout_ms;
+        // 2026-08-30 pin: the pacing math must never hand the backend a
+        // 0 timeout - the interface contract maps 0 to the ~100 ms default
+        // (capture.h), which turns a behind-schedule loop into a 100 ms
+        // stall per frame (the boundary-alignment regression guard).
+        uint32_t prev = min_timeout_.load(std::memory_order_relaxed);
+        while (timeout_ms < prev &&
+               !min_timeout_.compare_exchange_weak(prev, timeout_ms,
+                                                   std::memory_order_relaxed)) {
+        }
         if (err) err->clear();
         if (next_ < script_.size()) {
           const Step st = script_[next_++];
@@ -8480,6 +8488,9 @@ int SelftestMain(bool desktop_pipeline_v2) {
 
       size_t frames() const { return frames_.load(); }
       uint32_t rebuilds() const { return rebuilds_; }
+      uint32_t min_timeout_seen() const {
+        return min_timeout_.load(std::memory_order_relaxed);
+      }
       // Task 5 backend-fallback knob (see Rebuild).
       uint32_t rebuild_fail_first = 0;
 
@@ -8522,6 +8533,7 @@ int SelftestMain(bool desktop_pipeline_v2) {
       size_t next_ = 0;
       std::atomic<size_t> frames_{0};
       uint32_t rebuilds_ = 0;
+      std::atomic<uint32_t> min_timeout_{0xFFFFFFFFu};
       xnc::FrameIdentity last_id_{};
       uint32_t gap_ms_ = 0;        // kGap window (0 = single pass)
       ULONGLONG gap_until_ = 0;    // active kGap window deadline
@@ -9023,6 +9035,7 @@ int SelftestMain(bool desktop_pipeline_v2) {
               return new LogSession(static_cast<SessionLog*>(ctx), pool);
         };
         cfg.session_ctx = &log;
+        const ULONGLONG t_b0 = GetTickCount64();
         xnc::MediaPipelineV2 pipe;
         CHECK("v2b-start", pipe.Start(cfg));
         if (pipe.running()) {
@@ -9033,6 +9046,12 @@ int SelftestMain(bool desktop_pipeline_v2) {
                          5000));
           Sleep(150);  // settle: nothing more may be submitted while busy
           CHECK("v2b-slots-bound-at-three", log.submits == 3);
+          // 2026-08-30 regression guard: while the pool is saturated the
+          // submission boundary has passed on every loop pass - the pacing
+          // math must still poll (>=1 ms), never fall back to the ~100 ms
+          // backend default that a 0 timeout requests (capture.h contract).
+          CHECK("v2b-acquire-timeout-floor",
+                cap.min_timeout_seen() >= 1u && cap.min_timeout_seen() != 0xFFFFFFFFu);
           // Arm the sticky IDR during the wait.
           pipe.RequestIdr("coalesce-test");
           Sleep(100);
@@ -9108,6 +9127,15 @@ int SelftestMain(bool desktop_pipeline_v2) {
                     std::string::npos &&
                     res.stages_json.find("\"encoder_backend\": \"factory\"") !=
                         std::string::npos);
+          // 2026-08-30 churn floor: while the pool was saturated the
+          // keepalive could not submit - its feeds must be floored to one
+          // attempt per frame period (an unfloored feed re-fires every loop
+          // pass, ~thousands/s here, and churns Snapshot+PublishContent).
+          const ULONGLONG t_b1 = GetTickCount64();
+          CHECK("v2b-keepalive-churn-floor",
+                res.keepalive_feeds <=
+                    static_cast<uint64_t>(
+                        ((t_b1 - t_b0) * cfg.fps) / 1000) + 8);
           std::printf("SELFTEST NOTE: v2b submits=%llu outputs=%llu aus=%llu\n",
                       (unsigned long long)log.submits,
                       (unsigned long long)log.outputs,
@@ -9460,6 +9488,15 @@ int SelftestMain(bool desktop_pipeline_v2) {
                                               ids.front().encode_seq == 1 &&
                                               ids.back().encode_seq >= 10);
           CHECK("v2g-gap-accounted", res.reorder_gap_skips >= 1);
+          // 2026-08-30 accounting pin: over a run WITH a swallowed gap and
+          // reorder-window traffic, every submission must resolve - an
+          // observed output or a counted skip - except the rung's parked
+          // tail at drain (delay=1 + in-flight; 4 is the slack). The old
+          // encoded-vs-aus_written comparison could never close here; the
+          // resolved accounting must, or the loop polls at kOwedPollMs
+          // forever.
+          CHECK("v2g-outputs-resolved-closed",
+                res.encoded <= res.outputs_resolved + 4);
           // The gap incident armed a sticky IDR that forced a LATER
           // submission (the recovery contract).
           std::vector<SessionLog::Rec> subs;
@@ -10455,9 +10492,10 @@ int SelftestMain(bool desktop_pipeline_v2) {
     // ---- 2026-08-30 M4 unification: keepalive pins (arch Fix 4) ----
     // v2s: static content after two frames - the ONE keepalive (replacing
     // the warm-up feeds, the bounded park flush and the 0-fps idle) must
-    // (a) keep re-feeding the surface at max(250ms, 2*spf) so the parked
-    // tail (LogSession delay=5, the QSV shape) keeps emitting, (b) never
-    // run away (every feed submits; the submission re-arms the threshold),
+    // (a) keep re-feeding the surface at the configured frame cadence so a
+    // static desktop still presents near target FPS (the browser counts
+    // delivered AUs, not capture changes), (b) never run away (every feed
+    // submits; the FPS gate remains the single pacing owner),
     // and (c) land a refresh IDR every 2 s of continuous keepalive (the
     // decoder/TWCC/freeze-detector liveness the old 0-fps idle lost).
     // XNC_QSV_IDLE_FLUSH=0 is the documented A/B gate and makes the
@@ -10491,7 +10529,10 @@ int SelftestMain(bool desktop_pipeline_v2) {
         const size_t s0 = log.submits.load();
         const size_t aus0 = sink.CopyAus().size();
         const size_t forced0 = log.ForcedSubmits();
-        // Static from here: keepalive re-feeds at the 250 ms floor.
+        // Static from here: keepalive must fill the capture gaps at the
+        // configured 30 fps cadence. The old 250 ms floor produced ~4 fps
+        // all the way through WebRTC even though every downstream stage was
+        // healthy.
         const ULONGLONG t0 = GetTickCount64();
         CHECK("v2s-keepalive-fed",
               wait_for([&] { return log.submits.load() >= s0 + 4; }, 6000));
@@ -10507,13 +10548,24 @@ int SelftestMain(bool desktop_pipeline_v2) {
         CHECK("v2s-keepalive-idr", forced1 > forced0);
         CHECK("v2s-keepalive-idr-cadence",
               (forced1 - forced0) <= static_cast<size_t>((t1 - t0) / 1500) + 2);
-        // (b) cadence-bounded: >= 250 ms per feed (+ slack for the 5 ms
-        // poll jitter) - a runaway feed loop fails this.
+        // User-visible cadence: at least 80% of the configured target over
+        // this real-wall-clock window. A 250 ms keepalive (~4 fps) fails by
+        // a wide margin; ordinary Windows scheduling jitter is tolerated.
+        const size_t min_target_submits = static_cast<size_t>(
+            ((t1 - t0) * static_cast<ULONGLONG>(cfg.fps) * 8) / 10000);
+        CHECK("v2s-static-presented-cadence",
+              static_cast<size_t>(s1 - s0) >= min_target_submits);
+        // Upper bound keeps the FPS gate as the sole pacing owner: no busy
+        // feed loop may exceed target cadence by more than test slack.
         CHECK("v2s-keepalive-cadence",
               static_cast<size_t>(s1 - s0) <=
-                  static_cast<size_t>((t1 - t0) / 150) + 3);
+                  static_cast<size_t>(((t1 - t0) * cfg.fps) / 1000) + 6);
         // (a) every feed flushed a parked output through the sink.
         CHECK("v2s-keepalive-emits", sink.CopyAus().size() > aus0);
+        // 2026-08-30 regression guard: the pacing math never hands the
+        // backend a 0 timeout (the ~100 ms default per capture.h) - a
+        // behind-schedule pass must poll, not stall.
+        CHECK("v2s-acquire-timeout-floor", cap.min_timeout_seen() >= 1u);
         const xnc::MediaPipelineV2::Result res = pipe.Stop();
         CHECK("v2s-ok", res.ok);
         CHECK("v2s-no-resets", res.resets == 0);
@@ -10583,7 +10635,7 @@ int SelftestMain(bool desktop_pipeline_v2) {
         const ULONGLONG t2 = GetTickCount64();
         CHECK("v2t-keepalive-cadence",
               static_cast<size_t>(s2 - s1) <=
-                  static_cast<size_t>((t2 - t1) / 150) + 3);
+                  static_cast<size_t>(((t2 - t1) * cfg.fps) / 1000) + 6);
         const xnc::MediaPipelineV2::Result res = pipe.Stop();
         CHECK("v2t-ok", res.ok);
         CHECK("v2t-resets", res.resets >= 1);

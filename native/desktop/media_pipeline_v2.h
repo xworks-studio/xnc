@@ -411,6 +411,13 @@ class MediaPipelineV2 {
     // and outputs dropped for arriving below the already-published seq.
     uint64_t reorder_gap_skips = 0;
     uint64_t reorder_late_drops = 0;
+    // Outputs RESOLVED by the loop: observed from the rung (published,
+    // straggler-dropped or retired) plus never-emitted seqs accounted as
+    // gap skips. encoded - outputs_resolved is what the rung still owes -
+    // the polling-cadence predicate (aus_written counts a different
+    // population: a dropped output never reaches it). At a clean drain
+    // this closes to within the rung's parked tail.
+    uint64_t outputs_resolved = 0;
     // M2 Task 5 unified-reset accounting: the ordered phases of EVERY
     // executed reset (8 per reset, ResetPhase order - assertable against
     // the spec sequence), the storm backoff applied per executed reset

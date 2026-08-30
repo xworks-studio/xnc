@@ -35,7 +35,11 @@ namespace xnc {
 
 namespace {
 
-uint64_t NowMs() { return GetTickCount64(); }
+// Pacing clock (2026-08-30): QPC-derived, not GetTickCount64 - on this
+// box's Windows 11 the tick stays ~15.6 ms even under timeBeginPeriod(1),
+// which quantized the 15 fps BitBlt interval (66 ms) up to ~78 ms
+// (~12.8 fps served). All call sites compare values from this same clock.
+uint64_t NowMs() { return NowMonoUs() / 1000; }
 
 // Destroys every GDI object (SelectObject restore order matters for the
 // owned bitmap: it cannot be deleted while selected into mem_dc).

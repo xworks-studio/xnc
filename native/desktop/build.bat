@@ -38,7 +38,7 @@ rem libs (d3d11/mfplat/mfuuid/ole32 already linked above); artifacts go to
 rem ..\..\bin (gitignored).
 rem Targets:
 rem   build.bat            build ..\..\bin\xnc-desktop.exe
-rem   build.bat selftest   build + run bin\xnc-desktop.exe --selftest
+rem   build.bat selftest   build + run the full desktop selftest, including V2
 setlocal
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
 if errorlevel 1 (
@@ -54,7 +54,7 @@ if errorlevel 1 exit /b 1
 echo [desktop] built ..\..\bin\xnc-desktop.exe
 
 if "%~1"=="selftest" (
-  ..\..\bin\xnc-desktop.exe --selftest
+  ..\..\bin\xnc-desktop.exe --selftest --desktop-pipeline-v2
   if errorlevel 1 exit /b 1
   echo [desktop] selftest target ok
 )

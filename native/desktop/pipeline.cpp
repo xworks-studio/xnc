@@ -113,7 +113,13 @@ void LatestFrameStore::Invalidate() {
 
 namespace {
 
-uint64_t NowMs() { return GetTickCount64(); }
+// Pacing clock (2026-08-30): QPC-derived, not GetTickCount64. The comment
+// below (and years of measurement) assumed timeBeginPeriod(1) lifted the
+// tick to ~1 ms; on this box's Windows 11 it does NOT - the tick stays
+// ~15.6 ms, quantizing the spf pacing (33 ms @ 30 fps) up to 46.9 ms
+// (~21 fps served). QPC keeps the pacing exact. All call sites compare
+// values from this same clock (identity stamps use NowMonoUs directly).
+uint64_t NowMs() { return NowMonoUs() / 1000; }
 
 // Idle nap between do-nothing timeouts (static screen after warm-up): real
 // backends block inside Acquire (spf or 100 ms), fakes return instantly -

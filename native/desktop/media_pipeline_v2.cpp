@@ -64,7 +64,16 @@ const char* MediaFileSink::OnAu(const EncodedAU& au) {
 
 namespace {
 
-uint64_t NowMs() { return GetTickCount64(); }
+// Pacing clock (2026-08-30): QPC-derived, NOT GetTickCount64. On this
+// box's Windows 11, timeBeginPeriod(1) no longer lifts the GetTickCount64
+// tick (still ~15.6 ms quanta), so every NowMs()-based pacing decision -
+// the FPS gate, the keepalive threshold, the acquire wait - quantized UP
+// to the next 15.6 ms boundary: 30 fps landed on 3 ticks = 46.875 ms =
+// 21.3 fps, 60 fps on 2 ticks = 32 fps (measured on QSV AND on the
+// selftest fakes - interval p50 46.9 ms in both). QPC has ns-grade
+// granularity; every NowMs() call site compares values captured from this
+// same clock, so the epoch difference from GetTickCount64 is invisible.
+uint64_t NowMs() { return NowMonoUs() / 1000; }
 
 // 1 ms timer resolution for the pacing Sleeps (pipeline.cpp pattern).
 class TimePeriodGuard {
@@ -87,13 +96,13 @@ constexpr DWORD kOwedPollMs = 5;
 // 2026-08-30 M4 unification (arch Fix 4): ONE keepalive replaces the three
 // overlapping idle paths (the spec-7.4 warm-up feeds bounded 34/2s, the
 // 2026-08-28 static-idle park flush bounded 8/episode, and the do-nothing
-// 0-fps idle). kKeepaliveAfterMs is the starvation floor - no submission
-// for max(250ms, 2*spf) re-feeds the LatestSurface (2 slots = the
-// healthy paced path never qualifies; last_submit_ms advances every
-// slot). kKeepaliveIdrMs is the periodic refresh-IDR cadence during
-// CONTINUOUS keepalive: a static desktop otherwise never re-keys, the
-// decoder cools, transport-cc stalls and the freeze detector fires.
-constexpr uint64_t kKeepaliveAfterMs = 250;
+// 0-fps idle). Capture is change-driven, but the browser's user-visible FPS
+// counts presented AUs; therefore a watched static desktop must re-feed the
+// LatestSurface once per configured frame period. TrySubmit's FPS gate remains
+// the single pacing owner, so this neither bursts nor creates another clock.
+// kKeepaliveIdrMs is the periodic refresh-IDR cadence during CONTINUOUS
+// keepalive: a static desktop otherwise never re-keys, the decoder cools,
+// transport-cc stalls and the freeze detector fires.
 constexpr uint64_t kKeepaliveIdrMs = 2000;
 // ON by default (the 2026-08-28 labs-xiaoxin measurement: with the flush,
 // the hardware rung's semi-static dwell collapsed from a uniform ~586 ms
@@ -432,9 +441,17 @@ struct MediaPipelineV2::Impl {
   bool idr_in_flight = false;   // armed IDR (subscriber/keepalive) until the key AU
   uint32_t idr_feeds = 0;       // keepalive feeds under the in-flight IDR
   uint64_t last_initiated_idr_ms = 0;
+  // Start time of the last accepted submission. Scheduling from the end of
+  // conversion/Submit adds that processing cost to every frame period and
+  // turns a 30 fps static stream into ~21 fps.
   uint64_t last_submit_ms = 0;
   uint64_t submit_t0 = 0, submit_count = 0;
   uint32_t spf_ms = 33;
+  // Time of the last keepalive feed ATTEMPT (fed or not). Anchors the retry
+  // floor when a feed fails to submit (slot pool saturated): without it the
+  // feed re-fires every loop pass (~5 ms while outputs are owed) and churns
+  // Snapshot+PublishContent without producing anything.
+  uint64_t last_keepalive_feed_ms = 0;
   // The IDR-emergence bound: keepalive feeds under one armed IDR beyond
   // this depth mean the rung is not going to surface it - clear the
   // in-flight marker so future subscriber requests are not starved
@@ -620,6 +637,7 @@ class Loop {
     if (!im_.session) return;
     EncoderOutput out;
     while (im_.session->TakeOutput(&out, 0)) {
+      im_.res.outputs_resolved++;  // observed, whatever its publication fate
       // Task 6: submit -> output-availability for THIS output (its
       // submission stamp -> the moment the loop observes it here).
       const uint64_t now_us = NowMonoUs();
@@ -715,6 +733,9 @@ class Loop {
       }
       if (skipped != 0) {
         im_.res.reorder_gap_skips += skipped;
+        // The skipped seqs will never surface as outputs - resolving them
+        // here keeps OutputsOwed() from going permanently true.
+        im_.res.outputs_resolved += skipped;
         if (!im_.reorder_gap_idr_armed) {
           im_.reorder_gap_idr_armed = true;
           im_.mbox.ArmIdr("reorder_gap");
@@ -773,9 +794,15 @@ class Loop {
     eau.width = im_.stream_w;
     eau.height = im_.stream_h;
     eau.flags = is_idr ? AuFlags::kAuFlagKey : AuFlags::kAuFlagNone;
-    eau.annexb = std::make_shared<const std::vector<uint8_t>>(im_.shaped);
+    // The shaped bytes move straight into the immutable shared payload -
+    // shaping into a reused scratch and copying it out here was a second
+    // full-AU memcpy on every frame (the scratch reallocates next AU,
+    // the same allocation count the copy path paid).
+    const size_t shaped_bytes = im_.shaped.size();
+    eau.annexb =
+        std::make_shared<const std::vector<uint8_t>>(std::move(im_.shaped));
     im_.res.aus_written++;
-    im_.res.bytes_written += im_.shaped.size();
+    im_.res.bytes_written += shaped_bytes;
     // Task 6: the capture->AU observation - the AU's pixel-capture stamp to
     // the shaped AU being complete (one step short of the sink's own I/O).
     {
@@ -872,9 +899,27 @@ class Loop {
     // kOwedPollMs (not a full spf) - a ready AU must not park behind a
     // blocking capture wait; the retry loop is semantically identical
     // (kNoChange just re-enters AcquireOnce via the run loop).
+    // Capture wait and conversion/submit share ONE frame budget. Waiting a
+    // full spf after the previous submit's processing serialized
+    //   processing cost + spf
+    // and capped a 30 fps static stream at ~21 fps (47 ms/frame). Wait only
+    // until the next submission boundary; TrySubmit remains the final gate.
     uint32_t acquire_wait_ms = im_.spf_ms;
+    if (im_.last_submit_ms != 0) {
+      const uint64_t now_ms = NowMs();
+      const uint64_t next_submit_ms = im_.last_submit_ms + im_.spf_ms;
+      const uint64_t remaining_ms =
+          next_submit_ms > now_ms ? next_submit_ms - now_ms : 0;
+      if (remaining_ms < acquire_wait_ms)
+        acquire_wait_ms = static_cast<uint32_t>(remaining_ms);
+    }
     if (OutputsOwed() && acquire_wait_ms > kOwedPollMs)
       acquire_wait_ms = kOwedPollMs;
+    // The backend contract maps timeout 0 to the ~100 ms default
+    // (capture.h), which would turn exactly the behind-schedule regime this
+    // clamp targets (conversion+submit cost >= spf) into a 100 ms stall per
+    // frame (~8 fps at 30 fps target). Poll instead.
+    if (acquire_wait_ms == 0) acquire_wait_ms = 1;
     const uint64_t acq_t0 = NowMonoUs();
     const CaptureStatus st =
         im_.cfg.surf->AcquireSurface(im_.latest, acquire_wait_ms, &spec, &aerr);
@@ -955,13 +1000,17 @@ class Loop {
   // parked in its emit depth but not yet emitted). While true, the run
   // loop polls CollectOutputs at kOwedPollMs instead of the idle cadence
   // (see kOwedPollMs) - the same predicate the park flush uses.
+  // resolved, not aus_written: a dropped output (retired epoch, straggler)
+  // never reaches aus_written, so comparing the lifetime counters went
+  // permanently true after the first drop and pinned the loop to 5 ms
+  // polls for the rest of the run.
   bool OutputsOwed() const {
-    return im_.res.encoded > im_.res.aus_written;
+    return im_.res.encoded > im_.res.outputs_resolved;
   }
 
   // 2026-08-30 M4 unification (arch Fix 4): the ONE keepalive. While the
   // stream has subscribers and no submission has happened for
-  // max(kKeepaliveAfterMs, 2*spf), re-feed the LatestSurface:
+  // one configured frame period, re-feed the LatestSurface:
   //   - the hardware rung's emit depth parks the tail of a content burst
   //     inside the MFT until further inputs arrive (QSV ~5 inputs, the
   //     software MFT ~17; the RERUN-2 P0 froze a static desktop for the
@@ -975,9 +1024,11 @@ class Loop {
   // (force_idr on the next submission): a static desktop otherwise never
   // re-keys. The fed frame is a RE-ENCODE, not a replay - TrySubmit stamps
   // present_mono_us = NowMonoUs() at submission (source_mono_us keeps the
-  // content's capture stamp). Runaway-bounded by construction: every feed
-  // submits, the submission advances last_submit_ms, and the next feed
-  // waits out the threshold again (<= ~4 feeds/s at the 250ms floor).
+  // content's capture stamp). Runaway-bounded: a feed that submits advances
+  // last_submit_ms (next feed waits out the frame period); a feed that
+  // fails to submit is floored to one attempt per frame period off
+  // last_keepalive_feed_ms (TrySubmit still picks the mailbox content up
+  // the moment a slot frees).
   void KeepaliveFeed() {
     if (!IdleFlushEnabled()) return;  // XNC_QSV_IDLE_FLUSH=0: the A/B gate
     if (im_.last_submit_ms == 0) return;  // no base frame yet
@@ -986,10 +1037,19 @@ class Loop {
       return;  // nobody watching: no feed, no refresh IDR (selftest fakes
                // and the file sink leave it null = always alive)
     const uint64_t since_submit = NowMs() - im_.last_submit_ms;
-    const uint64_t after_ms = 2ull * im_.spf_ms > kKeepaliveAfterMs
-                                  ? 2ull * im_.spf_ms
-                                  : kKeepaliveAfterMs;
+    const uint64_t after_ms = im_.spf_ms != 0 ? im_.spf_ms : 1;
     if (since_submit < after_ms) return;
+    // Retry floor: when a fed frame fails to submit (slot pool saturated,
+    // kNotReady), last_submit_ms does not advance and the threshold above
+    // stays satisfied - without anchoring on the last feed ATTEMPT the loop
+    // would re-feed every pass (~5 ms while outputs are owed) and churn
+    // Snapshot+PublishContent. The mailbox keeps the content either way;
+    // TrySubmit submits it the moment a slot frees.
+    const uint64_t now_ms = NowMs();
+    const uint64_t anchor_ms = im_.last_keepalive_feed_ms > im_.last_submit_ms
+                                   ? im_.last_keepalive_feed_ms
+                                   : im_.last_submit_ms;
+    if (anchor_ms != 0 && now_ms - anchor_ms < after_ms) return;
     FrameIdentity sid;
     ID3D11Texture2D* tex = nullptr;
     if (!im_.latest.Snapshot(&sid, &tex)) return;
@@ -1026,6 +1086,7 @@ class Loop {
       im_.idr_feeds = 0;
     }
     ++im_.res.keepalive_feeds;
+    im_.last_keepalive_feed_ms = now_ms;
     im_.mbox.PublishContent(sid);  // same content, new seq at submit
   }
 
@@ -1084,6 +1145,7 @@ class Loop {
     }
     FrameIdentity id = mid;
     id.encode_seq = ++im_.next_encode_seq;
+    const uint64_t submit_started_ms = NowMs();
     id.present_mono_us = NowMonoUs();  // stamped at submission (ruling 3)
     // Task 6: queue age - the latest-content wait: this content's capture
     // stamp to its submission stamp (depth-one mailbox + slot/FPS gates).
@@ -1151,7 +1213,10 @@ class Loop {
     if (!im_.session_is_hw && im_.cfg.session_factory == nullptr)
       im_.res.cpu_readbacks++;
     im_.submit_count++;
-    im_.last_submit_ms = NowMs();
+    // Keep the pacing clock on the same submission-start event as the media
+    // stamp above. Conversion/encoder call cost must fit inside the frame
+    // budget, not be serialized after it on every cadence.
+    im_.last_submit_ms = submit_started_ms;
     if (force)
       XNC_LOG_INFO("idr_submitted seq=%llu reason=%s",
                    static_cast<unsigned long long>(id.encode_seq), idr_reason);
@@ -1501,6 +1566,9 @@ class Loop {
       im_.session->Shutdown(ShutdownMode::kImmediate);
       im_.session.reset();
     }
+    // The torn session discards its in-flight outputs unobserved - resolve
+    // them here or OutputsOwed() stays true for the rest of the run.
+    im_.res.outputs_resolved = im_.res.encoded;
     im_.pool.RetireAll();
     im_.pool.FreeRetired();
     im_.latest.Reset();
