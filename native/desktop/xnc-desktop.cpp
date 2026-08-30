@@ -659,7 +659,7 @@ int RunConsoleDiagV2(const xnc::DiagOptions& opt, FILE* out, xnc::ICapture* cap,
   pr.counters.encoded = res.encoded;
   pr.counters.keyframes = res.keyframes;
   pr.counters.timeouts = res.timeouts;
-  pr.counters.warmup_feeds = res.warmup_feeds;
+  pr.counters.warmup_feeds = res.keepalive_feeds;  // Fix 4: keepalive re-feeds (sidecar field name kept for tooling)
   pr.counters.rebuilds = res.rebuilds;
   pr.aus_written = res.aus_written;
   pr.bytes_written = res.bytes_written;
@@ -671,12 +671,12 @@ int RunConsoleDiagV2(const xnc::DiagOptions& opt, FILE* out, xnc::ICapture* cap,
   xnc::CopyReason(pr.last_reset_reason, sizeof(pr.last_reset_reason),
                   res.last_reset_reason);
   write_stats(pr);
-  XNC_LOG_INFO("console_diag_v2_stop duration=%us captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu resets=%u aus=%llu ok=%d backend=%s",
+  XNC_LOG_INFO("console_diag_v2_stop duration=%us captured=%llu encoded=%llu keyframes=%llu timeouts=%llu keepalive_feeds=%llu resets=%u aus=%llu ok=%d backend=%s",
                opt.duration_s, static_cast<unsigned long long>(res.captured),
                static_cast<unsigned long long>(res.encoded),
                static_cast<unsigned long long>(res.keyframes),
                static_cast<unsigned long long>(res.timeouts),
-               static_cast<unsigned long long>(res.warmup_feeds), res.resets,
+               static_cast<unsigned long long>(res.keepalive_feeds), res.resets,
                static_cast<unsigned long long>(res.aus_written), res.ok ? 1 : 0,
                res.encoder_backend);
   std::fclose(out);

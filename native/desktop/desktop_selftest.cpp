@@ -8492,7 +8492,7 @@ int SelftestMain(bool desktop_pipeline_v2) {
         xnc::FrameIdentity id{};
         bool force = false;
       };
-      std::mutex mu;
+      mutable std::mutex mu;  // Fix 4 pin: ForcedSubmits locks in a const method
       std::vector<Rec> subs;    // every submission, in order (never erased)
       std::deque<Rec> fifo;     // pending outputs (hold mode / delay queue)
       std::deque<Rec> ready;    // ready outputs (non-hold mode)
@@ -8508,6 +8508,16 @@ int SelftestMain(bool desktop_pipeline_v2) {
       bool swap_pairs = false;            // v2g: emit pairs [k+1, k]
       uint64_t swallow_seq = 0;           // v2g: never emit this seq
       std::atomic<size_t> hw_faults{0};   // v2m: HwFaultSession contract breaks
+      // Fix 4 pin: submissions that consumed a forced-IDR flag (the fake
+      // marks EVERY output AU as a key NAL, so the refresh-IDR cadence is
+      // only observable at the submission boundary).
+      size_t ForcedSubmits() const {
+        std::lock_guard<std::mutex> lk2(mu);
+        size_t n = 0;
+        for (const auto& r : subs)
+          if (r.force) ++n;
+        return n;
+      }
     };
     class LogSession final : public xnc::IEncoderSession {
      public:
@@ -8854,6 +8864,14 @@ int SelftestMain(bool desktop_pipeline_v2) {
         std::lock_guard<std::mutex> lk(mu);
         return aus;
       }
+      // Key-flagged AU count (the keepalive refresh-IDR pin).
+      size_t CopyKeys() const {
+        std::lock_guard<std::mutex> lk(mu);
+        size_t n = 0;
+        for (const auto& a : aus)
+          if ((a.flags & xnc::AuFlags::kAuFlagKey) != 0) ++n;
+        return n;
+      }
       std::vector<xnc::FrameIdentity> CopyIds() const {
         std::lock_guard<std::mutex> lk(mu);
         std::vector<xnc::FrameIdentity> ids;
@@ -9186,7 +9204,7 @@ int SelftestMain(bool desktop_pipeline_v2) {
                     (unsigned long long)r1.keyframes,
                     (unsigned long long)r1.captured,
                     (unsigned long long)r1.encoded,
-                    (unsigned long long)r1.warmup_feeds);
+                    (unsigned long long)r1.keepalive_feeds);
         // Pristine second run: the first IDR AU decodes to the SAME luma
         // hash (deterministic pixels through the whole V2 chain).
         ScriptedDeviceCapture cap2(v2_dev.Get(), v2_ctx.Get(), script, w, h);
@@ -9239,8 +9257,8 @@ int SelftestMain(bool desktop_pipeline_v2) {
             cfg.cap = gcap.get();
             cfg.surf = gsurf;
             cfg.sink = &sink;
-            cfg.fps = 60;  // submissions outpace the GDI BitBlt cadence so
-                           // the 2s warm-up wall bound fits enough inputs
+            cfg.fps = 60;  // submissions outpace the GDI BitBlt cadence
+                           // (static gaps ride the keepalive - Fix 4)
             cfg.duration_s = 10;
             xnc::MediaPipelineV2 pipe;
             CHECK("v2e-start", pipe.Start(cfg));
@@ -9253,10 +9271,11 @@ int SelftestMain(bool desktop_pipeline_v2) {
               CHECK("v2e-captured", res.captured >= 1);
               CHECK("v2e-encoded", res.encoded >= 1);
               if (res.keyframes == 0)
-                std::printf("SELFTEST NOTE: v2e static screen starved the "
-                            "2s warm-up bound (encoded=%llu, no IDR; the "
-                            "pixel proof is v2c's decoded determinism)\n",
-                            (unsigned long long)res.encoded);
+                std::printf("SELFTEST NOTE: v2e produced no key AU "
+                            "(encoded=%llu feeds=%llu; the pixel proof is "
+                            "v2c's decoded determinism)\n",
+                            (unsigned long long)res.encoded,
+                            (unsigned long long)res.keepalive_feeds);
               CHECK("v2e-keys", res.keyframes >= 1 || res.encoded >= 10);
               CHECK("v2e-identity-monotonic",
                     DeliveredIdentitiesValid(sink.CopyIds()));
@@ -9266,7 +9285,7 @@ int SelftestMain(bool desktop_pipeline_v2) {
                           res.width, res.height,
                           (unsigned long long)res.aus_written,
                           (unsigned long long)res.keyframes,
-                          (unsigned long long)res.warmup_feeds);
+                          (unsigned long long)res.keepalive_feeds);
             }
           }
         }
@@ -10383,12 +10402,16 @@ int SelftestMain(bool desktop_pipeline_v2) {
       }
     }
 
-    // ---- 2026-08-28 fix round: idle park flush pins ----
-    // v2s: static content after two frames - the parked tail (modeled by
-    // the LogSession's delay=5 emit depth, the QSV shape) must be flushed
-    // by bounded same-surface re-feeds while the flush is enabled (the
-    // landed default; XNC_QSV_IDLE_FLUSH=0 is the documented A/B gate and
-    // makes the growth assertions fail - the RED check).
+    // ---- 2026-08-30 M4 unification: keepalive pins (arch Fix 4) ----
+    // v2s: static content after two frames - the ONE keepalive (replacing
+    // the warm-up feeds, the bounded park flush and the 0-fps idle) must
+    // (a) keep re-feeding the surface at max(250ms, 2*spf) so the parked
+    // tail (LogSession delay=5, the QSV shape) keeps emitting, (b) never
+    // run away (every feed submits; the submission re-arms the threshold),
+    // and (c) land a refresh IDR every 2 s of continuous keepalive (the
+    // decoder/TWCC/freeze-detector liveness the old 0-fps idle lost).
+    // XNC_QSV_IDLE_FLUSH=0 is the documented A/B gate and makes the
+    // growth assertions fail - the RED check.
     {
       const uint32_t w = 320, h = 240;
       std::vector<ScriptedDeviceCapture::Step> script{
@@ -10412,37 +10435,56 @@ int SelftestMain(bool desktop_pipeline_v2) {
       xnc::MediaPipelineV2 pipe;
       CHECK("v2s-start", pipe.Start(cfg));
       if (pipe.running()) {
-        // First published key AU = warmup done (have_key): the baseline.
+        // First published key AU = the baseline (the stream's base IDR).
         CHECK("v2s-first-au", wait_for([&] { return sink.CopyAus().size() >= 1; }, 8000));
         CHECK("v2s-captured-frames", cap.frames() == 2);
         const size_t s0 = log.submits.load();
         const size_t aus0 = sink.CopyAus().size();
-        // Static from here: the flush must re-feed the surface (parked
-        // tail emits) BOUNDED by the per-episode budget (kFlushFeedBound).
-        CHECK("v2s-flush-fed", wait_for([&] { return log.submits.load() >= s0 + 4; }, 6000));
-        Sleep(1500);  // let any runaway feeding surface
+        const size_t forced0 = log.ForcedSubmits();
+        // Static from here: keepalive re-feeds at the 250 ms floor.
+        const ULONGLONG t0 = GetTickCount64();
+        CHECK("v2s-keepalive-fed",
+              wait_for([&] { return log.submits.load() >= s0 + 4; }, 6000));
+        // (c) 3 s more of continuous keepalive: at least one refresh IDR
+        // (2 s cadence) must ride the keepalive submissions, and no more
+        // than one per kKeepaliveIdrMs (+ slack) - the fake marks every
+        // output AU as a key NAL, so the cadence is pinned on the forced
+        // submissions.
+        Sleep(3000);
+        const ULONGLONG t1 = GetTickCount64();
         const size_t s1 = log.submits.load();
-        CHECK("v2s-flush-bounded", s1 - s0 <= 8);
-        // Every feed flushed one parked output through the sink.
-        CHECK("v2s-flush-emits", sink.CopyAus().size() > aus0);
+        const size_t forced1 = log.ForcedSubmits();
+        CHECK("v2s-keepalive-idr", forced1 > forced0);
+        CHECK("v2s-keepalive-idr-cadence",
+              (forced1 - forced0) <= static_cast<size_t>((t1 - t0) / 1500) + 2);
+        // (b) cadence-bounded: >= 250 ms per feed (+ slack for the 5 ms
+        // poll jitter) - a runaway feed loop fails this.
+        CHECK("v2s-keepalive-cadence",
+              static_cast<size_t>(s1 - s0) <=
+                  static_cast<size_t>((t1 - t0) / 150) + 3);
+        // (a) every feed flushed a parked output through the sink.
+        CHECK("v2s-keepalive-emits", sink.CopyAus().size() > aus0);
         const xnc::MediaPipelineV2::Result res = pipe.Stop();
         CHECK("v2s-ok", res.ok);
         CHECK("v2s-no-resets", res.resets == 0);
-        std::printf("SELFTEST NOTE: v2s idle-flush subs=%zu->%zu aus=%zu->%zu "
-                    "(delay=5 park; flush env=%s)\n",
-                    s0, s1, aus0, sink.CopyAus().size(),
-                    flush_env_state());
+        CHECK("v2s-keepalive-counted", res.keepalive_feeds >= 4);
+        std::printf("SELFTEST NOTE: v2s keepalive subs=%zu->%zu aus=%zu->%zu "
+                    "forced=%zu->%zu feeds=%llu window=%lums (delay=5 park; keepalive env=%s)\n",
+                    s0, s1, aus0, sink.CopyAus().size(), forced0, forced1,
+                    static_cast<unsigned long long>(res.keepalive_feeds),
+                    static_cast<unsigned long>(t1 - t0), flush_env_state());
       } else {
         CHECK("v2s-start-running", false);
       }
     }
 
-    // v2t: rebuild (scripted kAccessLost) landing MID-static-episode - the
-    // flush budget must be replenished by the reset (media_pipeline_v2
-    // RunReset phase 5; without it the post-rebuild parked tail re-freezes
-    // - review IMPORTANT 2). Script: 2 frames, a 1.5 s static episode (the
-    // flush budget exhausts ~0.4 s in - deterministic, time-based gap),
-    // access-lost (reset), one re-init frame, then static forever.
+    // v2t: rebuild (scripted kAccessLost) landing MID-keepalive - the ONE
+    // mechanism has no per-episode budget to replenish, so the post-
+    // rebuild static window keeps feeding (the pre-unification bug shape:
+    // flush_feeds stayed exhausted across the rebuild and the new parked
+    // tail re-froze - review IMPORTANT 2). Script: 2 frames, a 1.5 s
+    // static episode, access-lost (reset), one re-init frame, then static
+    // forever.
     {
       const uint32_t w = 320, h = 240;
       std::vector<ScriptedDeviceCapture::Step> script{
@@ -10471,7 +10513,7 @@ int SelftestMain(bool desktop_pipeline_v2) {
       CHECK("v2t-start", pipe.Start(cfg));
       if (pipe.running()) {
         CHECK("v2t-first-au", wait_for([&] { return sink.CopyAus().size() >= 1; }, 8000));
-        // The scripted 1.5 s static episode exhausts the flush budget,
+        // The scripted 1.5 s static episode keeps the keepalive feeding,
         // THEN the access-lost drives the reset; the final scripted frame
         // re-inits the stream (one submission past the rebuild).
         CHECK("v2t-rebuild-ran",
@@ -10480,20 +10522,26 @@ int SelftestMain(bool desktop_pipeline_v2) {
         CHECK("v2t-post-rebuild-base",
               wait_for([&] { return log.submits.load() > s_pre; }, 8000));
         const size_t s1 = log.submits.load();
-        // Post-rebuild STATIC: the replenished budget must flush the new
-        // parked tail (this is the assertion the pre-fix code fails -
-        // flush_feeds stayed exhausted across the rebuild).
-        CHECK("v2t-post-rebuild-flush",
+        const ULONGLONG t1 = GetTickCount64();
+        // Post-rebuild STATIC: keepalive keeps feeding the new parked tail
+        // (this is the assertion the pre-unification code fails - the
+        // episode budget was spent and never replenished).
+        CHECK("v2t-post-rebuild-keepalive",
               wait_for([&] { return log.submits.load() >= s1 + 4; }, 6000));
-        Sleep(1500);
+        Sleep(1000);
         const size_t s2 = log.submits.load();
-        CHECK("v2t-post-rebuild-bounded", s2 - s1 <= 8);
+        const ULONGLONG t2 = GetTickCount64();
+        CHECK("v2t-keepalive-cadence",
+              static_cast<size_t>(s2 - s1) <=
+                  static_cast<size_t>((t2 - t1) / 150) + 3);
         const xnc::MediaPipelineV2::Result res = pipe.Stop();
         CHECK("v2t-ok", res.ok);
         CHECK("v2t-resets", res.resets >= 1);
-        std::printf("SELFTEST NOTE: v2t flush-reset subs=%zu(pre)%zu(rebuild)"
-                    "%zu(post) rebuilds=%u resets=%u flush_env=%s\n",
-                    s_pre, s1, s2, cap.rebuilds(), res.resets, flush_env_state());
+        std::printf("SELFTEST NOTE: v2t keepalive-reset subs=%zu(pre)%zu(rebuild)"
+                    "%zu(post) rebuilds=%u resets=%u feeds=%llu keepalive env=%s\n",
+                    s_pre, s1, s2, cap.rebuilds(), res.resets,
+                    static_cast<unsigned long long>(res.keepalive_feeds),
+                    flush_env_state());
       } else {
         CHECK("v2t-start-running", false);
       }

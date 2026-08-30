@@ -381,6 +381,13 @@ class MediaPipelineV2 {
     // keep the deterministic selftest scenarios fast). Hard backoff is
     // 2x this. 0 = no backoff.
     uint32_t reset_backoff_base_ms = 500;
+    // 2026-08-30 M4 unification (arch Fix 4): the keepalive's liveness
+    // probe - returns the CURRENT subscriber count (thread-safe). Null =
+    // always alive (the file sink and the selftest fakes); RtServer::
+    // ServeV2 wires RtServer::SubscriberCount so a zero-subscriber stream
+    // neither feeds nor burns refresh IDRs.
+    size_t (*subscribers_fn)(void*) = nullptr;
+    void* subscribers_ctx = nullptr;
   };
 
   struct Result {
@@ -390,7 +397,10 @@ class MediaPipelineV2 {
     uint64_t captured = 0;          // kFrame acquisitions
     uint64_t encoded = 0;           // accepted encoder submissions
     uint64_t timeouts = 0;          // static-screen (kNoChange) observes
-    uint64_t warmup_feeds = 0;      // idle re-feeds (spec 7.4/7.5)
+    // 2026-08-30 M4 unification (arch Fix 4): the ONE idle mechanism's
+    // re-feed counter (replaces the warm-up feeds, the static-idle park
+    // flush and the 0-fps idle; see media_pipeline_v2.cpp KeepaliveFeed).
+    uint64_t keepalive_feeds = 0;   // keepalive re-feeds of the LatestSurface
     uint64_t keyframes = 0;         // IDR AUs published
     uint64_t aus_written = 0;       // shaped AUs pushed to the sink
     uint64_t bytes_written = 0;

@@ -364,6 +364,12 @@ int RtServer::ServeV2(ICapture& cap, ICaptureSurface& surf, const Opts& o,
     return kind == MediaBackend::kGdi ? TryCreateGdiCapture(err)
                                       : TryCreateDxgiCapture(err);
   };
+  // Fix 4: the keepalive's liveness probe - a zero-subscriber stream
+  // neither re-feeds nor burns refresh IDRs.
+  cfg.subscribers_fn = [](void* ctx) -> size_t {
+    return static_cast<RtServer*>(ctx)->SubscriberCount();
+  };
+  cfg.subscribers_ctx = this;
   MediaPipelineV2 pipe;
   MediaPipelineV2::Result res;
   if (pipe.Start(cfg)) {
@@ -384,12 +390,12 @@ int RtServer::ServeV2(ICapture& cap, ICaptureSurface& surf, const Opts& o,
   g_active_rt.store(nullptr);
   Shutdown();
   v2_pipe_.store(nullptr);  // readers are joined; the pipe is going away
-  XNC_LOG_INFO("console_rt_v2_stop captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu resets=%u aus=%llu reorder_gap_skips=%llu reorder_late_drops=%llu ok=%d backend=%s",
+  XNC_LOG_INFO("console_rt_v2_stop captured=%llu encoded=%llu keyframes=%llu timeouts=%llu keepalive_feeds=%llu resets=%u aus=%llu reorder_gap_skips=%llu reorder_late_drops=%llu ok=%d backend=%s",
                static_cast<unsigned long long>(res.captured),
                static_cast<unsigned long long>(res.encoded),
                static_cast<unsigned long long>(res.keyframes),
                static_cast<unsigned long long>(res.timeouts),
-               static_cast<unsigned long long>(res.warmup_feeds), res.resets,
+               static_cast<unsigned long long>(res.keepalive_feeds), res.resets,
                static_cast<unsigned long long>(res.aus_written),
                static_cast<unsigned long long>(res.reorder_gap_skips),
                static_cast<unsigned long long>(res.reorder_late_drops),

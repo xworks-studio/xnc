@@ -84,17 +84,17 @@ constexpr DWORD kIdleSleepMs = 15;
 // publication waits for the next 15ms gate slice (or loop top), landing
 // up to one slice late, then the next lands early.
 constexpr DWORD kOwedPollMs = 5;
-// Warm-up wall bound (spec 7.4; mirrors pipeline.cpp).
-constexpr uint64_t kWarmupWallBoundMs = 2000ull;
-// 2026-08-28 QSV static-idle park: the idle flush's trigger and budget.
-// kFlushAfterSpf: input starvation threshold in spf units before a flush
-// feed fires (2 = one missed submission slot; the healthy paced path never
-// qualifies because last_submit_ms advances every slot).
-// kFlushFeedBound: feeds per content episode - the QSV emit depth is ~5,
-// so 8 covers the tail with margin; a new captured frame resets the
-// episode (AcquireOnce kFrame branch).
-constexpr uint64_t kFlushAfterSpf = 2;
-constexpr uint32_t kFlushFeedBound = 8;
+// 2026-08-30 M4 unification (arch Fix 4): ONE keepalive replaces the three
+// overlapping idle paths (the spec-7.4 warm-up feeds bounded 34/2s, the
+// 2026-08-28 static-idle park flush bounded 8/episode, and the do-nothing
+// 0-fps idle). kKeepaliveAfterMs is the starvation floor - no submission
+// for max(250ms, 2*spf) re-feeds the LatestSurface (2 slots = the
+// healthy paced path never qualifies; last_submit_ms advances every
+// slot). kKeepaliveIdrMs is the periodic refresh-IDR cadence during
+// CONTINUOUS keepalive: a static desktop otherwise never re-keys, the
+// decoder cools, transport-cc stalls and the freeze detector fires.
+constexpr uint64_t kKeepaliveAfterMs = 250;
+constexpr uint64_t kKeepaliveIdrMs = 2000;
 // ON by default (the 2026-08-28 labs-xiaoxin measurement: with the flush,
 // the hardware rung's semi-static dwell collapsed from a uniform ~586 ms
 // to ~114 ms p50 / ~119 ms p95 at native 2880x1800 with zero unrecovered
@@ -429,28 +429,23 @@ struct MediaPipelineV2::Impl {
   std::vector<uint8_t> sps_pps;  // harvested from the session's key AUs
   bool sps_pps_missing_logged = false;
   bool have_key = false;
-  bool idr_in_flight = false;   // armed subscriber IDR until the key AU
-  uint64_t od_armed_ms = 0;     // on-demand window anchor
-  uint32_t od_feeds = 0;
+  bool idr_in_flight = false;   // armed IDR (subscriber/keepalive) until the key AU
+  uint32_t idr_feeds = 0;       // keepalive feeds under the in-flight IDR
   uint64_t last_initiated_idr_ms = 0;
-  uint64_t warmup_started_ms = 0;
-  uint32_t warmup_gen_feeds = 0;
-  bool warmup_phase_logged = false;
   uint64_t last_submit_ms = 0;
   uint64_t submit_t0 = 0, submit_count = 0;
   uint32_t spf_ms = 33;
-  uint32_t warmup_feed_bound = 34;
-  // 2026-08-28 QSV static-idle park (Defect 2): the hardware rung's
-  // structural ~5-input emit depth parks the LAST submissions of a content
-  // burst inside the MFT until further inputs arrive - on a static desktop
-  // that is tens of seconds (the RERUN-2 P0 burst/stall: 4 unrecovered
-  // freezes, capture->AU p95 ~59 s at native 2880x1800 while the SAME
-  // binary at the SAME resolution paces at 65-110 ms under moving
-  // content). The idle flush re-feeds the current surface (the spec
-  // 7.4/7.5 feed mechanism, extended past warmup/IDR) when outputs are
-  // owed and input has starved, bounded per content episode.
-  uint32_t flush_feeds = 0;    // feeds spent on the current episode
-  uint64_t flush_episodes = 0; // episodes started (diagnostics)
+  // The IDR-emergence bound: keepalive feeds under one armed IDR beyond
+  // this depth mean the rung is not going to surface it - clear the
+  // in-flight marker so future subscriber requests are not starved
+  // (WarmupFeedBound convention: ~2x the software rung's lookahead).
+  uint32_t idr_feed_bound = 34;
+  // 2026-08-30 M4 unification (arch Fix 4): keepalive state - the ONE idle
+  // mechanism (see kKeepaliveAfterMs). keepalive_since_ms anchors the
+  // current continuous-keepalive stretch (reset by real content); the IDR
+  // refresh rides kKeepaliveIdrMs of it.
+  uint64_t keepalive_since_ms = 0;
+  uint64_t keepalive_idr_ms = 0;
   // M3 Task 3 (SET_VIDEO_CONFIG): live max_w (mirrors cfg.max_width at
   // Start; SetMaxWidth stores from any thread, InitStream loads on the media
   // loop - the atomic is the whole synchronization).
@@ -526,7 +521,7 @@ class Loop {
             ? static_cast<uint64_t>(im_.cfg.duration_s) * 1000ull
             : 0ull;
     im_.spf_ms = 1000u / (im_.cfg.fps ? im_.cfg.fps : 30u);
-    im_.warmup_feed_bound = WarmupFeedBound(im_.cfg.fps);
+    im_.idr_feed_bound = WarmupFeedBound(im_.cfg.fps);
     XNC_LOG_INFO("media_v2_start fps=%u bitrate=%u max_w=%u duration_s=%u",
                  im_.cfg.fps, im_.cfg.bitrate_bps, im_.cfg.max_width,
                  im_.cfg.duration_s);
@@ -582,13 +577,13 @@ class Loop {
     EmitStages(true);  // Task 6: final summary (log line + sidecar block)
     im_.sink().OnState("stream_end", im_.res.ok);
     const MediaPipelineV2::Result& r = im_.res;
-    XNC_LOG_INFO("media_v2_stop elapsed=%llums captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu resets=%u rebuilds=%u w=%u h=%u aus=%llu bytes=%llu reorder_gap_skips=%llu reorder_late_drops=%llu backend=%s cpu_readbacks=%llu ok=%d",
+    XNC_LOG_INFO("media_v2_stop elapsed=%llums captured=%llu encoded=%llu keyframes=%llu timeouts=%llu keepalive_feeds=%llu resets=%u rebuilds=%u w=%u h=%u aus=%llu bytes=%llu reorder_gap_skips=%llu reorder_late_drops=%llu backend=%s cpu_readbacks=%llu ok=%d",
                  static_cast<unsigned long long>(NowMs() - im_.t0),
                  static_cast<unsigned long long>(r.captured),
                  static_cast<unsigned long long>(r.encoded),
                  static_cast<unsigned long long>(r.keyframes),
                  static_cast<unsigned long long>(r.timeouts),
-                 static_cast<unsigned long long>(r.warmup_feeds), r.resets,
+                 static_cast<unsigned long long>(r.keepalive_feeds), r.resets,
                  r.rebuilds, r.width, r.height,
                  static_cast<unsigned long long>(r.aus_written),
                  static_cast<unsigned long long>(r.bytes_written),
@@ -793,6 +788,7 @@ class Loop {
         XNC_LOG_INFO("idr_delivered seq=%llu",
                      static_cast<unsigned long long>(out.id.encode_seq));
         im_.idr_in_flight = false;
+        im_.idr_feeds = 0;
       }
     }
     return true;
@@ -817,8 +813,7 @@ class Loop {
     im_.last_initiated_idr_ms = NowMs();
     im_.mbox.ArmIdr(pending);
     im_.idr_in_flight = true;
-    im_.od_armed_ms = NowMs();
-    im_.od_feeds = 0;
+    im_.idr_feeds = 0;
     im_.sink().ConsumePendingIdr(pending);
     XNC_LOG_INFO("idr_request reason=%s min_interval_ms=%llu", pending,
                  static_cast<unsigned long long>(kIdrMinIntervalMs));
@@ -837,7 +832,7 @@ class Loop {
     if (fps != 0) {
       im_.cfg.fps = fps;
       im_.spf_ms = 1000u / fps;
-      im_.warmup_feed_bound = WarmupFeedBound(fps);
+      im_.idr_feed_bound = WarmupFeedBound(fps);
       // Hot-fps fix (M4 congestion repro, 2026-08-28): TrySubmit's FPS gate
       // paces on the ABSOLUTE deadline submit_t0 + (submit_count+1)*spf_ms.
       // A hot spf change (30fps -> 5fps) re-scales the whole accumulated
@@ -910,13 +905,12 @@ class Loop {
           }
         }
         im_.mbox.PublishContent(spec);  // depth-one cell (coalescing)
-        im_.flush_feeds = 0;  // new content: a fresh park-flush episode
-        if (im_.warmup_started_ms == 0) im_.warmup_started_ms = NowMs();
+        im_.keepalive_since_ms = 0;  // real content: keepalive stretch ends
         return true;
       }
       case CaptureStatus::kNoChange:
         im_.res.timeouts++;
-        IdleFeed();
+        KeepaliveFeed();
         return true;
       case CaptureStatus::kRetry:
         return true;  // backend healed in place; call again
@@ -957,101 +951,74 @@ class Loop {
     return im_.res.encoded > im_.res.aus_written;
   }
 
-  // Idle re-feed (spec 7.4/7.5; the M0 timeout-path semantics): on a
-  // static screen, re-publish the surface's current identity so the
-  // encoder's lookahead fills and the (possibly forced) IDR emerges.
-  // Bounded by WarmupFeedBound and the 2 s wall clock; paced to spf.
-  // 2026-08-28: extended with the static-idle PARK flush - the encoder
-  // rungs park the tail of a content burst inside their emit depth (QSV
-  // ~5 inputs, the software MFT ~17) and only emit when MORE inputs
-  // arrive; without a flush a static desktop freezes the stream for the
-  // whole gap (the RERUN-2 P0). XNC_QSV_IDLE_FLUSH=1 arms it (A/B gate).
-  void IdleFeed() {
-    if (im_.last_submit_ms != 0 &&
-        NowMs() - im_.last_submit_ms < im_.spf_ms)
-      return;
-    const uint64_t elapsed = im_.warmup_started_ms != 0
-                                 ? NowMs() - im_.warmup_started_ms
-                                 : 0;
-    const bool warmup_ok = !im_.have_key &&
-                           im_.warmup_gen_feeds < im_.warmup_feed_bound &&
-                           elapsed < kWarmupWallBoundMs;
-    const bool ondemand_ok =
-        im_.have_key && im_.idr_in_flight &&
-        im_.od_feeds < im_.warmup_feed_bound &&
-        (im_.od_armed_ms == 0 ||
-         NowMs() - im_.od_armed_ms < kWarmupWallBoundMs);
-    if (warmup_ok || ondemand_ok) {
-      FrameIdentity sid;
-      ID3D11Texture2D* tex = nullptr;
-      if (im_.latest.Snapshot(&sid, &tex)) {
-        if (tex != nullptr) tex->Release();
-        im_.mbox.PublishContent(sid);  // same content, new seq at submit
-        if (!im_.have_key) {
-          ++im_.warmup_gen_feeds;
-          ++im_.res.warmup_feeds;
-        } else {
-          ++im_.od_feeds;
-          ++im_.res.warmup_feeds;
-        }
-        return;
-      }
+  // 2026-08-30 M4 unification (arch Fix 4): the ONE keepalive. While the
+  // stream has subscribers and no submission has happened for
+  // max(kKeepaliveAfterMs, 2*spf), re-feed the LatestSurface:
+  //   - the hardware rung's emit depth parks the tail of a content burst
+  //     inside the MFT until further inputs arrive (QSV ~5 inputs, the
+  //     software MFT ~17; the RERUN-2 P0 froze a static desktop for the
+  //     whole gap) - the feed flushes the parked tail;
+  //   - the decoder stays warm, transport-cc keeps measuring and the
+  //     freeze detector stays quiet (the old 0-fps idle stalled all
+  //     three for the length of every static gap);
+  //   - a fresh stream's first IDR surfaces through the lookahead depth
+  //     (the warm-up path's job, now unbounded by construction).
+  // Every kKeepaliveIdrMs of CONTINUOUS keepalive arms one refresh IDR
+  // (force_idr on the next submission): a static desktop otherwise never
+  // re-keys. The fed frame is a RE-ENCODE, not a replay - TrySubmit stamps
+  // present_mono_us = NowMonoUs() at submission (source_mono_us keeps the
+  // content's capture stamp). Runaway-bounded by construction: every feed
+  // submits, the submission advances last_submit_ms, and the next feed
+  // waits out the threshold again (<= ~4 feeds/s at the 250ms floor).
+  void KeepaliveFeed() {
+    if (!IdleFlushEnabled()) return;  // XNC_QSV_IDLE_FLUSH=0: the A/B gate
+    if (im_.last_submit_ms == 0) return;  // no base frame yet
+    if (im_.cfg.subscribers_fn != nullptr &&
+        im_.cfg.subscribers_fn(im_.cfg.subscribers_ctx) == 0)
+      return;  // nobody watching: no feed, no refresh IDR (selftest fakes
+               // and the file sink leave it null = always alive)
+    const uint64_t since_submit = NowMs() - im_.last_submit_ms;
+    const uint64_t after_ms = 2ull * im_.spf_ms > kKeepaliveAfterMs
+                                  ? 2ull * im_.spf_ms
+                                  : kKeepaliveAfterMs;
+    if (since_submit < after_ms) return;
+    FrameIdentity sid;
+    ID3D11Texture2D* tex = nullptr;
+    if (!im_.latest.Snapshot(&sid, &tex)) return;
+    if (tex != nullptr) tex->Release();
+    if (im_.keepalive_since_ms == 0) {
+      im_.keepalive_since_ms = NowMs();
+      im_.keepalive_idr_ms = NowMs();
+      XNC_LOG_INFO("keepalive_begin starved_ms=%llu owed=%llu",
+                   static_cast<unsigned long long>(since_submit),
+                   static_cast<unsigned long long>(im_.res.encoded -
+                                                   im_.res.aus_written));
     }
-    // Static-idle park flush: outputs are owed (submissions the rung has
-    // not emitted yet) and input has starved for > kFlushAfterSpf slots ->
-    // re-feed the SAME surface so the parked tail emits within ~depth*spf
-    // instead of at the next desktop change. Bounded per content episode
-    // (reset when a real frame arrives); no-op on a healthy paced feed
-    // (last_submit_ms advances every slot, so the starvation predicate
-    // never qualifies) and on the software rung (outputs surface at
-    // submit, owed stays ~0).
-    if (IdleFlushEnabled() && im_.have_key && !im_.idr_in_flight &&
-        im_.last_submit_ms != 0 &&
-        NowMs() - im_.last_submit_ms > kFlushAfterSpf * im_.spf_ms &&
-        im_.flush_feeds < kFlushFeedBound &&
-        im_.res.encoded > im_.res.aus_written) {
-      FrameIdentity sid;
-      ID3D11Texture2D* tex = nullptr;
-      if (im_.latest.Snapshot(&sid, &tex)) {
-        if (tex != nullptr) tex->Release();
-        if (im_.flush_feeds == 0) {
-          ++im_.flush_episodes;
-          XNC_LOG_INFO("idle_flush_begin owed=%llu starved_ms=%llu",
-                       static_cast<unsigned long long>(im_.res.encoded -
-                                                       im_.res.aus_written),
-                       static_cast<unsigned long long>(NowMs() -
-                                                       im_.last_submit_ms));
-        }
-        ++im_.flush_feeds;
-        im_.mbox.PublishContent(sid);  // same content, new seq at submit
-        return;
-      }
+    // Periodic refresh IDR: one per kKeepaliveIdrMs of continuous
+    // keepalive (never displaces an armed IDR; PollIdrRequest's subscriber
+    // arms keep their kIdrMinIntervalMs accounting).
+    if (NowMs() - im_.keepalive_since_ms >= kKeepaliveIdrMs &&
+        NowMs() - im_.keepalive_idr_ms >= kKeepaliveIdrMs &&
+        !im_.mbox.idr_armed() && !im_.idr_in_flight) {
+      im_.keepalive_idr_ms = NowMs();
+      im_.idr_in_flight = true;
+      im_.idr_feeds = 0;
+      im_.mbox.ArmIdr("keepalive");
+      XNC_LOG_INFO("keepalive_idr armed min_interval_ms=%llu (decoder warm, twcc alive)",
+                   static_cast<unsigned long long>(kKeepaliveIdrMs));
     }
-    PhaseOutcomeLogs();
-  }
-
-  void PhaseOutcomeLogs() {
-    const bool have_base = im_.next_content_id != 0;
-    if (!im_.warmup_phase_logged && have_base) {
-      if (im_.have_key) {
-        im_.warmup_phase_logged = true;
-        XNC_LOG_INFO("warmup_done feeds=%u keyframes=%llu",
-                     im_.warmup_gen_feeds,
-                     static_cast<unsigned long long>(im_.res.keyframes));
-      } else if (im_.warmup_gen_feeds >= im_.warmup_feed_bound ||
-                 (im_.warmup_started_ms != 0 &&
-                  NowMs() - im_.warmup_started_ms >= kWarmupWallBoundMs)) {
-        im_.warmup_phase_logged = true;
-        XNC_LOG_INFO("warmup_exhausted feeds=%u bound=%u",
-                     im_.warmup_gen_feeds, im_.warmup_feed_bound);
-      }
+    if (im_.idr_in_flight) ++im_.idr_feeds;
+    // Emergence bound: an armed IDR the rung will not surface after a
+    // full lookahead depth of feeds - clear the marker so subscriber
+    // requests are not starved by the in-flight gate.
+    if (im_.idr_in_flight && im_.idr_feeds >= im_.idr_feed_bound) {
+      XNC_LOG_INFO("keepalive_idr_exhausted feeds=%u bound=%u", im_.idr_feeds,
+                   im_.idr_feed_bound);
+      im_.idr_in_flight = false;
+      im_.idr_feeds = 0;
     }
-    if (im_.idr_in_flight && have_base &&
-        im_.od_feeds >= im_.warmup_feed_bound) {
-      XNC_LOG_INFO("idr_feed_exhausted feeds=%u bound=%u", im_.od_feeds,
-                   im_.warmup_feed_bound);
-      im_.idr_in_flight = false;  // surfaces with the next real frame batch
-    }
+    ++im_.res.keepalive_feeds;
+    im_.mbox.PublishContent(sid);  // same content, new seq at submit
   }
 
   // ---- submission ----
@@ -1591,18 +1558,10 @@ class Loop {
     Phase(ResetPhase::kBase);
     im_.capture_epoch++;
     im_.codec_epoch++;
-    im_.warmup_started_ms = 0;
-    im_.warmup_gen_feeds = 0;
-    im_.warmup_phase_logged = false;
-    // The rebuild is a content-episode boundary for the idle park flush
-    // too (review IMPORTANT 2, 2026-08-28). Defense-in-depth rather than
-    // load-bearing today: phase 3 below tears the SESSION down, so a
-    // post-rebuild flush always requires the new base kFrame - which
-    // already replenishes via AcquireOnce's kFrame branch (measured: the
-    // v2t selftest pin passes with this line removed). Kept so the budget
-    // is correct by construction at every episode boundary, independent
-    // of the re-init path's shape.
-    im_.flush_feeds = 0;
+    // The rebuild is a keepalive-stretch boundary too: the post-rebuild
+    // base kFrame re-anchors it (AcquireOnce's kFrame branch), so a
+    // refresh IDR cannot ride a pre-rebuild anchor.
+    im_.keepalive_since_ms = 0;
 
     // Phase 6 - config: a pending reconfigure request SURVIVES the reset
     // (the loop consumes it only with a live session) and applies to the
@@ -1700,23 +1659,23 @@ class Loop {
                               ? im_.cfg.desktop_name_fn(im_.cfg.desktop_name_ctx)
                               : nullptr;
     if (desktop != nullptr && *desktop != '\0') {
-      XNC_LOG_INFO("diag_media_v2 elapsed=%us captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu resets=%u w=%u h=%u aus=%llu bytes=%llu desktop=%s",
+      XNC_LOG_INFO("diag_media_v2 elapsed=%us captured=%llu encoded=%llu keyframes=%llu timeouts=%llu keepalive_feeds=%llu resets=%u w=%u h=%u aus=%llu bytes=%llu desktop=%s",
                    elapsed_s, static_cast<unsigned long long>(im_.res.captured),
                    static_cast<unsigned long long>(im_.res.encoded),
                    static_cast<unsigned long long>(im_.res.keyframes),
                    static_cast<unsigned long long>(im_.res.timeouts),
-                   static_cast<unsigned long long>(im_.res.warmup_feeds),
+                   static_cast<unsigned long long>(im_.res.keepalive_feeds),
                    im_.res.resets, im_.res.width, im_.res.height,
                    static_cast<unsigned long long>(im_.res.aus_written),
                    static_cast<unsigned long long>(im_.res.bytes_written),
                    desktop);
     } else {
-      XNC_LOG_INFO("diag_media_v2 elapsed=%us captured=%llu encoded=%llu keyframes=%llu timeouts=%llu warmup_feeds=%llu resets=%u w=%u h=%u aus=%llu bytes=%llu",
+      XNC_LOG_INFO("diag_media_v2 elapsed=%us captured=%llu encoded=%llu keyframes=%llu timeouts=%llu keepalive_feeds=%llu resets=%u w=%u h=%u aus=%llu bytes=%llu",
                    elapsed_s, static_cast<unsigned long long>(im_.res.captured),
                    static_cast<unsigned long long>(im_.res.encoded),
                    static_cast<unsigned long long>(im_.res.keyframes),
                    static_cast<unsigned long long>(im_.res.timeouts),
-                   static_cast<unsigned long long>(im_.res.warmup_feeds),
+                   static_cast<unsigned long long>(im_.res.keepalive_feeds),
                    im_.res.resets, im_.res.width, im_.res.height,
                    static_cast<unsigned long long>(im_.res.aus_written),
                    static_cast<unsigned long long>(im_.res.bytes_written));
