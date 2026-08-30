@@ -677,11 +677,15 @@ bool ConfigureUnit(Unit& u, IMFDXGIDeviceManager* mgr, uint32_t w, uint32_t h,
     return false;
   }
 
-  // Rate control BEFORE types (the mf_encoder.cpp lesson). LowDelayVBR
-  // first, CBR fallback - measured: software only accepts CBR; QSV/Arc
-  // rejects LowDelayVBR with 0x80070057 and takes CBR. XNC_QSV_RC=cbr
-  // (hypothesis c, 2026-08-28) makes CBR explicit AND pairs it with
-  // AVEncCommonMeanBitRate below.
+  // Rate control BEFORE types (the mf_encoder.cpp lesson).
+  // (2026-08-30 网页实测修正)VBR 家族超产:LowDelayVBR 在静态桌面上
+  // 实测产出 ~2.5x 配置码率(500k 配置 → ~1.3Mbps 实际)——pacing 预算
+  // 按配置计算,准入门持续拒帧,QoS 棱梯在相邻档间振荡(fps=5↔10,生产
+  // 时间线每 ~12s 一循环)。默认改为峰值受限 VBR(peak == mean):静态
+  // 内容不 padding(CBR 会用垃圾填满信道),动态内容不超过配置预算。
+  // 回退顺序:PeakConstrainedVBR → CBR(配 MeanBitRate)→ LowDelayVBR
+  //(旧路径,software MFT 实测只收 CBR,Arc 拒 LowDelayVBR)。
+  // XNC_QSV_RC=cbr(hypothesis c, 2026-08-28)保持显式 CBR + MeanBitRate。
   u.codec_api.Reset();
   u.mft->QueryInterface(IID_PPV_ARGS(u.codec_api.GetAddressOf()));
   if (u.codec_api.Get() != nullptr) {
@@ -691,12 +695,28 @@ bool ConfigureUnit(Unit& u, IMFDXGIDeviceManager* mgr, uint32_t w, uint32_t h,
                      "rate_control_cbr_explicit");
       CodecApiSetUi4(u.codec_api.Get(), &CODECAPI_AVEncCommonMeanBitRate,
                      bitrate, "mean_bitrate");
-    } else if (!CodecApiSetUi4(u.codec_api.Get(),
-                               &CODECAPI_AVEncCommonRateControlMode,
-                               eAVEncCommonRateControlMode_LowDelayVBR,
-                               "rate_control_low_delay")) {
+    } else if (CodecApiSetUi4(
+                   u.codec_api.Get(), &CODECAPI_AVEncCommonRateControlMode,
+                   eAVEncCommonRateControlMode_PeakConstrainedVBR,
+                   "rate_control_peak_vbr")) {
+      // 峰值 = 均值 = 配置码率:预算即上限。
+      CodecApiSetUi4(u.codec_api.Get(), &CODECAPI_AVEncCommonMaxBitRate,
+                     bitrate, "max_bitrate_peak");
+      CodecApiSetUi4(u.codec_api.Get(), &CODECAPI_AVEncCommonMeanBitRate,
+                     bitrate, "mean_bitrate_peak");
+    } else if (CodecApiSetUi4(u.codec_api.Get(),
+                              &CODECAPI_AVEncCommonRateControlMode,
+                              eAVEncCommonRateControlMode_CBR,
+                              "rate_control_cbr")) {
+      // 回退 CBR 也必须配 MeanBitRate(修前不配 —— 编码器可能落在自身
+      // 默认码率上,与 2026-08-30 的超产测量一致)。
+      CodecApiSetUi4(u.codec_api.Get(), &CODECAPI_AVEncCommonMeanBitRate,
+                     bitrate, "mean_bitrate_cbr");
+    } else {
+      // 最后回退(旧默认顺序):LowDelayVBR,无峰值约束。
       CodecApiSetUi4(u.codec_api.Get(), &CODECAPI_AVEncCommonRateControlMode,
-                     eAVEncCommonRateControlMode_CBR, "rate_control_cbr");
+                     eAVEncCommonRateControlMode_LowDelayVBR,
+                     "rate_control_low_delay");
     }
   }
 
@@ -1552,6 +1572,12 @@ bool MfGpuEncoder::Reconfigure(uint32_t bitrate, uint32_t fps) {
     XNC_LOG_INFO("gpu_reconfigure_rate_rejected hr=0x%08x",
                  static_cast<unsigned int>(hr));
     return false;
+  }
+  // PeakConstrainedVBR 下峰值约束必须跟随均值(否则热更后峰值仍停在
+  // 初始码率);个别实现拒绝运行时改峰值 —— 只记录,不失败。
+  if (FAILED(impl_->unit.codec_api->SetValue(&CODECAPI_AVEncCommonMaxBitRate,
+                                             &v))) {
+    XNC_LOG_INFO("gpu_reconfigure_peak_kept (max_bitrate not hot-updatable)");
   }
   impl_->bitrate = bitrate;
   return true;
