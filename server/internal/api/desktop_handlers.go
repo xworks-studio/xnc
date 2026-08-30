@@ -132,7 +132,7 @@ func (h *handlers) desktopStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.startSession(w, r, proto.KindDesktop, params, "desktop.open", "desktop.close",
-		map[string]any{"turn": turn, "mediaProtocol": media},
+		map[string]any{"turn": turn, "mediaProtocol": media, "iceTransportPolicy": icePolicy},
 		map[string]string{"mediaProtocol": media},
 		func(res *session.CreateResult) map[string]any {
 			// ① M2-Slice3 Task 4：lease 判定随 202 下发（授予时 leaseId 与

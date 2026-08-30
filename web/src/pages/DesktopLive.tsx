@@ -56,6 +56,7 @@ interface DesktopStartResponse {
   sessionId: string;
   websocketUrl: string;
   turn?: { urls: string[]; username: string; credential: string };
+  iceTransportPolicy?: string;
 }
 
 type LiveState =
@@ -845,7 +846,10 @@ export default function DesktopLive() {
                   ) ?? f.displays[0];
                 setDisplaySel(active.index);
               }
-              // relay-only PC per the dev topology (non-TLS coturn = M2)
+              // ICE policy: server-controlled (缺省 relay = 安全约束; server
+              // config "all" 时下发 all,LAN 直连避免公网 TURN 丢包)。
+              const icePolicy =
+                res.iceTransportPolicy === "all" ? "all" : "relay";
               pc = new RTCPeerConnection({
                 iceServers: [
                   {
@@ -854,7 +858,7 @@ export default function DesktopLive() {
                     credential: res.turn!.credential,
                   },
                 ],
-                iceTransportPolicy: "relay",
+                iceTransportPolicy: icePolicy as RTCIceTransportPolicy,
               });
               pc.onconnectionstatechange = () => setIceState(pc?.connectionState ?? "new");
               // Agent pre-creates input/mouse/cursor; in-band negotiation
