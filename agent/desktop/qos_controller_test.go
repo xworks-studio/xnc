@@ -74,7 +74,9 @@ func TestQoSInitialEmitOnFirstControllerFeedback(t *testing.T) {
 	}
 }
 
-// queueAge>100ms → 立即 30% 降码率(不要求稳定窗口、不触发 1/s 限速)。
+// queueAge>100ms → 立即 30% 降码率(不要求稳定窗口)。Fix 3:立即通道
+// 与常规降档共用 1/s 限速 —— 「立即」= 窗口内的第一次剪码不等稳定窗,
+// 不是无限速(修前 1/s 反馈节奏下每秒 30% 连剪 = 无界棘轮)。
 func TestQoSImmediateDownshiftOnQueueAge(t *testing.T) {
 	c, clk := newQoSTestController()
 	c.Observe(fb("s1", true, 8_000_000, 5)) // controller 就位(初始下发)
@@ -83,11 +85,21 @@ func TestQoSImmediateDownshiftOnQueueAge(t *testing.T) {
 	if !ok || cfg.Bitrate != 2_300_000*7/10 {
 		t.Fatalf("queueAge=150ms should cut bitrate to 70%%: got %+v ok=%v", cfg, ok)
 	}
-	// 立即通道绕过 1/s 限速:100ms 后再次拥塞 → 再降 30%。
+	// 100ms 后再次拥塞:同一 1/s 窗内 → 抑制(且非 grace 挂起:HeldCuts
+	// 不动,挡住它的是限速本身)。
 	clk.advance(100 * time.Millisecond)
+	held0 := c.HeldCuts()
+	if acts := c.Observe(fb("s1", true, 8_000_000, 200)); len(acts) != 0 {
+		t.Fatalf("immediate cut must respect the 1/s limiter, got %+v", acts)
+	}
+	if c.HeldCuts() != held0 {
+		t.Fatalf("suppression must be the rate limit, not the reset grace (held %d -> %d)", held0, c.HeldCuts())
+	}
+	// 窗口过后 → 再降 30%。
+	clk.advance(1000 * time.Millisecond)
 	cfg, ok = configOf(t, c.Observe(fb("s1", true, 8_000_000, 200)))
 	if !ok || cfg.Bitrate != 2_300_000*7/10*7/10 {
-		t.Fatalf("immediate cut bypasses the 1/s limiter: got %+v ok=%v", cfg, ok)
+		t.Fatalf("post-window congestion should cut again: got %+v ok=%v", cfg, ok)
 	}
 }
 
@@ -356,12 +368,12 @@ func TestQoSMaxWAspectMapping(t *testing.T) {
 		Now: clk.Now,
 	})
 	c.Observe(fb("s1", true, 8_000_000, 5))
-	// 码率 5 步 + fps 4 步打到底。
+	// 码率 5 步 + fps 4 步打到底(1/s 限速节奏)。
 	for i := 0; i < 9; i++ {
-		clk.advance(100 * time.Millisecond)
+		clk.advance(1100 * time.Millisecond)
 		c.Observe(fb("s1", true, 1_000, 500))
 	}
-	clk.advance(100 * time.Millisecond)
+	clk.advance(1100 * time.Millisecond)
 	cfg, ok := configOf(t, c.Observe(fb("s1", true, 1_000, 500)))
 	if !ok || cfg.MaxW != 1920 {
 		t.Fatalf("aspect mapping: first height step 1080 -> maxW 1920, got %+v", cfg)
@@ -595,9 +607,10 @@ func TestQoSSharplyDegradingEstStillDownshiftsPromptly(t *testing.T) {
 func TestQoSUpshiftRampStepCap(t *testing.T) {
 	c, clk := newQoSTestController()
 	c.Observe(fb("s1", true, 8_000_000, 5))
-	// 拥塞立即通道 ×0.7 连降 5 拍到 500k 下限(fps/height 未动)。
+	// 拥塞立即通道 ×0.7 连降 5 拍到 500k 下限(fps/height 未动;Fix 3
+	// 起按 1/s 限速节奏推进)。
 	for i := 0; i < 5; i++ {
-		clk.advance(100 * time.Millisecond)
+		clk.advance(1100 * time.Millisecond)
 		c.Observe(fb("s1", true, 1_000, 500))
 	}
 	if got := c.Current().Bitrate; got != 500_000 {
@@ -756,23 +769,29 @@ func TestQoSMaxFPSUpshiftSpendsHeadroomOnBitrateNotFps(t *testing.T) {
 	}
 	// bitrate 到顶后的下一步:fps 无档(30 已是阶梯顶)→ height 恢复
 	// 1920x1080 流上 height 阶梯本就无更高档 → 无动作(全顶)。降档
-	// 反向验证:拥塞到底后 fps 沿钳后阶梯 30→20(不是 60→30)。
-	for i := 0; i < 12; i++ {
-		c.Observe(fb("s1", true, 100_000_000, 300))
-	}
-	clk.advance(1100 * time.Millisecond)
-	for i := 0; i < 6; i++ { // 码率到底后 fps 连降
+	// 反向验证:拥塞到底后 fps 沿钳后阶梯 30→20(不是 60→30;Fix 3 起
+	// 按 1/s 限速节奏推进)。
+	sawFPS := uint32(30)
+	for i := 0; i < 12; i++ { // 码率到底 + fps 连降
+		clk.advance(1100 * time.Millisecond)
 		acts := c.Observe(fb("s1", true, 100_000_000, 300))
 		cfg, ok := configOf(t, acts)
 		if !ok {
 			continue
 		}
-		if cfg.FPS != 30 && cfg.FPS != 20 && cfg.FPS != 15 && cfg.FPS != 10 && cfg.FPS != 5 {
+		if cfg.FPS == 30 {
+			continue // 仍在码率阶梯下行(1/s 一档,fps 未动)
+		}
+		if cfg.FPS != 20 && cfg.FPS != 15 && cfg.FPS != 10 && cfg.FPS != 5 {
 			t.Fatalf("fps downshift must walk the clamped ladder, got %+v", cfg)
 		}
 		if cfg.Bitrate != qosMinBitrateBps {
 			t.Fatalf("fps steps only after bitrate bottoms out, got %+v", cfg)
 		}
+		if cfg.FPS >= sawFPS {
+			t.Fatalf("fps downshift must descend, %d -> %d", sawFPS, cfg.FPS)
+		}
+		sawFPS = cfg.FPS
 	}
 }
 
@@ -851,8 +870,9 @@ func TestQoSSparseCadenceQueueMsNotCongestion(t *testing.T) {
 	}
 }
 
-// (b)健康节奏:presentedFps=25、queueMs=180 → 与今日完全一致的立即
-// 30% 通道(绕过 1/s 限速,连续拥塞连续剪)。
+// (b)健康节奏:presentedFps=25、queueMs=180 → 立即 30% 通道照常(不等
+// 稳定窗;Fix 3 起与常规降档共用 1/s 限速 —— 窗口内的第二次拥塞抑制,
+// 窗口过后续降)。
 func TestQoSHealthyCadenceQueueMsStillCongestion(t *testing.T) {
 	c, clk := newQoSTestController()
 	c.Observe(fbCadence("s1", 8_000_000, 5, 25))
@@ -861,9 +881,13 @@ func TestQoSHealthyCadenceQueueMsStillCongestion(t *testing.T) {
 		t.Fatalf("healthy-cadence queueMs=180 must cut 30%%: got %+v ok=%v", cfg, ok)
 	}
 	clk.advance(100 * time.Millisecond)
+	if acts := c.Observe(fbCadence("s1", 8_000_000, 200, 25)); len(acts) != 0 {
+		t.Fatalf("second cut within 1s must be rate-limited, got %+v", acts)
+	}
+	clk.advance(1000 * time.Millisecond)
 	cfg, ok = configOf(t, c.Observe(fbCadence("s1", 8_000_000, 200, 25)))
 	if !ok || cfg.Bitrate != 2_300_000*7/10*7/10 {
-		t.Fatalf("immediate cut must still bypass the 1/s limiter: got %+v ok=%v", cfg, ok)
+		t.Fatalf("post-window congestion should cut again: got %+v ok=%v", cfg, ok)
 	}
 	if got := c.CadenceHolds(); got != 0 {
 		t.Fatalf("healthy cadence must not count holds, got %d", got)

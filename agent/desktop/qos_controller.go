@@ -12,10 +12,11 @@
 //   - controller(优先 viewer):先到先得;离场/隐藏/被修剪后由字典序最小
 //     的可见 viewer 接任(确定性,同一集合必选出同一人)。只有它的反馈驱
 //     动全局决策;隐藏 viewer 的反馈一律不计(也不触发旁观者暂停)。
-//   - 拥塞(controller queueMs > 100):立即把码率砍到 70%(绕过 1/s 限速
-//     与稳定窗);码率已在 500kbps 下限 → fps 沿 {60,30,20,15,10,5} 降一档;
-//     fps 已在 5 → height 沿 {1440,1080,900,720} 降一档(max_w 推导见下)。
-//     全部到底后拥塞不再有动作(default-safe)。M4 节奏门:queueMs 是
+//   - 拥塞(controller queueMs > 100):立即把码率砍到 70%(不要求稳定
+//     窗,但与常规降档共用 1/s 限速 —— Fix 3);码率已在 500kbps 下限
+//     → fps 沿 {60,30,20,15,10,5} 降一档;fps 已在 5 → height 沿
+//     {1440,1080,900,720} 降一档(max_w 推导见下)。全部到底后拥塞不再
+//     有动作(default-safe)。M4 节奏门:queueMs 是
 //     浏览器 jitterBufferDelay 代理,稀疏流(静态桌面 ~5fps)上恒读
 //     ~半帧间隔 → 每报必中。越线的 queueMs 仅在呈现节奏健康
 //     (presentedFps ≥ 8)或超灾难线(> 3×max(期望帧间隔,250ms))时
@@ -54,8 +55,7 @@
 // reset-recovery grace(M4 修正):max_w 变更的决策走 host 的 resolution
 // 重置(编码器重建、codec epoch 前进、首个恢复 IDR 之前无帧产出)。
 // 重置在途(FrameObserved 尚未被「严格新代」帧确认,Fix 1)期间拥塞剪
-// 码一律挂起(held,不累积——阶梯是状态机,恢复确认后自然续降);且
-// reset-triggering 剪刀之后立即通道不再完全绕过 qosDownMinInterval。修
+// 码一律挂起(held,不累积——阶梯是状态机,恢复确认后自然续降)。修
 // 前:每条拥塞反馈都再剪一档 max_w → 密集重置风暴 → 恢复 IDR 反复作废
 // → 观众饿死而 host 徒劳产 IDR(M3-T6 合成矩阵的假编码器无重启延迟,
 // 从未暴露此链)。
@@ -108,7 +108,8 @@ const (
 	qosQueueEscapeFactor  = 3.0
 	qosQueueEscapeFloorMs = 250.0
 	// qosStableWindow:升档前的稳定窗;qosDownMinInterval /
-	// qosUpMinInterval:降/升档限速(立即通道绕过降档限速)。
+	// qosUpMinInterval:降/升档限速(Fix 3 起拥塞立即通道与常规降档通道
+	// 共用同一 1/s 降档限速 —— 「立即」指不要求稳定窗,不是无限速)。
 	qosStableWindow    = 10 * time.Second
 	qosDownMinInterval = 1 * time.Second
 	qosUpMinInterval   = 3 * time.Second
@@ -228,7 +229,6 @@ type QoSController struct {
 	resetPending    bool
 	lastCodecEpoch  uint64
 	graceCodecEpoch uint64
-	lastMaxWActAt   time.Time
 	heldCuts        uint32
 
 	// cadenceHolds(M4 节奏门):queueMs 越线但因呈现节奏稀疏被抑制的
@@ -352,7 +352,10 @@ func (c *QoSController) decide(fb ViewerFeedback, now time.Time) []Action {
 
 	target := qosTargetBitrate(fb.EstimatedBps)
 	if fb.QueueMs > qosQueueAgeMs && c.queueCongestionReal(fb) {
-		// 拥塞:稳定窗作废;立即 30% 通道(绕过 1/s 限速)。
+		// 拥塞:稳定窗作废;立即 30% 通道 —— 「立即」= 窗口内的第一次
+		// 剪码不要求稳定窗(M4 架构修正 Fix 3:不再绕过 qosDownMinInterval
+		// —— 不限速的立即通道对 1/s 反馈节奏就是每秒 30% 棘轮,直到
+		// max_w 触发重置风暴)。
 		// M4 节奏门:queueMs 越线但呈现节奏稀疏(假拥塞,见
 		// queueCongestionReal)→ 不进此通道,反馈照常走带宽证据/
 		// 稳定窗路径(queueMs 已随反馈记录,仅不驱动降档)。
@@ -365,11 +368,11 @@ func (c *QoSController) decide(fb ViewerFeedback, now time.Time) []Action {
 			c.heldCuts++
 			return nil
 		}
+		if now.Sub(c.lastDownAt) < qosDownMinInterval {
+			return nil // 同一 1/s 限速(与常规降档通道共用 lastDownAt)
+		}
 		if next := c.stepDown(); next != c.cur {
-			if !c.noteMaxWChange(next, now) {
-				c.heldCuts++
-				return nil
-			}
+			c.noteMaxWChange(next)
 			c.cur = next
 			c.lastDownAt = now
 			return []Action{{Kind: actionSetVideoConfig, Config: c.cur}}
@@ -400,12 +403,10 @@ func (c *QoSController) decide(fb ViewerFeedback, now time.Time) []Action {
 		return nil
 	}
 	if next := c.stepUp(target); next != c.cur {
-		// height 升档同样改变 max_w → 同样触发 host 重置:同受 grace 与
-		// 最小间隔约束(升档本就要求 10s 稳定 + 3s 限速,这里是防御性
-		// 的对称闭合)。
-		if !c.noteMaxWChange(next, now) {
-			return nil
-		}
+		// height 升档同样改变 max_w → 同样触发 host 重置:置 grace
+		//(升档本就要求 10s 稳定窗 + 3s 限速,任何降档之后 ≥10s,天然
+		// 满足降档限速,无需独立的 max_w 间隔记账 —— Fix 3 的净删除)。
+		c.noteMaxWChange(next)
 		c.cur = next
 		c.lastUpAt = now
 		return []Action{{Kind: actionSetVideoConfig, Config: c.cur}}
@@ -415,21 +416,15 @@ func (c *QoSController) decide(fb ViewerFeedback, now time.Time) []Action {
 
 // noteMaxWChange 判定 next 是否为 reset-triggering 决策(max_w 变更):
 // 是则置 grace(resetPending)并快照当前已见 codec epoch(grace 的解除
-// 资格线:只认严格新于它的帧,见 FrameObserved);若距上一次
-// reset-triggering 决策不足 qosDownMinInterval(立即通道也不许完全绕过
-// —— 密集 max_w 变更就是重置风暴)则返回 false = 本拍挂起。非 max_w
-// 决策(bitrate/fps 热更新)恒 true。
-func (c *QoSController) noteMaxWChange(next VideoConfig, now time.Time) bool {
+// 资格线:只认严格新于它的帧,见 FrameObserved)。非 max_w 决策
+// (bitrate/fps 热更新)不动 grace。决策节奏由调用方限速(降档 =
+// lastDownAt 的 1/s;升档 = 10s 稳定窗 + 3s)。
+func (c *QoSController) noteMaxWChange(next VideoConfig) {
 	if next.MaxW == c.cur.MaxW {
-		return true
+		return
 	}
-	if now.Sub(c.lastMaxWActAt) < qosDownMinInterval {
-		return false
-	}
-	c.lastMaxWActAt = now
 	c.resetPending = true
 	c.graceCodecEpoch = c.lastCodecEpoch
-	return true
 }
 
 // FrameObserved 通知决策器「流又产出了一帧(codecEpoch)」(session 帧泵
