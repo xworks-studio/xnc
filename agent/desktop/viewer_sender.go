@@ -174,16 +174,16 @@ type ViewerSender struct {
 	bucket     tokenBucket
 	interval   frameIntervalStats
 
-	mu             sync.Mutex
-	state          viewerSendState
-	epoch          frameEpoch // live 期间正在发送的帧代际
-	pendingEpoch   frameEpoch // Discontinuity 后等待的代际(0 = 不校验)
-	queue          []queuedPacket
-	queueEnqueued  time.Time // 当前在队帧的入队时刻(年龄判据)
+	mu            sync.Mutex
+	state         viewerSendState
+	epoch         frameEpoch // live 期间正在发送的帧代际
+	pendingEpoch  frameEpoch // Discontinuity 后等待的代际(0 = 不校验)
+	queue         []queuedPacket
+	queueEnqueued time.Time     // 当前在队帧的入队时刻(年龄判据)
 	queueDeadline time.Duration // 当前在队帧的准入视界(年龄界 = 入队门,Fix 5)
-	queueBytes     int       // 在队帧的 AU 字节累计
-	stats          viewerStatsN
-	pumpStarted    bool
+	queueBytes    int           // 在队帧的 AU 字节累计
+	stats         viewerStatsN
+	pumpStarted   bool
 
 	notify chan struct{} // 唤醒 pace 泵(容量 1,合并重复唤醒)
 	done   chan struct{}

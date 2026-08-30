@@ -253,3 +253,51 @@ describe("FrameCorrelator (rVFC correlation)", () => {
     expect(s.decodeFailures).toBe(0);
   });
 });
+
+// [M4 deliverable] end-to-end per correlated frame: min-offset normalized
+// (presented nowMs and meta.sourceMonoUs live in different clock domains;
+// e2e = raw − session-min(raw) is the excess over the best observed path).
+describe("FrameCorrelator end-to-end (min-offset normalized)", () => {
+  const metaAt = (ts: number, sourceMonoMs: number): FrameMetaV1 => ({
+    ...metaOf(ts, 1n, BigInt(ts)),
+    sourceMonoUs: BigInt(Math.round(sourceMonoMs * 1000)),
+  });
+
+  it("null before any correlated frame; per-frame e2e after hits", () => {
+    const c = new FrameCorrelator();
+    // Arbitrary clock skew: browser clock runs 10s ahead of the host clock.
+    const skewMs = 10_000;
+    expect(c.snapshot().e2eLastMs).toBeNull();
+    expect(c.snapshot().e2eP95Ms).toBeNull();
+    c.onMeta(metaAt(1, 1_000)); // capture at host t=1000ms
+    const r1 = c.onPresented(1, 1_000 + skewMs + 50); // presented +50ms path
+    expect(r1.e2eMs).toBe(0); // the first sample IS the session minimum
+    c.onMeta(metaAt(2, 1_033));
+    const r2 = c.onPresented(2, 1_033 + skewMs + 120); // +120ms path
+    expect(r2.e2eMs).toBeGreaterThan(68);
+    expect(r2.e2eMs).toBeLessThan(72);
+    const s = c.snapshot();
+    expect(s.e2eLastMs).toBeCloseTo(r2.e2eMs as number, 5);
+    expect(s.e2eP95Ms).toBeGreaterThanOrEqual(r2.e2eMs as number);
+  });
+
+  it("a new best path lowers the floor, never below 0", () => {
+    const c = new FrameCorrelator();
+    c.onMeta(metaAt(1, 0));
+    c.onMeta(metaAt(2, 33));
+    c.onMeta(metaAt(3, 66));
+    // First sample is its own minimum: excess 0 even though the raw path
+    // was 200ms.
+    expect(c.onPresented(1, 200).e2eMs).toBe(0);
+    // A better raw path (150) becomes the new floor...
+    expect(c.onPresented(2, 183).e2eMs).toBe(0);
+    // ...and later frames are measured against it (raw 180 -> excess 30).
+    expect(c.onPresented(3, 246).e2eMs).toBe(30);
+  });
+
+  it("miss/no-timestamp presentations carry no e2e", () => {
+    const c = new FrameCorrelator();
+    expect(c.onPresented(999, 100).e2eMs).toBeNull(); // no meta
+    expect(c.onPresented(undefined, 100).e2eMs).toBeNull();
+  });
+});

@@ -130,6 +130,11 @@ interface ViewerFeedbackFrame {
   freezeCount?: number;
   freezes?: number;
   presentedFps?: number;
+  /** [M4] p95 of source-capture→presented over correlated frames this
+   * session (ms, min-offset normalized — the two timestamps live in
+   * different clock domains; the value is the excess over the best
+   * observed path). Absent when nothing has correlated yet. */
+  e2eP95Ms?: number;
 }
 
 /** Module-scoped live-WebSocket handle so the PLI/lease buttons can reach
@@ -716,6 +721,12 @@ export default function DesktopLive() {
         freezes: sample.freezes - base.freezes,
         presentedFps: Math.round((presentedDelta / elapsedS) * 10) / 10,
       };
+      // [M4 deliverable] end-to-end p95 rides the same 1s report (host
+      // diag line + agent-side correlation); absent with no samples.
+      const corrSnap = correlator.snapshot();
+      if (corrSnap.e2eP95Ms !== null) {
+        fb.e2eP95Ms = Math.round(corrSnap.e2eP95Ms * 10) / 10;
+      }
       send(fb);
     };
 
@@ -748,14 +759,17 @@ export default function DesktopLive() {
         }
         // 逐帧诊断:每呈现一帧记录 帧号:mediaTime(秒,3位):呈现间隔(ms)。
         // mediaTime 倒退 = 回退帧;间隔 0/巨大 = 重复/卡顿。M3 Task 5:
-        // 命中 frame-meta 时追加身份列 :E<codecEpoch>:S<encodeSeq>。
+        // 命中 frame-meta 时追加身份列 :E<codecEpoch>:S<encodeSeq>;M4
+        // 交付指标:再追加端到端 :e2e=NNNms(采集时戳→呈现时戳,最小偏移
+        // 归一 —— 见 desktopFrameMeta 的时钟域说明)。
         const di = diagRef.current;
         if (framediag && di) {
           const mt = typeof meta.mediaTime === "number" ? meta.mediaTime : NaN;
           const dt = di.lastPresent ? Math.round((_now - di.lastPresent) * 1000) / 1000 : 0;
           di.lastPresent = _now;
+          const e2e = corr.e2eMs !== null ? `:e2e=${Math.round(corr.e2eMs)}ms` : "";
           const id = corr.meta ? `:E${corr.meta.codecEpoch}:S${corr.meta.encodeSeq}` : "";
-          di.frames.push(`${frameCount}:${mt.toFixed(3)}:${dt.toFixed(1)}${id}`);
+          di.frames.push(`${frameCount}:${mt.toFixed(3)}:${dt.toFixed(1)}${id}${e2e}`);
           if (di.frames.length > 240) di.frames.splice(0, di.frames.length - 240);
           // 每 ~1s 快照一次 DOM(避免每帧 setState 拖累渲染)。
           if (frameCount % 30 === 0) setDiag({ frames: di.frames.slice(-120), stats: di.stats });

@@ -1008,9 +1008,12 @@ int RunConsoleRt(const xnc::DiagOptions& opt, bool desktop_pipeline_v2) {
       ro.displays_fn = [](void*) { return xnc::DxgiDisplaysSnapshot(); };
       ro.switch_display_fn = [](void*, uint32_t idx) { return xnc::DxgiSelectDisplay(idx); };
       // M3 Task 3: 0x0129 capability advertisement (the application goes
-      // through ServeV2's internal pipeline pointer).
+      // through ServeV2's internal pipeline pointer). M4: same for 0x012A
+      // (the viewer-metrics forward lands in the pipeline's diag beat).
       ro.set_video_config_fn = &RtAdvertiseSetVideoConfigV2;
       ro.set_video_config_ctx = nullptr;
+      ro.viewer_metrics_fn = [](void*, uint32_t, uint32_t) {};
+      ro.viewer_metrics_ctx = nullptr;
       xnc::RtServer server;
       // Fix round 1 (finding 2): --max-w rides into the pipeline's
       // VideoProcessor; ServeV2 starts the HOST_HELLO at the same scaled

@@ -461,6 +461,12 @@ class MediaPipelineV2 {
   // Arms the sticky IDR: the loop's NEXT submission is forced to an IDR,
   // exactly once (the brief's sticky-once contract).
   void RequestIdr(const char* reason);
+  // M4 deliverable metrics (any thread): the agent forwards the browser's
+  // 1s viewer_feedback summary (presented fps x10 + the min-offset-
+  // normalized capture->present p95) so the per-second diag beat can carry
+  // the viewer-side columns next to the host's own counters. Latest wins;
+  // the beat omits both until the first report arrives.
+  void NoteViewerMetrics(uint32_t presented_fps_x10, uint32_t e2e_p95_ms);
   // Reconfigure request; applied by the loop before its next iteration.
   void Reconfigure(uint32_t bitrate_bps, uint32_t fps);
   // M3 Task 3 (SET_VIDEO_CONFIG): live max_w. Any thread. A change requests

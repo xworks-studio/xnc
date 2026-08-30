@@ -8246,6 +8246,56 @@ int SelftestMain(bool desktop_pipeline_v2) {
                 (unsigned long long)st.video_configs,
                 (unsigned long long)st.video_config_rejected);
   }
+  { // rt 场景 ⑬(M4 交付指标):VIEWER_METRICS 0x012A —— 0x0129 applier
+    // + viewer_metrics sink 已接的 host:扩展 HOST_HELLO 广告
+    // bit0|bit1;合法 [u32 fps_x10][u32 e2e_ms] → FlagResponse + sink 收
+    // 到原值;坏 payload → FlagResponse|FlagError。无管线(观测面,无媒
+    // 体行为)。
+    xnc::RtServer rt;
+    xnc::RtServer::Opts ro = rt_opts(13);
+    ro.pipeline_v2 = true;
+    static uint32_t got_fps_x10 = 0, got_e2e = 0;
+    got_fps_x10 = got_e2e = 0;
+    ro.set_video_config_fn = [](void*, uint32_t, uint32_t, uint32_t) {
+      return true;  // bit0 先决:bit1 只与 bit0 同广告
+    };
+    ro.viewer_metrics_fn = [](void*, uint32_t fps_x10, uint32_t e2e) {
+      got_fps_x10 = fps_x10;
+      got_e2e = e2e;
+    };
+    CHECK("rt13-start", rt.Start(ro, kRtW, kRtH));
+    RtTestClient a;
+    CHECK("rt13-connect", a.Connect(ro.pipe_name.c_str(), kRtSecret, sizeof(kRtSecret)));
+    CHECK("rt13-attach", a.Attach(14));
+    CHECK("rt13-hello-caps",
+          a.hello_ok_ && a.caps_ == (xnc::kHostCapSetVideoConfig |
+                                     xnc::kHostCapViewerMetrics));
+    CHECK("rt13-send", a.SendRaw(xnc::kMsgViewerMetrics,
+                                 xnc::EncodeViewerMetrics({247, 83})));
+    CHECK("rt13-send-bad", a.SendRaw(xnc::kMsgViewerMetrics, {1, 2, 3}));
+    bool ok_resp = false, err_resp = false;
+    const ULONGLONG dl = GetTickCount64() + 2500;
+    while (GetTickCount64() < dl && !(ok_resp && err_resp)) {
+      xnc::Frame f;
+      if (!a.ReadFrameT(f, 200)) break;
+      a.CountFrame(f);
+      if (f.message_type == xnc::kMsgViewerMetrics) {
+        if ((f.flags & xnc::kFlagError) != 0) err_resp = true;
+        if ((f.flags & xnc::kFlagResponse) != 0 && (f.flags & xnc::kFlagError) == 0)
+          ok_resp = true;
+      }
+    }
+    rt.Shutdown();
+    CHECK("rt13-ok-resp", ok_resp);
+    CHECK("rt13-bad-resp", err_resp);
+    CHECK("rt13-sink", got_fps_x10 == 247 && got_e2e == 83);
+    const xnc::RtServer::Stats st = rt.stats();
+    CHECK("rt13-stats", st.viewer_metrics == 1 && st.viewer_metrics_rejected == 1);
+    std::printf("SELFTEST NOTE: rt13 ok=%d err=%d fps_x10=%u e2e=%u stats=[%llu,%llu]\n",
+                ok_resp ? 1 : 0, err_resp ? 1 : 0, got_fps_x10, got_e2e,
+                (unsigned long long)st.viewer_metrics,
+                (unsigned long long)st.viewer_metrics_rejected);
+  }
   // ---- M2 Task 4: MediaPipelineV2 (depth-one GPU media pipeline). These
   // scenarios run ONLY with --desktop-pipeline-v2 (ruling 1: the CLI flag
   // selects MediaPipelineV2 + the v2 wire together; the plain selftest

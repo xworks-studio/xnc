@@ -535,20 +535,22 @@ func TestQoSStaleControllerPruned(t *testing.T) {
 // viewer_feedback 信令帧形态(session.go 解析目标的纯校验)。
 func TestViewerFeedbackJSONShape(t *testing.T) {
 	raw := `{"type":"viewer_feedback","visible":true,"estimatedBps":4200000,` +
-		`"queueMs":12.5,"decodeQueue":2,"rttMs":38.2,"presentedFps":4.9}`
+		`"queueMs":12.5,"decodeQueue":2,"rttMs":38.2,"presentedFps":4.9,"e2eP95Ms":83.4}`
 	var f viewerFeedbackFrame
 	if err := json.Unmarshal([]byte(raw), &f); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	if !f.Visible || f.EstimatedBps != 4_200_000 || f.QueueMs != 12.5 ||
-		f.DecodeQueue != 2 || f.RTTMs != 38.2 || f.PresentedFps != 4.9 {
+		f.DecodeQueue != 2 || f.RTTMs != 38.2 || f.PresentedFps != 4.9 ||
+		f.E2EP95Ms != 83.4 {
 		t.Fatalf("parsed feedback mismatch: %+v", f)
 	}
 	// 旧 web:字段缺席 → 0(节奏门旁路 = 今日行为)。
 	old := `{"type":"viewer_feedback","visible":true,"estimatedBps":4200000,` +
 		`"queueMs":12.5,"decodeQueue":2,"rttMs":38.2}`
 	var g viewerFeedbackFrame
-	if err := json.Unmarshal([]byte(old), &g); err != nil || g.PresentedFps != 0 {
+	if err := json.Unmarshal([]byte(old), &g); err != nil ||
+		g.PresentedFps != 0 || g.E2EP95Ms != 0 {
 		t.Fatalf("absent presentedFps must parse to 0: %+v err=%v", g, err)
 	}
 }

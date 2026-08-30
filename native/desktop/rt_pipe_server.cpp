@@ -768,6 +768,48 @@ void RtServer::ReaderLoop(std::shared_ptr<SubConn> c) {
             goto conn_done;
           break;
         }
+        case kMsgViewerMetrics: {
+          // M4 deliverable metrics: the browser's 1s viewer_feedback summary
+          // forwarded by the agent, landing in the host's per-second diag
+          // beat (viewer_presented_fps / capture_to_present_p95_ms).
+          // Preference: the V2 pipeline ServeV2 owns, then the Opts sink.
+          // Best-effort - a metrics report never disturbs media.
+          ViewerMetricsPayload vm;
+          if (!DecodeViewerMetrics(f, &vm)) {
+            {
+              std::lock_guard<std::mutex> lk(mu_);
+              stats_.viewer_metrics_rejected++;
+            }
+            PushControlTo(c.get(), Frame{kFlagResponse | kFlagError,
+                                          kMsgViewerMetrics, f.request_id, {}});
+            break;
+          }
+          bool ok = false;
+          if (MediaPipelineV2* p = v2_pipe_.load(std::memory_order_acquire)) {
+            p->NoteViewerMetrics(vm.presented_fps_x10, vm.e2e_p95_ms);
+            ok = true;
+          } else if (opts_.viewer_metrics_fn != nullptr) {
+            opts_.viewer_metrics_fn(opts_.viewer_metrics_ctx, vm.presented_fps_x10,
+                                    vm.e2e_p95_ms);
+            ok = true;
+          }
+          {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (ok)
+              stats_.viewer_metrics++;
+            else
+              stats_.viewer_metrics_rejected++;
+          }
+          XNC_LOG_INFO("rt viewer_metrics sub=%u fps_x10=%u e2e_p95_ms=%u ok=%d",
+                       c->sub_id, vm.presented_fps_x10, vm.e2e_p95_ms, ok ? 1 : 0);
+          if (!PushControlTo(c.get(),
+                             Frame{ok ? kFlagResponse
+                                      : static_cast<uint8_t>(kFlagResponse |
+                                                             kFlagError),
+                                   kMsgViewerMetrics, f.request_id, {}}))
+            goto conn_done;
+          break;
+        }
         case kMsgPing: {
           if (!PushControlTo(c.get(), Frame{kFlagResponse, kMsgPong, f.request_id, {}}))
             goto conn_done;
@@ -1043,8 +1085,15 @@ std::vector<uint8_t> RtServer::BuildHelloPayload(uint32_t fps) {
   HostHelloPayload hh{gen_.load(), src_w_, src_h_, fps, opts_.max_subs};
   hh.displays = CurrentDisplays();
   if (!opts_.pipeline_v2) return EncodeHostHello(hh);
-  if (opts_.set_video_config_fn != nullptr)
-    return EncodeHostHelloV2Caps(hh, kHostCapSetVideoConfig);
+  // M4: bit 1 (0x012A viewer metrics) only alongside bit 0 (see the
+  // capability comment - the metrics forward is part of the same QoS
+  // observability plane the 0x0129 wiring implies).
+  uint32_t caps = 0;
+  if (opts_.set_video_config_fn != nullptr) {
+    caps = kHostCapSetVideoConfig;
+    if (opts_.viewer_metrics_fn != nullptr) caps |= kHostCapViewerMetrics;
+    return EncodeHostHelloV2Caps(hh, caps);
+  }
   return EncodeHostHelloV2(hh);
 }
 

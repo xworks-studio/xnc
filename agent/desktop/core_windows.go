@@ -399,3 +399,10 @@ func (p *pipeSource) SetVideoConfig(cfg VideoConfig) error {
 func (p *pipeSource) RequestKeyframe(reason string) error { return p.sub.RequestKeyframe(reason) }
 
 func (p *pipeSource) Close() error { return p.sub.Close() }
+
+// ReportViewerMetrics 转发 0x012A(M4 交付指标:view 呈现指标 → host 的
+// diag_media_v2 周期日志)。host 未广告能力时 desktoppipe 静默跳过 ——
+// best-effort,错误只记日志(绝不影响媒体面)。
+func (p *pipeSource) ReportViewerMetrics(presentedFps float64, e2eP95Ms float64) error {
+	return p.sub.SendViewerMetrics(presentedFps, e2eP95Ms)
+}

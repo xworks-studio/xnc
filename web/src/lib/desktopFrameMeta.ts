@@ -145,13 +145,31 @@ export interface CorrelationSnapshot {
   plausibleFreezes: number;
   /** High-water identity of the last non-regressed hit. */
   lastHit: FrameMetaV1 | null;
+  /**
+   * [M4 deliverable] End-to-end of the LAST correlated frame (ms), source
+   * capture stamp -> presented timestamp — min-offset normalized (see
+   * FrameCorrelator.onPresented). null before the first correlated frame.
+   */
+  e2eLastMs: number | null;
+  /**
+   * [M4 deliverable] p95 of the end-to-end over the recent correlated
+   * frames (ms), null with no samples yet.
+   */
+  e2eP95Ms: number | null;
 }
 
 /** Result of correlating one presented frame. */
 export interface PresentedCorrelation {
   meta: FrameMetaV1 | null;
   regressed: boolean;
+  /** [M4 deliverable] Min-offset-normalized end-to-end of THIS frame
+   * (ms), null when nowMs was not supplied / no meta hit. */
+  e2eMs: number | null;
 }
+
+/** Bounded ring of recent end-to-end samples (p95 window; ~1s at 30fps
+ * of correlated frames). */
+const E2E_WINDOW = 32;
 
 /**
  * FrameCorrelator ties the two async streams together:
@@ -163,11 +181,22 @@ export interface PresentedCorrelation {
  *    regression is counted and flagged; the caller decides whether to
  *    console.warn. The high-water mark survives regressions so a
  *    repeated backtrack counts each time.
+ *
+ * [M4 deliverable] End-to-end per correlated frame: raw =
+ * presentedNowMs − meta.sourceMonoUs/1000 mixes TWO clock domains (the
+ * host monotonic clock vs browser performance.now()), so the absolute
+ * value is meaningless. The session MINIMUM of raw approximates the
+ * clock offset plus the best-case path, and raw − min is the per-frame
+ * end-to-end EXCESS over the best observed path — a correct relative
+ * latency (trend / p95) without any shared clock. The minimum can only
+ * decrease, so the metric never drifts upward from clock skew.
  */
 export class FrameCorrelator {
   private readonly map: FrameMetaMap;
   private readonly snap: CorrelationSnapshot;
   private lastPresentedAt: number | null = null;
+  private minRawMs: number | null = null;
+  private readonly e2e: number[] = [];
 
   constructor(capacity: number = FRAME_META_MAP_CAPACITY) {
     this.map = new FrameMetaMap(capacity);
@@ -181,6 +210,8 @@ export class FrameCorrelator {
       regressions: 0,
       plausibleFreezes: 0,
       lastHit: null,
+      e2eLastMs: null,
+      e2eP95Ms: null,
     };
   }
 
@@ -212,12 +243,12 @@ export class FrameCorrelator {
     }
     if (typeof rtpTimestamp !== "number") {
       this.snap.noTimestamp++;
-      return { meta: null, regressed: false };
+      return { meta: null, regressed: false, e2eMs: null };
     }
     const meta = this.map.lookup(rtpTimestamp);
     if (!meta) {
       this.snap.misses++;
-      return { meta: null, regressed: false };
+      return { meta: null, regressed: false, e2eMs: null };
     }
     this.snap.hits++;
     const last = this.snap.lastHit;
@@ -231,7 +262,26 @@ export class FrameCorrelator {
     } else {
       this.snap.lastHit = meta; // high-water mark
     }
-    return { meta, regressed };
+    let e2eMs: number | null = null;
+    if (typeof nowMs === "number") {
+      e2eMs = this.noteE2e(meta, nowMs);
+    }
+    return { meta, regressed, e2eMs };
+  }
+
+  /** Min-offset-normalized end-to-end of one correlated frame (see the
+   * class comment for why the raw cross-clock difference is normalized). */
+  private noteE2e(meta: FrameMetaV1, nowMs: number): number | null {
+    const raw = nowMs - Number(meta.sourceMonoUs) / 1000;
+    if (!Number.isFinite(raw)) return null;
+    if (this.minRawMs === null || raw < this.minRawMs) this.minRawMs = raw;
+    const e2e = raw - this.minRawMs;
+    this.snap.e2eLastMs = e2e;
+    this.e2e.push(e2e);
+    if (this.e2e.length > E2E_WINDOW) this.e2e.splice(0, this.e2e.length - E2E_WINDOW);
+    const sorted = [...this.e2e].sort((a, b) => a - b);
+    this.snap.e2eP95Ms = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))];
+    return e2e;
   }
 
   snapshot(): CorrelationSnapshot {

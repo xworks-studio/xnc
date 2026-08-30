@@ -148,3 +148,12 @@ type SasCaller interface {
 type DisplaySwitcher interface {
 	SwitchDisplay(index uint32) error
 }
+
+// ViewerMetricsReporter 是 Source 的可选能力(M4 交付指标):把 viewer
+// 侧呈现指标(呈现帧率、采集→呈现 p95,毫秒)转发给 host 的 diag 面
+//(pipe 0x012A → host 的 diag_media_v2 周期日志的 viewer_presented_fps /
+// capture_to_present_p95_ms 列)。未实现者(旧 host、fake、非 Windows 桩)
+// 静默跳过 —— 指标转发是 best-effort,永不影响媒体面;调用方忽略错误。
+type ViewerMetricsReporter interface {
+	ReportViewerMetrics(presentedFps float64, captureToPresentP95Ms float64) error
+}

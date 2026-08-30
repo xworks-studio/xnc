@@ -1387,3 +1387,42 @@ func TestSendVideoConfigWire(t *testing.T) {
 		t.Fatal("unsupported host must not see a 0x0129 on the wire")
 	}
 }
+
+// TestSendViewerMetricsWire(M4 交付指标):能力广告在场 → 0x012A
+// [u32 fps_x10][u32 e2e_p95_ms];未广告 → 无操作(不写线、不报错 ——
+// 指标转发是 best-effort)。
+func TestSendViewerMetricsWire(t *testing.T) {
+	c, s := net.Pipe()
+	defer c.Close()
+	defer s.Close()
+	sub := &Sub{conn: c, subID: 5,
+		hello: &HelloInfo{MediaProtocol: 2, Capabilities: CapSetVideoConfig | CapViewerMetrics}}
+	errCh := make(chan error, 1)
+	go func() { errCh <- sub.SendViewerMetrics(24.7, 83) }()
+	f, err := ipc.ReadFrame(s)
+	if err != nil {
+		t.Fatalf("read frame: %v", err)
+	}
+	if f.MessageType != msgViewerMtrc {
+		t.Fatalf("message type = %#04x, want 0x012A", f.MessageType)
+	}
+	if len(f.Payload) != 8 ||
+		binary.LittleEndian.Uint32(f.Payload) != 247 ||
+		binary.LittleEndian.Uint32(f.Payload[4:]) != 83 {
+		t.Fatalf("payload = %v, want [247 83] LE", f.Payload)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	// 未广告能力:静默无操作(绝不为指标打扰 host)。
+	noCap := &Sub{conn: c, subID: 6,
+		hello: &HelloInfo{MediaProtocol: 2, Capabilities: CapSetVideoConfig}}
+	if err := noCap.SendViewerMetrics(30, 50); err != nil {
+		t.Fatalf("unadvertised host must be a silent no-op, got %v", err)
+	}
+	s.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if _, err := ipc.ReadFrame(s); err == nil {
+		t.Fatal("unadvertised host must not see a 0x012A on the wire")
+	}
+}

@@ -77,6 +77,7 @@ const (
 	msgDisplayChg  uint16 = 0x010A
 	msgSwitchDisp  uint16 = 0x0128
 	msgSetVideoCfg uint16 = 0x0129 // M3 Task 3:QoS 决策下发(出站)
+	msgViewerMtrc  uint16 = 0x012A // M4:viewer 指标转发 host diag(出站)
 	msgFrameV2     uint16 = 0x0205 // M1 Task 2/3:v2 已验证媒体帧
 	msgStreamDisc  uint16 = 0x020B // M1 Task 4:断流(v2 模式;v1 收到即拒)
 )
@@ -143,6 +144,10 @@ const (
 	// CapSetVideoConfig:host 处理 SET_VIDEO_CONFIG 0x0129(bitrate/fps 热
 	// 更新 + max_w reset 路径)。
 	CapSetVideoConfig uint32 = 1 << 0
+	// CapViewerMetrics(M4):host 接收 VIEWER_METRICS 0x012A(viewer 呈现
+	// 指标转发进 host 的 1s diag 面;仅在 CapSetVideoConfig 同置时广告
+	// —— 二者同属 rt server 的 QoS 观测面)。
+	CapViewerMetrics uint32 = 1 << 1
 )
 
 // crc32cTable 是 v2 帧 CRC32C(Castagnoli,反射多项式 0x82F63B78,
@@ -531,6 +536,29 @@ func (s *Sub) SendVideoConfig(bitrateKbps, fps, maxW uint32) error {
 	binary.LittleEndian.PutUint32(p[4:], fps)
 	binary.LittleEndian.PutUint32(p[8:], maxW)
 	return s.writeCtrl(&ipc.Frame{MessageType: msgSetVideoCfg, RequestID: 1, Payload: p})
+}
+
+// SendViewerMetrics 发送 0x012A [u32 presented_fps_x10][u32 e2e_p95_ms]
+//(M4 交付指标:把 browser viewer_feedback 的 1s 摘要转发给 host,进其
+// diag_media_v2 周期日志的 viewer_presented_fps / capture_to_present_p95_ms
+// 列)。仅当 capabilities 广告了 CapViewerMetrics 才发送;未广告时静默跳过
+//(返回 nil —— 指标转发是 best-effort,永不影响媒体面)。
+func (s *Sub) SendViewerMetrics(presentedFps float64, e2eP95Ms float64) error {
+	if h := s.Hello(); h == nil || h.Capabilities&CapViewerMetrics == 0 {
+		return nil
+	}
+	fpsX10 := uint32(presentedFps * 10)
+	if presentedFps < 0 {
+		fpsX10 = 0
+	}
+	e2e := uint32(e2eP95Ms)
+	if e2eP95Ms < 0 {
+		e2e = 0
+	}
+	p := make([]byte, 8)
+	binary.LittleEndian.PutUint32(p, fpsX10)
+	binary.LittleEndian.PutUint32(p[4:], e2e)
+	return s.writeCtrl(&ipc.Frame{MessageType: msgViewerMtrc, RequestID: 1, Payload: p})
 }
 
 // Close 发送 DETACH(尽力而为)、关闭连接并置 done(解除泵的可能

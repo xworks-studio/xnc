@@ -62,6 +62,19 @@
 //                               media_protocol (absent = 0 = none). Bit 0
 //                               (kHostCapSetVideoConfig) = set_video_config_fn
 //                               is wired.
+//   MSG_VIEWER_METRICS 0x012A req (M4 deliverable metrics)
+//                               [u32 presented_fps_x10][u32 e2e_p95_ms] -
+//                               the agent forwards the browser's latest
+//                               viewer_feedback summary (presented fps and
+//                               the min-offset-normalized capture->present
+//                               p95) so the HOST's per-second diag beat can
+//                               carry end-to-end observability next to its
+//                               own capture/encode counters. Best-effort:
+//                               FlagResponse on shape, no behavior. Like
+//                               0x0129 the capability (kHostCapViewerMetrics,
+//                               capabilities bit 1) is advertised ONLY in
+//                               the extended HOST_HELLO - v1-wire hosts
+//                               never see 0x012A.
 //   MSG_STREAM_DISCONTINUITY 0x020B event (M1 Task 4; v2 mode ONLY)
 //                               [u64 capture_epoch][u64 codec_epoch]
 //                               [char reason[32]] with a FIXED reason
@@ -139,6 +152,7 @@ constexpr uint16_t kMsgAttach = 0x0102, kMsgDetach = 0x0103, kMsgKeyframeReq = 0
                    kMsgInput = 0x0108, kMsgCursor = 0x0109,
                    kMsgDisplayChanged = 0x010A, kMsgSwitchDisplay = 0x0128,
                    kMsgSetVideoConfig = 0x0129,  // M3 Task 3: QoS decision
+                   kMsgViewerMetrics = 0x012A,   // M4: viewer feedback -> host diag
                    kMsgFrameV2 = 0x0205;  // M1 Task 2: validated Pipe v2 media frame
 // M1 Task 4: stream discontinuity (v2 mode only; see header comment).
 constexpr uint16_t kMsgStreamDiscontinuity = 0x020B;
@@ -155,9 +169,12 @@ inline constexpr uint32_t kMediaProtocolV2 = 2;
 
 // M3 Task 3: capability bits carried by the further-extended HOST_HELLO
 // (trailing u32 `capabilities` after media_protocol; absent = 0 = none).
-// Values stay in {0,1} for now - bit assignments only, so the two hello
-// shapes can never be confused on the wire (see DecodeHostHelloV2).
+// Bit assignments only, so the two hello shapes can never be confused on
+// the wire (see DecodeHostHelloV2). M4: bit 1 (viewer metrics) is only
+// ever advertised ALONGSIDE bit 0 (the 0x0129 wiring implies the 0x012A
+// wiring - both are the rt server's QoS/observability plane).
 inline constexpr uint32_t kHostCapSetVideoConfig = 1u << 0;
+inline constexpr uint32_t kHostCapViewerMetrics = 1u << 1;  // M4: 0x012A
 
 namespace rt_detail {
 
@@ -529,6 +546,30 @@ inline bool DecodeSetVideoConfig(const Frame& f, VideoConfigPayload* out) {
   return true;
 }
 
+// ---- 0x012A MSG_VIEWER_METRICS req (M4 deliverable metrics):
+// [u32 presented_fps_x10][u32 e2e_p95_ms] ----
+// The agent's per-second forward of the browser's viewer_feedback summary
+// (fps x10 keeps one decimal; e2e_p95_ms is the min-offset-normalized
+// capture->present p95 the web correlator computes). Diagnostic only.
+
+struct ViewerMetricsPayload {
+  uint32_t presented_fps_x10 = 0;
+  uint32_t e2e_p95_ms = 0;
+};
+
+inline std::vector<uint8_t> EncodeViewerMetrics(const ViewerMetricsPayload& v) {
+  std::vector<uint8_t> p(8, 0);
+  rt_detail::PutU32(p.data(), v.presented_fps_x10);
+  rt_detail::PutU32(p.data() + 4, v.e2e_p95_ms);
+  return p;
+}
+inline bool DecodeViewerMetrics(const Frame& f, ViewerMetricsPayload* out) {
+  if (out == nullptr || f.payload.size() != 8) return false;
+  out->presented_fps_x10 = rt_detail::GetU32(f.payload.data());
+  out->e2e_p95_ms = rt_detail::GetU32(f.payload.data() + 4);
+  return true;
+}
+
 inline std::vector<uint8_t> EncodeStateEvent(const char* code, bool recoverable) {
   std::vector<uint8_t> p(33, 0);
   CopyPad32(reinterpret_cast<char*>(p.data()), code);
@@ -813,6 +854,14 @@ class RtServer : public AuSink {
     bool (*set_video_config_fn)(void* ctx, uint32_t bitrate_bps, uint32_t fps,
                                 uint32_t max_w) = nullptr;
     void* set_video_config_ctx = nullptr;
+    // M4: 0x012A VIEWER_METRICS sink (the diag beat's viewer columns).
+    // Non-null advertises kHostCapViewerMetrics (alongside bit 0 - see the
+    // capability comment). ServeV2 prefers its own pipeline pointer, so a
+    // null fn still works there as long as the bit is not needed at the
+    // FIRST hello; the production wiring provides the stub either way.
+    void (*viewer_metrics_fn)(void* ctx, uint32_t presented_fps_x10,
+                              uint32_t e2e_p95_ms) = nullptr;
+    void* viewer_metrics_ctx = nullptr;
     // M3 Task 3 (M0 pipeline): live fps pacing + reset-reinit bitrate hints,
     // forwarded into PipelineOpts (null = opts.fps/target_bitrate_bps fixed,
     // the pre-M3 behavior). V2 path ignores these (Reconfigure is hot there).
@@ -841,6 +890,8 @@ class RtServer : public AuSink {
     uint64_t switch_invalid = 0;  // 0x0128 rejected idx / no handler (M2-S3 T5)
     uint64_t video_configs = 0;   // 0x0129 accepted (hot apply) - M3 Task 3
     uint64_t video_config_rejected = 0;  // 0x0129 malformed / no applier
+    uint64_t viewer_metrics = 0;  // 0x012A accepted - M4 diag forward
+    uint64_t viewer_metrics_rejected = 0;  // 0x012A malformed / no sink
     uint64_t stream_discontinuities = 0;  // 0x020B sent (v2 epoch advances; M1 Task 4)
   };
 

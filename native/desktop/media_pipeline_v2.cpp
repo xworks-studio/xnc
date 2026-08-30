@@ -485,6 +485,14 @@ struct MediaPipelineV2::Impl {
   uint32_t next_hist_beat_s = 10;
   bool stages_semantics_logged = false;  // one-time preamble per run
 
+  // M4 deliverable metrics: the latest agent-forwarded viewer summary
+  // (0x012A; a pipe reader thread writes, the beat reads - relaxed
+  // atomics, latest wins). seen gates the diag columns until the first
+  // report.
+  std::atomic<bool> viewer_metrics_seen{false};
+  std::atomic<uint32_t> viewer_fps_x10{0};
+  std::atomic<uint32_t> viewer_e2e_p95_ms{0};
+
   Result res;
   std::atomic<bool> running{false};
   std::atomic<bool> stop_now{false};
@@ -1658,8 +1666,20 @@ class Loop {
     const char* desktop = im_.cfg.desktop_name_fn != nullptr
                               ? im_.cfg.desktop_name_fn(im_.cfg.desktop_name_ctx)
                               : nullptr;
+    // M4 deliverable metrics: the viewer-side columns ride the same beat
+    // once the agent's first 0x012A forward landed (absent before - the
+    // diag shape stays stable for pre-M4 log tooling).
+    char viewer[96] = {0};
+    if (im_.viewer_metrics_seen.load(std::memory_order_relaxed)) {
+      const uint32_t fps_x10 =
+          im_.viewer_fps_x10.load(std::memory_order_relaxed);
+      const uint32_t e2e = im_.viewer_e2e_p95_ms.load(std::memory_order_relaxed);
+      _snprintf_s(viewer, sizeof(viewer), _TRUNCATE,
+                  " viewer_presented_fps=%u.%u capture_to_present_p95_ms=%u",
+                  fps_x10 / 10u, fps_x10 % 10u, e2e);
+    }
     if (desktop != nullptr && *desktop != '\0') {
-      XNC_LOG_INFO("diag_media_v2 elapsed=%us captured=%llu encoded=%llu keyframes=%llu timeouts=%llu keepalive_feeds=%llu resets=%u w=%u h=%u aus=%llu bytes=%llu desktop=%s",
+      XNC_LOG_INFO("diag_media_v2 elapsed=%us captured=%llu encoded=%llu keyframes=%llu timeouts=%llu keepalive_feeds=%llu resets=%u w=%u h=%u aus=%llu bytes=%llu%s desktop=%s",
                    elapsed_s, static_cast<unsigned long long>(im_.res.captured),
                    static_cast<unsigned long long>(im_.res.encoded),
                    static_cast<unsigned long long>(im_.res.keyframes),
@@ -1668,9 +1688,9 @@ class Loop {
                    im_.res.resets, im_.res.width, im_.res.height,
                    static_cast<unsigned long long>(im_.res.aus_written),
                    static_cast<unsigned long long>(im_.res.bytes_written),
-                   desktop);
+                   viewer, desktop);
     } else {
-      XNC_LOG_INFO("diag_media_v2 elapsed=%us captured=%llu encoded=%llu keyframes=%llu timeouts=%llu keepalive_feeds=%llu resets=%u w=%u h=%u aus=%llu bytes=%llu",
+      XNC_LOG_INFO("diag_media_v2 elapsed=%us captured=%llu encoded=%llu keyframes=%llu timeouts=%llu keepalive_feeds=%llu resets=%u w=%u h=%u aus=%llu bytes=%llu%s",
                    elapsed_s, static_cast<unsigned long long>(im_.res.captured),
                    static_cast<unsigned long long>(im_.res.encoded),
                    static_cast<unsigned long long>(im_.res.keyframes),
@@ -1678,7 +1698,8 @@ class Loop {
                    static_cast<unsigned long long>(im_.res.keepalive_feeds),
                    im_.res.resets, im_.res.width, im_.res.height,
                    static_cast<unsigned long long>(im_.res.aus_written),
-                   static_cast<unsigned long long>(im_.res.bytes_written));
+                   static_cast<unsigned long long>(im_.res.bytes_written),
+                   viewer);
     }
   }
 
@@ -1731,6 +1752,14 @@ bool MediaPipelineV2::Start(const Config& cfg) {
 
 void MediaPipelineV2::RequestIdr(const char* reason) {
   impl_->mbox.ArmIdr(reason != nullptr && reason[0] != '\0' ? reason : "explicit");
+}
+
+// M4 deliverable metrics (any thread; the beat reads - see Impl).
+void MediaPipelineV2::NoteViewerMetrics(uint32_t presented_fps_x10,
+                                         uint32_t e2e_p95_ms) {
+  impl_->viewer_fps_x10.store(presented_fps_x10, std::memory_order_relaxed);
+  impl_->viewer_e2e_p95_ms.store(e2e_p95_ms, std::memory_order_relaxed);
+  impl_->viewer_metrics_seen.store(true, std::memory_order_relaxed);
 }
 
 void MediaPipelineV2::Reconfigure(uint32_t bitrate_bps, uint32_t fps) {

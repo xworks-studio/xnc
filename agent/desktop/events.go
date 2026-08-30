@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -140,6 +141,9 @@ func (e *sessionEvents) onKeyframeReq() {
 // QoSController.Observe → Action 应用(SET_VIDEO_CONFIG 0x0129 下发 host
 // + 全体发送器 pacing 预算;旁观者带宽不足 → spectator_network_paused
 // + 暂停)。qos 为 nil(无 HOST_HELLO 的测试拓扑)时安全忽略。
+// M4 交付指标:随反馈节拍(web 的 1s 节奏)记一条 sender_stats INFO
+//(发送侧拥塞面的可观测性:入队门拒收/年龄冲刷/令牌债务/准入通过率),
+// 并把 viewer 呈现指标经 0x012A 转发 host 的 diag 面(best-effort)。
 func (e *sessionEvents) onViewerFeedback(raw []byte) {
 	if e.qos == nil {
 		return
@@ -151,6 +155,27 @@ func (e *sessionEvents) onViewerFeedback(raw []byte) {
 		e.log.Debug("desktop viewer_feedback malformed; ignored", "err", err)
 		return
 	}
+	sc := e.senderCongestionSnapshot()
+	if e.pub != nil {
+		if st := e.pub.vs.Stats(); st.FramesSent > 0 {
+			attempted := st.Admitted + st.DeadlineDropped + st.OverflowFlushes
+			pass := 100.0
+			if attempted > 0 {
+				pass = float64(st.Admitted) / float64(attempted) * 100
+			}
+			e.log.Info("sender_stats",
+				"deadline_dropped", st.DeadlineDropped,
+				"overflow_flushes", st.OverflowFlushes,
+				"bucket_debt_ms", st.DebtMs,
+				"admission_pass_rate", strconv.FormatFloat(pass, 'f', 1, 64)+"%")
+		}
+		// viewer 指标 → host diag 面(可选能力;未实现/未广告 = 静默)。
+		if rep, ok := e.dyn.(ViewerMetricsReporter); ok {
+			if err := rep.ReportViewerMetrics(f.PresentedFps, f.E2EP95Ms); err != nil {
+				e.log.Debug("viewer metrics forward failed", "err", err)
+			}
+		}
+	}
 	acts := e.qos.observe(ViewerFeedback{
 		SessionID:    e.sessionID,
 		Visible:      f.Visible,
@@ -159,7 +184,7 @@ func (e *sessionEvents) onViewerFeedback(raw []byte) {
 		DecodeQueue:  f.DecodeQueue,
 		RTTMs:        f.RTTMs,
 		PresentedFps: f.PresentedFps,
-		Sender:       e.senderCongestionSnapshot(),
+		Sender:       sc,
 	})
 	if len(acts) > 0 {
 		e.qos.apply(acts, e.dyn)
