@@ -1192,3 +1192,36 @@ git-ignored.
   is absorbing sparse-stream noise.
 - fps<=5 ladder-bottom IDR-only degenerate stream (§15 follow-up) is unchanged — with the guard,
   healthy sessions simply no longer FALL to the ladder bottom from phantom congestion.
+
+## 17. 2026-08-30 — configurable ICE policy for LAN direct connect (`1b6dce9`)
+
+Production follow-up to §16's session: with the congestion false positive fixed, the same LAN
+user still saw heavy loss (432 lost packets → PLI storm → ~0.5fps effective) because
+`IceTransportPolicy` was hard-wired relay-only server-side (field never sent → agent forces
+`RelayOnly`). When browser and node are both on 192.168.1.x, relay-only hauls every packet
+through the public TURN server (114.55.5.26) — a WAN round-trip per packet on a LAN session.
+
+**Change (minimal, server-only)**: `XNC_DESKTOP_ICE_POLICY` env knob, default `"relay"`
+(backward compatible — not configuring it is byte-identical to before). `"all"` → server injects
+`proto.DesktopIceAll` into SESSION_OPEN params → agent (already handles it, zero agent changes)
+uses `ICETransportPolicyAll` so direct host/srflx candidates win on-LAN. Fail-closed: only the
+exact string `"all"` opens direct; anything else (empty, `ALL`, typos) normalizes to `"relay"`.
+Client-submitted `iceTransportPolicy` remains whitelisted away regardless — the control point is
+server config only, same as TURN/mediaProtocol. Wired: `config.go` (`DesktopICEPolicy`),
+`desktop_handlers.go` (inject when `all`), `deploy/docker-compose.yml`
+(`XNC_DESKTOP_ICE_POLICY: ${XNC_DESKTOP_ICE_POLICY:-relay}`).
+
+**Tests**: `TestDesktopICEPolicyEnv` (config: no env → relay, `all` → all, `ALL`/`direct` →
+relay) and `TestDesktopICEPolicy` (api: default omits the field even when the client begs for
+`all`; config `all` injects `proto.DesktopIceAll` and manager snapshot matches SESSION_OPEN
+byte-for-byte). `go test ./internal/config ./internal/api -count=1` green (Docker up, so the
+testcontainers suites ran too; api suite 101s).
+
+**Known limitation (flagged, out of scope here)**: the browser VIEWER pins
+`iceTransportPolicy: "relay"` on its own `RTCPeerConnection` (web/src/pages/DesktopLive.tsx,
+"relay-only PC per the dev topology"). ICE needs BOTH ends relaxed for a direct pair — a
+relay-only browser only gathers TURN candidates, so even with the agent on `all`, viewer↔agent
+media still transits TURN. Realizing LAN direct for production browsers needs a web follow-up
+(e.g. the 202 response carries the server-selected policy and DesktopLive builds its PC from
+it); server + agent sides are now ready for that. Server image rebuild + SRV deploy is likewise
+a separate step.
