@@ -452,21 +452,43 @@ func TestViewerSenderQueueAgeOverflowFlushesAndRequestsKeyOnce(t *testing.T) {
 // TestViewerSenderDeadlineBeyondHardMaxNotQueued:预算使最后一包的
 // plan 截止超 100ms → 整帧不入队(无任何部分包发出)+ 抑制(只丢不
 // 采样)+ 恰一次合并请求;对比:预算充足(截止 ~5ms,50ms 目标内)
-// 时整帧入队送出。
+// 时整帧入队送出。IDR 死亡螺旋修正:关键帧后的最初 recoveryGraceDeltas
+// 个撞门增量走恢复窗豁免(有界突发准入、不转 waitIDR);豁免耗尽后
+// 真实过载照常拒收转 waitIDR —— 本用例同时钉死这两半。
 func TestViewerSenderDeadlineBeyondHardMaxNotQueued(t *testing.T) {
-	// ① 硬上限:100kbps → 85KB/s;~20KB 帧(去 burst 后 ~16.7KB)需
-	// ~197ms > 100ms → 不入队。
+	// ① 硬上限:100kbps → 13.1KB/s;~20KB 帧(去 burst 后 ~16.7KB)需
+	// ~1.28s > 100ms。
 	s := newFakeViewerSenderWithBudget(100_000)
 	if err := s.Enqueue(idr(1)); err != nil { // 小 IDR 立即送出 → live
 		t.Fatalf("small idr: %v", err)
 	}
 	sent0 := s.sent()
-	big := Frame{PresentMonoUs: vsMono(2), AU: vsBigIDRAU(20_000)}
-	if err := s.Enqueue(big); err != nil {
+	totalBig := expectedPacketCount(t, vsBigIDRAU(20_000))
+	bigAt := func(i uint64) Frame { return Frame{PresentMonoUs: vsMono(i), AU: vsBigIDRAU(20_000)} }
+	// 恢复窗豁免 ×recoveryGraceDeltas:开流 IDR 后的前两个撞门增量被有界
+	// 突发准入(零请求、零拒收、保持 live —— 修前这里就是死亡螺旋每圈
+	// 的起点:拒收 → waitIDR + pacer → ≥500ms 才有下一 IDR)。
+	for i := 0; i < recoveryGraceDeltas; i++ {
+		if err := s.Enqueue(bigAt(uint64(2 + i))); err != nil {
+			t.Fatalf("grace delta %d: %v", i, err)
+		}
+		if s.state() != stateLive {
+			t.Fatalf("grace delta %d: state=%v, want live (recovery-burst admission)", i, s.state())
+		}
+	}
+	if reqs := s.keyRequests(); len(reqs) != 0 {
+		t.Fatalf("grace deltas fired key requests %v, want none", reqs)
+	}
+	if st := s.vs.Stats(); st.DeadlineDropped != 0 {
+		t.Fatalf("grace deltas: deadlineDropped=%d, want 0", st.DeadlineDropped)
+	}
+	// 豁免耗尽后的撞门增量:整帧不入队 + waitIDR + 恰一次 [pacer]
+	//(豁免增量此前已整帧送出 —— superseded 冲刷/截止 drain,非部分包)。
+	if err := s.Enqueue(bigAt(4)); err != nil {
 		t.Fatalf("over-deadline delta: %v", err)
 	}
-	if s.sent() != sent0 {
-		t.Fatalf("frame with >100ms deadline was (partially) queued: %d -> %d", sent0, s.sent())
+	if s.sent() != sent0+2*totalBig {
+		t.Fatalf("over-deadline frame partially queued: sent=%d, want %d", s.sent(), sent0+2*totalBig)
 	}
 	if s.state() != stateWaitIDR {
 		t.Fatalf("state after not-queued frame=%v, want waitIDR (suppression, never sampling)", s.state())
@@ -481,8 +503,8 @@ func TestViewerSenderDeadlineBeyondHardMaxNotQueued(t *testing.T) {
 	if err := s.Enqueue(delta(3)); err != nil {
 		t.Fatalf("suppressed delta: %v", err)
 	}
-	if s.sent() != sent0 {
-		t.Fatalf("delta after suppression was sent: %d -> %d", sent0, s.sent())
+	if s.sent() != sent0+2*totalBig {
+		t.Fatalf("delta after suppression was sent: %d -> %d", sent0+2*totalBig, s.sent())
 	}
 
 	// ② 50ms 目标内:4Mbps → 3.4MB/s;~16.7KB 需 ~5ms → 正常入队送出。
@@ -507,6 +529,92 @@ func TestViewerSenderDeadlineBeyondHardMaxNotQueued(t *testing.T) {
 	}
 	if reqs := s2.keyRequests(); len(reqs) != 0 {
 		t.Fatalf("in-budget path fired key requests %v, want none", reqs)
+	}
+}
+
+// ---- IDR 恢复死亡螺旋修正:恢复窗豁免 ----
+
+// TestViewerSenderRecoveryBurstBreaksIDRSpiral 钉死生产事故形态(0.5.10
+// 前 fps=2、preKeyDropped=656、仅 8 帧到达观众):500k 码率下限预算 +
+// ~21fps 生产节奏 —— 恢复 IDR 落地(C2 豁免,令牌债务钳 50ms 地板)后,
+// 紧随的膨胀增量(地板余债 + IDR 后残差膨胀)撞 100ms 入队门。修前:
+// 立刻再转 waitIDR + [pacer] → host kIdrMinIntervalMs=500 + 编码深度令
+// 下一 IDR ≥500ms 不可得 → 每周期 ~15 帧被抑制、~1s 一循环。修后:
+// 恢复窗内的撞门增量按有界突发准入(live 保持、零关键帧请求),正常
+// 尺寸帧一过门即恢复常规门控;此后同样的撞门增量照常拒收转 waitIDR
+//(合法溢出恢复不被削弱)。
+func TestViewerSenderRecoveryBurstBreaksIDRSpiral(t *testing.T) {
+	s := newFakeViewerSenderWithBudget(500_000) // 事故现场:QoS 码率下限
+	big := func(key bool, i uint64) Frame {
+		return Frame{Key: key, PresentMonoUs: vsMono(i), AU: vsNAL(key, i, 12_000)}
+	}
+	// 恢复 IDR(~12KB:500k 下铺完 ~190ms → C2 豁免落地,债务钳地板)。
+	if err := s.Enqueue(big(true, 1)); err != nil {
+		t.Fatalf("recovery idr: %v", err)
+	}
+	if s.state() != stateLive {
+		t.Fatalf("state=%v, want live after recovery IDR", s.state())
+	}
+	pktBig := expectedPacketCount(t, vsNAL(false, 2, 12_000))
+	pktIDR := expectedPacketCount(t, vsNAL(true, 1, 12_000))
+
+	// P1(同钟到达):地板余债 + 膨胀 → 撞门 → 恢复窗豁免(不转 waitIDR)。
+	if err := s.Enqueue(big(false, 2)); err != nil {
+		t.Fatalf("p1: %v", err)
+	}
+	if s.state() != stateLive {
+		t.Fatalf("p1: state=%v, want live (recovery-burst admission breaks the spiral)", s.state())
+	}
+	// P2(+47ms):豁免名额内同样准入。
+	s.clk.advance(47 * time.Millisecond)
+	_ = s.vs.drainNow()
+	if err := s.Enqueue(big(false, 3)); err != nil {
+		t.Fatalf("p2: %v", err)
+	}
+	if s.state() != stateLive {
+		t.Fatalf("p2: state=%v, want live", s.state())
+	}
+	// P3(+47ms,正常尺寸):过门即恢复完成(豁免清零)。
+	s.clk.advance(47 * time.Millisecond)
+	_ = s.vs.drainNow()
+	if err := s.Enqueue(delta(4)); err != nil {
+		t.Fatalf("p3: %v", err)
+	}
+	if s.state() != stateLive {
+		t.Fatalf("p3: state=%v, want live", s.state())
+	}
+	// 全部完整送出(豁免帧截止钳在入队 +100ms 视界内;正常增量在帧距
+	// 内铺完 —— 恰在 +20ms drain,不触碰普通增量的年龄界)。
+	s.clk.advance(20 * time.Millisecond)
+	if err := s.vs.drainNow(); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if got, want := s.sent(), pktIDR+2*pktBig+1; got != want {
+		t.Fatalf("sent=%d, want %d (idr + 2 grace deltas + normal delta)", got, want)
+	}
+	st := s.vs.Stats()
+	if st.PreKeyDropped != 0 || st.DeadlineDropped != 0 || st.KeyRequests != 0 {
+		t.Fatalf("spiral signature: preKeyDropped=%d deadlineDropped=%d keyRequests=%d, want 0/0/0",
+			st.PreKeyDropped, st.DeadlineDropped, st.KeyRequests)
+	}
+	if st.FramesSent != 4 {
+		t.Fatalf("framesSent=%d, want 4", st.FramesSent)
+	}
+
+	// 控制腿:豁免已清零,同样的撞门增量照常拒收 → waitIDR + 恰一次
+	// [pacer](合法溢出恢复原样)。
+	s.clk.advance(47 * time.Millisecond)
+	if err := s.Enqueue(big(false, 5)); err != nil {
+		t.Fatalf("over-deadline delta: %v", err)
+	}
+	if s.state() != stateWaitIDR {
+		t.Fatalf("state=%v, want waitIDR after grace is spent", s.state())
+	}
+	if reqs := s.keyRequests(); len(reqs) != 1 || reqs[0] != "pacer" {
+		t.Fatalf("key requests = %v, want exactly [pacer]", reqs)
+	}
+	if st := s.vs.Stats(); st.DeadlineDropped != 1 {
+		t.Fatalf("deadlineDropped=%d, want 1", st.DeadlineDropped)
 	}
 }
 

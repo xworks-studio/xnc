@@ -25,6 +25,16 @@
 //     整帧被拒 → waitIDR 棘轮 = 观众永久卡死。IDR 绝不拒收:头段按令牌
 //     节奏铺开,尾段截止钳到入队 +100ms(有界突发,与冲刷同类);令牌
 //     债务钳到 50ms 目标窗口等值(后续 delta 照常入门)。
+//   - 恢复窗豁免(IDR 恢复死亡螺旋修正):C2 只保住恢复 IDR 本身,但 IDR
+//     落地时债务钳在 50ms 地板,紧随其后的增量帧(残差膨胀 + 地板余债)
+//     常撞 100ms 门 → 立刻再转 waitIDR + "pacer" 请求 → host 侧
+//     kIdrMinIntervalMs=500 + 编码深度令新 IDR ≥500ms 不可得 → 每周期
+//     ~15 帧被抑制、只交付 1 IDR → 再撞门,~1s 循环(生产实测 fps=2、
+//     preKeyDropped=656、encoder_idr_timeout[pacer] 每秒一条)。恢复 IDR
+//     的参考链本可承载这些帧,拒收它们等于作废刚到的 IDR。因此关键帧
+//     准入后的最初 recoveryGraceDeltas 个撞门增量按关键帧同款有界突发
+//     准入(截止钳 +100ms、债务钳地板);任一增量正常过门即认定恢复
+//     完成并清零豁免 —— 正常门控与溢出恢复路径尽快原样恢复。
 //   - 队列年龄(实际时刻)超过 maxQueueAge(增量帧):冲刷在队包(立即
 //     写出以完成在途帧,避免撕裂帧)、清空队列、进入 waitIDR,并恰一次
 //     触发合并关键帧回调。进行中的关键帧不被年龄界冲刷(冲刷会转
@@ -91,6 +101,12 @@ const (
 	// 的增量帧仍在 100ms 门内可入队、按节奏铺开(不为一次关键帧长期
 	// 还债,否则恢复 IDR 之后 delta 接连被拒,流退化为 IDR-only)。
 	pacingDebtFloor = 50 * time.Millisecond
+	// recoveryGraceDeltas(IDR 恢复死亡螺旋修正):关键帧准入后、首个正常
+	// 过门的增量帧之前,至多这么多个撞门增量帧按关键帧同款有界突发准入
+	// (见文件头「恢复窗豁免」)。2 = 覆盖恢复 IDR 后的残差膨胀帧 + 地板
+	// 余债帧(生产 500k 地板预算下实测:IDR、膨胀 P1、P2 三帧后门控自然
+	// 恢复);再多会实质弱化 100ms 门对真实过载的节流。
+	recoveryGraceDeltas = 2
 	// defaultPacingBudgetBps 是预算缺省值(bits/s;BudgetBps=0 时生效)。
 	// 拥塞控制(后续任务)将按 TWCC 反馈驱动预算。
 	defaultPacingBudgetBps = 20_000_000
@@ -179,8 +195,9 @@ type ViewerSender struct {
 	pendingEpoch  frameEpoch // Discontinuity 后等待的代际(0 = 不校验)
 	queue         []queuedPacket
 	queueEnqueued time.Time // 当前在队帧的入队时刻(年龄判据)
-	queueKey      bool      // 当前在队帧是否关键帧(C2 完成保证)
+	queueHolds    bool      // 在队帧必须完整送出(关键帧,或恢复窗豁免增量:年龄界不冲刷,冲刷会转 waitIDR = 恢复自残)
 	queueBytes    int       // 在队帧的 AU 字节累计
+	recoveryGrace int       // 关键帧后剩余的恢复窗豁免名额(正常过门即清零;0 = 正常门控)
 	stats         viewerStatsN
 	pumpStarted   bool
 
@@ -288,12 +305,13 @@ func (b *tokenBucket) reserve(sizes []int, now time.Time) (deadlines []time.Time
 	return deadlines, true
 }
 
-// reserveKeyframe(C2 final-fixwave):关键帧豁免 100ms 入队门 —— 绝不
-// 拒收。头段截止按令牌节奏(plan 原值),尾段钳到 now+maxQueueAge:
-// 整帧铺开仍受 100ms 视界约束(超出部分以有界突发送出,与冲刷已接受
-// 的突发同类),配 drainLocked 的「进行中关键帧不被年龄界冲刷」保证
-// AU 必然完整送出。余额照记(长期速率公平),但债务钳到
-// pacingDebtFloor 等值 —— 后续增量帧照常入门、按节奏铺开。
+// reserveKeyframe(C2 final-fixwave;IDR 死亡螺旋修正:恢复窗豁免增量
+// 复用同一语义):关键帧豁免 100ms 入队门 —— 绝不拒收。头段截止按令牌
+// 节奏(plan 原值),尾段钳到 now+maxQueueAge:整帧铺开仍受 100ms 视界
+// 约束(超出部分以有界突发送出,与冲刷已接受的突发同类),配
+// drainLocked 的「进行中关键帧不被年龄界冲刷」保证 AU 必然完整送出。
+// 余额照记(长期速率公平),但债务钳到 pacingDebtFloor 等值 —— 后续
+// 增量帧照常入门、按节奏铺开。
 func (b *tokenBucket) reserveKeyframe(sizes []int, now time.Time) []time.Time {
 	deadlines, tokens := b.plan(sizes, now)
 	gate := now.Add(maxQueueAge)
@@ -444,21 +462,35 @@ func (s *ViewerSender) Enqueue(f Frame) error {
 	// 入队门:增量帧的最后一包截止超 maxQueueAge → 整帧不入队(抑制只
 	// 丢不采样:进入 waitIDR 并恰一次合并请求,绝无「丢 P 帧后继续发
 	// 后续 P 帧」);关键帧走 reserveKeyframe 豁免(C2,见其注释)——
-	// 恢复 IDR 永远可交付。
+	// 恢复 IDR 永远可交付。恢复窗豁免(IDR 死亡螺旋修正,见文件头):
+	// 关键帧准入后的最初 recoveryGraceDeltas 个撞门增量同走关键帧豁免
+	// (有界突发 + 债务地板)—— 拒收它们会把刚落地的恢复 IDR 作废并
+	// 立刻再转 waitIDR(host kIdrMinIntervalMs=500 令下一个 IDR ≥500ms
+	// 不可得,~15 帧/周期被抑制 = fps≈2 的死亡螺旋);任一增量正常过门
+	// 即恢复完成,豁免清零,真实过载照常入门拒收。
+	exempt := false
 	var deadlines []time.Time
 	if f.Key {
 		deadlines = s.bucket.reserveKeyframe(sizes, now)
+		s.recoveryGrace = recoveryGraceDeltas
 	} else if d, ok := s.bucket.reserve(sizes, now); !ok {
-		s.stats.deadlineDropped++
-		s.state = stateWaitIDR
-		if keyReason == "" {
-			keyReason = "pacer"
+		if s.recoveryGrace > 0 {
+			deadlines = s.bucket.reserveKeyframe(sizes, now)
+			s.recoveryGrace--
+			exempt = true
+		} else {
+			s.stats.deadlineDropped++
+			s.state = stateWaitIDR
+			if keyReason == "" {
+				keyReason = "pacer"
+			}
+			s.mu.Unlock()
+			s.fireKey(keyReason)
+			return nil
 		}
-		s.mu.Unlock()
-		s.fireKey(keyReason)
-		return nil
 	} else {
 		deadlines = d
+		s.recoveryGrace = 0
 	}
 	// frame-meta(M3 Task 4,修正轮):身份在本帧 admitted 入队时绑定
 	//(此刻 per-viewer 时戳已定),随队列槽位携带——任何写出顺序(入口
@@ -468,7 +500,7 @@ func (s *ViewerSender) Enqueue(f Frame) error {
 	if s.makeMeta != nil {
 		meta = s.makeMeta(f, ts)
 	}
-	s.queueKey = f.Key // 单帧队列:此刻队列必空(上方已冲刷/丢弃)
+	s.queueHolds = f.Key || exempt // 单帧队列:此刻队列必空(上方已冲刷/丢弃)
 	for i := range pkts {
 		s.queue = append(s.queue, queuedPacket{
 			pkt:      pkts[i],
@@ -643,7 +675,7 @@ func (s *ViewerSender) discontinuityLocked(fe frameEpoch) {
 // dropQueueLocked 丢弃全部在队包(旧代数据无效)。
 func (s *ViewerSender) dropQueueLocked() {
 	s.queue = nil
-	s.queueKey = false
+	s.queueHolds = false
 	s.queueBytes = 0
 }
 
@@ -664,7 +696,7 @@ func (s *ViewerSender) flushQueueLocked(cause string) error {
 }
 
 // ageOverflowLocked 是「队列年龄超限」的统一转移(drainLocked 的检测点
-// 与单测直接驱动同一入口;C2 后仅增量帧可入):冲刷在队包(立即写出以
+// 与单测直接驱动同一入口;C2 后仅普通增量帧可入):冲刷在队包(立即写出以
 // 完成在途帧)、清空队列、进入 waitIDR。返回应触发的合并关键帧 reason
 // (仅 live→waitIDR 的转移触发;已在 waitIDR 时返回 ""——等待中的请求
 // 已合并)。
@@ -698,17 +730,18 @@ func (s *ViewerSender) writeLocked(q queuedPacket) error {
 	return nil
 }
 
-// drainLocked 送出截止时刻已到的在队包;若当前在队帧(增量帧)年龄超过
+// drainLocked 送出截止时刻已到的在队包;若当前在队帧(普通增量帧)年龄超过
 // maxQueueAge 则先走 ageOverflow 转移。C2:进行中的关键帧不被年龄界冲刷
 // —— 其截止已钳到入队 +100ms(reserveKeyframe),这里跳过冲刷判定让
-// AU 必然完整送出(冲刷虽也整帧写出,但会转 waitIDR = 恢复自残);帧
-// 间年龄界照旧。返回(待触发的合并请求 reason,首个写错误)。写错误
-// 视为发送面死亡:弃队列并转入 closed。
+// AU 必然完整送出(冲刷虽也整帧写出,但会转 waitIDR = 恢复自残);恢复
+// 窗豁免的增量(IDR 死亡螺旋修正)同享此保证(同一钳制语义);帧间年龄
+// 界照旧。返回(待触发的合并请求 reason,首个写错误)。写错误视为发送面
+// 死亡:弃队列并转入 closed。
 func (s *ViewerSender) drainLocked(now time.Time) (string, error) {
 	if len(s.queue) == 0 {
 		return "", nil
 	}
-	if now.Sub(s.queueEnqueued) > maxQueueAge && !s.queueKey {
+	if now.Sub(s.queueEnqueued) > maxQueueAge && !s.queueHolds {
 		return s.ageOverflowLocked(now), nil
 	}
 	t0 := time.Now()

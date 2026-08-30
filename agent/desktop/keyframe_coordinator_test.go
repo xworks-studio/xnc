@@ -134,6 +134,61 @@ func TestKeyframeCoordinatorCooldownElapsesAfterIDR(t *testing.T) {
 	}
 }
 
+// TestKeyframeCoordinatorPacerBackoff(IDR 恢复死亡螺旋修正):发送器
+// pacer 循环的撞门拒收可以在 host 未产出上一条请求的 IDR 时再次触发,而
+// host kIdrMinIntervalMs=500 + 编码深度令 pacer 请求的 IDR ≥500ms 不可得
+//(生产日志:同一秒两条 client_reason=pacer)。因此非 urgent 的 pacer
+// 请求在 2×IDR 宽限(33ms 帧距 → 宽限 250ms → 退避 500ms)内不开启新
+// 周期;其余 reason 照常冷却合并;退避过后 pacer 恢复正常打 host。
+func TestKeyframeCoordinatorPacerBackoff(t *testing.T) {
+	f := newFakeCoordinator(33 * time.Millisecond) // 宽限 250ms → 退避 500ms
+	f.coord.Request("pacer", false)                // t=0 打 host
+	if reqs := f.sink.requests(); len(reqs) != 1 || reqs[0] != "pacer" {
+		t.Fatalf("host requests = %v, want [pacer]", reqs)
+	}
+
+	// t=100ms:在途周期内(pending 非空)→ 并入,不打 host。
+	f.clk.advance(100 * time.Millisecond)
+	f.coord.Request("pacer", false)
+	if reqs := f.sink.requests(); len(reqs) != 1 {
+		t.Fatalf("pending merge duplicated host request: %v", reqs)
+	}
+
+	// t=300ms:宽限(250ms)已过 → 超时清空周期;退避窗内(lastPacer=
+	// 100ms,退避至 600ms)的新 pacer 请求整体丢弃 —— 不打 host、不进
+	// pending(在途/排队中的上一条已覆盖它)。
+	f.clk.advance(200 * time.Millisecond)
+	if p := f.coord.Pending(); len(p) != 0 {
+		t.Fatalf("pending after grace = %v, want expired", p)
+	}
+	f.coord.Request("pacer", false)
+	if reqs := f.sink.requests(); len(reqs) != 1 {
+		t.Fatalf("pacer backoff failed to suppress: %v", reqs)
+	}
+	if p := f.coord.Pending(); len(p) != 0 {
+		t.Fatalf("backoff must not open a cycle: pending=%v", p)
+	}
+
+	// 其他 reason 不受 pacer 退避影响:pli 在 t=300ms(距上次打 host
+	// 300ms ≥ 250ms 冷却)照常打 host。
+	f.coord.Request("pli", false)
+	if reqs := f.sink.requests(); len(reqs) != 2 || reqs[1] != "pli" {
+		t.Fatalf("pli must not inherit the pacer backoff: %v", reqs)
+	}
+
+	// t=700ms:退避(600ms)已过 → pacer 恢复正常开新周期。
+	f.clk.advance(400 * time.Millisecond)
+	f.coord.Request("pacer", false)
+	if reqs := f.sink.requests(); len(reqs) != 3 || reqs[2] != "pacer" {
+		t.Fatalf("pacer must fire after the backoff window: %v", reqs)
+	}
+	// 恰两次超时状态:t=250ms 的 pacer 周期与 t=550ms 的 pli 周期(测试
+	// 不喂 IDR,各自宽限到点恰一次)。
+	if codes := f.state.snapshot(); len(codes) != 2 || codes[0] != stateEncoderIDRTimeout || codes[1] != stateEncoderIDRTimeout {
+		t.Fatalf("states = %v, want two encoder_idr_timeout (pacer cycle, pli cycle)", codes)
+	}
+}
+
 // ---- Step 1(裁决 2):urgent 绕过冷却、但绝不复制在途请求 ----
 
 // TestKeyframeCoordinatorUrgentBypassesCooldownNeverDuplicates:

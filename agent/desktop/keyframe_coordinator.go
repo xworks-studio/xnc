@@ -38,6 +38,10 @@ import (
 // defaultKeyframeCooldown 是常规关键帧请求的合并窗口(裁决 2)。
 const defaultKeyframeCooldown = 250 * time.Millisecond
 
+// keyRequestReasonPacer 与 viewer_sender.go 入队门拒收路径的 fireKey
+// ("pacer")同义 —— 发送器内部 pacer 循环的稳定 reason 串。
+const keyRequestReasonPacer = "pacer"
+
 // stateEncoderIDRTimeout 是「请求的关键帧未在宽限内产出」的稳定状态码
 // (经 OnState 回调下发;viewer 对未知 state code 按既有词汇规则忽略)。
 const stateEncoderIDRTimeout = "encoder_idr_timeout"
@@ -100,6 +104,7 @@ type KeyframeCoordinator struct {
 	mu          sync.Mutex
 	pending     map[string]struct{} // 在途请求周期并入的 reason 集
 	lastRequest time.Time           // 最近一次实际打 host 的时刻
+	lastPacer   time.Time           // 最近一次 pacer 请求进入在途周期的时刻(退避基准)
 	requested   keyframeID          // 该周期的请求快照(打 host 时的 lastIDR)
 	deadline    time.Time           // 该周期的 IDR 宽限
 	timedOut    bool                // 该周期已发过 encoder_idr_timeout
@@ -150,6 +155,14 @@ func newKeyframeCoordinator(cfg KeyframeCoordinatorConfig) *KeyframeCoordinator 
 
 // Request 合并一条关键帧请求(brief API)。urgent(新订阅/epoch 变更)绕过
 // 冷却,但 pending 非空时只并入 reason 集(绝不复制在途请求)。
+//
+// pacer 专项退避(IDR 恢复死亡螺旋修正):常规 250ms 冷却为 PLI 设计;而
+// 发送器 pacer 循环的撞门拒收可以在 host 尚未产出上一个请求的 IDR 时再次
+// 触发 —— host 侧 kIdrMinIntervalMs=500 + 编码器深度令 pacer 请求的 IDR
+// 物理上 ≥500ms 不可得(生产日志:同一秒内两条 client_reason=pacer 请求,
+// 第二条只能排到 min_interval 边界被服务)。因此非 urgent 的 pacer 请求在
+// 距上一条 pacer 请求 2×IDR 宽限(≥500ms)内不开启新周期(在途/排队中的
+// 上一条已覆盖它);其余 reason(pli/fir/connect/overflow/resume)语义不变。
 func (c *KeyframeCoordinator) Request(reason string, urgent bool) {
 	if reason == "" {
 		return
@@ -158,11 +171,23 @@ func (c *KeyframeCoordinator) Request(reason string, urgent bool) {
 	now := c.nowFn()
 	emit := c.expireLocked(now)
 	fire := ""
-	if len(c.pending) > 0 {
+	switch {
+	case len(c.pending) > 0:
 		c.pending[reason] = struct{}{} // 并入在途周期
-	} else if urgent || elapsed(now, c.lastRequest) >= c.cooldown {
+		if reason == keyRequestReasonPacer {
+			c.lastPacer = now
+		}
+	case reason == keyRequestReasonPacer && !urgent &&
+		elapsed(now, c.lastPacer) < 2*c.grace():
+		// pacer 退避窗内:丢弃(上一条 pacer 请求仍在 host 侧产出/排队,
+		// 重发只会制造 encoder_idr_timeout 噪声;退避过后发送器的下一次
+		// 转移仍会重新触发)。
+	case urgent || elapsed(now, c.lastRequest) >= c.cooldown:
 		c.pending[reason] = struct{}{}
 		c.lastRequest = now
+		if reason == keyRequestReasonPacer {
+			c.lastPacer = now
+		}
 		c.requested = c.lastIDR
 		c.deadline = now.Add(c.grace())
 		c.timedOut = false
