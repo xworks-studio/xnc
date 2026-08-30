@@ -33,18 +33,19 @@ func pumpDisplayEvents(ctx context.Context, w *wsWriter, dyn Source) {
 }
 
 // qosObservingSource 在帧汇出点(source → publisher 帧泵)喂养共享 QoS
-// 的帧观测(M4 修正):透传全部 Source 行为,仅对每帧回调一次 —— host
-// 重置后的新代帧流由此解除 qos 控制器的 reset-recovery grace。onFrame
+// 的帧观测(M4 修正):透传全部 Source 行为,仅对每帧回调一次(携带
+// Frame,消费侧取 CodecEpoch)—— host 重置后的新代帧流由此解除 qos
+// 控制器的 reset-recovery grace(Fix 1:旧代在飞帧不算确认)。onFrame
 // 为 nil 时纯透传。
 type qosObservingSource struct {
 	Source
-	onFrame func()
+	onFrame func(Frame)
 }
 
 func (s qosObservingSource) RecvFrame(ctx context.Context) (Frame, bool) {
 	f, ok := s.Source.RecvFrame(ctx)
 	if ok && s.onFrame != nil {
-		s.onFrame()
+		s.onFrame(f)
 	}
 	return f, ok
 }

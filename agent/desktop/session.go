@@ -158,14 +158,16 @@ func (q *streamQoS) observe(fb ViewerFeedback) []Action {
 	return acts
 }
 
-// frameObserved 通知决策器帧流仍在产出(session 帧泵逐帧喂入):host 重
-// 置后的新代帧确认重置完成 → 解除 reset-recovery grace,拥塞控制恢复。
-func (q *streamQoS) frameObserved() {
+// frameObserved 通知决策器帧流仍在产出(session 帧泵逐帧喂入,携带该帧
+// 的 codec epoch):host 重置后的「新代」帧确认重置完成 → 解除
+// reset-recovery grace,拥塞控制恢复(旧代在飞帧不算确认 —— Fix 1)。
+func (q *streamQoS) frameObserved(codecEpoch uint64) {
 	q.mu.Lock()
-	held := q.ctrl.FrameObserved()
+	held := q.ctrl.FrameObserved(codecEpoch)
 	q.mu.Unlock()
 	if held {
-		q.log.Info("desktop qos: encoder reset confirmed by frame flow; congestion control resumed")
+		q.log.Info("desktop qos: encoder reset confirmed by new-generation frame; congestion control resumed",
+			"codec_epoch", codecEpoch)
 	}
 }
 
@@ -500,10 +502,12 @@ func (h *Handler) setupPublisher(ctx context.Context, w *wsWriter, src Source,
 	// 包裹:key 帧身份(CodecEpoch/EncodeSeq,Task 1 透传)在汇出点喂
 	// coord.OnIDR——在途关键帧请求只被「匹配或更新」的 IDR 清除。M4 修
 	// 正:再包一层 qosObservingSource,逐帧喂共享 QoS(reset-recovery
-	// grace 的解除信号;连接就绪前的帧同样计入)。
+	// grace 的解除信号,Fix 1 起只认新 codec epoch 的帧;连接就绪前的帧
+	// 同样计入)。
 	var pumpSrc Source = idrObservingSource{Source: src, onIDR: coord.OnIDR}
 	if qos != nil {
-		pumpSrc = qosObservingSource{Source: pumpSrc, onFrame: qos.frameObserved}
+		pumpSrc = qosObservingSource{Source: pumpSrc,
+			onFrame: func(f Frame) { qos.frameObserved(f.CodecEpoch) }}
 	}
 	go pumpFrames(ctx, log, pumpSrc, pub)
 	go pumpCursor(ctx, src, ictl)

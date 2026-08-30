@@ -251,6 +251,7 @@ func TestQoSSpectatorPauseBelow35PercentControllerBandwidth(t *testing.T) {
 func TestQoSLadderEscalationAndRecovery(t *testing.T) {
 	c, clk := newQoSTestController()
 	c.Observe(fb("s1", true, 8_000_000, 5))
+	gen := uint64(0) // 帧流 codec epoch 递增器(新代帧模拟)
 
 	congest := func() VideoConfig {
 		// M4 修正后的契约:决策按真实反馈节奏(≥1/s)驱动,且每步之间
@@ -261,7 +262,8 @@ func TestQoSLadderEscalationAndRecovery(t *testing.T) {
 		if !ok {
 			t.Fatalf("congestion step missing an action")
 		}
-		c.FrameObserved()
+		gen++
+		c.FrameObserved(gen) // 新代帧确认(可能刚发生的 max_w 重置)
 		return cfg
 	}
 	// 码率连降(立即通道)到 500k 下限:2.3M→1.61M→1.127M→789k→552k→500k。
@@ -307,7 +309,8 @@ func TestQoSLadderEscalationAndRecovery(t *testing.T) {
 	var steps []VideoConfig
 	for i := 0; i < 40; i++ {
 		clk.advance(3500 * time.Millisecond)
-		c.FrameObserved() // 恢复期帧流持续(上一步若改了 max_w,新代帧确认)
+		gen++
+		c.FrameObserved(gen) // 恢复期帧流持续(上一步若改了 max_w,新代帧确认)
 		cfg, ok := configOf(t, c.Observe(fb("s1", true, 30_000_000, 5)))
 		if !ok {
 			break
@@ -402,8 +405,8 @@ func TestQoSCongestionHeldWhileResetInFlight(t *testing.T) {
 		t.Fatalf("maxW cascaded to %d while reset in flight, want 1600", got)
 	}
 
-	// (b)grace 被帧观测解除后,<1s 的立即通道拥塞仍被最小间隔挡住。
-	c.FrameObserved()
+	// (b)grace 被新代帧观测解除后,<1s 的立即通道拥塞仍被最小间隔挡住。
+	c.FrameObserved(1)
 	clk.advance(100 * time.Millisecond)
 	if acts := c.Observe(fb("s1", true, 1_000, 500)); len(acts) != 0 {
 		t.Fatalf("immediate path must respect the min interval after a reset-triggering cut, got %+v", acts)
@@ -435,10 +438,10 @@ func TestQoSGraceClearsOnFrameObservation(t *testing.T) {
 	}
 	// 帧观测解除(grace 清空即恢复;返回值报告确有一次在途挂起被解除)。
 	clk.advance(2 * time.Second)
-	if !c.FrameObserved() {
+	if !c.FrameObserved(1) {
 		t.Fatal("FrameObserved should report clearing an in-flight hold")
 	}
-	if c.FrameObserved() {
+	if c.FrameObserved(1) {
 		t.Fatal("second FrameObserved must be a no-op (no hold outstanding)")
 	}
 	if cfg, ok := configOf(t, c.Observe(fb("s1", true, 1_000, 500))); !ok || cfg.MaxW != 1280 {
@@ -450,6 +453,50 @@ func TestQoSGraceClearsOnFrameObservation(t *testing.T) {
 	clk.advance(2 * time.Second)
 	if acts := c.Observe(fb("s1", true, 1_000, 500)); len(acts) != 0 {
 		t.Fatalf("ladder floor: congestion is a no-op, got %+v", acts)
+	}
+}
+
+// TestQoSGraceOnlyClearedByNewerCodecEpoch(Fix 1):grace 的解除只认
+// 「codec epoch 严格新于置位时刻已见代」的帧。修前 FrameObserved 对
+// ANY 帧清位 —— 重置在途时旧代在飞帧(host 重启编码器前产出的尾巴,
+// 与置位时刻同代)立刻清掉 grace → 拥塞剪码可再触发一次 max_w 重置 →
+// 恢复 IDR 作废 → 重置风暴/livelock 复发(架构评审 6 系统性问题的
+// 头号项)。本用例在无 Fix 1 时必败:第 (a) 步的旧代帧会清掉 grace,
+// +2s 的拥塞反馈便会剪出第二档 max_w。
+func TestQoSGraceOnlyClearedByNewerCodecEpoch(t *testing.T) {
+	c, clk := newQoSTestController()
+	c.Observe(fb("s1", true, 8_000_000, 5))
+	// 帧流已在 codec epoch 5 上运行(grace 置位时 lastCodecEpoch=5)。
+	c.FrameObserved(5)
+	// 码率 5 步 + fps 4 步打到底(非 max_w 决策),再首档 height 剪刀。
+	for i := 0; i < 9; i++ {
+		clk.advance(1100 * time.Millisecond)
+		c.Observe(fb("s1", true, 1_000, 500))
+	}
+	clk.advance(1100 * time.Millisecond)
+	if cfg, ok := configOf(t, c.Observe(fb("s1", true, 1_000, 500))); !ok || cfg.MaxW != 1600 {
+		t.Fatalf("height step setup failed: %+v ok=%v", cfg, ok)
+	}
+
+	// (a)旧代在飞帧(epoch 5,重置期间仍在产出)不得解除 grace:间隔
+	// 已满足(2s > 1s),唯一的护栏就是 epoch 资格线。
+	if c.FrameObserved(5) {
+		t.Fatal("same-generation frame must not clear the reset grace")
+	}
+	clk.advance(2 * time.Second)
+	if acts := c.Observe(fb("s1", true, 1_000, 500)); len(acts) != 0 {
+		t.Fatalf("stale-generation frame cleared the grace: second max_w reset cascaded, got %+v", acts)
+	}
+	if got := c.Current().MaxW; got != 1600 {
+		t.Fatalf("maxW cascaded to %d on stale-generation confirmation, want 1600", got)
+	}
+
+	// (b)新代首帧(epoch 6,host 重置后的恢复 IDR)解除 → 拥塞控制恢复。
+	if !c.FrameObserved(6) {
+		t.Fatal("new-generation frame should clear the in-flight grace")
+	}
+	if cfg, ok := configOf(t, c.Observe(fb("s1", true, 1_000, 500))); !ok || cfg.MaxW != 1280 {
+		t.Fatalf("post-confirmation congestion should cut one height rung, got %+v ok=%v", cfg, ok)
 	}
 }
 

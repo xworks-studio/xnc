@@ -53,11 +53,12 @@
 //
 // reset-recovery grace(M4 修正):max_w 变更的决策走 host 的 resolution
 // 重置(编码器重建、codec epoch 前进、首个恢复 IDR 之前无帧产出)。
-// 重置在途(FrameObserved 尚未确认)期间拥塞剪码一律挂起(held,不累
-// 积——阶梯是状态机,恢复确认后自然续降);且 reset-triggering 剪刀之
-// 后立即通道不再完全绕过 qosDownMinInterval。修前:每条拥塞反馈都再剪
-// 一档 max_w → 密集重置风暴 → 恢复 IDR 反复作废 → 观众饿死而 host 徒
-// 劳产 IDR(M3-T6 合成矩阵的假编码器无重启延迟,从未暴露此链)。
+// 重置在途(FrameObserved 尚未被「严格新代」帧确认,Fix 1)期间拥塞剪
+// 码一律挂起(held,不累积——阶梯是状态机,恢复确认后自然续降);且
+// reset-triggering 剪刀之后立即通道不再完全绕过 qosDownMinInterval。修
+// 前:每条拥塞反馈都再剪一档 max_w → 密集重置风暴 → 恢复 IDR 反复作废
+// → 观众饿死而 host 徒劳产 IDR(M3-T6 合成矩阵的假编码器无重启延迟,
+// 从未暴露此链)。
 package desktop
 
 import (
@@ -212,13 +213,23 @@ type QoSController struct {
 	lastUpAt    time.Time
 
 	// reset-recovery grace(M4 修正,见文件头):resetPending = 一条改变
-	// max_w 的配置已下发、尚未被帧流确认(host 重置编码器期间)。此间拥
-	// 塞剪码挂起;lastMaxWActAt 让 reset-triggering 剪刀即便在立即通道
-	// 也遵守 qosDownMinInterval(修前立即通道完全绕过限速)。heldCuts 记
-	// 数挂起次数(可观测性:streamQoS 观测并记日志)。
-	resetPending  bool
-	lastMaxWActAt time.Time
-	heldCuts      uint32
+	// max_w 的配置已下发、尚未被新代帧流确认(host 重置编码器期间)。此
+	// 间拥塞剪码挂起。heldCuts 记数挂起次数(可观测性:streamQoS 观测并
+	// 记日志)。
+	//
+	// epoch 资格(M4 架构修正 Fix 1):grace 只被「codec epoch 严格新于
+	// 置位时刻已见代」的帧解除 —— lastCodecEpoch 是帧流上最近观测的
+	// codec epoch(逐帧喂入时推进),graceCodecEpoch 是 grace 置位时的快
+	// 照。修前 FrameObserved 对 ANY 帧清位:重置在途时旧代在飞帧(host
+	// 重启编码器前已产出的尾巴)立刻清掉 grace → 拥塞剪码再触发一次
+	// max_w 重置 → 新恢复 IDR 又被作废 → 重置风暴/livelock 复发。旧代
+	// 帧的 CodecEpoch ≤ 快照,不再解除;新代首帧(host 重置后的恢复
+	// IDR)严格前进,才恢复拥塞控制。
+	resetPending    bool
+	lastCodecEpoch  uint64
+	graceCodecEpoch uint64
+	lastMaxWActAt   time.Time
+	heldCuts        uint32
 
 	// cadenceHolds(M4 节奏门):queueMs 越线但因呈现节奏稀疏被抑制的
 	// 拥塞拍数(可观测性:streamQoS 观测并记日志;与 heldCuts 对偶——
@@ -403,10 +414,11 @@ func (c *QoSController) decide(fb ViewerFeedback, now time.Time) []Action {
 }
 
 // noteMaxWChange 判定 next 是否为 reset-triggering 决策(max_w 变更):
-// 是则记录时刻并置 grace(resetPending);若距上一次 reset-triggering 决
-// 策不足 qosDownMinInterval(立即通道也不许完全绕过——密集 max_w 变更
-// 就是重置风暴)则返回 false = 本拍挂起。非 max_w 决策(bitrate/fps 热
-// 更新)恒 true。
+// 是则置 grace(resetPending)并快照当前已见 codec epoch(grace 的解除
+// 资格线:只认严格新于它的帧,见 FrameObserved);若距上一次
+// reset-triggering 决策不足 qosDownMinInterval(立即通道也不许完全绕过
+// —— 密集 max_w 变更就是重置风暴)则返回 false = 本拍挂起。非 max_w
+// 决策(bitrate/fps 热更新)恒 true。
 func (c *QoSController) noteMaxWChange(next VideoConfig, now time.Time) bool {
 	if next.MaxW == c.cur.MaxW {
 		return true
@@ -416,16 +428,25 @@ func (c *QoSController) noteMaxWChange(next VideoConfig, now time.Time) bool {
 	}
 	c.lastMaxWActAt = now
 	c.resetPending = true
+	c.graceCodecEpoch = c.lastCodecEpoch
 	return true
 }
 
-// FrameObserved 通知决策器「流又产出帧了」(session 帧泵逐帧喂入):host
-// 重置后的新代帧流确认重置已完成 → 解除 reset-recovery grace。返回是否
-// 解除了一次在途挂起(真值时 streamQoS 记一条恢复日志)。
-func (c *QoSController) FrameObserved() bool {
-	held := c.resetPending
+// FrameObserved 通知决策器「流又产出了一帧(codecEpoch)」(session 帧泵
+// 逐帧喂入):host 重置后的新代帧流确认重置已完成 → 解除 reset-recovery
+// grace。只有 CodecEpoch 严格大于 grace 置位时刻已见代的帧才有资格解除
+//(旧代在飞帧不算确认 —— Fix 1,见字段注释);v1 帧(epoch=0)永远不
+// 解除(v1 host 无 SET_VIDEO_CONFIG 能力,grace 由 ResetConfirmed 解)。
+// 返回是否解除了一次在途挂起(真值时 streamQoS 记一条恢复日志)。
+func (c *QoSController) FrameObserved(codecEpoch uint64) bool {
+	if codecEpoch > c.lastCodecEpoch {
+		c.lastCodecEpoch = codecEpoch
+	}
+	if !c.resetPending || codecEpoch <= c.graceCodecEpoch {
+		return false
+	}
 	c.resetPending = false
-	return held
+	return true
 }
 
 // ResetConfirmed 无帧观测地解除 grace(host 未收到配置 → 无重置可能在
