@@ -34,6 +34,14 @@ type Config struct {
 	DesktopPerNode     int           // XNC_DESKTOP_PER_NODE，默认 4（对齐 agent host max_subs=4，多 viewer），0 = 不限
 	DesktopIdleTimeout time.Duration // XNC_DESKTOP_IDLE，默认 5m（无信令活动即关），0 = 不限
 
+	// DesktopICEPolicy（M4 Task 7 LAN 直连）：desktop 会话 ICE transport
+	// policy 的 server 侧总开关。"relay"（缺省，spec 强约束）= 不下发字段，
+	// agent 强制 relay-only；"all"（XNC_DESKTOP_ICE_POLICY，LAN 场景放开）
+	// = SESSION_OPEN params 携带 proto.DesktopIceAll，允许 host/srflx 直连
+	// 候选（绕开公网 TURN 中继的同网回环丢包）。归一化后只有这两个值：
+	// 空/未知值一律 fail closed 回 "relay"（不配置 = 行为不变）。
+	DesktopICEPolicy string // XNC_DESKTOP_ICE_POLICY，"relay"（缺省）| "all"
+
 	// —— M4 Task 4：desktop 媒体管线 v2 canary（server 侧 per-session
 	// 选择 = 生产控制点；节点本机 XNC_DESKTOP_PIPELINE_V2 仍是 host 侧
 	// force，二者不一致时 agent 按会话钉子响亮拒绝）。百分比桶按节点 UUID
@@ -62,6 +70,7 @@ func Load() (Config, error) {
 		TurnPool:           envList("XNC_TURN_POOL"),
 		DesktopPerNode:     envInt("XNC_DESKTOP_PER_NODE", 4),
 		DesktopIdleTimeout: envDur("XNC_DESKTOP_IDLE", 5*time.Minute),
+		DesktopICEPolicy:   icePolicy(os.Getenv("XNC_DESKTOP_ICE_POLICY")),
 		DesktopMediaV2Percent:   envInt("XNC_DESKTOP_MEDIA_V2_PERCENT", 0),
 		DesktopMediaV2Allowlist: envList("XNC_DESKTOP_MEDIA_V2_ALLOWLIST"),
 		DesktopMediaV2Rollback:  envBool("XNC_DESKTOP_MEDIA_V2_ROLLBACK", false),
@@ -125,4 +134,15 @@ func envBool(k string, d bool) bool {
 		}
 	}
 	return d
+}
+
+// icePolicy 归一化 XNC_DESKTOP_ICE_POLICY：仅 "all" 视为放开直连，其余
+//（空/未知值）fail closed 回 "relay"——缺省行为与旧版完全一致（不配置 =
+// agent 侧强制 relay）。字面量对应 proto.DesktopIceAll（"all"），此处不引
+// proto 依赖以保持 config 只依赖标准库。
+func icePolicy(v string) string {
+	if v == "all" {
+		return "all"
+	}
+	return "relay"
 }

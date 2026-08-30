@@ -31,6 +31,10 @@ services:
       XNC_DESKTOP_MEDIA_V2_PERCENT: ${XNC_DESKTOP_MEDIA_V2_PERCENT:-0}
       XNC_DESKTOP_MEDIA_V2_ALLOWLIST: ${XNC_DESKTOP_MEDIA_V2_ALLOWLIST:-}
       XNC_DESKTOP_MEDIA_V2_ROLLBACK: ${XNC_DESKTOP_MEDIA_V2_ROLLBACK:-false}
+      # Desktop ICE policy (M4 Task 7): "relay" (default, spec-mandated) keeps
+      # all media through TURN; "all" allows LAN direct connect when browser
+      # and node share a LAN (bypasses the public TURN relay round-trip).
+      XNC_DESKTOP_ICE_POLICY: ${XNC_DESKTOP_ICE_POLICY:-relay}
       # TURN relay config handed to desktop sessions (mirrors coturn below).
       # server 只读 XNC_TURN_CREDENTIAL(单一来源,config.go);XNC_TURN_PASSWORD
       # 仅供 coturn 自身用户配置(turnserver.conf 模板,见下),与 server env 无关。

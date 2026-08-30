@@ -383,3 +383,34 @@ func TestDesktopMediaProtocolDefaultAndRollback(t *testing.T) {
 	require.NoError(t, jsonUnmarshal(openParams2, &p2))
 	assert.Equal(t, proto.MediaProtocolV1, p2.MediaProtocol)
 }
+
+// TestDesktopICEPolicy（M4 Task 7）：缺省（config 未配置）→ SESSION_OPEN
+// params 不携带 iceTransportPolicy（agent 侧强制 relay，行为与旧版一致）；
+// server config 显式 "all"（XNC_DESKTOP_ICE_POLICY，env → 字段的解析见
+// config 包 TestDesktopICEPolicyEnv）→ params 携带 proto.DesktopIceAll，
+// 允许 LAN 直连候选。客户端提交的 iceTransportPolicy 无论何种配置都绝不透传。
+func TestDesktopICEPolicy(t *testing.T) {
+	// ① 缺省：无配置 → 不下发字段（= agent relay-only）。
+	_, openParams, _, _ := openDesktopForMedia(t, nil,
+		`{"iceTransportPolicy":"all"}`) // 客户端试图放开——必须被白名单剥离
+	var p proto.DesktopParams
+	require.NoError(t, jsonUnmarshal(openParams, &p))
+	assert.Empty(t, p.IceTransportPolicy,
+		"default config must not send iceTransportPolicy (agent enforces relay)")
+
+	// ② server config "all" → params 携带 DesktopIceAll；客户端提交值
+	//（试图钉回 relay）仍被剥离，server 独占控制点。
+	_, openParams2, env2, nodeID2 := openDesktopForMedia(t, func(c *config.Config) {
+		c.DesktopICEPolicy = proto.DesktopIceAll
+	}, `{"iceTransportPolicy":"relay"}`)
+	var p2 proto.DesktopParams
+	require.NoError(t, jsonUnmarshal(openParams2, &p2))
+	assert.Equal(t, proto.DesktopIceAll, p2.IceTransportPolicy,
+		"config all must inject proto.DesktopIceAll into SESSION_OPEN params")
+
+	// 快照语义：manager 存的 params 与 SESSION_OPEN 下发逐字节一致（ICE
+	// policy 同 mediaProtocol 一样在会话打开时定死）。
+	sess := env2.Sess.SessionsOf(mustUUID(nodeID2), proto.KindDesktop)
+	require.NotEmpty(t, sess)
+	assert.JSONEq(t, string(openParams2), string(sess[0].Params))
+}

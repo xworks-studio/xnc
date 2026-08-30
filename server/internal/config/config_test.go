@@ -27,3 +27,32 @@ func TestTurnPoolEnv(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, c.TurnPool)
 }
+
+// TestDesktopICEPolicyEnv（M4 Task 7）：XNC_DESKTOP_ICE_POLICY 缺省 =
+// "relay"（向后兼容：不配置与旧版 relay-only 行为一致）；"all" = 放开 LAN
+// 直连；未知值 fail closed 回 "relay"。
+func TestDesktopICEPolicyEnv(t *testing.T) {
+	setRequiredEnv(t)
+
+	// 缺省：未配置 → relay（不配置 = 行为不变）。
+	c, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, "relay", c.DesktopICEPolicy)
+
+	// 显式 all → 放开直连。
+	t.Setenv("XNC_DESKTOP_ICE_POLICY", "all")
+	c, err = Load()
+	require.NoError(t, err)
+	assert.Equal(t, "all", c.DesktopICEPolicy)
+
+	// 未知值（拼错/恶意）→ fail closed 回 relay。
+	t.Setenv("XNC_DESKTOP_ICE_POLICY", "ALL")
+	c, err = Load()
+	require.NoError(t, err)
+	assert.Equal(t, "relay", c.DesktopICEPolicy)
+
+	t.Setenv("XNC_DESKTOP_ICE_POLICY", "direct")
+	c, err = Load()
+	require.NoError(t, err)
+	assert.Equal(t, "relay", c.DesktopICEPolicy)
+}

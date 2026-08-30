@@ -25,7 +25,8 @@ const desktopSignaling = "webrtc"
 // turn / iceTransportPolicy / mediaProtocol 等安全敏感字段绝不从客户端接受
 // ——TURN 配置只来自 server config（SESSION_OPEN params 与 REST 响应同源），
 // mediaProtocol 只来自 server 侧 canary 选择（M4 Task 4），iceTransportPolicy
-// 从不下发（agent 缺省 = 强制 relay；DesktopIceAll 仅回环单测）。未知字段经
+// 只来自 server config 的 XNC_DESKTOP_ICE_POLICY（M4 Task 7；缺省不下发 =
+// agent 强制 relay，显式 "all" 才放开直连）。未知字段经
 // json.Decode 默认忽略，等效剥离。
 type desktopReq struct {
 	Signaling  string `json:"signaling"`
@@ -92,6 +93,16 @@ func (h *handlers) desktopStart(w http.ResponseWriter, r *http.Request) {
 	}
 	media := selectMediaProtocol(h.desktopMediaRollout(), nodeID.String())
 
+	// ICE policy（M4 Task 7）：缺省（"relay"）不下发字段 = agent 强制
+	// relay-only（spec 安全强约束，行为与旧版一致）；server config 显式
+	// "all"（XNC_DESKTOP_ICE_POLICY，LAN 直连放开）时下发 proto.DesktopIceAll，
+	// 允许 host/srflx 候选绕开公网 TURN（同网回环丢包修复）。只来自
+	// server config——客户端提交值已被 desktopReq 白名单剥离。
+	var icePolicy string
+	if h.cfg.DesktopICEPolicy == proto.DesktopIceAll {
+		icePolicy = proto.DesktopIceAll
+	}
+
 	r.Body = http.MaxBytesReader(w, r.Body, desktopBodyMaxBytes)
 	var req desktopReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
@@ -110,10 +121,11 @@ func (h *handlers) desktopStart(w http.ResponseWriter, r *http.Request) {
 		Signaling:  req.Signaling,
 		Turn:       turn, // server config 独占；客户端提交的 turn 已被白名单剥离
 		WTSSession: req.WTSSession,
-		// IceTransportPolicy 故意不设：缺省 = agent 侧强制 relay。
-		// MediaProtocol 只来自 server 选择（canary 控制点）；客户端提交
-		// 值已被 desktopReq 白名单剥离。
-		MediaProtocol: media,
+		// IceTransportPolicy：仅 server config "all" 时下发（缺省空 = agent
+		// 侧强制 relay）。MediaProtocol 只来自 server 选择（canary 控制点）；
+		// 客户端提交值已被 desktopReq 白名单剥离。
+		IceTransportPolicy: icePolicy,
+		MediaProtocol:      media,
 	})
 	if err != nil {
 		respondError(w, proto.Err(500, proto.CodeInternal, "encode params"))

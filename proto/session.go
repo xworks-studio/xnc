@@ -29,8 +29,10 @@ const KindScreen = "screen"
 // 见 agent/desktop/session.go 文件头，T5/T6 消费）。
 const KindDesktop = "desktop"
 
-// DesktopIceAll 是 iceTransportPolicy 的非 relay 覆盖值，仅回环单测使用
-// （无 TURN 环境）；缺省（空或 "relay"）= 生产强约束 relay。
+// DesktopIceAll 是 iceTransportPolicy 的非 relay 覆盖值：server config
+// XNC_DESKTOP_ICE_POLICY=all 时随 SESSION_OPEN params 下发（M4 Task 7 LAN
+// 直连），回环单测亦用（无 TURN 环境）；缺省（空或 "relay"）= 生产强约束
+// relay——agent 侧 p.IceTransportPolicy != DesktopIceAll 即 RelayOnly。
 const DesktopIceAll = "all"
 
 // DesktopTurnConfig 是 desktop 会话的 TURN 中继配置（server 经
@@ -63,7 +65,8 @@ type DesktopParams struct {
 	Turn      *DesktopTurnConfig `json:"turn,omitempty"`
 	// WTSSession 目标 WTS 会话 id；0 = 活动控制台会话（dev 默认）。
 	WTSSession uint32 `json:"wtsSession,omitempty"`
-	// IceTransportPolicy 缺省 "relay"；DesktopIceAll 仅测试。
+	// IceTransportPolicy 缺省 "relay"（不下发字段）；DesktopIceAll 由 server
+	// config（XNC_DESKTOP_ICE_POLICY=all）或回环单测显式放开直连。
 	IceTransportPolicy string `json:"iceTransportPolicy,omitempty"`
 	// LeaseID（M2-Slice3 Task 4）：server 侧 per-node 仲裁的唯一活约 id。
 	// 仅授予会话的 params 携带（每节点同时至多一个）；未携带 = view-only。
