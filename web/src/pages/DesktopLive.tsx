@@ -223,6 +223,7 @@ export default function DesktopLive() {
   const [text, setText] = useState("");
   const ioRef = useRef<DesktopIo>(freshIo());
   const dimsRef = useRef<StreamDims | null>(null);
+  const iceModeRef = useRef<string>("relay");
   const composingRef = useRef(false);
 
   // State mirrors ioRef.lease (set alongside it in every transition), so
@@ -850,6 +851,7 @@ export default function DesktopLive() {
               // config "all" 时下发 all,LAN 直连避免公网 TURN 丢包)。
               const icePolicy =
                 res.iceTransportPolicy === "all" ? "all" : "relay";
+              iceModeRef.current = icePolicy;
               pc = new RTCPeerConnection({
                 iceServers: [
                   {
@@ -1123,7 +1125,7 @@ export default function DesktopLive() {
             ))}
           </select>
         )}
-        <span className="dim mono">h264/relay</span>
+        <span className="dim mono">{`h264/${iceModeRef.current ?? "relay"}`}</span>
         {agentState && <span className="dim mono">{agentState}</span>}
         <button onClick={sendPli} className="desktop-pli" type="button">
           PLI
