@@ -137,15 +137,23 @@ func newStreamQoS(cfg QoSControllerConfig, log *slog.Logger) *streamQoS {
 }
 
 // observe 消费一条反馈并返回决策(控制器互斥;动作应用在锁外)。grace
-// 挂起的拥塞剪码记一条 INFO(重置风暴诊断的核心观测线)。
+// 挂起的拥塞剪码记一条 INFO(重置风暴诊断的核心观测线);节奏门抑制的
+// 假拥塞拍记 DEBUG(M4:静态会话下每秒一条,INFO 会刷屏 —— 计数器
+// CadenceHolds 提供聚合观测)。
 func (q *streamQoS) observe(fb ViewerFeedback) []Action {
 	q.mu.Lock()
 	before := q.ctrl.HeldCuts()
+	beforeHolds := q.ctrl.CadenceHolds()
 	acts := q.ctrl.Observe(fb)
 	held := q.ctrl.HeldCuts() - before
+	holds := q.ctrl.CadenceHolds() - beforeHolds
 	q.mu.Unlock()
 	if held > 0 {
 		q.log.Info("desktop qos: congestion cut held (encoder reset in flight)", "held_total", held)
+	}
+	if holds > 0 {
+		q.log.Debug("desktop qos: browser queue congestion suppressed (sparse cadence)",
+			"queue_ms", fb.QueueMs, "presented_fps", fb.PresentedFps, "holds_total", holds)
 	}
 	return acts
 }

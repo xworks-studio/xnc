@@ -84,8 +84,9 @@ type config struct {
 	switchDisplay       int           // server 模式:连接后发一次 switch_display(-1=off;M2-S3 Task 5)
 	// M3 Task 6:TURN/TCP 拥塞 E2E。
 	fbBps             uint64  // >0:server 模式每 1s 注入一条合成 viewer_feedback(estimatedBps=fbBps)
-	fbQueueMs         float64 // 合成反馈的 queueMs(拥塞判据:>100 触发立即降档)
+	fbQueueMs         float64 // 合成反馈的 queueMs(拥塞判据:>100 触发立即降档——受节奏门约束)
 	fbRttMs           float64 // 合成反馈的 rttMs(随档记录,不参与 agent 判据)
+	fbPresentedFps    float64 // 合成反馈的 presentedFps(>0=携带该字段;0=缺省=旧 web 形态,节奏门旁路)
 	expectQueueMaxMs  int     // 0=跳过;接收侧排队年龄硬上限断言(全局约束 100ms)
 	expectRecoveryIdr bool    // 恢复必须 IDR 起步(接收间隙后首帧非 IDR = 违例)
 	jsonOnly          bool
@@ -129,6 +130,8 @@ func parseFlags() *config {
 		"synthetic viewer_feedback: send {estimatedBps=fb-bps, queueMs=fb-queue-ms, rttMs=fb-rtt-ms} every 1s over the session WS (server mode; 0=off)")
 	flag.Float64Var(&c.fbQueueMs, "fb-queue-ms", 5, "synthetic viewer_feedback queueMs (>100 = congestion at the agent)")
 	flag.Float64Var(&c.fbRttMs, "fb-rtt-ms", 30, "synthetic viewer_feedback rttMs (recorded, not part of the agent's decision)")
+	flag.Float64Var(&c.fbPresentedFps, "fb-presented-fps", 0,
+		"synthetic viewer_feedback presentedFps (>0 = include the field: sparse cadence guard suppresses queueMs congestion below 8fps unless queueMs exceeds 3x max(expected period,250ms); 0 = omit = old-web shape, legacy behavior)")
 	flag.IntVar(&c.expectQueueMaxMs, "expect-queue-max-ms", 0,
 		"fail if the receive-side queue-age max exceeds this ms (0=skip; global constraint hard max 100)")
 	flag.BoolVar(&c.expectRecoveryIdr, "expect-recovery-idr", false,
@@ -1488,14 +1491,18 @@ func runServer(c *config) (*summary, error) {
 			v.fbSent.Add(1)
 			wctx, wcancel := context.WithTimeout(ctx, 10*time.Second)
 			defer wcancel()
-			b, _ := json.Marshal(map[string]any{
+			fb := map[string]any{
 				"type":         "viewer_feedback",
 				"visible":      true,
 				"estimatedBps": c.fbBps,
 				"queueMs":      c.fbQueueMs,
 				"decodeQueue":  0,
 				"rttMs":        c.fbRttMs,
-			})
+			}
+			if c.fbPresentedFps > 0 {
+				fb["presentedFps"] = c.fbPresentedFps
+			}
+			b, _ := json.Marshal(fb)
 			if err := ws.Write(wctx, websocket.MessageText, b); err != nil {
 				log.Warn("synthetic viewer_feedback send failed", "err", err)
 			}

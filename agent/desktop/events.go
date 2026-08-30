@@ -125,6 +125,7 @@ func (e *sessionEvents) onViewerFeedback(raw []byte) {
 		QueueMs:      f.QueueMs,
 		DecodeQueue:  f.DecodeQueue,
 		RTTMs:        f.RTTMs,
+		PresentedFps: f.PresentedFps,
 	})
 	if len(acts) > 0 {
 		e.qos.apply(acts, e.dyn)

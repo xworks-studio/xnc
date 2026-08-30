@@ -171,6 +171,8 @@ type switchDisplayFrame struct {
 
 // viewerFeedbackFrame 是 {"type":"viewer_feedback",...} 上行帧(M3 Task 3;
 // 字段契约见文件头。queueMs/rttMs 是毫秒;decodeQueue 是帧数)。
+// presentedFps(M4):viewer 实际呈现帧率(rvfc/getStats 汇总);0 = 旧 web
+// 未上报 —— QoS 节奏门据此区分「稀疏流的 jitter 代理基线」与真拥塞。
 type viewerFeedbackFrame struct {
 	Type         string  `json:"type"`
 	Visible      bool    `json:"visible"`
@@ -178,6 +180,7 @@ type viewerFeedbackFrame struct {
 	QueueMs      float64 `json:"queueMs"`
 	DecodeQueue  float64 `json:"decodeQueue"`
 	RTTMs        float64 `json:"rttMs"`
+	PresentedFps float64 `json:"presentedFps"`
 }
 
 // displayJSON 是 displays[] 的 viewer 契约形态(与 Display 镜像)。

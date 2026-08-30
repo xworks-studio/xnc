@@ -49,6 +49,12 @@ func fb(sid string, visible bool, estBps uint64, queueMs float64) ViewerFeedback
 	return ViewerFeedback{SessionID: sid, Visible: visible, EstimatedBps: estBps, QueueMs: queueMs}
 }
 
+// fbCadence:带 presentedFps 的反馈(0 = 旧 web 未上报形态)。
+func fbCadence(sid string, estBps uint64, queueMs, presentedFps float64) ViewerFeedback {
+	return ViewerFeedback{SessionID: sid, Visible: true, EstimatedBps: estBps,
+		QueueMs: queueMs, PresentedFps: presentedFps}
+}
+
 // ---- 决策表(brief Step 1 五行 + 限速/阶梯补充)----
 
 // 首个可见 viewer 成为 controller:恰一次下发初始配置(驱动 pacing 预算
@@ -463,14 +469,21 @@ func TestQoSStaleControllerPruned(t *testing.T) {
 // viewer_feedback 信令帧形态(session.go 解析目标的纯校验)。
 func TestViewerFeedbackJSONShape(t *testing.T) {
 	raw := `{"type":"viewer_feedback","visible":true,"estimatedBps":4200000,` +
-		`"queueMs":12.5,"decodeQueue":2,"rttMs":38.2}`
+		`"queueMs":12.5,"decodeQueue":2,"rttMs":38.2,"presentedFps":4.9}`
 	var f viewerFeedbackFrame
 	if err := json.Unmarshal([]byte(raw), &f); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	if !f.Visible || f.EstimatedBps != 4_200_000 || f.QueueMs != 12.5 ||
-		f.DecodeQueue != 2 || f.RTTMs != 38.2 {
+		f.DecodeQueue != 2 || f.RTTMs != 38.2 || f.PresentedFps != 4.9 {
 		t.Fatalf("parsed feedback mismatch: %+v", f)
+	}
+	// 旧 web:字段缺席 → 0(节奏门旁路 = 今日行为)。
+	old := `{"type":"viewer_feedback","visible":true,"estimatedBps":4200000,` +
+		`"queueMs":12.5,"decodeQueue":2,"rttMs":38.2}`
+	var g viewerFeedbackFrame
+	if err := json.Unmarshal([]byte(old), &g); err != nil || g.PresentedFps != 0 {
+		t.Fatalf("absent presentedFps must parse to 0: %+v err=%v", g, err)
 	}
 }
 
@@ -756,5 +769,91 @@ func TestQoSParseMaxFPS(t *testing.T) {
 		if !tc.ok && err == nil {
 			t.Fatalf("qosParseMaxFPS(%q) must error, got %d", tc.in, got)
 		}
+	}
+}
+
+// ---- M4 节奏门:稀疏流的 queueMs jitter 代理误报 ----
+//
+// 生产证据(2026-08-30,静态桌面会话):浏览器 controller-viewer 的
+// jitterBufferDelay 代理在 ~5fps 稀疏流上恒读 ~半帧间隔(100-200ms+)
+// → >100ms 拥塞判据每报必中 → 每秒 30% 剪码 → 分辨率阶梯走底 → 每次
+// max_w 变更 = 重置 = 新 epoch = IDR(节点侧 keyframes 以 ~1/s 攀升,
+// 观众看到 ~1fps)。门禁:queueMs 仅在呈现节奏健康(presentedFps ≥ 8)
+// 或超灾难线(> 3×max(当前目标帧率的期望帧间隔,250ms))时构成拥塞。
+
+// (a)稀疏流:presentedFps=5、queueMs=180(目标 fps=30)→ 连续多拍
+// (生产节奏 1/s,30 拍)零降档 —— 码率/fps/max_w 纹丝不动,抑制计数
+// 逐拍累积(可观测性)。est=2.7M 保持无带宽证据(恒平 headroom,不触
+// C1;目标 2.295M < 2.3M 亦无升档)。
+func TestQoSSparseCadenceQueueMsNotCongestion(t *testing.T) {
+	c, clk := newQoSTestController()
+	if acts := c.Observe(fbCadence("s1", 2_700_000, 5, 5)); len(acts) != 1 {
+		t.Fatalf("first feedback should only emit the initial config, got %+v", acts)
+	}
+	for i := 0; i < 30; i++ {
+		clk.advance(1 * time.Second) // web 1s 反馈节奏
+		if acts := c.Observe(fbCadence("s1", 2_700_000, 180, 5)); len(acts) != 0 {
+			t.Fatalf("sparse observation %d: proxy queueMs must not downshift, got %+v", i+1, acts)
+		}
+	}
+	if got := c.Current(); got != (VideoConfig{Bitrate: 2_300_000, FPS: 30, MaxW: 1920}) {
+		t.Fatalf("sparse stream must hold config, got %+v", got)
+	}
+	if got := c.CadenceHolds(); got != 30 {
+		t.Fatalf("cadence holds = %d, want 30 (one per suppressed sample)", got)
+	}
+}
+
+// (b)健康节奏:presentedFps=25、queueMs=180 → 与今日完全一致的立即
+// 30% 通道(绕过 1/s 限速,连续拥塞连续剪)。
+func TestQoSHealthyCadenceQueueMsStillCongestion(t *testing.T) {
+	c, clk := newQoSTestController()
+	c.Observe(fbCadence("s1", 8_000_000, 5, 25))
+	cfg, ok := configOf(t, c.Observe(fbCadence("s1", 8_000_000, 180, 25)))
+	if !ok || cfg.Bitrate != 2_300_000*7/10 {
+		t.Fatalf("healthy-cadence queueMs=180 must cut 30%%: got %+v ok=%v", cfg, ok)
+	}
+	clk.advance(100 * time.Millisecond)
+	cfg, ok = configOf(t, c.Observe(fbCadence("s1", 8_000_000, 200, 25)))
+	if !ok || cfg.Bitrate != 2_300_000*7/10*7/10 {
+		t.Fatalf("immediate cut must still bypass the 1/s limiter: got %+v ok=%v", cfg, ok)
+	}
+	if got := c.CadenceHolds(); got != 0 {
+		t.Fatalf("healthy cadence must not count holds, got %d", got)
+	}
+}
+
+// (c)灾难逃逸:presentedFps=2、queueMs=1500 → 即便节奏稀疏也剪(真
+// 队列积压远超任何节奏的 3×期望帧间隔);门禁线之下(700ms < 3×250ms
+// @30fps 目标)仍被抑制。
+func TestQoSCatastrophicQueueEscapesCadenceGuard(t *testing.T) {
+	c, clk := newQoSTestController()
+	c.Observe(fbCadence("s1", 8_000_000, 5, 2))
+	clk.advance(1 * time.Second)
+	if acts := c.Observe(fbCadence("s1", 8_000_000, 700, 2)); len(acts) != 0 {
+		t.Fatalf("queueMs=700 below the 750ms escape line must stay suppressed, got %+v", acts)
+	}
+	clk.advance(1 * time.Second)
+	cfg, ok := configOf(t, c.Observe(fbCadence("s1", 8_000_000, 1500, 2)))
+	if !ok || cfg.Bitrate != 2_300_000*7/10 {
+		t.Fatalf("catastrophic queueMs=1500 at 2fps must cut 30%%: got %+v ok=%v", cfg, ok)
+	}
+	if got := c.CadenceHolds(); got != 1 {
+		t.Fatalf("holds = %d, want 1 (the 700ms sample; escape does not count)", got)
+	}
+}
+
+// (d)字段缺席(旧 web,presentedFps=0)→ 今日行为:越线即剪。缺省
+// 选择 = 不削减弱信号部署的拥塞控制;误报由 web 升级携带 presentedFps
+// 后自然收窄(agent 先行收窄会把旧 web 静默置于「永不拥塞降档」)。
+func TestQoSAbsentPresentedFpsKeepsLegacyBehavior(t *testing.T) {
+	c, _ := newQoSTestController()
+	c.Observe(fb("s1", true, 8_000_000, 5)) // 旧 web 形态:无 presentedFps
+	cfg, ok := configOf(t, c.Observe(fb("s1", true, 8_000_000, 180)))
+	if !ok || cfg.Bitrate != 2_300_000*7/10 {
+		t.Fatalf("absent presentedFps must keep today's immediate cut: got %+v ok=%v", cfg, ok)
+	}
+	if got := c.CadenceHolds(); got != 0 {
+		t.Fatalf("legacy path must not count holds, got %d", got)
 	}
 }

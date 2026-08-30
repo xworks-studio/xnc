@@ -15,7 +15,12 @@
 //   - 拥塞(controller queueMs > 100):立即把码率砍到 70%(绕过 1/s 限速
 //     与稳定窗);码率已在 500kbps 下限 → fps 沿 {60,30,20,15,10,5} 降一档;
 //     fps 已在 5 → height 沿 {1440,1080,900,720} 降一档(max_w 推导见下)。
-//     全部到底后拥塞不再有动作(default-safe)。
+//     全部到底后拥塞不再有动作(default-safe)。M4 节奏门:queueMs 是
+//     浏览器 jitterBufferDelay 代理,稀疏流(静态桌面 ~5fps)上恒读
+//     ~半帧间隔 → 每报必中。越线的 queueMs 仅在呈现节奏健康
+//     (presentedFps ≥ 8)或超灾难线(> 3×max(期望帧间隔,250ms))时
+//     才算拥塞;字段缺席(旧 web)= 今日行为。发送侧真实排队
+//     (viewer_sender maxQueueAge 丢帧)不受此门约束。
 //   - 非拥塞降档(85%×est < 当前码率,如 TWCC 估计跌落)+ C1 迟滞
 //     (final-fixwave):还须 headroom 比率(est/码率)较上一拍衰减 ≥5%
 //     或 est 深于 0.95×85%×码率;≤1/s 一次。纯「85%×est < 码率」对
@@ -90,6 +95,17 @@ const (
 	// qosQueueAgeMs:拥塞判据(发送侧排队目标 50ms/硬上限 100ms 的全局
 	// 约束镜像)。
 	qosQueueAgeMs = 100.0
+	// M4 节奏门(稀疏流 jitter 代理误报):queueMs 是浏览器的
+	// jitterBufferDelay 代理,静态桌面 ~5fps 下恒读 ~半帧间隔 ——
+	// qosCadenceFloorFps:呈现帧率 ≥ 此值的流,帧间隔 ≪ 判据线,代理
+	// 读数才是真排队;低于它则 queueMs 不构成拥塞证据,唯一例外是
+	// qosQueueEscapeFactor × max(当前目标帧率的期望帧间隔,
+	// qosQueueEscapeFloorMs) 的灾难逃逸(真排队积压在任何节奏下都该
+	// 立即剪)。presentedFps=0(旧 web 未上报)→ 门禁旁路 = 今日行为
+	// (旧部署的拥塞控制不得被静默削弱)。
+	qosCadenceFloorFps    = 8.0
+	qosQueueEscapeFactor  = 3.0
+	qosQueueEscapeFloorMs = 250.0
 	// qosStableWindow:升档前的稳定窗;qosDownMinInterval /
 	// qosUpMinInterval:降/升档限速(立即通道绕过降档限速)。
 	qosStableWindow    = 10 * time.Second
@@ -125,6 +141,12 @@ type ViewerFeedback struct {
 	QueueMs      float64
 	DecodeQueue  float64 // 解码队列深度(帧)——记录,不参与判据
 	RTTMs        float64
+	// PresentedFps 是 viewer 实际呈现帧率(web rvfc/getStats 汇总;0 =
+	// 旧 web 未上报)。M4 节奏门:稀疏流(静态桌面 ~5fps)上 Chrome
+	// jitterBufferDelay 代理恒读 ~半个帧间隔(100-200ms+),>100ms 的
+	// 拥塞判据每报必中 —— queueMs 只在节奏健康时才算拥塞证据(见
+	// queueCongestionReal)。
+	PresentedFps float64
 }
 
 // actionKind 是 Action 的判别器。
@@ -197,6 +219,11 @@ type QoSController struct {
 	resetPending  bool
 	lastMaxWActAt time.Time
 	heldCuts      uint32
+
+	// cadenceHolds(M4 节奏门):queueMs 越线但因呈现节奏稀疏被抑制的
+	// 拥塞拍数(可观测性:streamQoS 观测并记日志;与 heldCuts 对偶——
+	// 那是「真拥塞但重置在途」,这是「假拥塞」)。
+	cadenceHolds uint32
 
 	// C1 迟滞参考:上一拍 controller 观测的 (est, 该拍生效码率[动作前])。
 	// 以动作前码率为参考,我们自己降档后 goodput 的等比例回落(比率回
@@ -313,8 +340,11 @@ func (c *QoSController) decide(fb ViewerFeedback, now time.Time) []Action {
 	c.lastEstBps, c.lastRefBps, c.estRefKnown = fb.EstimatedBps, c.cur.Bitrate, true
 
 	target := qosTargetBitrate(fb.EstimatedBps)
-	if fb.QueueMs > qosQueueAgeMs {
+	if fb.QueueMs > qosQueueAgeMs && c.queueCongestionReal(fb) {
 		// 拥塞:稳定窗作废;立即 30% 通道(绕过 1/s 限速)。
+		// M4 节奏门:queueMs 越线但呈现节奏稀疏(假拥塞,见
+		// queueCongestionReal)→ 不进此通道,反馈照常走带宽证据/
+		// 稳定窗路径(queueMs 已随反馈记录,仅不驱动降档)。
 		c.stableSince = time.Time{}
 		// reset-recovery grace:重置在途期间挂起(编码器重启本身就会推
 		// 高排队年龄——此刻的拥塞证据是垃圾;剪码只会再触发一次重置,
@@ -404,6 +434,39 @@ func (c *QoSController) ResetConfirmed() { c.resetPending = false }
 
 // HeldCuts 返回 grace 挂起的拥塞剪码累计数(可观测性)。
 func (c *QoSController) HeldCuts() uint32 { return c.heldCuts }
+
+// CadenceHolds 返回节奏门抑制的 queueMs 拥塞拍累计数(可观测性)。
+func (c *QoSController) CadenceHolds() uint32 { return c.cadenceHolds }
+
+// queueCongestionReal(M4 节奏门)判定一条越线 queueMs 是否真拥塞:
+//   - presentedFps = 0(旧 web 未上报)→ true:回退今日行为 —— 旧部署
+//     的拥塞控制不得因 agent 升级被静默削弱(宁可继承误报,由 web 升级
+//     携带 presentedFps 后自然收窄);
+//   - presentedFps ≥ qosCadenceFloorFps → true:帧间隔 ≪ 判据线,代理
+//     读数即真排队;
+//   - 否则(queueMs > 判据线且节奏稀疏):仅当 queueMs 超过
+//     3 × max(当前目标帧率的期望帧间隔, 250ms) 的灾难线才为 true
+//     —— 稀疏节奏下的 jitter 代理基线 ~半帧间隔是几何而非拥塞,但真
+//     正的队列积压在任何节奏下都会远超自身节奏的 3 倍。
+//
+// 被抑制的拍计入 cadenceHolds(queueMs 本身随 ViewerFeedback 记录)。
+func (c *QoSController) queueCongestionReal(fb ViewerFeedback) bool {
+	if fb.PresentedFps <= 0 {
+		return true // 旧 web:字段缺席 = 今日行为(见上)
+	}
+	if fb.PresentedFps >= qosCadenceFloorFps {
+		return true
+	}
+	periodMs := 1000.0 / float64(c.cur.FPS)
+	if periodMs < qosQueueEscapeFloorMs {
+		periodMs = qosQueueEscapeFloorMs
+	}
+	if fb.QueueMs > qosQueueEscapeFactor*periodMs {
+		return true // 灾难逃逸:稀疏节奏下仍是真排队
+	}
+	c.cadenceHolds++
+	return false
+}
 
 // stepDown 计算拥塞时的下一档(码率 70% → fps 降档 → height 降档;全在
 // 底则返回当前值 = 无动作)。
