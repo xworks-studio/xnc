@@ -55,6 +55,13 @@ func fbCadence(sid string, estBps uint64, queueMs, presentedFps float64) ViewerF
 		QueueMs: queueMs, PresentedFps: presentedFps}
 }
 
+// fbCongest:拥塞形态反馈(queueMs=500 越线 + 健康节奏 25fps —— 节奏门
+// 之下 queueMs 构成拥塞证据;Fix 6 起无 presentedFps 的越线 queueMs 仅咨
+// 询,不再驱动立即通道,故拥塞用例一律带健康节奏)。
+func fbCongest(sid string, estBps uint64) ViewerFeedback {
+	return fbCadence(sid, estBps, 500, 25)
+}
+
 // ---- 决策表(brief Step 1 五行 + 限速/阶梯补充)----
 
 // 首个可见 viewer 成为 controller:恰一次下发初始配置(驱动 pacing 预算
@@ -81,7 +88,7 @@ func TestQoSImmediateDownshiftOnQueueAge(t *testing.T) {
 	c, clk := newQoSTestController()
 	c.Observe(fb("s1", true, 8_000_000, 5)) // controller 就位(初始下发)
 
-	cfg, ok := configOf(t, c.Observe(fb("s1", true, 8_000_000, 150)))
+	cfg, ok := configOf(t, c.Observe(fbCongest("s1", 8_000_000)))
 	if !ok || cfg.Bitrate != 2_300_000*7/10 {
 		t.Fatalf("queueAge=150ms should cut bitrate to 70%%: got %+v ok=%v", cfg, ok)
 	}
@@ -89,7 +96,7 @@ func TestQoSImmediateDownshiftOnQueueAge(t *testing.T) {
 	// 不动,挡住它的是限速本身)。
 	clk.advance(100 * time.Millisecond)
 	held0 := c.HeldCuts()
-	if acts := c.Observe(fb("s1", true, 8_000_000, 200)); len(acts) != 0 {
+	if acts := c.Observe(fbCongest("s1", 8_000_000)); len(acts) != 0 {
 		t.Fatalf("immediate cut must respect the 1/s limiter, got %+v", acts)
 	}
 	if c.HeldCuts() != held0 {
@@ -97,7 +104,7 @@ func TestQoSImmediateDownshiftOnQueueAge(t *testing.T) {
 	}
 	// 窗口过后 → 再降 30%。
 	clk.advance(1000 * time.Millisecond)
-	cfg, ok = configOf(t, c.Observe(fb("s1", true, 8_000_000, 200)))
+	cfg, ok = configOf(t, c.Observe(fbCongest("s1", 8_000_000)))
 	if !ok || cfg.Bitrate != 2_300_000*7/10*7/10 {
 		t.Fatalf("post-window congestion should cut again: got %+v ok=%v", cfg, ok)
 	}
@@ -174,7 +181,7 @@ func TestQoSNoUpshiftBeforeTenStableSeconds(t *testing.T) {
 	}
 	// 拥塞:立即 30% 降 + 稳定窗口重置(10s 内不再升档)。
 	clk.advance(100 * time.Millisecond)
-	cfg, _ = configOf(t, c.Observe(fb("s1", true, 100_000_000, 300)))
+	cfg, _ = configOf(t, c.Observe(fbCongest("s1", 100_000_000)))
 	if cfg.Bitrate != 15_000_000*7/10 {
 		t.Fatalf("congestion after upshift cuts 30%%: got %+v", cfg)
 	}
@@ -270,7 +277,7 @@ func TestQoSLadderEscalationAndRecovery(t *testing.T) {
 		// 帧流持续(max_w 步后由新代帧确认重置完成——reset-recovery
 		// grace;间隔同时满足 reset-triggering 剪刀的最小间隔)。
 		clk.advance(1100 * time.Millisecond)
-		cfg, ok := configOf(t, c.Observe(fb("s1", true, 1_000, 500)))
+		cfg, ok := configOf(t, c.Observe(fbCongest("s1", 1_000)))
 		if !ok {
 			t.Fatalf("congestion step missing an action")
 		}
@@ -300,7 +307,7 @@ func TestQoSLadderEscalationAndRecovery(t *testing.T) {
 	}
 	// 全底后再拥塞 → 无新动作。
 	clk.advance(100 * time.Millisecond)
-	if acts := c.Observe(fb("s1", true, 1_000, 500)); len(acts) != 0 {
+	if acts := c.Observe(fbCongest("s1", 1_000)); len(acts) != 0 {
 		t.Fatalf("all rungs at floor: congestion is a no-op, got %+v", acts)
 	}
 
@@ -371,10 +378,10 @@ func TestQoSMaxWAspectMapping(t *testing.T) {
 	// 码率 5 步 + fps 4 步打到底(1/s 限速节奏)。
 	for i := 0; i < 9; i++ {
 		clk.advance(1100 * time.Millisecond)
-		c.Observe(fb("s1", true, 1_000, 500))
+		c.Observe(fbCongest("s1", 1_000))
 	}
 	clk.advance(1100 * time.Millisecond)
-	cfg, ok := configOf(t, c.Observe(fb("s1", true, 1_000, 500)))
+	cfg, ok := configOf(t, c.Observe(fbCongest("s1", 1_000)))
 	if !ok || cfg.MaxW != 1920 {
 		t.Fatalf("aspect mapping: first height step 1080 -> maxW 1920, got %+v", cfg)
 	}
@@ -393,10 +400,10 @@ func TestQoSCongestionHeldWhileResetInFlight(t *testing.T) {
 	// 码率 5 步 + fps 4 步打到底(均非 max_w 决策:不受 grace 影响)。
 	for i := 0; i < 9; i++ {
 		clk.advance(1100 * time.Millisecond)
-		c.Observe(fb("s1", true, 1_000, 500))
+		c.Observe(fbCongest("s1", 1_000))
 	}
 	clk.advance(1100 * time.Millisecond)
-	cfg, ok := configOf(t, c.Observe(fb("s1", true, 1_000, 500)))
+	cfg, ok := configOf(t, c.Observe(fbCongest("s1", 1_000)))
 	if !ok || cfg.MaxW != 1600 || cfg.FPS != 5 || cfg.Bitrate != 500_000 {
 		t.Fatalf("first height step (maxW 1600) missing: got %+v ok=%v", cfg, ok)
 	}
@@ -406,7 +413,7 @@ func TestQoSCongestionHeldWhileResetInFlight(t *testing.T) {
 	// 动作之后不再有第二个 max_w 重置。
 	for i := 0; i < 5; i++ {
 		clk.advance(100 * time.Millisecond)
-		if acts := c.Observe(fb("s1", true, 1_000, 500)); len(acts) != 0 {
+		if acts := c.Observe(fbCongest("s1", 1_000)); len(acts) != 0 {
 			t.Fatalf("congestion while reset in flight must be held, got %+v", acts)
 		}
 	}
@@ -420,17 +427,17 @@ func TestQoSCongestionHeldWhileResetInFlight(t *testing.T) {
 	// (b)grace 被新代帧观测解除后,<1s 的立即通道拥塞仍被最小间隔挡住。
 	c.FrameObserved(1)
 	clk.advance(100 * time.Millisecond)
-	if acts := c.Observe(fb("s1", true, 1_000, 500)); len(acts) != 0 {
+	if acts := c.Observe(fbCongest("s1", 1_000)); len(acts) != 0 {
 		t.Fatalf("immediate path must respect the min interval after a reset-triggering cut, got %+v", acts)
 	}
 
 	// 间隔过后:恰再降一档(1600→1280),并再次置 grace(下一档等确认)。
 	clk.advance(2 * time.Second)
-	cfg, ok = configOf(t, c.Observe(fb("s1", true, 1_000, 500)))
+	cfg, ok = configOf(t, c.Observe(fbCongest("s1", 1_000)))
 	if !ok || cfg.MaxW != 1280 {
 		t.Fatalf("post-confirmation congestion should step exactly one height rung, got %+v ok=%v", cfg, ok)
 	}
-	if acts := c.Observe(fb("s1", true, 1_000, 500)); len(acts) != 0 {
+	if acts := c.Observe(fbCongest("s1", 1_000)); len(acts) != 0 {
 		t.Fatalf("new maxW cut must re-arm the grace, got %+v", acts)
 	}
 }
@@ -442,10 +449,10 @@ func TestQoSGraceClearsOnFrameObservation(t *testing.T) {
 	c.Observe(fb("s1", true, 8_000_000, 5))
 	for i := 0; i < 9; i++ {
 		clk.advance(1100 * time.Millisecond)
-		c.Observe(fb("s1", true, 1_000, 500))
+		c.Observe(fbCongest("s1", 1_000))
 	}
 	clk.advance(1100 * time.Millisecond)
-	if cfg, ok := configOf(t, c.Observe(fb("s1", true, 1_000, 500))); !ok || cfg.MaxW != 1600 {
+	if cfg, ok := configOf(t, c.Observe(fbCongest("s1", 1_000))); !ok || cfg.MaxW != 1600 {
 		t.Fatalf("height step setup failed: %+v ok=%v", cfg, ok)
 	}
 	// 帧观测解除(grace 清空即恢复;返回值报告确有一次在途挂起被解除)。
@@ -456,14 +463,14 @@ func TestQoSGraceClearsOnFrameObservation(t *testing.T) {
 	if c.FrameObserved(1) {
 		t.Fatal("second FrameObserved must be a no-op (no hold outstanding)")
 	}
-	if cfg, ok := configOf(t, c.Observe(fb("s1", true, 1_000, 500))); !ok || cfg.MaxW != 1280 {
+	if cfg, ok := configOf(t, c.Observe(fbCongest("s1", 1_000))); !ok || cfg.MaxW != 1280 {
 		t.Fatalf("post-grace congestion should cut again, got %+v ok=%v", cfg, ok)
 	}
 	// host 不支持 SET_VIDEO_CONFIG:apply 侧走 ResetConfirmed,grace 不滞留
 	// (720 已是 16:9 height 阶梯最底:全底后拥塞本就无动作)。
 	c.ResetConfirmed()
 	clk.advance(2 * time.Second)
-	if acts := c.Observe(fb("s1", true, 1_000, 500)); len(acts) != 0 {
+	if acts := c.Observe(fbCongest("s1", 1_000)); len(acts) != 0 {
 		t.Fatalf("ladder floor: congestion is a no-op, got %+v", acts)
 	}
 }
@@ -483,10 +490,10 @@ func TestQoSGraceOnlyClearedByNewerCodecEpoch(t *testing.T) {
 	// 码率 5 步 + fps 4 步打到底(非 max_w 决策),再首档 height 剪刀。
 	for i := 0; i < 9; i++ {
 		clk.advance(1100 * time.Millisecond)
-		c.Observe(fb("s1", true, 1_000, 500))
+		c.Observe(fbCongest("s1", 1_000))
 	}
 	clk.advance(1100 * time.Millisecond)
-	if cfg, ok := configOf(t, c.Observe(fb("s1", true, 1_000, 500))); !ok || cfg.MaxW != 1600 {
+	if cfg, ok := configOf(t, c.Observe(fbCongest("s1", 1_000))); !ok || cfg.MaxW != 1600 {
 		t.Fatalf("height step setup failed: %+v ok=%v", cfg, ok)
 	}
 
@@ -496,7 +503,7 @@ func TestQoSGraceOnlyClearedByNewerCodecEpoch(t *testing.T) {
 		t.Fatal("same-generation frame must not clear the reset grace")
 	}
 	clk.advance(2 * time.Second)
-	if acts := c.Observe(fb("s1", true, 1_000, 500)); len(acts) != 0 {
+	if acts := c.Observe(fbCongest("s1", 1_000)); len(acts) != 0 {
 		t.Fatalf("stale-generation frame cleared the grace: second max_w reset cascaded, got %+v", acts)
 	}
 	if got := c.Current().MaxW; got != 1600 {
@@ -507,7 +514,7 @@ func TestQoSGraceOnlyClearedByNewerCodecEpoch(t *testing.T) {
 	if !c.FrameObserved(6) {
 		t.Fatal("new-generation frame should clear the in-flight grace")
 	}
-	if cfg, ok := configOf(t, c.Observe(fb("s1", true, 1_000, 500))); !ok || cfg.MaxW != 1280 {
+	if cfg, ok := configOf(t, c.Observe(fbCongest("s1", 1_000))); !ok || cfg.MaxW != 1280 {
 		t.Fatalf("post-confirmation congestion should cut one height rung, got %+v ok=%v", cfg, ok)
 	}
 }
@@ -611,7 +618,7 @@ func TestQoSUpshiftRampStepCap(t *testing.T) {
 	// 起按 1/s 限速节奏推进)。
 	for i := 0; i < 5; i++ {
 		clk.advance(1100 * time.Millisecond)
-		c.Observe(fb("s1", true, 1_000, 500))
+		c.Observe(fbCongest("s1", 1_000))
 	}
 	if got := c.Current().Bitrate; got != 500_000 {
 		t.Fatalf("floor setup: bitrate=%d, want 500k", got)
@@ -774,7 +781,7 @@ func TestQoSMaxFPSUpshiftSpendsHeadroomOnBitrateNotFps(t *testing.T) {
 	sawFPS := uint32(30)
 	for i := 0; i < 12; i++ { // 码率到底 + fps 连降
 		clk.advance(1100 * time.Millisecond)
-		acts := c.Observe(fb("s1", true, 100_000_000, 300))
+		acts := c.Observe(fbCongest("s1", 100_000_000))
 		cfg, ok := configOf(t, acts)
 		if !ok {
 			continue
@@ -914,17 +921,24 @@ func TestQoSCatastrophicQueueEscapesCadenceGuard(t *testing.T) {
 	}
 }
 
-// (d)字段缺席(旧 web,presentedFps=0)→ 今日行为:越线即剪。缺省
-// 选择 = 不削减弱信号部署的拥塞控制;误报由 web 升级携带 presentedFps
-// 后自然收窄(agent 先行收窄会把旧 web 静默置于「永不拥塞降档」)。
+// (d)字段缺席(旧 web / Firefox 无 rVFC,presentedFps=0)→ 节奏未知:
+// queueMs 是 jitter 代理,节奏未知时无法区分代理几何与真排队 —— 单独
+// 的越线 queueMs 仅咨询,不剪码(Fix 6;拥塞确认通道 = 发送侧证据,
+// Fix 2 的 TestQoSSenderCongestionEvidenceCutsImmediately)。带宽证据路径
+// 照常可用(真拥塞最终推高 deadlineDropped/debt 或压低 est)。
 func TestQoSAbsentPresentedFpsKeepsLegacyBehavior(t *testing.T) {
-	c, _ := newQoSTestController()
+	c, clk := newQoSTestController()
 	c.Observe(fb("s1", true, 8_000_000, 5)) // 旧 web 形态:无 presentedFps
-	cfg, ok := configOf(t, c.Observe(fb("s1", true, 8_000_000, 180)))
-	if !ok || cfg.Bitrate != 2_300_000*7/10 {
-		t.Fatalf("absent presentedFps must keep today's immediate cut: got %+v ok=%v", cfg, ok)
+	for i := 0; i < 3; i++ {
+		clk.advance(1100 * time.Millisecond)
+		if acts := c.Observe(fb("s1", true, 8_000_000, 180)); len(acts) != 0 {
+			t.Fatalf("cadence-unknown queueMs alone must stay advisory, got %+v", acts)
+		}
 	}
-	if got := c.CadenceHolds(); got != 0 {
-		t.Fatalf("legacy path must not count holds, got %d", got)
+	if got := c.Current().Bitrate; got != 2_300_000 {
+		t.Fatalf("cadence-unknown proxy must not cut bitrate, got %d", got)
+	}
+	if got := c.CadenceHolds(); got != 3 {
+		t.Fatalf("holds = %d, want 3 (one per suppressed sample)", got)
 	}
 }

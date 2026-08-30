@@ -102,8 +102,8 @@ const (
 	// 读数才是真排队;低于它则 queueMs 不构成拥塞证据,唯一例外是
 	// qosQueueEscapeFactor × max(当前目标帧率的期望帧间隔,
 	// qosQueueEscapeFloorMs) 的灾难逃逸(真排队积压在任何节奏下都该
-	// 立即剪)。presentedFps=0(旧 web 未上报)→ 门禁旁路 = 今日行为
-	// (旧部署的拥塞控制不得被静默削弱)。
+	// 立即剪)。presentedFps=0(旧 web 未上报)→ 节奏未知:queueMs 单独
+	// 仅咨询(Fix 6;拥塞确认通道 = 发送侧证据,Fix 2)。
 	qosCadenceFloorFps    = 8.0
 	qosQueueEscapeFactor  = 3.0
 	qosQueueEscapeFloorMs = 250.0
@@ -144,10 +144,11 @@ type ViewerFeedback struct {
 	DecodeQueue  float64 // 解码队列深度(帧)——记录,不参与判据
 	RTTMs        float64
 	// PresentedFps 是 viewer 实际呈现帧率(web rvfc/getStats 汇总;0 =
-	// 旧 web 未上报)。M4 节奏门:稀疏流(静态桌面 ~5fps)上 Chrome
-	// jitterBufferDelay 代理恒读 ~半个帧间隔(100-200ms+),>100ms 的
-	// 拥塞判据每报必中 —— queueMs 只在节奏健康时才算拥塞证据(见
-	// queueCongestionReal)。
+	// 旧 web 未上报 / Firefox 无 rVFC)。M4 节奏门:稀疏流(静态桌面
+	// ~5fps)上 Chrome jitterBufferDelay 代理恒读 ~半个帧间隔
+	// (100-200ms+),>100ms 的拥塞判据每报必中 —— queueMs 只在节奏健康
+	// 时才算拥塞证据;节奏未知(0)时仅咨询,须发送侧证据确认(见
+	// queueCongestionReal 与 Fix 2 的 SenderCongestion)。
 	PresentedFps float64
 }
 
@@ -455,9 +456,11 @@ func (c *QoSController) HeldCuts() uint32 { return c.heldCuts }
 func (c *QoSController) CadenceHolds() uint32 { return c.cadenceHolds }
 
 // queueCongestionReal(M4 节奏门)判定一条越线 queueMs 是否真拥塞:
-//   - presentedFps = 0(旧 web 未上报)→ true:回退今日行为 —— 旧部署
-//     的拥塞控制不得因 agent 升级被静默削弱(宁可继承误报,由 web 升级
-//     携带 presentedFps 后自然收窄);
+//   - presentedFps = 0(旧 web / Firefox 无 rVFC)→ 节奏未知:queueMs
+//     是浏览器 jitterBufferDelay 代理,节奏未知时无法区分「代理几何」
+//     与「真排队」—— 单独的 queueMs 仅咨询(advisory),不计拥塞
+//     (M4 架构修正 Fix 6;Fix 2 起由发送侧证据 DeadlineDroppedRate/
+//     BucketDebtMs 补上确认通道 —— 发送器先于浏览器看到真排队);
 //   - presentedFps ≥ qosCadenceFloorFps → true:帧间隔 ≪ 判据线,代理
 //     读数即真排队;
 //   - 否则(queueMs > 判据线且节奏稀疏):仅当 queueMs 超过
@@ -468,7 +471,8 @@ func (c *QoSController) CadenceHolds() uint32 { return c.cadenceHolds }
 // 被抑制的拍计入 cadenceHolds(queueMs 本身随 ViewerFeedback 记录)。
 func (c *QoSController) queueCongestionReal(fb ViewerFeedback) bool {
 	if fb.PresentedFps <= 0 {
-		return true // 旧 web:字段缺席 = 今日行为(见上)
+		c.cadenceHolds++ // 节奏未知:proxy queueMs 单独不构成拥塞证据
+		return false
 	}
 	if fb.PresentedFps >= qosCadenceFloorFps {
 		return true
