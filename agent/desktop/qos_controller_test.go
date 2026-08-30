@@ -942,3 +942,82 @@ func TestQoSAbsentPresentedFpsKeepsLegacyBehavior(t *testing.T) {
 		t.Fatalf("holds = %d, want 3 (one per suppressed sample)", got)
 	}
 }
+
+// ---- Fix 2:发送侧拥塞证据(第一类真证据)----
+//
+// 架构评审:QoS 只信浏览器 jitter 代理 → 振荡类缺陷的根因。发送器
+// (本机令牌桶/入队门)先于浏览器看到真排队:DeadlineDroppedRate(窗口
+// 内入队门拒收占比)与 BucketDebtMs(债务折算毫秒)越过阈值即为真拥
+// 塞,单独触发立即通道 —— 无需浏览器确认;浏览器 queueMs 降为次要
+// 证据(节奏未知时须发送侧确认,见 (d))。
+
+// (e)发送侧证据单独触发:queueMs 完全健康(5ms)+ DeadlineDroppedRate
+// 5%(> 1% 阈值)→ 立即 30% 剪码(修前这拍不进拥塞通道,只能等带宽
+// 估计跌落)。债务证据(250ms > 200ms)同款;阈值之下不单独触发。
+func TestQoSSenderCongestionEvidenceCutsImmediately(t *testing.T) {
+	c, clk := newQoSTestController()
+	c.Observe(fbCadence("s1", 8_000_000, 5, 25))
+	clk.advance(1100 * time.Millisecond)
+	fb := fbCadence("s1", 8_000_000, 5, 25) // queueMs=5:浏览器侧毫无拥塞迹象
+	fb.Sender.DeadlineDroppedRate = 0.05
+	cfg, ok := configOf(t, c.Observe(fb))
+	if !ok || cfg.Bitrate != 2_300_000*7/10 {
+		t.Fatalf("sender deadline drops must cut 30%% without browser confirmation: got %+v ok=%v", cfg, ok)
+	}
+	// 债务证据:窗口内 0 拒收但债务 250ms > 200ms → 同样立即剪。
+	clk.advance(1100 * time.Millisecond)
+	fb = fbCadence("s1", 8_000_000, 5, 25)
+	fb.Sender.BucketDebtMs = 250
+	cfg, ok = configOf(t, c.Observe(fb))
+	if !ok || cfg.Bitrate != 2_300_000*7/10*7/10 {
+		t.Fatalf("sender bucket debt must cut 30%%: got %+v ok=%v", cfg, ok)
+	}
+	// 阈值之下(0.5% / 150ms)= 非拥塞证据,不单独触发。
+	clk.advance(1100 * time.Millisecond)
+	fb = fbCadence("s1", 8_000_000, 5, 25)
+	fb.Sender.DeadlineDroppedRate = 0.005
+	fb.Sender.BucketDebtMs = 150
+	if acts := c.Observe(fb); len(acts) != 0 {
+		t.Fatalf("sub-threshold sender evidence must not act, got %+v", acts)
+	}
+}
+
+// (f)发送侧确认解锁节奏未知的 queueMs:presentedFps=0 + queueMs=180
+// 单独仅咨询((d));同一拍带发送侧证据 → 拥塞成立,立即剪码。
+func TestQoSSenderCongestionConfirmsCadenceUnknownQueueMs(t *testing.T) {
+	c, _ := newQoSTestController()
+	c.Observe(fb("s1", true, 8_000_000, 5))
+	fb := fb("s1", true, 8_000_000, 180) // 旧 web 形态:无 presentedFps
+	fb.Sender.DeadlineDroppedRate = 0.02
+	cfg, ok := configOf(t, c.Observe(fb))
+	if !ok || cfg.Bitrate != 2_300_000*7/10 {
+		t.Fatalf("sender-confirmed queueMs must cut 30%%: got %+v ok=%v", cfg, ok)
+	}
+}
+
+// 采集侧:窗口差分 DeadlineDroppedRate(1s 反馈节拍上的 pub.vs.Stats()
+// 采样)。首拍只采样(零值);次拍 98 准入 + 2 拒收 → 2%。
+func TestSenderCongestionSnapshotWindowRates(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	pub, err := NewPublisher(PublisherConfig{Log: log})
+	if err != nil {
+		t.Fatalf("publisher: %v", err)
+	}
+	defer pub.Close()
+	e := &sessionEvents{pub: pub}
+
+	if sc := e.senderCongestionSnapshot(); sc.DeadlineDroppedRate != 0 || sc.OverflowFlushes != 0 {
+		t.Fatalf("first snapshot must only prime the window, got %+v", sc)
+	}
+	pub.vs.mu.Lock()
+	pub.vs.stats.admitted += 98
+	pub.vs.stats.deadlineDropped += 2
+	pub.vs.mu.Unlock()
+	sc := e.senderCongestionSnapshot()
+	if sc.DeadlineDroppedRate < 0.0199 || sc.DeadlineDroppedRate > 0.0201 {
+		t.Fatalf("deadlineDroppedRate = %v, want 0.02 (2 of 100 attempted)", sc.DeadlineDroppedRate)
+	}
+	if sc.OverflowFlushes != 0 {
+		t.Fatalf("overflow flushes delta = %d, want 0", sc.OverflowFlushes)
+	}
+}

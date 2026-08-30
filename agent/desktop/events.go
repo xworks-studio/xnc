@@ -32,6 +32,39 @@ type sessionEvents struct {
 
 	pub         *Publisher
 	sasInFlight atomic.Bool // 同会话并发 SAS ≤1(M2-Slice2 Task 1)
+
+	// lastSenderStats 是上一拍(1s 反馈节拍)的本会话发送器统计快照
+	// (Fix 2:窗口差分 DeadlineDroppedRate 用;nil = 首拍只采样)。信令
+	// 循环单线程写,无锁。
+	lastSenderStats *ViewerStats
+}
+
+// senderCongestionSnapshot 采集本会话发送侧拥塞证据(Fix 2):在 web 的
+// 1s 反馈节拍上对 pub.vs.Stats() 差分 —— DeadlineDroppedRate = 窗口内
+// 入队门拒收占尝试比;OverflowFlushes/桶债务为记录量。发送器在本机测
+// 量排队,先于浏览器 jitter 代理看到真拥塞。无 pub(建联前)/首拍返回
+// 零值(证据缺席)。
+func (e *sessionEvents) senderCongestionSnapshot() SenderCongestion {
+	if e.pub == nil {
+		return SenderCongestion{}
+	}
+	st := e.pub.vs.Stats()
+	defer func() { e.lastSenderStats = &st }()
+	if e.lastSenderStats == nil {
+		return SenderCongestion{BucketDebtMs: st.DebtMs}
+	}
+	prev := e.lastSenderStats
+	sc := SenderCongestion{
+		OverflowFlushes: st.OverflowFlushes - prev.OverflowFlushes,
+		BucketDebtMs:    st.DebtMs,
+	}
+	attempted := (st.Admitted - prev.Admitted) +
+		(st.DeadlineDropped - prev.DeadlineDropped) +
+		(st.OverflowFlushes - prev.OverflowFlushes)
+	if attempted > 0 {
+		sc.DeadlineDroppedRate = float64(st.DeadlineDropped-prev.DeadlineDropped) / float64(attempted)
+	}
+	return sc
 }
 
 // handle 分发一条入站信令帧;返回 false = 会话终结(offer 建联失败,agent
@@ -126,6 +159,7 @@ func (e *sessionEvents) onViewerFeedback(raw []byte) {
 		DecodeQueue:  f.DecodeQueue,
 		RTTMs:        f.RTTMs,
 		PresentedFps: f.PresentedFps,
+		Sender:       e.senderCongestionSnapshot(),
 	})
 	if len(acts) > 0 {
 		e.qos.apply(acts, e.dyn)

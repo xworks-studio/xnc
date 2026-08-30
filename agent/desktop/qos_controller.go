@@ -12,11 +12,13 @@
 //   - controller(优先 viewer):先到先得;离场/隐藏/被修剪后由字典序最小
 //     的可见 viewer 接任(确定性,同一集合必选出同一人)。只有它的反馈驱
 //     动全局决策;隐藏 viewer 的反馈一律不计(也不触发旁观者暂停)。
-//   - 拥塞(controller queueMs > 100):立即把码率砍到 70%(不要求稳定
-//     窗,但与常规降档共用 1/s 限速 —— Fix 3);码率已在 500kbps 下限
-//     → fps 沿 {60,30,20,15,10,5} 降一档;fps 已在 5 → height 沿
-//     {1440,1080,900,720} 降一档(max_w 推导见下)。全部到底后拥塞不再
-//     有动作(default-safe)。M4 节奏门:queueMs 是
+//   - 拥塞:发送侧证据优先(Fix 2)—— DeadlineDroppedRate > 1% 或桶债
+//     务 > 200ms = 真拥塞,单独即可剪(浏览器代理不越线也剪);否则
+//     controller queueMs > 100 且节奏门放行 → 立即把码率砍到 70%(不
+//     要求稳定窗,但与常规降档共用 1/s 限速 —— Fix 3);码率已在
+//     500kbps 下限 → fps 沿 {60,30,20,15,10,5} 降一档;fps 已在 5 →
+//     height 沿 {1440,1080,900,720} 降一档(max_w 推导见下)。全部到底
+//     后拥塞不再有动作(default-safe)。M4 节奏门:queueMs 是
 //     浏览器 jitterBufferDelay 代理,稀疏流(静态桌面 ~5fps)上恒读
 //     ~半帧间隔 → 每报必中。越线的 queueMs 仅在呈现节奏健康
 //     (presentedFps ≥ 8)或超灾难线(> 3×max(期望帧间隔,250ms))时
@@ -107,6 +109,13 @@ const (
 	qosCadenceFloorFps    = 8.0
 	qosQueueEscapeFactor  = 3.0
 	qosQueueEscapeFloorMs = 250.0
+	// 发送侧拥塞阈值(Fix 2;与 ViewerSender 的 pacing 参数同源派生,
+	// 非新旋钮):DeadlineDroppedRate 越过 1% = 窗口内开始丢帧(30fps
+	// 1s 窗 = 每秒 ~1 帧);BucketDebtMs 越过 200ms = 令牌桶债务已超
+	// pacingBudgetFraction 余量能吸收的深度(2×maxQueueAge 视界:债务
+	// 本身就是排队年龄,100ms 目标 + 100ms 冲刷界)。
+	qosSenderDropRateFloor = 0.01
+	qosSenderDebtMsFloor   = 200.0
 	// qosStableWindow:升档前的稳定窗;qosDownMinInterval /
 	// qosUpMinInterval:降/升档限速(Fix 3 起拥塞立即通道与常规降档通道
 	// 共用同一 1/s 降档限速 —— 「立即」指不要求稳定窗,不是无限速)。
@@ -134,6 +143,29 @@ func bitrateForWidth(w uint32) uint32 {
 	}
 }
 
+// SenderCongestion 是发送侧真实拥塞证据(M4 架构修正 Fix 2):本会话
+// ViewerSender 的窗口观测(events.go 在 1s 反馈节拍上从 pub.vs.Stats()
+// 采样差分)。发送器先于浏览器看到真排队 —— 令牌桶债务与入队门拒收是
+// 本机测量,不经 RTCP 往返、不受 jitter 代理几何误报影响;浏览器
+// queueMs 代理降为次要证据(有发送侧确认时才有裁决力)。
+type SenderCongestion struct {
+	// DeadlineDroppedRate:窗口内被入队门拒收的帧占比(拒收/尝试)。
+	// > qosSenderDropRateFloor(1%)= 真拥塞 —— 拥塞在发送侧已经丢帧。
+	DeadlineDroppedRate float64
+	// OverflowFlushes:窗口内队列年龄超限冲刷次数(累计形态记录)。
+	OverflowFlushes uint64
+	// BucketDebtMs:当前令牌桶债务(毫秒;债务 = 排队中尚未铺出的字节
+	// ÷ pacing 速率)。> qosSenderDebtMsFloor(200ms)= 发送面已在结构
+	// 性落后,无论浏览器代理读什么。
+	BucketDebtMs float64
+}
+
+// senderReal 报告这组证据是否构成真拥塞(阈值见字段注释)。
+func (s SenderCongestion) real() bool {
+	return s.DeadlineDroppedRate > qosSenderDropRateFloor ||
+		s.BucketDebtMs > qosSenderDebtMsFloor
+}
+
 // ViewerFeedback 是一条 viewer 网络观测(session.go 从 viewer_feedback
 // 信令帧解析;SessionID 由会话侧填充——路由到正确的 viewer)。
 type ViewerFeedback struct {
@@ -150,6 +182,9 @@ type ViewerFeedback struct {
 	// 时才算拥塞证据;节奏未知(0)时仅咨询,须发送侧证据确认(见
 	// queueCongestionReal 与 Fix 2 的 SenderCongestion)。
 	PresentedFps float64
+	// Sender 是本会话发送侧的拥塞证据(Fix 2;零值 = 无发送器观测
+	// —— 建联前/测试拓扑 —— 仅浏览器证据可用)。
+	Sender SenderCongestion
 }
 
 // actionKind 是 Action 的判别器。
@@ -352,7 +387,12 @@ func (c *QoSController) decide(fb ViewerFeedback, now time.Time) []Action {
 	c.lastEstBps, c.lastRefBps, c.estRefKnown = fb.EstimatedBps, c.cur.Bitrate, true
 
 	target := qosTargetBitrate(fb.EstimatedBps)
-	if fb.QueueMs > qosQueueAgeMs && c.queueCongestionReal(fb) {
+	// 发送侧证据优先(Fix 2):DeadlineDroppedRate/桶债务是本机测量,先于
+	// 任何浏览器代理看到真排队;它单独即可构成拥塞(浏览器 queueMs 不越
+	// 线也剪 —— 发送器已在丢帧,等代理确认只会多丢一拍)。浏览器代理在
+	// 节奏未知时降为「需发送侧确认」(queueCongestionReal)。
+	senderReal := fb.Sender.real()
+	if senderReal || (fb.QueueMs > qosQueueAgeMs && c.queueCongestionReal(fb, senderReal)) {
 		// 拥塞:稳定窗作废;立即 30% 通道 —— 「立即」= 窗口内的第一次
 		// 剪码不要求稳定窗(M4 架构修正 Fix 3:不再绕过 qosDownMinInterval
 		// —— 不限速的立即通道对 1/s 反馈节奏就是每秒 30% 棘轮,直到
@@ -458,9 +498,8 @@ func (c *QoSController) CadenceHolds() uint32 { return c.cadenceHolds }
 // queueCongestionReal(M4 节奏门)判定一条越线 queueMs 是否真拥塞:
 //   - presentedFps = 0(旧 web / Firefox 无 rVFC)→ 节奏未知:queueMs
 //     是浏览器 jitterBufferDelay 代理,节奏未知时无法区分「代理几何」
-//     与「真排队」—— 单独的 queueMs 仅咨询(advisory),不计拥塞
-//     (M4 架构修正 Fix 6;Fix 2 起由发送侧证据 DeadlineDroppedRate/
-//     BucketDebtMs 补上确认通道 —— 发送器先于浏览器看到真排队);
+//     与「真排队」—— 单独的 queueMs 仅咨询(advisory),仅当发送侧
+//     证据确认(senderReal,Fix 2)时才算拥塞;
 //   - presentedFps ≥ qosCadenceFloorFps → true:帧间隔 ≪ 判据线,代理
 //     读数即真排队;
 //   - 否则(queueMs > 判据线且节奏稀疏):仅当 queueMs 超过
@@ -469,9 +508,12 @@ func (c *QoSController) CadenceHolds() uint32 { return c.cadenceHolds }
 //     正的队列积压在任何节奏下都会远超自身节奏的 3 倍。
 //
 // 被抑制的拍计入 cadenceHolds(queueMs 本身随 ViewerFeedback 记录)。
-func (c *QoSController) queueCongestionReal(fb ViewerFeedback) bool {
+func (c *QoSController) queueCongestionReal(fb ViewerFeedback, senderReal bool) bool {
 	if fb.PresentedFps <= 0 {
-		c.cadenceHolds++ // 节奏未知:proxy queueMs 单独不构成拥塞证据
+		if senderReal {
+			return true // 节奏未知但发送器已确认(拒收/债务越线)
+		}
+		c.cadenceHolds++ // 节奏未知且无发送侧确认:proxy queueMs 仅咨询
 		return false
 	}
 	if fb.PresentedFps >= qosCadenceFloorFps {

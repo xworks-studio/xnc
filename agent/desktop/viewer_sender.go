@@ -225,7 +225,8 @@ type viewerStatsN struct {
 	epochDropped    uint64 // 旧/异代 epoch 抑制的帧
 	pausedDropped   uint64
 	closedDropped   uint64
-	deadlineDropped uint64 // 截止超 100ms 未入队的增量帧(关键帧豁免,C2)
+	admitted        uint64 // 过入队门被接受的帧(与 deadlineDropped 对偶)
+	deadlineDropped uint64 // 截止超准入线未入队的帧(整帧拒收)
 	overflowFlushes uint64 // 队列年龄超限冲刷次数
 	keyRequests     uint64 // 合并关键帧请求触发次数
 }
@@ -240,11 +241,14 @@ type ViewerStats struct {
 	EpochDropped    uint64
 	PausedDropped   uint64
 	ClosedDropped   uint64
+	Admitted        uint64
 	DeadlineDropped uint64
 	OverflowFlushes uint64
 	KeyRequests     uint64
 	QueuePackets    int
 	QueueBytes      int
+	// DebtMs 是当前令牌桶债务(毫秒;Fix 2 的发送侧拥塞证据之一)。
+	DebtMs float64
 }
 
 // tokenBucket 是 per-viewer 令牌桶:速率恒为预算的 pacingBudgetFraction 倍
@@ -274,6 +278,16 @@ func (b *tokenBucket) refill(now time.Time) {
 		}
 		b.last = now
 	}
+}
+
+// debtMs 报告当前债务折算的毫秒数(负余额 ÷ 速率;无债务 = 0)。这是
+// 发送面结构性落后的直接测量(Fix 2 的拥塞证据):债务本身就是排队
+// 年龄。
+func (b *tokenBucket) debtMs() float64 {
+	if b.tokens >= 0 || b.rate <= 0 {
+		return 0
+	}
+	return -b.tokens / b.rate * 1000
 }
 
 // plan 为一帧的全部包计算计划发送时刻(不改余额;返回影子余额)。
@@ -473,11 +487,13 @@ func (s *ViewerSender) Enqueue(f Frame) error {
 	if f.Key {
 		deadlines = s.bucket.reserveKeyframe(sizes, now)
 		s.recoveryGrace = recoveryGraceDeltas
+		s.stats.admitted++
 	} else if d, ok := s.bucket.reserve(sizes, now); !ok {
 		if s.recoveryGrace > 0 {
 			deadlines = s.bucket.reserveKeyframe(sizes, now)
 			s.recoveryGrace--
 			exempt = true
+			s.stats.admitted++
 		} else {
 			s.stats.deadlineDropped++
 			s.state = stateWaitIDR
@@ -491,6 +507,7 @@ func (s *ViewerSender) Enqueue(f Frame) error {
 	} else {
 		deadlines = d
 		s.recoveryGrace = 0
+		s.stats.admitted++
 	}
 	// frame-meta(M3 Task 4,修正轮):身份在本帧 admitted 入队时绑定
 	//(此刻 per-viewer 时戳已定),随队列槽位携带——任何写出顺序(入口
@@ -593,11 +610,13 @@ func (s *ViewerSender) Stats() ViewerStats {
 		EpochDropped:    s.stats.epochDropped,
 		PausedDropped:   s.stats.pausedDropped,
 		ClosedDropped:   s.stats.closedDropped,
+		Admitted:        s.stats.admitted,
 		DeadlineDropped: s.stats.deadlineDropped,
 		OverflowFlushes: s.stats.overflowFlushes,
 		KeyRequests:     s.stats.keyRequests,
 		QueuePackets:    len(s.queue),
 		QueueBytes:      s.queueBytes,
+		DebtMs:          s.bucket.debtMs(),
 	}
 }
 
