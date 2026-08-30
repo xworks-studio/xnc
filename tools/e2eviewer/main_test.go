@@ -848,12 +848,15 @@ func startLoopPeer(t *testing.T, ctx context.Context, wsURL, session string, log
 	return &loopPeer{t: t, ctx: ctx, ws: ws, v: v}
 }
 
-// sendFeedback 注入一条合成 viewer_feedback(1s 节奏由调用方掌握)。
+// sendFeedback 注入一条当前 Web 形态的合成 viewer_feedback(1s 节奏由
+// 调用方掌握)。presentedFps=30 证明 queueMs 来自健康呈现节奏；省略该
+// 字段表示旧 Web / 节奏未知，按新 QoS 契约只能作为咨询信号。
 func (p *loopPeer) sendFeedback(bps uint64, queueMs, rttMs float64) {
 	p.t.Helper()
 	b, _ := json.Marshal(map[string]any{
 		"type": "viewer_feedback", "visible": true,
 		"estimatedBps": bps, "queueMs": queueMs, "decodeQueue": 0, "rttMs": rttMs,
+		"presentedFps": 30,
 	})
 	p.v.fbSent.Add(1)
 	wctx, wcancel := context.WithTimeout(p.ctx, 5*time.Second)
@@ -1054,17 +1057,18 @@ func runNetworkCase(t *testing.T, tc netCase, dir string) {
 		}
 	}
 
-	// ④ Phase C(档位拥塞):controller queueMs = 档位排队反馈。>100 →
-	// 立即 30% 降档;连发拥塞反馈(250ms 间隔)走立即通道连降 ——
+	// ④ Phase C(档位拥塞):controller queueMs = 档位排队反馈。>100 且
+	// presentedFps=30 → 立即 30% 降档;后续反馈遵守共享 1s 限速 ——
 	// final-fixwave C1 后 est 路径带迟滞(flat est 不再触发降档),拥塞
 	// 立即通道是本相位唯一的降档来源,≤700k 只能由它到达;<100 → 无降档
 	//(升档需 10s 稳定窗,本用例内不触发)。
 	ctrl.sendFeedback(tc.bps, tc.queueMs, tc.rttMs)
 	if tc.congest {
 		// 1M 档连降 4 拍:2.3M→1.61M→1.127M→789k→552k(≤700k 达标,
-		// 仍 ≥500k 下限;立即通道绕过 1/s 限速)。
+		// 仍 ≥500k 下限)。Fix 3 后“立即”只免首拍稳定窗，不绕过
+		// qosDownMinInterval；因此每拍跨过 1s 窗口。
 		for i := 0; i < 3; i++ {
-			time.Sleep(250 * time.Millisecond)
+			time.Sleep(1050 * time.Millisecond)
 			ctrl.sendFeedback(tc.bps, tc.queueMs, tc.rttMs)
 		}
 		pollUntil(t, 5*time.Second, "congestion downshift (immediate 30% channel)", func() bool {
