@@ -11,3 +11,9 @@ SELECT * FROM nodes WHERE cluster_id = $1 AND name = $2;
 
 -- name: GetNodeByID :one
 SELECT * FROM nodes WHERE id = $1;
+
+-- name: GetMachineIDConflictCluster :one
+-- 跨 cluster machineId 冲突检查（用户 JWT 注册 409，spec §6.4）：machineId 已
+-- 注册于其他 cluster 时返回该 cluster 名（供 CLI 提示 --force 或管理端处理）。
+SELECT c.name FROM nodes n JOIN clusters c ON c.id = n.cluster_id
+WHERE n.machine_id = $1 AND n.cluster_id <> $2 LIMIT 1;

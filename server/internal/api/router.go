@@ -105,6 +105,8 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		cr.Post("/", h.createCluster)
 		// 软删除：owner-only，有节点 409（handler 内判定）
 		cr.Delete("/{id}", h.deleteCluster)
+		// 用户 JWT 授权的节点注册（spec §6.4）：任一成员；409 含冲突 cluster 名
+		cr.Post("/{id}/nodes/register", h.userRegisterNode)
 	})
 
 	// 用户管理：无自注册，仅 admin（任一 cluster owner）可创建/列出。

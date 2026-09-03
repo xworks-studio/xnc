@@ -11,6 +11,10 @@ const (
 	CodeEnrollmentTokenInvalid  = "ENROLLMENT_TOKEN_INVALID"
 	CodeEnrollmentTokenExpired  = "ENROLLMENT_TOKEN_EXPIRED"
 	CodeNodeAlreadyEnrolled     = "NODE_ALREADY_ENROLLED"
+	// CodeMachineIDConflict：machineId 已注册于其他 cluster（§6.4 用户 JWT 注册
+	// 的 409，message 含冲突 cluster 名；与同 cluster 异 key 的
+	// NODE_ALREADY_ENROLLED 区分——前者走 --force/管理端，后者是错误）。
+	CodeMachineIDConflict = "MACHINE_ID_CONFLICT"
 	CodeSessionNotFound         = "SESSION_NOT_FOUND"
 	CodeSessionExpired          = "SESSION_EXPIRED"
 	CodeSessionLimited          = "SESSION_LIMIT_EXCEEDED"

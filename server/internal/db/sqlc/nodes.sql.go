@@ -61,6 +61,25 @@ func (q *Queries) CreateNode(ctx context.Context, arg CreateNodeParams) (Node, e
 	return i, err
 }
 
+const getMachineIDConflictCluster = `-- name: GetMachineIDConflictCluster :one
+SELECT c.name FROM nodes n JOIN clusters c ON c.id = n.cluster_id
+WHERE n.machine_id = $1 AND n.cluster_id <> $2 LIMIT 1
+`
+
+type GetMachineIDConflictClusterParams struct {
+	MachineID string    `json:"machine_id"`
+	ClusterID uuid.UUID `json:"cluster_id"`
+}
+
+// 跨 cluster machineId 冲突检查（用户 JWT 注册 409，spec §6.4）：machineId 已
+// 注册于其他 cluster 时返回该 cluster 名（供 CLI 提示 --force 或管理端处理）。
+func (q *Queries) GetMachineIDConflictCluster(ctx context.Context, arg GetMachineIDConflictClusterParams) (string, error) {
+	row := q.db.QueryRow(ctx, getMachineIDConflictCluster, arg.MachineID, arg.ClusterID)
+	var name string
+	err := row.Scan(&name)
+	return name, err
+}
+
 const getNodeByID = `-- name: GetNodeByID :one
 SELECT id, cluster_id, name, machine_id, hostname, os_version, agent_version, shell_type, public_key, status, last_seen_at, created_at, target_release, channel FROM nodes WHERE id = $1
 `
