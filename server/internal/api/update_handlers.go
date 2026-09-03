@@ -188,8 +188,10 @@ func (h *handlers) adminUploadRelease(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// setup.exe 与 bundle 同 release 并存（§14 迁移期）：maybeOfferUpdate
-	// 对新 agent 推安装器编排、对存量 agent 兜底 bundle；/setup.exe 与
-	// /setup.json 由 setup_handlers 动态服务该制品。
+	// 按制品偏好决策——release 带 setup.exe 则全员推 UPDATE_AVAILABLE
+	// （安装器编排；存量 bundle agent 对其前向兼容忽略），仅 bundle-only
+	// release 才走遗留 UPDATE_OFFER（存量节点的最后升级通道）。
+	// /setup.exe 与 /setup.json 由 setup_handlers 动态服务该制品。
 	if setupBytes != nil {
 		ssum := sha256.Sum256(setupBytes)
 		if err := h.st.Q().PutArtifact(ctx, sqlc.PutArtifactParams{
