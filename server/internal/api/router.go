@@ -154,6 +154,11 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		cr.Get("/download", h.cliDownload)
 	})
 
+	// 安装器分发（设计 §4，无认证——产品首次下载入口）：频道最新 setup.exe
+	// 直流 + 动态版本清单 setup.json（供 xnc upgrade --check / CI 消费）。
+	r.Get("/setup.exe", h.setupDownload)
+	r.Get("/setup.json", h.setupManifest)
+
 	// 快捷安装（无 JWT——token 是凭证；SPA 兜底之前注册）
 	// curl -sL xnc.app/a/<token> | cmd    → agent 安装
 	// curl -sL xnc.app/c | cmd           → CLI 安装
