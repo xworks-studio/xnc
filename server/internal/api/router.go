@@ -162,13 +162,16 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 	r.Get("/setup.json", h.setupManifest)
 
 	// 快捷安装（无 JWT——token 是凭证；SPA 兜底之前注册）
-	// curl -sL xnc.app/a/<token> | cmd    → agent 安装
-	// curl -sL xnc.app/c | cmd           → CLI 安装
+	// DEPRECATED（设计 §14）：一行流由 setup.exe + `xnc register` 取代
+	// （安装器是唯一安装入口）。迁移期保留 2 个 release 周期，随后连同
+	// install_handlers.go / install_scripts.go 一并删除。
+	// curl -sL xnc.app/a/<token> | cmd    → agent 安装（deprecated）
+	// curl -sL xnc.app/c | cmd           → CLI 安装（deprecated）
 	r.Get("/a/{token}", h.installAgentCmd)
 	r.Get("/a-dev/{token}", h.installAgentCmd)
 	r.Get("/c", h.installCliCmd)
 	r.Get("/c-dev", h.installCliCmd)
-	// 安装脚本本体（cmd 脚本内引用下载）
+	// 安装脚本本体（cmd 脚本内引用下载；deprecated，随上面的入口一同退役）
 	r.Get("/install/agent.ps1", h.serveAgentInstallPS)
 	r.Get("/install/cli.ps1", h.serveCliInstallPS)
 

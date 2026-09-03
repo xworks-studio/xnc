@@ -6,6 +6,12 @@
 // maybeOfferUpdate 的 bundle 兜底通道），全网切换后随 /api/agent/bundle
 // 一并退役。
 //
+// "最后一个 bundle" 的过渡语义（spec §14）：该 bundle 携带**编排版 agent**
+// （安装器编排自更新），存量节点经 bundle 通道完成最后一次升级后**永久
+// 切换到安装器更新**（spec §9）；此后发布只携带 setup.exe（上传端点的
+// setup 部件），bundle 通道关闭。切换成功判据 = installer-cache 就位且
+// 下一版本经安装器完成（agent 上报 update_ok）。
+//
 // --include-helper: 额外打包 xnc-screen-helper.exe（从 <binDir> 读）。仅用于
 // 0.4.6 过渡 bundle——0.4.5 agent 的 requiredFiles 仍含已退役的 helper，
 // 缺它 stage 校验会拒收 0.4.6 bundle；0.4.6+ agent 的 requiredFiles 不含

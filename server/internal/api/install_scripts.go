@@ -1,5 +1,10 @@
 // install_scripts.go — 安装脚本文本（PowerShell，server 按请求动态生成）。
 //
+// DEPRECATED（设计 §14）：本文件是 install_handlers.go 一行流
+// （/a/<token>、/c）的脚本体，随一行流一同退役（保留 2 个 release 周期，
+// 之后删除）。替代流程：/setup.exe 下载 Inno Setup 安装器 → 安装 →
+// 首用 `xnc register` 完成绑定。
+//
 // UI 设计：Unicode 方框 + 步骤编号 + 颜色 + 下载进度条。兼容 cmd 与
 // PowerShell 终端（非 TTY 自动降级纯文本）。
 package api

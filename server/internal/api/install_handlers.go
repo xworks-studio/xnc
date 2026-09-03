@@ -1,5 +1,12 @@
 // install_handlers.go — 快捷安装端点：/a/<token>（agent）、/c（CLI）。
 //
+// DEPRECATED（设计 §14，docs/superpowers/specs/2026-09-03-innosetup-installer-
+// unified-auth-design.md）：本文件全套（含 /install/*.ps1 脚本本体）已被
+// setup.exe + `xnc register` 流程取代——安装器（/setup.exe 下载、Inno Setup
+// 安装、首用 register 绑定）是唯一安装入口。迁移期保留 2 个 release 周期
+// 供存量用户过渡，随后整套删除。每次请求记一条 deprecation 日志（见
+// logDeprecatedInstall），便于观测剩余流量、确认退役时机。
+//
 // 用户命令（复制/手打即完成安装）：
 //
 //	curl -sL xnc.app/a/xnc_enroll_XXXX | cmd
@@ -13,13 +20,21 @@ package api
 
 import (
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 )
 
+// logDeprecatedInstall — 一行流每请求一条 deprecation 日志（§14 退役观测）。
+func logDeprecatedInstall(r *http.Request) {
+	slog.Warn("deprecated one-liner install served (removal after 2 release cycles; use setup.exe + xnc register)",
+		"path", r.URL.Path, "remote", r.RemoteAddr)
+}
+
 // installAgentCmd — GET /a/{token}：返回 agent 安装 cmd 脚本。
 // token 为 enrollment token（server 校验有效性后动态嵌入安装脚本）。
 func (h *handlers) installAgentCmd(w http.ResponseWriter, r *http.Request) {
+	logDeprecatedInstall(r)
 	token := r.PathValue("token")
 	if token == "" || !strings.HasPrefix(token, "xnc_enroll_") {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -41,6 +56,7 @@ func (h *handlers) installAgentCmd(w http.ResponseWriter, r *http.Request) {
 
 // installCliCmd — GET /c 或 /c-dev：返回 CLI 安装 cmd 脚本。
 func (h *handlers) installCliCmd(w http.ResponseWriter, r *http.Request) {
+	logDeprecatedInstall(r)
 	channel := "stable"
 	if strings.HasPrefix(r.URL.Path, "/c-dev") {
 		channel = "dev"
@@ -92,6 +108,7 @@ endlocal
 // serveAgentInstallPS — GET /install/agent.ps1?token=&channel=：
 // 输出 agent 安装 PowerShell 脚本（cmd 批处理引用下载此文件）。
 func (h *handlers) serveAgentInstallPS(w http.ResponseWriter, r *http.Request) {
+	logDeprecatedInstall(r)
 	token := r.URL.Query().Get("token")
 	channel := r.URL.Query().Get("channel")
 	if channel == "" {
@@ -103,6 +120,7 @@ func (h *handlers) serveAgentInstallPS(w http.ResponseWriter, r *http.Request) {
 
 // serveCliInstallPS — GET /install/cli.ps1?channel=
 func (h *handlers) serveCliInstallPS(w http.ResponseWriter, r *http.Request) {
+	logDeprecatedInstall(r)
 	channel := r.URL.Query().Get("channel")
 	if channel == "" {
 		channel = "stable"
