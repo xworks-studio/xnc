@@ -22,6 +22,12 @@ func runAgent(server, token, stateDir, serviceName, desktopCorePipe, desktopCore
 		os.Setenv("XNC_DESKTOP_CORE_PIPE", desktopCorePipe)
 		os.Setenv("XNC_DESKTOP_CORE_SECRET_HEX", desktopCoreSecretHex)
 	}
+	// 首启迁移（仅当使用新默认目录时；显式 --state-dir 不迁移）：
+	// 必须先于服务日志打开——日志落在新目录，且日志句柄会占住目录使
+	// 搬移失败。
+	if stateDir == defaultStateDir() {
+		stateDir = migrateLegacyStateDir(stateDir)
+	}
 	a := &agent.Agent{ServerURL: server, Token: token, StateDir: stateDir}
 	if svcapp.IsService() {
 		// 服务上下文无有效 stdout/stderr——日志落盘 state 目录（否则
@@ -70,11 +76,50 @@ func buildServiceArgs(server, token, stateDir, serviceName, desktopCorePipe, des
 
 func uninstallService(serviceName string) error { return svcapp.Uninstall(serviceName) }
 
-// defaultStateDir：服务以 SYSTEM 运行，状态放在 %ProgramData%\XNCAgent。
+// defaultStateDir：服务以 SYSTEM 运行，状态放在 %ProgramData%\XNC
+//（设计 §3.3 机器级状态统一目录；旧 XNCAgent 由 migrateLegacyStateDir
+// 首启迁移）。
 func defaultStateDir() string {
 	pd := os.Getenv("ProgramData")
 	if pd == "" {
 		pd = "."
 	}
-	return filepath.Join(pd, "XNCAgent")
+	return filepath.Join(pd, "XNC")
+}
+
+// legacyStateDirName 旧状态目录名（首启迁移源，设计 §14）。
+const legacyStateDirName = "XNCAgent"
+
+// migrateLegacyStateDir 首启状态目录迁移（设计 §14）：StateDir 统一为
+// %ProgramData%\XNC。规则：
+//   - 旧目录存在、新目录不存在 → 整体 rename 搬移（identity.json 等
+//     全部随迁——搬移而非复制，绝不产生两份状态）；
+//   - 两者并存 → 以新目录为准，记警告（不合并、不删除）；
+//   - 搬移失败（目录被占用等）→ 保留旧目录（identity 必须存活），本次
+//     运行退回旧目录，下次启动重试；
+//   - 都不存在 → 创建新目录（空转态也要写服务日志）。0700 与
+//     identity.Save 同一权限约定（Go 映射为 SYSTEM+Administrators+属主）。
+//
+// 返回本次运行实际使用的状态目录。
+func migrateLegacyStateDir(newDir string) string {
+	oldDir := filepath.Join(filepath.Dir(newDir), legacyStateDirName)
+	_, oldErr := os.Stat(oldDir)
+	_, newErr := os.Stat(newDir)
+	switch {
+	case oldErr == nil && newErr == nil:
+		slog.Warn("state dir: legacy and new both exist; using new",
+			"legacy", oldDir, "new", newDir)
+	case oldErr == nil:
+		if err := os.Rename(oldDir, newDir); err != nil {
+			slog.Warn("state dir migration failed; using legacy dir this run",
+				"legacy", oldDir, "new", newDir, "err", err)
+			return oldDir
+		}
+		slog.Info("state dir migrated", "from", oldDir, "to", newDir)
+	default:
+		if err := os.MkdirAll(newDir, 0o700); err != nil {
+			slog.Warn("state dir create failed", "dir", newDir, "err", err)
+		}
+	}
+	return newDir
 }

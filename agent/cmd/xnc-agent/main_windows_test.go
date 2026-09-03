@@ -3,9 +3,12 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // 回归覆盖（评审 Critical）：服务参数必须是逐词的 argv 元素。
@@ -52,5 +55,66 @@ func TestBuildServiceArgs(t *testing.T) {
 			"--desktop-core-secret-hex=746573",
 			"--token=tok",
 		}, got)
+	})
+}
+
+// 状态目录统一为 %ProgramData%\XNC（设计 §3.3/§14）。
+func TestDefaultStateDir(t *testing.T) {
+	t.Setenv("ProgramData", `D:\ProgramData`)
+	assert.Equal(t, `D:\ProgramData\XNC`, defaultStateDir())
+}
+
+func TestMigrateLegacyStateDir(t *testing.T) {
+	write := func(dir, name, content string) {
+		require.NoError(t, os.MkdirAll(dir, 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600))
+	}
+
+	t.Run("legacy only: wholesale move, identity survives", func(t *testing.T) {
+		base := t.TempDir()
+		old, new := filepath.Join(base, "XNCAgent"), filepath.Join(base, "XNC")
+		write(old, "identity.json", "{}")
+		write(old, "agent-service.log", "log")
+
+		got := migrateLegacyStateDir(new)
+		assert.Equal(t, new, got)
+		assert.NoDirExists(t, old, "successful move removes the legacy dir (contents moved, not copied)")
+		for _, f := range []string{"identity.json", "agent-service.log"} {
+			assert.FileExists(t, filepath.Join(new, f), "%s must survive migration", f)
+		}
+	})
+
+	t.Run("both exist: prefer new, leave legacy untouched", func(t *testing.T) {
+		base := t.TempDir()
+		old, new := filepath.Join(base, "XNCAgent"), filepath.Join(base, "XNC")
+		write(old, "legacy-marker.txt", "old")
+		write(new, "new-marker.txt", "new")
+
+		got := migrateLegacyStateDir(new)
+		assert.Equal(t, new, got)
+		assert.FileExists(t, filepath.Join(old, "legacy-marker.txt"))
+		assert.FileExists(t, filepath.Join(new, "new-marker.txt"))
+	})
+
+	t.Run("neither exists: create new dir", func(t *testing.T) {
+		base := t.TempDir()
+		new := filepath.Join(base, "XNC")
+		got := migrateLegacyStateDir(new)
+		assert.Equal(t, new, got)
+		assert.DirExists(t, new, "idle-mode first boot still needs the dir for service logs")
+	})
+
+	// 搬移失败（目录被占用，如另一进程 CWD）：绝不删旧目录，本次退回
+	// 旧目录运行（identity 必须存活），下次启动重试。
+	t.Run("move fails: fall back to legacy dir, nothing deleted", func(t *testing.T) {
+		base := t.TempDir()
+		old, new := filepath.Join(base, "XNCAgent"), filepath.Join(base, "XNC")
+		write(old, "identity.json", "{}")
+		t.Chdir(old) // 占用旧目录，让 rename 确定性失败
+
+		got := migrateLegacyStateDir(new)
+		assert.Equal(t, old, got, "must fall back to legacy dir this run")
+		assert.FileExists(t, filepath.Join(old, "identity.json"), "legacy identity must never be destroyed")
+		assert.NoDirExists(t, new)
 	})
 }
