@@ -93,7 +93,12 @@ func (h *handlers) targetReleaseFor(ctx context.Context, nodeID uuid.UUID) (sqlc
 
 // maybeOfferUpdate — 版本落后则经控制通道下发 UPDATE_OFFER。
 // HELLO 握手、心跳、强制 rollout 三入口共用；幂等性由 agent 侧去重保证
-// （同版本重复 OFFER 静默跳过），服务端不做去重以保持无状态。
+// （同版本重复推送静默跳过），服务端不做去重以保持无状态。
+//
+// 新协议：release 带 setup.exe 制品 → 推 UPDATE_AVAILABLE（安装器编排，
+// spec §9.1；推送只是"立即检查"的信号，agent 自行拉取 setup.json 复核）。
+// 迁移期兜底：仅含 bundle.tar.gz 的历史 release → 推遗留 UPDATE_OFFER
+// （存量 bundle agent 的最后通道，spec §14；新 agent 对其前向兼容忽略）。
 func (h *handlers) maybeOfferUpdate(ctx context.Context, nodeID uuid.UUID, currentVersion string, send func(proto.Message) error) {
 	if currentVersion == "" {
 		return
@@ -103,9 +108,22 @@ func (h *handlers) maybeOfferUpdate(ctx context.Context, nodeID uuid.UUID, curre
 		return
 	}
 	q := h.st.Q()
+	if art, err := q.GetArtifact(ctx, sqlc.GetArtifactParams{ReleaseID: rel.ID, Name: setupArtifactName}); err == nil {
+		push, _ := proto.NewMsg(proto.TypeUpdateAvailable, proto.UpdateAvailable{
+			Version: rel.Version,
+			URL:     "/setup.exe?channel=" + rel.Channel,
+			SHA256:  art.Sha256,
+		})
+		if err := send(push); err != nil {
+			slog.Warn("update: push send failed", "node", nodeID, "err", err)
+		} else {
+			slog.Info("update: pushed", "node", nodeID, "from", currentVersion, "to", rel.Version)
+		}
+		return
+	}
 	art, err := q.GetArtifact(ctx, sqlc.GetArtifactParams{ReleaseID: rel.ID, Name: bundleArtifactName})
 	if err != nil {
-		slog.Warn("update: bundle artifact missing", "version", rel.Version, "err", err)
+		slog.Warn("update: setup/bundle artifact missing", "version", rel.Version, "err", err)
 		return
 	}
 	tok := mintDownloadToken(nodeID, rel.ID)
@@ -115,8 +133,8 @@ func (h *handlers) maybeOfferUpdate(ctx context.Context, nodeID uuid.UUID, curre
 		SHA256:  art.Sha256,
 	})
 	if err := send(offer); err != nil {
-		slog.Warn("update: offer send failed", "node", nodeID, "err", err)
+		slog.Warn("update: legacy offer send failed", "node", nodeID, "err", err)
 	} else {
-		slog.Info("update: offered", "node", nodeID, "from", currentVersion, "to", rel.Version)
+		slog.Info("update: offered (legacy bundle)", "node", nodeID, "from", currentVersion, "to", rel.Version)
 	}
 }

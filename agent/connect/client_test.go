@@ -538,3 +538,37 @@ func TestOnReadyFiresAfterHelloAck(t *testing.T) {
 		t.Fatal("Run did not return after cancel")
 	}
 }
+
+// TestDispatchesUpdateAvailable（Task 7，spec §9.1 触发①）：HELLO_ACK 后
+// server 下发 UPDATE_AVAILABLE，必须经 UpdateAvailableFunc 分发（独立
+// goroutine，不阻塞读循环），载荷完整到达。
+func TestDispatchesUpdateAvailable(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	got := make(chan proto.UpdateAvailable, 1)
+
+	srv := fakeServerWithHooks(t, pub, func(write func(typ string, p any)) {
+		write(proto.TypeUpdateAvailable, proto.UpdateAvailable{
+			Version: "0.6.2", URL: "/setup.exe?channel=stable", SHA256: "abc"})
+	})
+	defer srv.Close()
+
+	k := &identity.Key{NodeID: "node-x", Priv: priv}
+	c := NewClient("ws"+srv.URL[4:], k, machineinfo.Info{})
+	c.Beat = 50 * time.Millisecond
+	c.UpdateAvailableFunc = func(_ context.Context, push proto.UpdateAvailable) {
+		got <- push
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+
+	select {
+	case push := <-got:
+		assert.Equal(t, "0.6.2", push.Version)
+		assert.Equal(t, "/setup.exe?channel=stable", push.URL)
+		assert.Equal(t, "abc", push.SHA256)
+	case <-time.After(3 * time.Second):
+		t.Fatal("no UPDATE_AVAILABLE dispatched")
+	}
+}

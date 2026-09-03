@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -13,24 +12,9 @@ import (
 	"github.com/spf13/cobra"
 
 	"xnc/agent/machineinfo"
-	"xnc/agent/updater"
 )
 
 func main() {
-	// apply-update：自更新换文件子模式（updater.apply spawn 的第二自我。
-	// 不走 cobra flag 树——参数位置式：--apply-update <stageDir> <parentPID>）。
-	for _, arg := range os.Args[1:] {
-		if arg == "--apply-update" && len(os.Args) >= 4 {
-			logf := func(format string, args ...any) {
-				fmt.Fprintf(os.Stderr, "apply-update: "+format+"\n", args...)
-			}
-			if err := updater.RunApply(os.Args[2], os.Args[3], logf); err != nil {
-				logf("FAILED: %v", err)
-				os.Exit(1)
-			}
-			return
-		}
-	}
 	if err := newRootCmd().Execute(); err != nil {
 		os.Exit(1)
 	}

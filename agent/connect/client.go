@@ -48,9 +48,10 @@ type Client struct {
 	OnReady func(sendControl func(m proto.Message) error)
 	// TargetVersionFunc：快速版本检查回调（HELLO_ACK/心跳 ACK 目标版本）。
 	TargetVersionFunc func(target string)
-	// UpdateOfferFunc：UPDATE_OFFER 到达（独立 goroutine 分发）。携带 send
-	// 供 UPDATE_STATUS 上报。nil 时 offer 静默忽略。
-	UpdateOfferFunc func(ctx context.Context, offer proto.UpdateOffer)
+	// UpdateAvailableFunc：UPDATE_AVAILABLE 到达（独立 goroutine 分发，
+	// spec §9.1 触发①）。推送只是"立即检查"的提示，接收方自行拉取
+	// setup.json。nil 时静默忽略。
+	UpdateAvailableFunc func(ctx context.Context, push proto.UpdateAvailable)
 
 	sendMu      sync.Mutex
 	currentSend func(m proto.Message) error
@@ -311,10 +312,10 @@ func (c *Client) drain(pctx context.Context, ws *websocket.Conn, dead func()) {
 					h := c.Handler
 					go h.HandleSessionOpen(pctx, so) // 会话处理不得阻塞心跳/读取
 				}
-			case proto.TypeUpdateOffer:
-				var offer proto.UpdateOffer
-				if err := m.Decode(&offer); err == nil {
-					go c.HandleUpdateOffer(pctx, offer) // 下载不得阻塞心跳读取
+			case proto.TypeUpdateAvailable:
+				var push proto.UpdateAvailable
+				if err := m.Decode(&push); err == nil {
+					go c.HandleUpdateAvailable(pctx, push) // 检查/下载不得阻塞心跳读取
 				}
 			case proto.TypeSessionClose:
 				var sc proto.SessionClose
@@ -395,11 +396,11 @@ func (c *Client) OnTargetVersion(target string) {
 	}
 }
 
-// HandleUpdateOffer drain 收到 UPDATE_OFFER 时分发（独立 goroutine，与
-// 会话消息同等待遇——下载不得阻塞心跳读取）。
-func (c *Client) HandleUpdateOffer(pctx context.Context, offer proto.UpdateOffer) {
-	if c.UpdateOfferFunc != nil {
-		c.UpdateOfferFunc(pctx, offer)
+// HandleUpdateAvailable drain 收到 UPDATE_AVAILABLE 时分发（独立
+// goroutine，与会话消息同等待遇——检查/下载不得阻塞心跳读取）。
+func (c *Client) HandleUpdateAvailable(pctx context.Context, push proto.UpdateAvailable) {
+	if c.UpdateAvailableFunc != nil {
+		c.UpdateAvailableFunc(pctx, push)
 	}
 }
 

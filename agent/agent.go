@@ -48,6 +48,9 @@ type Agent struct {
 
 	connMu sync.Mutex
 	conn   *connect.Client // 当前连接周期的控制客户端（status online 判据）
+
+	updMu sync.Mutex
+	upd   *updater.Updater // 当前连接周期的更新编排器（UpdateNow/Task 8 复用）
 }
 
 // rebindCh 返回（必要时创建）唤醒通道。
@@ -79,6 +82,18 @@ func (a *Agent) currentConn() *connect.Client {
 	a.connMu.Lock()
 	defer a.connMu.Unlock()
 	return a.conn
+}
+
+func (a *Agent) setUpdater(u *updater.Updater) {
+	a.updMu.Lock()
+	defer a.updMu.Unlock()
+	a.upd = u
+}
+
+func (a *Agent) currentUpdater() *updater.Updater {
+	a.updMu.Lock()
+	defer a.updMu.Unlock()
+	return a.upd
 }
 
 func (a *Agent) identityPath() string { return filepath.Join(a.StateDir, "identity.json") }
@@ -282,17 +297,30 @@ func (a *Agent) runConnected(ctx context.Context, b *binding.Binding) error {
 		slog.Warn("binding/identity node mismatch", "binding", b.NodeID, "identity", k.NodeID)
 	}
 
-	// 自更新：清扫上次失败的 staging 残留；三入口（握手回执/心跳搭车/
-	// 强制 OFFER）收敛到同一 Updater（幂等去重）。
+	// 自更新编排（spec §9，安装器即更新器）：清扫 bundle 期遗留；构造
+	// 编排器（频道来自绑定）。启动巡检（过期 pending 兜底/版本一致性）
+	// 与 6h 轮询随周期启动；WS 推送与目标版本信号经回调触发。
 	updater.CleanupStale(a.StateDir)
-	upd := &updater.Updater{
-		ServerURL: server, StateDir: a.StateDir,
-		Version: info.AgentVersion, Log: slog.Default(),
-	}
+	upd := updater.New(server, a.StateDir, info.AgentVersion, channelOf(b), slog.Default())
+	a.setUpdater(upd)
+	go upd.StartupPendingCheck(cycleCtx)
+	go func() {
+		t := time.NewTicker(updater.PollInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-cycleCtx.Done():
+				return
+			case <-t.C:
+				_ = upd.CheckNow(cycleCtx)
+			}
+		}
+	}()
 
 	c := connect.NewClient(server, k, info)
 	a.setConn(c)
 	defer a.setConn(nil)
+	defer a.setUpdater(nil)
 	// 每次连接就绪（含重连）重建 engine：旧 engine 的 sendControl 绑定旧连接，
 	// 其 active 会话已随断连作废，重建即正确语义。
 	c.OnReady = func(sendControl func(m proto.Message) error) {
@@ -312,24 +340,32 @@ func (a *Agent) runConnected(ctx context.Context, b *binding.Binding) error {
 		}
 		c.Handler = engine
 
-		// 控制连接就绪 = 新版存活的证明：写 apply-update 子进程等的
-		// connected 标记（apply 验证/回滚的判据），并上报 UPDATE_STATUS
-		// done（若本进程是更新产物）。
-		_ = os.WriteFile(updater.ConnectedMarkerPath(a.StateDir), []byte("ok"), 0o644)
-
-		// 目标版本信号（快速检查①②）需要 send 上报 STATUS——每条连接
-		// 重新注入。
+		// 控制连接就绪（spec §9.4 自检的"WS 可达"判据）。先补报看门狗/
+		// 离线回滚留下的延迟审计（一次性），再做更新自检收尾（仅
+		// pending.to == 自报版本时有动作：成功删 pending+看门狗+写缓存+
+		// audit update_ok；失败主动回滚）。
 		upd.Report = sendControl
+		if ev, ok := updater.ConsumeAuditMarker(a.StateDir); ok {
+			slog.Warn("update: deferred rollback audit", "event", ev.Event,
+				"from", ev.From, "to", ev.To, "reason", ev.Reason)
+			if m, err := proto.NewMsg(proto.TypeUpdateAudit, ev); err == nil {
+				_ = sendControl(m)
+			}
+		}
+		go upd.SelfCheck(cycleCtx)
 	}
-	// 快速版本检查：targetVersion ≠ 当前版本时向 server 主动询问式触发
-	// 依赖 server 的 OFFER（服务端在 ACK 后自查）——agent 侧把 target
-	// 视作 offer 的本地等价信号（URL 由 server 在 OFFER 给出；此路径
-	// 仅当日标版本信号先于 OFFER 到达时用于日志感知，不自行构造 URL）。
+	// 快速版本检查（HELLO_ACK/心跳 ACK 目标版本 ≠ 自报）：立即拉 setup.json
+	// 检查并应用（spec §9.1）。
 	c.TargetVersionFunc = func(target string) {
-		slog.Info("update: target version signal", "target", target, "current", info.AgentVersion)
+		if target != "" && target != info.AgentVersion {
+			slog.Info("update: target version signal", "target", target, "current", info.AgentVersion)
+			go func() { _ = upd.CheckNow(cycleCtx) }()
+		}
 	}
-	c.UpdateOfferFunc = func(ctx context.Context, offer proto.UpdateOffer) {
-		upd.Handle(ctx, offer, c.CurrentSend())
+	// WS 推送 UPDATE_AVAILABLE（spec §9.1 触发①）：推送即完整目标清单
+	// （已认证通道），直接编排。
+	c.UpdateAvailableFunc = func(ctx context.Context, push proto.UpdateAvailable) {
+		_ = upd.HandlePush(ctx, push)
 	}
 	if err := c.Run(cycleCtx); err != nil && ctx.Err() == nil && cycleCtx.Err() == nil {
 		return err
@@ -486,4 +522,27 @@ func (a *Agent) Status() agentctl.Status {
 		st.State = agentctl.StateOnline
 	}
 	return st
+}
+
+// channelOf 绑定频道（spec §9.1；空 = stable）。
+func channelOf(b *binding.Binding) string {
+	if b.Channel == "" {
+		return "stable"
+	}
+	return b.Channel
+}
+
+// UpdateNow 立即检查并静默应用更新（spec §9.1 手动触发；Task 8 agentctl
+// upgrade op 的内核——CLI 自身不替换文件）。跳过退避（人工决策）；
+// 黑名单/降级保护/pending 串行化照常。无绑定 = 无更新源，直接报错。
+func (a *Agent) UpdateNow(ctx context.Context) error {
+	b, ok := a.currentBinding()
+	if !ok {
+		return errors.New("not_registered: no binding")
+	}
+	u := a.currentUpdater()
+	if u == nil {
+		u = updater.New(b.Server, a.StateDir, machineinfo.Version, channelOf(b), slog.Default())
+	}
+	return u.ForceCheck(ctx)
 }

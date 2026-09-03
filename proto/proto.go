@@ -20,7 +20,16 @@ const (
 	TypeSessionOpen    = "SESSION_OPEN"
 	TypeSessionRefused = "SESSION_REFUSED"
 	TypeSessionClose   = "SESSION_CLOSE"
-	// 自更新（agent 拉取 bundle 的指令走已认证控制通道，内容走 HTTPS）。
+	// 自更新（spec §9，安装器即更新器）。UPDATE_AVAILABLE：server → agent
+	// 新版本推送——仅是"立即检查一轮"的提示，setup.json 才是清单权威
+	// （版本/url/sha256 以 agent 自行拉取的 setup.json 为准）。
+	TypeUpdateAvailable = "UPDATE_AVAILABLE"
+	// UPDATE_AUDIT：agent → server 更新结果审计（update_ok / update_rollback，
+	// spec §9.4）。仅经已认证控制连接发送；server 侧记审计日志。
+	TypeUpdateAudit = "UPDATE_AUDIT"
+	// 遗留 bundle 更新通道（spec §14 迁移期）：仅存量 bundle agent 认识；
+	// 新 agent 对 UPDATE_OFFER 前向兼容忽略，存量 agent 对
+	// UPDATE_AVAILABLE 同样忽略。bundle agent 全网切换完成后删除。
 	TypeUpdateOffer  = "UPDATE_OFFER"
 	TypeUpdateStatus = "UPDATE_STATUS"
 	// NODE_DELETE：agent → server 机器自注销（spec §7 deregister）。仅经已认证
@@ -72,8 +81,32 @@ type HeartbeatAck struct {
 	TargetVersion string `json:"targetVersion,omitempty"`
 }
 
-// UpdateOffer 服务端 → agent：目标版本与下载凭证。URL 携带短时效单次
-// 令牌（绑定节点）；SHA256 为信任根（控制通道已认证，哈希即真相）。
+// UpdateAvailable 服务端 → agent：新版本推送提示（spec §9.1）。字段与
+// setup.json 对齐；agent 收到后立即拉取 setup.json 复核（哈希即真相，
+// 推送仅是触发信号，不作为下载凭证）。
+type UpdateAvailable struct {
+	Version string `json:"version"`
+	URL     string `json:"url"` // /setup.exe?channel=<ch>（相对路径）
+	SHA256  string `json:"sha256"`
+}
+
+// UpdateAudit agent → server：更新结果审计（spec §9.4）。事件二值：
+// 更新完成（自检通过）/ 回滚（自检失败、安装器失败、看门狗兜底）。
+const (
+	UpdateEventOK       = "update_ok"
+	UpdateEventRollback = "update_rollback"
+)
+
+type UpdateAudit struct {
+	Event  string `json:"event"` // update_ok | update_rollback
+	From   string `json:"from"`
+	To     string `json:"to"`
+	Reason string `json:"reason,omitempty"` // 回滚原因
+}
+
+// ---- 遗留 bundle 更新通道载荷（spec §14 迁移期，随 UPDATE_OFFER 退役）----
+
+// UpdateOffer 遗留 bundle 下载凭证（短时效单次令牌，绑定节点）。
 type UpdateOffer struct {
 	Version   string `json:"version"`
 	URL       string `json:"url"`
@@ -81,8 +114,8 @@ type UpdateOffer struct {
 	ExpiresAt string `json:"expiresAt,omitempty"`
 }
 
-// UpdateStatus agent → 服务端：更新阶段上报（apply 后的最终确认由新版
-// agent 的 HELLO 版本承担）。
+// UpdateStatus 遗留阶段上报（bundle agent → server；最终确认由新版
+// HELLO 版本承担）。
 const (
 	UpdatePhaseDownloading = "downloading"
 	UpdatePhaseVerifying   = "verifying"

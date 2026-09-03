@@ -158,11 +158,20 @@ func (h *handlers) agentConnect(w http.ResponseWriter, r *http.Request) {
 			// ACK 经串行化发送器（与 SESSION_OPEN/CLOSE 单一写路径）
 			ack, _ := proto.NewMsg(proto.TypeHeartbeatAck, proto.HeartbeatAck{TargetVersion: targetVer})
 			_ = sendControl(ack)
+		case proto.TypeUpdateAudit:
+			// agent 更新结果审计（spec §9.4：update_ok / update_rollback）。
+			// 最小接受：记审计日志（DB 化留给后续任务，spec §9 未定义表）。
+			var ua proto.UpdateAudit
+			if m.Decode(&ua) == nil {
+				slog.Info("agent update audit", "node", node.ID, "event", ua.Event,
+					"from", ua.From, "to", ua.To, "reason", ua.Reason)
+			}
 		case proto.TypeUpdateStatus:
-			// agent 更新阶段上报（审计日志；最终确认 = 新版 HELLO 版本）。
+			// 遗留 bundle agent 阶段上报（spec §14 迁移期；最终确认 = 新版
+			// HELLO 版本）。
 			var us proto.UpdateStatus
 			if m.Decode(&us) == nil {
-				slog.Info("agent update status", "node", node.ID, "version", us.Version,
+				slog.Info("agent update status (legacy)", "node", node.ID, "version", us.Version,
 					"phase", us.Phase, "err", us.Error)
 			}
 		case proto.TypeSessionRefused:
