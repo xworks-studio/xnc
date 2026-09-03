@@ -84,9 +84,11 @@ func newFakeInstaller(t *testing.T) *fakeInstaller {
 	return &fakeInstaller{dir: t.TempDir()}
 }
 
-// ok 退出 0 的安装器；marker 追加一行（记录"安装发生"）。
+// ok 退出 0 的安装器；marker 追加一行（记录"安装发生"），args 记录 %*
+//（断言静默参数——2026-09-03 真机回归钉：/DIR 带内嵌引号会让 Inno 以
+// 退出码 3 拒绝安装）。
 func (f *fakeInstaller) ok(name string) string {
-	return f.write(name, "@echo ran-"+name+" >> \""+filepath.Join(f.dir, name+".log")+"\"\r\n@exit /b 0\r\n")
+	return f.write(name, "@echo ran-"+name+" %* >> \""+filepath.Join(f.dir, name+".log")+"\"\r\n@exit /b 0\r\n")
 }
 
 // fail 退出码 code。
@@ -103,6 +105,12 @@ func (f *fakeInstaller) hang(name string) string {
 func (f *fakeInstaller) ran(name string) bool {
 	b, err := os.ReadFile(filepath.Join(f.dir, name+".log"))
 	return err == nil && strings.Contains(string(b), "ran-"+name)
+}
+
+// logText 返回安装器 marker 日志全文（含 %* 记录的参数）。
+func (f *fakeInstaller) logText(name string) string {
+	b, _ := os.ReadFile(filepath.Join(f.dir, name+".log"))
+	return string(b)
 }
 
 func (f *fakeInstaller) write(name, content string) string {
@@ -260,9 +268,18 @@ func TestOrchestrateSuccessFlow(t *testing.T) {
 	if len(execPaths) != 1 || execPaths[0] != staged {
 		t.Fatalf("exec = %v, want [%s]", execPaths, staged)
 	}
-	// 假安装器真跑过。
+	// 假安装器真跑过，且静默参数正确（/DIR 无内嵌引号——真机回归钉）。
 	if !h.fi.ran("install") {
 		t.Fatal("fake installer did not run")
+	}
+	argsLog := h.fi.logText("install")
+	for _, want := range []string{"/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", `/DIR=` + DefaultInstallDir} {
+		if !strings.Contains(argsLog, want) {
+			t.Errorf("installer args %q missing %q", argsLog, want)
+		}
+	}
+	if strings.Contains(argsLog, `\`+`"`) || strings.Contains(argsLog, `'"`) {
+		t.Errorf("installer args %q must not carry embedded quotes (Inno rejects them, exit 3)", argsLog)
 	}
 	// 退出 0：等新 agent 自检收尾——pending 保留、无审计、无黑名单。
 	if _, ok := LoadPending(h.u.StateDir); !ok {
@@ -273,6 +290,11 @@ func TestOrchestrateSuccessFlow(t *testing.T) {
 	}
 	if _, bad := Blacklisted(h.u.StateDir, "0.6.2"); bad {
 		t.Fatal("0.6.2 must not be blacklisted")
+	}
+	// 回滚源 stash：执行前 from 版安装器已备份进 rollback 子目录（真机
+	// 发现：新安装器会把顶层修剪成 keep-1 新版本）。
+	if got := CachedRollbackInstaller(h.u.StateDir, "0.6.1"); got == "" {
+		t.Fatal("rollback stash must hold the from-version installer")
 	}
 }
 
@@ -517,9 +539,14 @@ func TestSelfCheckFinalizes(t *testing.T) {
 	if _, throttled := Throttled(h.u.StateDir, "0.6.2", time.Now()); throttled {
 		t.Fatal("throttle must reset on success")
 	}
+	// 回滚源 stash 清除（下次更新重新入栈）。
+	if _, err := os.Stat(filepath.Join(h.u.StateDir, cacheName, rollbackName)); !os.IsNotExist(err) {
+		t.Fatal("rollback stash must be cleared on success")
+	}
 }
 
-// --- 场景 10：自检失败 → 主动回滚 ---
+// --- 场景 10：自检失败 → 主动回滚（经 rollback stash——顶层已被新安装器
+// 修剪为 keep-1 新版本，真机形态）---
 
 func TestSelfCheckFailureRollsBack(t *testing.T) {
 	h := newHarness(t, "0.6.2")
@@ -550,6 +577,34 @@ func TestSelfCheckFailureRollsBack(t *testing.T) {
 	}
 	if _, bad := Blacklisted(h.u.StateDir, "0.6.2"); !bad {
 		t.Fatal("failed version must be blacklisted")
+	}
+}
+
+// 场景 10b：顶层 from 安装器已被新安装器的 keep-1 修剪删除 → 回滚必须
+// 落到 rollback stash（真机发现的缺口回归钉）。
+func TestSelfCheckFailureRollsBackFromStash(t *testing.T) {
+	h := newHarness(t, "0.6.2")
+	h.f.setVersion("0.6.2")
+	h.setHealth(&staticErr{"XNCCore state=Stopped"})
+	h.u.HealthWindow = 200 * time.Millisecond
+	fi := newFakeInstaller(t)
+	h.queue(fi.ok("rollback"))
+	SavePending(h.u.StateDir, &PendingUpdate{From: "0.6.1", To: "0.6.2",
+		StartedAt: time.Now().UTC(), Deadline: time.Now().UTC().Add(15 * time.Minute)})
+	// 仅 stash 有 0.6.1（顶层已被新安装器刷新为新版本）。
+	seedCache(t, h.u.StateDir, "0.6.2", "new-top-level")
+	stash := filepath.Join(h.u.StateDir, cacheName, rollbackName)
+	os.MkdirAll(stash, 0o755)
+	os.WriteFile(filepath.Join(stash, "xnc-setup-0.6.1.exe"), []byte("stashed"), 0o644)
+
+	h.u.SelfCheck(context.Background())
+
+	if !fi.ran("rollback") {
+		t.Fatal("rollback must run from the stash when top level was pruned")
+	}
+	paths, _, _, _ := h.snapshot()
+	if len(paths) != 1 || paths[0] != filepath.Join(stash, "xnc-setup-0.6.1.exe") {
+		t.Fatalf("exec = %v, want stash path", paths)
 	}
 }
 
@@ -734,6 +789,7 @@ func TestWriteWatchdogScriptContent(t *testing.T) {
 		"xnc-setup-' + $from + '.exe",
 		"/VERYSILENT",
 		"installer-cache",
+		"rollback", // stash fallback lookup
 		"XNC", // installDir baked
 	} {
 		if !strings.Contains(s, want) {
@@ -742,6 +798,12 @@ func TestWriteWatchdogScriptContent(t *testing.T) {
 	}
 	if b[len(b)-1] != '\n' || b[len(b)-2] != '\r' {
 		t.Error("script must use CRLF")
+	}
+	// 回归钉（真机发现 2 例）：候选数组元素必须带括号，否则 PS 逗号/加号
+	// 优先级把表达式拼坏、Test-Path 恒假 → 看门狗找不到回滚源。
+	paren := strings.Count(s, "@(('xnc-setup-' + $from + '.exe'), ('xnc-setup-dev-' + $from + '.exe'))")
+	if paren != 2 { // 顶层 + stash 两处查找
+		t.Errorf("parenthesized candidate arrays = %d, want 2", paren)
 	}
 	// 单引号路径转义。
 	if err := writeWatchdogScript(dir, `C:\O'Brien\XNC`); err != nil {

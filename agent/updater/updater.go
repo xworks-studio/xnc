@@ -58,6 +58,7 @@ const (
 	watchdogFile  = "watchdog.ps1"
 	stagingName   = "staging"
 	cacheName     = "installer-cache"
+	rollbackName  = "rollback" // installer-cache 的回滚源子目录（见 stashRollbackSource）
 	WatchdogTask  = "XNCRollbackWatchdog" // 与 xnc.iss 共享的计划任务名（T6 契约）
 	coreServiceNm = "XNCCore"
 )
@@ -282,6 +283,13 @@ func (u *Updater) applyUpdate(ctx context.Context, m *SetupManifest) error {
 		u.recordFailure(m.Version, err)
 		return err
 	}
+	// 3b. 回滚源入 stash：新安装器的 post 脚本会把 installer-cache 顶层
+	// 修剪成仅剩新版本（T6 keep-1），自检失败时 from 版安装器已不在顶层。
+	// 执行前把 from 安装器备份到 installer-cache\rollback\（安装器的修剪
+	// 只扫顶层 *.exe，子目录不受影响——真机发现，2026-09-03）。
+	if err := u.stashRollbackSource(); err != nil {
+		u.log().Warn("update: rollback stash copy failed; continuing", "err", err)
+	}
 	// 4. pending 标记 + 一次性看门狗（先于执行，§9.3 步骤 1）。
 	p := &PendingUpdate{From: u.Version, To: m.Version,
 		StartedAt: u.clock().UTC(),
@@ -317,9 +325,10 @@ func (u *Updater) applyUpdate(ctx context.Context, m *SetupManifest) error {
 	return fmt.Errorf("update failed and rolled back: %w", err)
 }
 
-// Rollback §9.4 回滚：静默原地重跑 installer-cache 中的 from 版本安装器。
-// 先删 pending 与看门狗（防旧 agent 重启后再次触发回滚），再执行；audit
-// 尽力在线发送，离线落标记由下次连接补报；版本入黑名单。
+// Rollback §9.4 回滚：静默原地重跑 installer-cache 中的 from 版本安装器
+// （顶层 → rollback 子目录 stash → staging 兜底）。先删 pending 与看门狗
+// （防旧 agent 重启后再次触发回滚），再执行；audit 尽力在线发送，离线落
+// 标记由下次连接补报；版本入黑名单。
 func (u *Updater) Rollback(p *PendingUpdate, reason string) error {
 	u.audit(&proto.UpdateAudit{Event: proto.UpdateEventRollback,
 		From: p.From, To: p.To, Reason: reason})
@@ -327,6 +336,12 @@ func (u *Updater) Rollback(p *PendingUpdate, reason string) error {
 	_ = DeletePending(u.StateDir)
 	_ = u.deleteWatchdogTask()
 	src := CachedInstaller(u.StateDir, p.From)
+	if src == "" {
+		src = CachedRollbackInstaller(u.StateDir, p.From)
+	}
+	if src == "" {
+		src = StagedInstaller(u.StateDir, p.From)
+	}
 	if src == "" {
 		err := fmt.Errorf("rollback: no cached installer for %s", p.From)
 		u.log().Error("update: " + err.Error())
@@ -414,6 +429,7 @@ func (u *Updater) finalize(p *PendingUpdate) {
 	}
 	_ = DeletePending(u.StateDir)
 	_ = u.deleteWatchdogTask()
+	clearRollbackStash(u.StateDir)
 	ClearThrottle(u.StateDir, p.To)
 	u.log().Info("update: complete", "from", p.From, "to", p.To)
 	u.audit(&proto.UpdateAudit{Event: proto.UpdateEventOK, From: p.From, To: p.To})
@@ -593,9 +609,39 @@ func findInstaller(dir, version string) string {
 	return ""
 }
 
-// CachedInstaller installer-cache 中 version 的安装器路径（无则空串）。
+// CachedInstaller installer-cache 顶层中 version 的安装器路径（无则空串）。
 func CachedInstaller(stateDir, version string) string {
 	return findInstaller(filepath.Join(stateDir, cacheName), version)
+}
+
+// CachedRollbackInstaller installer-cache\rollback\ stash 中 version 的
+// 安装器路径（无则空串）。
+func CachedRollbackInstaller(stateDir, version string) string {
+	return findInstaller(filepath.Join(stateDir, cacheName, rollbackName), version)
+}
+
+// stashRollbackSource 把 from（当前）版本的安装器备份进
+// installer-cache\rollback\（执行新安装器前调用；ensureRollbackSource 已
+// 保证顶层存在）。只保留 stash 中这一份。
+func (u *Updater) stashRollbackSource() error {
+	src := CachedInstaller(u.StateDir, u.Version)
+	if src == "" {
+		return fmt.Errorf("no top-level installer for %s to stash", u.Version)
+	}
+	b, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join(u.StateDir, cacheName, rollbackName)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	return writeAtomic(filepath.Join(dir, filepath.Base(src)), b)
+}
+
+// clearRollbackStash 自检成功后清除 stash（下次更新重新入栈）。
+func clearRollbackStash(stateDir string) {
+	_ = os.RemoveAll(filepath.Join(stateDir, cacheName, rollbackName))
 }
 
 // StagedInstaller staging 中 version 的安装器路径（无则空串）。

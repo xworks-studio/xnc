@@ -18,9 +18,14 @@ import (
 )
 
 // installerArgs 静默安装参数（spec §9.3；/DIR 指向安装目录）。
+//
+// /DIR 不带内嵌引号（真机发现的坑，2026-09-03）：Go 的 exec 会把
+// `"/DIR=\"C:\Program Files\XNC\""` 作为整条命令行转义，Inno 的解析器
+// 不认 \"，DIR 值带着字面引号进来 → "Folder names cannot include \""
+// → 安装中止退出码 3。单个 argv 元素 + 外层引号（Go 自动）即可让空格
+// 路径原样到达——等价于 cmd 语法 `/DIR="C:\Program Files\XNC"`。
 func installerArgs(installDir string) []string {
-	return []string{"/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
-		fmt.Sprintf(`/DIR="%s"`, installDir)}
+	return []string{"/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=" + installDir}
 }
 
 // platform 装配平台缝（New 已调用；直接构造 Updater 的测试再保险调用，

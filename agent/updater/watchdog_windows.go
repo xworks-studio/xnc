@@ -40,12 +40,14 @@ func (u *Updater) registerWatchdog(runAt time.Time) error {
 		return err
 	}
 	script := watchdogScriptPath(u.StateDir)
-	// ISO 8601 字面量 + [datetime] 转换：区域设置无关。
+	// ISO 8601 字面量 + [datetime] 转换：区域设置无关。必须用 LOCAL 时间——
+	// PS 5.1 的 [datetime]'…' 按本机时区解析（真机发现：喂 UTC 墙钟在
+	// UTC+8 机器上触发时刻是 8 小时前，一次性任务永不再触发）。
 	ps := fmt.Sprintf(
 		`$a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%s"'; `+
 			`$t = New-ScheduledTaskTrigger -Once -At ([datetime]'%s'); `+
 			`Register-ScheduledTask -TaskName '%s' -Action $a -Trigger $t -User 'SYSTEM' -RunLevel Highest -Force | Out-Null`,
-		script, runAt.UTC().Add(time.Second).Format("2006-01-02T15:04:05"), WatchdogTask)
+		script, runAt.Local().Add(time.Second).Format("2006-01-02T15:04:05"), WatchdogTask)
 	out, err := exec.Command("powershell.exe", "-NoProfile", "-Command", ps).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("register watchdog task: %w: %s", err, strings.TrimSpace(string(out)))
@@ -100,10 +102,21 @@ func writeWatchdogScript(stateDir, installDir string) error {
 	// 回滚（否则 from==to 死循环）。
 	b.WriteString("Remove-Item -Path $pending -Force\r\n")
 	b.WriteString("$cache = Join-Path $StateDir 'installer-cache'\r\n")
+	// 回滚源查找：顶层（更新从未发生的形态）→ rollback 子目录 stash
+	// （新安装器已把顶层修剪为新版本、agent 又没活到自检的形态）。
+	// 注意元素必须加括号：@('a'+$v+'b', ...) 不加括号时 PS 的逗号/加号
+	// 优先级会把表达式拼坏（真机发现：Test-Path 恒假 → 回滚源丢失）。
 	b.WriteString("$exe = $null\r\n")
 	b.WriteString("foreach ($leaf in @(('xnc-setup-' + $from + '.exe'), ('xnc-setup-dev-' + $from + '.exe'))) {\r\n")
 	b.WriteString("    $t = Join-Path $cache $leaf\r\n")
 	b.WriteString("    if (Test-Path $t) { $exe = $t; break }\r\n")
+	b.WriteString("}\r\n")
+	b.WriteString("if (-not $exe) {\r\n")
+	b.WriteString("    $stash = Join-Path $cache 'rollback'\r\n")
+	b.WriteString("    foreach ($leaf in @(('xnc-setup-' + $from + '.exe'), ('xnc-setup-dev-' + $from + '.exe'))) {\r\n")
+	b.WriteString("        $t = Join-Path $stash $leaf\r\n")
+	b.WriteString("        if (Test-Path $t) { $exe = $t; break }\r\n")
+	b.WriteString("    }\r\n")
 	b.WriteString("}\r\n")
 	b.WriteString("if (-not $exe) { Log \"watchdog: rollback source missing for $from; cannot roll back\"; exit 1 }\r\n")
 	b.WriteString("Log \"watchdog: executing rollback installer in place: $exe\"\r\n")
