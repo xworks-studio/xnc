@@ -21,7 +21,11 @@
 | `xnc download <node> <remote> <local>` | 下载（sha256 校验） |
 | `xnc screen <node> [--snapshot out.jpg \| --open] [--fps N]` | 桌面快照/只读预览（operator+） |
 | `xnc audit list [--node/--user/--action/--since]` | 审计日志查询 |
-| `xnc version` / `xnc status` | 版本 / Server 连通性 |
+| `xnc register` | 本机注册为节点：登录（无 JWT 时内联 login）→ 选 cluster（唯一 cluster 直接确认）→ 经 agentctl 管道注册 → 轮询至 online；已注册时提示当前绑定，`--force` 走 deregister+register。需先装 setup.exe（[xnc.app/setup.exe](https://xnc.app/setup.exe)） |
+| `xnc deregister` | 反注册本机（断连、删 server 节点、弃机器绑定，保留身份私钥）；需 admin 控制台 |
+| `xnc upgrade [--channel stable\|dev]` | 经 agentctl 管道触发本机 agent 立即检查并静默应用更新（安装器编排，阻塞显示进度至新版本上线）；`--channel` 先原子改绑定频道再按新频道检查 |
+| `xnc version` | CLI 版本 |
+| `xnc status` | 两块输出：local（agentctl 管道：state=unregistered/registered/online、nodeId、cluster、server、channel、version、在途 update 进度；管道不可达显示安装提示）+ session（当前登录 server/email/token 是否存在） |
 
 ## Node 选择器
 
@@ -83,9 +87,13 @@ exec / run 的 data 字段：`node`、`exitCode`、`stdout`、`stderr`、`durati
 ## 典型工作流
 
 ```bash
-# 注册新节点
+# 注册新节点（推荐：目标机装 setup.exe 后注册）
+#   1. 目标机: 下载 https://xnc.app/setup.exe 并安装（agent+CLI 一次装齐，零凭据）
+#   2. 目标机: xnc register        # 登录 → 选 cluster → 上线
+xnc register --force               # 已注册机器重绑（走 deregister+register）
+
+# 编排场景仍可用 token（register 管道之外的批量/无人值守路径）
 xnc token create production --ttl 30m
-# → 在目标节点执行：xnc-agent.exe install --server https://... --token <token>
 
 # 批量巡检
 xnc node list --status online --json
@@ -95,6 +103,9 @@ xnc exec web-01 -- Get-PSDrive C | Select-Object Used,Free
 # 部署脚本并执行
 xnc upload web-01 ./health.ps1 C:\Temp\health.ps1
 xnc exec web-01 -- pwsh -File C:\Temp\health.ps1
+
+# 手动升级某台本机 agent（目标机上执行；默认按机器当前频道）
+xnc upgrade --channel dev
 
 # 取回日志
 xnc download web-01 C:\logs\app.log ./web-01-app.log

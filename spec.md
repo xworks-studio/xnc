@@ -544,6 +544,11 @@ screen.close
 
 # 8. 节点注册
 
+> **迁移注记（2026-09）**：常规注册入口已换为 **setup.exe 安装器 + `xnc register`**
+> （安装期零凭据；register = 登录 → 选 cluster → 经 agentctl 管道注册，设计文档
+> `docs/superpowers/specs/2026-09-03-innosetup-installer-unified-auth-design.md` §6/§14）。
+> 下述 Enrollment Token 流程保留给编排/批量场景与迁移期一行流，不再是对用户的推荐路径。
+
 首次注册通过 Enrollment Token 完成。
 
 用户：
@@ -1281,6 +1286,14 @@ DELETE /api/clusters/{id}/members/{userId}
 POST /api/clusters/{id}/enrollment-tokens
 ```
 
+常规节点注册另有用户 JWT 授权端点（`xnc register` 走此路径，设计文档 §6.4）：
+
+```text
+POST /api/clusters/{id}/nodes/register    # Authorization: 用户 JWT；语义=铸
+                                           # 一次性 token 并同事务消费，audit
+                                           # 记 userId；token 创建面保留给编排
+```
+
 ---
 
 ## Nodes
@@ -1818,6 +1831,13 @@ sql-01    offline
 
 # 45. Agent 更新（自更新系统）
 
+> **迁移注记（2026-09）**：现行更新机制为**安装器编排**——release 携带 setup.exe
+> 制品时 server 推 `UPDATE_AVAILABLE`，agent 自行拉 `/setup.json` 复核后下载
+> setup.exe（sha256 强校验、installer-cache 回滚源就位前置检查）→ 静默安装 →
+> 新版本 HELLO 上报（设计文档 §9）。下述 bundle 流程降为**迁移期兜底**：存量
+> bundle 节点经最后一个 bundle（内含编排版 agent）升级一次后永久切换到安装器
+> 更新，随该版本关闭 bundle 通道（设计文档 §14）。
+
 服务端驱动的全自动更新。Agent 收到 UPDATE_OFFER 后完成：下载 → sha256 校验 → staging（解包逐文件验哈希）→ apply（spawn --apply-update 子进程）→ 服务重启 → 新版本 HELLO 上报。
 
 ## 快速版本检查（三通道，零轮询）
@@ -1885,11 +1905,23 @@ Caddyfile 环境变量：`XNC_DOMAIN`（主域）、`XNC_SHORT_DOMAIN`（短域�
 
 ## 快捷安装
 
+现行安装入口（设计文档 §4）：
+
 ```cmd
-curl -sL xnc.app/a/<enrollment-token> | cmd    :: agent 安装
-curl -sL xnc.app/c | cmd                       :: CLI 安装
-curl -sL xnc.app/a-dev/<token> | cmd           :: dev 频道 agent
-curl -sL xnc.app/c-dev | cmd                   :: dev 频道 CLI
+curl -LO https://xnc.app/setup.exe && setup.exe     :: 安装器（agent + CLI 一次装齐）
+curl -LO "https://xnc.app/setup.exe?channel=dev"    :: dev 频道安装器
+```
+
+安装期零凭据；装完在目标机执行 `xnc register`（登录 → 选 cluster → 上线）。
+
+> **迁移注记（2026-09）**：下面的一行流已 **deprecated**，由 setup.exe + register
+> 取代；保留 2 个 release 周期后删除（设计文档 §14）。
+
+```cmd
+curl -sL xnc.app/a/<enrollment-token> | cmd    :: agent 安装（deprecated）
+curl -sL xnc.app/c | cmd                       :: CLI 安装（deprecated）
+curl -sL xnc.app/a-dev/<token> | cmd           :: dev 频道 agent（deprecated）
+curl -sL xnc.app/c-dev | cmd                   :: dev 频道 CLI（deprecated）
 ```
 
 返回 .cmd 批处理 → PS 脚本（ExecutionPolicy Bypass）→ 下载 bundle → 安装到 Program Files / LOCALAPPDATA → 注册服务 / 加 PATH。终端 UI 含 ASCII banner + 步骤编号 + 颜色。
@@ -2629,10 +2661,16 @@ xnc cluster member list|add|remove
 xnc token create <cluster> [--ttl 30m] [--max-uses 1]
 xnc audit list [--node n] [--user u] [--action a] [--since 7d]
 
+# 注册与本机（安装器时代新增，设计文档 §6/§10）
+xnc register                                     # 本机注册为节点（登录→选 cluster→经 agentctl 管道注册→等上线）
+xnc deregister                                   # 反注册本机（删除 server 节点+本地绑定；需 admin 控制台）
+xnc upgrade [--channel stable|dev]               # 经 agentctl 管道触发本机 agent 立即检查并静默应用更新（安装器编排）
+                                                 # --channel 先原子改绑定频道再按新频道检查
+
 # 自更新与信息
 xnc update [--channel stable|dev]                # CLI 自更新
 xnc whoami
-xnc status                                       # Server 连通性
+xnc status                                       # 本机注册/更新块（agentctl 管道）+ 会话块（server/email/token）
 xnc version
 ```
 
