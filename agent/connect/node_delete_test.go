@@ -151,3 +151,40 @@ func TestConnected(t *testing.T) {
 	require.Eventually(t, func() bool { return !c.Connected() }, 5*time.Second, 50*time.Millisecond,
 		"Connected must drop after connection teardown")
 }
+
+// shortenAckTimeout 把删除确认等待缩短到测试量级（生产 30s）。
+func shortenAckTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := nodeDeleteAckTimeout
+	nodeDeleteAckTimeout = d
+	t.Cleanup(func() { nodeDeleteAckTimeout = old })
+}
+
+// 服务端挂起（收到 NODE_DELETE 后不关闭、不应答）：读取超时绝不能被当成
+// 删除确认——必须报错，agent 据此保留 binding（防孤儿节点）。
+func TestDeleteNodeServerHang(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	srv := deleteTestServer(t, pub, func(c *websocket.Conn, _ proto.Message) {
+		// 不关闭：模拟服务端删除处理挂起。
+		select {}
+	})
+	defer srv.Close()
+	shortenAckTimeout(t, 200*time.Millisecond)
+
+	c := deleteClient(srv, priv)
+	err := c.DeleteNode(t.Context())
+	require.Error(t, err, "timeout must not be treated as delete confirmation")
+	assert.Contains(t, err.Error(), "no close confirmation")
+}
+
+// 服务端硬关闭（CloseNow，无 close 帧）：仍是对端关闭，视为删除确认。
+func TestDeleteNodeAbruptClose(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	srv := deleteTestServer(t, pub, func(c *websocket.Conn, _ proto.Message) {
+		c.CloseNow()
+	})
+	defer srv.Close()
+
+	c := deleteClient(srv, priv)
+	require.NoError(t, c.DeleteNode(t.Context()))
+}

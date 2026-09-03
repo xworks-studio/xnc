@@ -190,7 +190,7 @@ func (a *Agent) synthesizeLegacyBinding() (*binding.Binding, bool) {
 // idleAwaitRegistration 未注册空转态（spec §6.1）：不发起任何外联、不做
 // 更新检查（更新源即 server，无绑定即无源）；仅周期重查 binding.json 并
 // 记 awaiting registration。控制管道注册（Task 4）经 rebind 唤醒即时接续
-//（<1s，5s 轮询仅兜底）。ctx 取消（服务停止/Ctrl+C）即返回 ctx.Err()。
+// （<1s，5s 轮询仅兜底）。ctx 取消（服务停止/Ctrl+C）即返回 ctx.Err()。
 func (a *Agent) idleAwaitRegistration(ctx context.Context) (*binding.Binding, error) {
 	slog.Info("awaiting registration", "stateDir", a.StateDir)
 	t := time.NewTicker(awaitBindingInterval)
@@ -358,7 +358,7 @@ func (a *Agent) loadOrCreateIdentity() (*identity.Key, bool, error) {
 
 // registerNode 调 Task 2 端点（spec §6.4）：
 // POST {server}/api/clusters/{id}/nodes/register，Authorization: 用户 JWT
-//（仅内存经手：进请求头、出函数体即弃，不落盘不写日志）；body 为 enroll 减
+// （仅内存经手：进请求头、出函数体即弃，不落盘不写日志）；body 为 enroll 减
 // token（hostname/machineId/osVersion/agentVersion/publicKey）。成功返回
 // nodeId；失败返回 proto 错误码形态 "<code>: <message>"（管道应答直通）。
 func registerNode(ctx context.Context, server, clusterID, jwt, publicKeyB64 string, info machineinfo.Info) (string, error) {
@@ -443,7 +443,7 @@ func (a *Agent) Register(ctx context.Context, server, clusterID, jwt string) (st
 
 // Deregister 实现 agentctl.Deps（spec §7）：一次性控制连接挑战认证（机器身份
 // 即凭据，无 JWT）→ NODE_DELETE → rebind 拆既有连接周期 → 删 binding.json
-//（保留 identity.json 供重注册复用）。服务端拒绝（ERROR 帧）时不删 binding，
+// （保留 identity.json 供重注册复用）。服务端拒绝（ERROR 帧）时不删 binding，
 // 错误以 "<code>: <message>" 直通。
 func (a *Agent) Deregister(ctx context.Context) error {
 	b, ok := a.currentBinding()
@@ -461,11 +461,13 @@ func (a *Agent) Deregister(ctx context.Context) error {
 	if err := c.DeleteNode(ctx); err != nil {
 		return err
 	}
-	// 注销成功：拆既有连接周期（若有），回空转重评估。
-	a.notifyRebind()
+	// 注销成功：先删 binding 再 rebind——若先发信号，run 循环可能抢在删除
+	// 落盘前消费它、重读到仍在的 binding，为已注销节点进入无信号的连接周期
+	// （无限退避重试）。顺序保证：周期重评估时 binding 必已消失 → 回空转。
 	if err := os.Remove(binding.Path(a.StateDir)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("internal: remove binding: %v", err)
 	}
+	a.notifyRebind()
 	slog.Info("deregistered via agentctl", "node", b.NodeID, "server", b.Server)
 	return nil
 }

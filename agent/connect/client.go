@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/rand"
 	"strings"
@@ -130,10 +131,19 @@ func (c *Client) RunOnce(ctx context.Context) error {
 // false）。agentctl status 的 "online" 判据；不触发拨号。
 func (c *Client) Connected() bool { return c.connReady.Load() }
 
+// nodeDeleteAckTimeout 是 DeleteNode 发送后等待服务端关闭（删除确认）的
+// 时限；包级变量供测试缩短。
+var nodeDeleteAckTimeout = 30 * time.Second
+
 // DeleteNode 机器自注销（spec §7 deregister）：一次性控制连接——挑战认证
 // （机器身份即凭据）→ 发送 NODE_DELETE → 等待服务端关闭（关闭即删除确认；
 // ERROR 帧先到 = 删除失败，返回带错误码的 error）。不进入心跳循环，不影响
 // 可能并存的常驻连接（服务端注销后会自行逐出后者）。
+//
+// 确认判据（严格）：只有对端关闭——close 帧（websocket.CloseStatus 命中）
+// 或 TCP 层 EOF——才算删除确认；读取超时/链路错误/坏帧一律报错。绝不能把
+// 未知状态当成功，否则 agent 会误删 binding 而服务端节点残留（孤儿节点，
+// 且后续 deregister 只会得到 not_registered，无自愈路径）。
 func (c *Client) DeleteNode(ctx context.Context) error {
 	ws, err := c.handshake(ctx)
 	if err != nil {
@@ -144,13 +154,20 @@ func (c *Client) DeleteNode(ctx context.Context) error {
 		return fmt.Errorf("send node_delete: %w", err)
 	}
 	for {
-		m, err := readMsg(ctx, ws, 30*time.Second)
+		m, err := readMsg(ctx, ws, nodeDeleteAckTimeout)
 		if err != nil {
-			// ctx 取消属调用方超时/中止；其余读错误 = 对端关闭 = 删除确认。
 			if ctx.Err() != nil {
-				return ctx.Err()
+				return ctx.Err() // 调用方取消/超时
 			}
-			return nil
+			// 对端关闭 = 删除确认：close 帧（任意状态码，含 1006 异常关闭
+			// 帧）或裸 TCP EOF（无 close 帧的硬关闭）。
+			if websocket.CloseStatus(err) != -1 ||
+				errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return nil
+			}
+			// 读取超时（readMsg 内部派生 ctx 的 DeadlineExceeded）/链路
+			// 错误/坏帧：状态未知，按失败上报。
+			return fmt.Errorf("node_delete: no close confirmation: %w", err)
 		}
 		if m.Type == proto.TypeError {
 			var e proto.ErrorPayload

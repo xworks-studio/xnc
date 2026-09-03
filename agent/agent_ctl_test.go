@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -187,6 +186,7 @@ type fakeControlServer struct {
 	nodeIDs  map[string]bool // 已见 nodeID（认证到达即记）
 	deletes  []string
 	errOnDel bool
+	auths    int // 完成挑战认证的连接数（重连回归断言用）
 }
 
 func newFakeControlServer(t *testing.T) *fakeControlServer {
@@ -226,6 +226,7 @@ func (f *fakeControlServer) handle(w http.ResponseWriter, r *http.Request) {
 			_ = m.Decode(&cr)
 			f.mu.Lock()
 			f.nodeIDs[cr.NodeID] = true
+			f.auths++
 			f.mu.Unlock()
 		case proto.TypeHello:
 			write(proto.TypeHelloAck, struct{}{})
@@ -249,6 +250,14 @@ func (f *fakeControlServer) deletesSeen() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.deletes)
+}
+
+// authCount 统计完成挑战认证的连接数（在线周期 + 注销一次性连接 + 任何
+// 意外的重连）。
+func (f *fakeControlServer) authCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.auths
 }
 
 // deregister：NODE_DELETE 走 WS（机器身份），binding 删除，identity 保留。
@@ -365,6 +374,16 @@ func TestRunCycleDeregister(t *testing.T) {
 	require.Eventually(t, func() bool { return a.Status().State == "unregistered" },
 		5*time.Second, 100*time.Millisecond, "agent must fall back to idle after deregister")
 
+	// 顺序回归陷阱（rebind 必须晚于 binding 删除）：若先发信号，run 循环可能
+	// 抢在删除落盘前消费它、重读到仍在的 binding，为已注销节点立刻发起一条
+	// 新的认证连接（在线周期 + 注销一次性连接之外的第 3+ 条）。观察窗口内
+	// 认证连接数不得增加。
+	auths := fc.authCount()
+	assert.GreaterOrEqual(t, auths, 2, "online cycle + one-shot deregister connections")
+	time.Sleep(700 * time.Millisecond)
+	assert.Equal(t, auths, fc.authCount(),
+		"no new authenticated connection may appear after deregister")
+
 	// Run 仍在运行（空转等待，不因 rebind 退出）。
 	select {
 	case err := <-runErr:
@@ -380,5 +399,3 @@ func TestRunCycleDeregister(t *testing.T) {
 		t.Fatal("Run did not return after ctx cancel")
 	}
 }
-
-var _ = fs.ErrNotExist // 保留 io/fs 引用（错误判定在实现中使用）

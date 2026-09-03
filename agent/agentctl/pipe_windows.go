@@ -125,11 +125,7 @@ func connIsAdmin(conn net.Conn) (bool, error) {
 	}
 	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err != nil {
-		// 进程已退出/权限不足时以 PROCESS_QUERY_INFORMATION 兜底重试。
-		h, err = windows.OpenProcess(windows.PROCESS_QUERY_INFORMATION, false, pid)
-		if err != nil {
-			return false, fmt.Errorf("open client process %d: %w", pid, err)
-		}
+		return false, fmt.Errorf("open client process %d: %w", pid, err)
 	}
 	defer windows.CloseHandle(h) //nolint:errcheck // 清理路径
 	var tok windows.Token
