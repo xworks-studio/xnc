@@ -202,7 +202,15 @@ ProgramData。
   - `{op:"register", …}` → `{ok, nodeId}` / `{error}`
   - `{op:"deregister"}` → `{ok}`（admin only）
   - `{op:"status"}` → `{state: unregistered|registered|online, nodeId,
-    server, clusterId, version}`（`xnc status` 本机部分的数据源）
+    server, clusterId, channel, version, update?}`（`xnc status` 本机部分
+    的数据源；update = 在途更新进度 `{phase: checking|applying, from, to}`，
+    仅供 `xnc upgrade` 轮询，可缺省）
+  - `{op:"upgrade", channel?}` → `{ok, triggered}`；channel 仅 stable|dev
+    （白名单外 bad_request），非空且异于绑定时先原子改 binding.channel
+    （§9.5）再按新频道立即检查应用。已在途（pending 或一次触发未收线）
+    → `{ok:true, triggered:false, note:"update already in progress"}`（非
+    错误，CLI 渲染 note 后转入 status 轮询）。无 admin 门（与 register
+    同级）。
 - 服务端点见 §11；管道本身只做转发与身份持有，不含业务逻辑。
 
 ### 6.4 server 侧新端点

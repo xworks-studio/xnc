@@ -99,7 +99,7 @@ Exit codes:
 		newLoginCmd(), newRegisterCmd(), newDeregisterCmd(),
 		newWhoamiCmd(), newStatusCmd(), newVersionCmd(),
 		// Admin & maintenance
-		newAuditCmd(), newUpdateCmd(),
+		newAuditCmd(), newUpdateCmd(), newUpgradeCmd(),
 	)
 	return root
 }

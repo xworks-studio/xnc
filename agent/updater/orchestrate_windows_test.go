@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -785,6 +786,103 @@ func TestDownloadRejectsCrossOriginURL(t *testing.T) {
 	}
 	if _, ok := LoadPending(h.u.StateDir); ok {
 		t.Fatal("no pending on cross-origin rejection")
+	}
+}
+
+// --- 场景 16：跨实例编排互斥（Task 8：手动触发自建实例 vs 连接周期实例）---
+
+// A（连接周期编排器）触发一轮更新并卡在下载（pending 落盘前的窗口）；
+// B（agentctl 手动触发的独立 Updater 实例）此时检查必须整体跳过——不下载、
+// 不写 pending、不执行安装器。进程级互斥是 §9.3 串行化的真实现：per-instance
+// inProgress 标记挡不住双实例并行（两安装器并发执行的回归钉）。
+func TestOrchestrateMutexAcrossInstances(t *testing.T) {
+	blob := []byte("cross-instance-installer")
+	sum := fileSHA256OrPanic(blob)
+	var downloads atomic.Int64
+	inDownload, release := make(chan struct{}), make(chan struct{})
+	// 放行幂等化：断言失败（Goexit）时 defer 先于 t.Cleanup 的 srv.Close
+	// 解除 A 的挂起下载，回归时不至于挂在清理上。
+	var releaseOnce sync.Once
+	releaseA := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseA()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/setup.json":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"version": "2.0.0", "url": "/setup.exe?channel=stable",
+				"sha256": sum, "size": len(blob)})
+		case "/setup.exe":
+			if downloads.Add(1) == 1 { // 首个下载（A）挂起至放行
+				inDownload <- struct{}{}
+				<-release
+			}
+			w.Write(blob)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	dir := t.TempDir()
+	seedCache(t, dir, "1.0.0", "current-installer")
+
+	var execCalls atomic.Int64
+	wire := func(u *Updater, failOnExec bool) {
+		u.execInstaller = func(string) error {
+			execCalls.Add(1)
+			if failOnExec {
+				t.Error("second instance must never execute the installer")
+			}
+			return nil
+		}
+		u.serviceHealthy = func() error { return nil }
+		u.registerWatchdogTask = func(time.Time) error { return nil }
+		u.deleteWatchdogTask = func() {}
+	}
+
+	// A：连接周期实例，编排中（闸门持有 + 下载挂起 + pending 未写）。
+	a := New(srv.URL, dir, "1.0.0", "stable", nil)
+	wire(a, false)
+	aDone := make(chan error, 1)
+	go func() { aDone <- a.ForceCheck(context.Background()) }()
+	select {
+	case <-inDownload:
+	case <-time.After(5 * time.Second):
+		t.Fatal("A never reached download")
+	}
+
+	// B：手动触发实例（Task 8 Agent.Upgrade 自建），pending 仍未写 →
+	// 只能靠进程级闸门拦截：必须跳过（nil，非错误）且零副作用。
+	if _, ok := LoadPending(dir); ok {
+		t.Fatal("precondition: pending must not exist while A downloads")
+	}
+	b := New(srv.URL, dir, "1.0.0", "stable", nil)
+	wire(b, true)
+	if err := b.CheckNow(context.Background()); err != nil {
+		t.Fatalf("gated check must be silent skip, got %v", err)
+	}
+	if n := downloads.Load(); n != 1 {
+		t.Fatalf("downloads = %d, want 1 (second instance must not download)", n)
+	}
+	if _, ok := LoadPending(dir); ok {
+		t.Fatal("second instance must not write pending")
+	}
+
+	releaseA()
+	select {
+	case err := <-aDone:
+		if err != nil {
+			t.Fatalf("A: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("A did not finish after release")
+	}
+	if execCalls.Load() != 1 {
+		t.Fatalf("execCalls = %d, want exactly 1 (A only)", execCalls.Load())
+	}
+	if p, ok := LoadPending(dir); !ok || p.To != "2.0.0" {
+		t.Fatalf("A must leave pending {to:2.0.0}, got %+v ok=%v", p, ok)
 	}
 }
 

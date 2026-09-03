@@ -32,13 +32,16 @@ func testPipe(t *testing.T) string {
 
 // fakeDeps 记录调用并返回预设结果的 Deps 桩。
 type fakeDeps struct {
-	mu         sync.Mutex
-	regArgs    []struct{ server, clusterID, jwt string }
-	regNodeID  string
-	regErr     error
-	deregCalls int
-	deregErr   error
-	statusVal  Status
+	mu           sync.Mutex
+	regArgs      []struct{ server, clusterID, jwt string }
+	regNodeID    string
+	regErr       error
+	deregCalls   int
+	deregErr     error
+	statusVal    Status
+	upgChannels  []string
+	upgTriggered bool
+	upgErr       error
 }
 
 func (f *fakeDeps) Register(_ context.Context, server, clusterID, jwt string) (string, error) {
@@ -59,6 +62,19 @@ func (f *fakeDeps) Status() Status {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.statusVal
+}
+
+func (f *fakeDeps) Upgrade(_ context.Context, channel string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.upgChannels = append(f.upgChannels, channel)
+	return f.upgTriggered, f.upgErr
+}
+
+func (f *fakeDeps) upgradeCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.upgChannels)
 }
 
 // serve 起真实管道服务端（真机 Windows 管道），等就绪后返回。
@@ -256,6 +272,77 @@ func TestListenClosesOnCtxCancel(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Error("Listen did not return after ctx cancel")
 	}
+}
+
+// ---- upgrade op（§9.1 手动触发 / §9.5 跨频道切换；无 admin 门） ----
+
+// upgrade：channel 原样到达编排层，应答 {ok:true,triggered:true}。
+func TestPipeUpgradeRoundTrip(t *testing.T) {
+	deps := &fakeDeps{upgTriggered: true}
+	s := serve(t, deps)
+	resp := roundTrip(t, s, Request{Op: OpUpgrade, Channel: "dev"})
+	assert.True(t, resp.OK)
+	assert.True(t, resp.Triggered)
+	assert.Empty(t, resp.Note)
+	assert.Empty(t, resp.Error)
+	require.Equal(t, []string{"dev"}, deps.upgChannels)
+
+	// 不带 channel（当前频道即时检查）同样放行。
+	resp = roundTrip(t, s, Request{Op: OpUpgrade})
+	assert.True(t, resp.OK)
+	assert.True(t, resp.Triggered)
+	assert.Equal(t, []string{"dev", ""}, deps.upgChannels)
+}
+
+// upgrade：更新已在途（pending/进行中）→ 非错误应答
+// {ok:true,triggered:false,note:"update already in progress"}（CLI 渲染
+// note 后转入轮询）。
+func TestPipeUpgradeAlreadyInProgress(t *testing.T) {
+	deps := &fakeDeps{upgTriggered: false}
+	s := serve(t, deps)
+	resp := roundTrip(t, s, Request{Op: OpUpgrade})
+	assert.True(t, resp.OK, "in-flight must not be an error")
+	assert.False(t, resp.Triggered)
+	assert.Equal(t, "update already in progress", resp.Note)
+	assert.Empty(t, resp.Error)
+}
+
+// upgrade：编排层错误原样透传（如 not_registered）。
+func TestPipeUpgradeError(t *testing.T) {
+	deps := &fakeDeps{upgErr: errors.New("not_registered: no binding")}
+	s := serve(t, deps)
+	resp := roundTrip(t, s, Request{Op: OpUpgrade})
+	assert.False(t, resp.OK)
+	assert.Equal(t, "not_registered: no binding", resp.Error)
+}
+
+// upgrade：channel 白名单校验先于编排层（stable|dev 之外的值 → bad_request，
+// 不触碰绑定）。
+func TestPipeUpgradeChannelValidation(t *testing.T) {
+	deps := &fakeDeps{upgTriggered: true}
+	s := serve(t, deps)
+	for _, ch := range []string{"beta", "STABLE", "stable ", "production"} {
+		resp := roundTrip(t, s, Request{Op: OpUpgrade, Channel: ch})
+		assert.False(t, resp.OK, "channel %q", ch)
+		assert.Contains(t, resp.Error, "bad_request", "channel %q", ch)
+	}
+	assert.Zero(t, deps.upgradeCalls(), "invalid channel must not reach Deps.Upgrade")
+}
+
+// upgrade：不设 admin 门（任何交互用户可触发，与 register 同级；§9.5 跨频道
+// 切换经管道 + binding 原子写实现，无需提权）。回归 pin：IsAdminConn 即使
+// 注入也绝不被 upgrade 分支调用。
+func TestPipeUpgradeNoAdminGate(t *testing.T) {
+	deps := &fakeDeps{upgTriggered: true}
+	var adminChecks atomic.Int64
+	s := serveServer(t, &Server{
+		Name: testPipe(t), Deps: deps,
+		Log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		IsAdminConn: func(net.Conn) (bool, error) { adminChecks.Add(1); return false, nil },
+	})
+	resp := roundTrip(t, s, Request{Op: OpUpgrade, Channel: "dev"})
+	assert.True(t, resp.OK, "upgrade must not require admin")
+	assert.Zero(t, adminChecks.Load())
 }
 
 // connIsAdmin 真实链路冒烟：裸管道 accept → 同进程 dial → 句柄取 pid →

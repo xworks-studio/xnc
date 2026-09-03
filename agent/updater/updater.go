@@ -107,8 +107,7 @@ type Updater struct {
 	// 失败时落 update-audit.json，agent 下次连接补报。
 	Report func(m proto.Message) error
 
-	mu         sync.Mutex
-	inProgress bool // 一轮检查进行中（进程内串行化）
+	now func() time.Time // 时钟缝（退避/过期测试注入）
 
 	// 平台缝（orchestrate_windows.go 提供真实现；orchestrate_other.go 桩；
 	// 单测注入假实现——假安装器即普通 .cmd）。
@@ -116,8 +115,6 @@ type Updater struct {
 	serviceHealthy       func() error
 	registerWatchdogTask func(runAt time.Time) error
 	deleteWatchdogTask   func() // 删除失败仅记日志（任务一次性，残留不重触发）
-
-	now func() time.Time // 时钟缝（退避/过期测试注入）
 }
 
 // New 构造编排器并装配平台实现（Windows 真实现，其他平台报错桩）。
@@ -208,21 +205,39 @@ func (u *Updater) check(ctx context.Context, force bool) error {
 	return u.orchestrateTrigger(ctx, force, m)
 }
 
-// orchestrateTrigger 节流闸门 + 编排主体（推送/轮询共用）。
+// 进程级编排互斥（§9.3 串行化）：同一 agent 进程只有一个安装目标，任何
+// 时刻至多一轮编排在跑。跨 Updater 实例生效——连接周期的轮询/推送编排器
+// 与 agentctl 手动触发（Task 8）自建的实例并存时仍互斥，否则两实例可
+// 并行下载并各跑一次安装器（pending 落盘前的窗口）。
+var (
+	orchestrateMu         sync.Mutex
+	orchestrateInProgress bool
+)
+
+func beginOrchestrate() bool {
+	orchestrateMu.Lock()
+	defer orchestrateMu.Unlock()
+	if orchestrateInProgress {
+		return false
+	}
+	orchestrateInProgress = true
+	return true
+}
+
+func endOrchestrate() {
+	orchestrateMu.Lock()
+	orchestrateInProgress = false
+	orchestrateMu.Unlock()
+}
+
+// orchestrateTrigger 节流闸门 + 编排主体（推送/轮询/手动共用）。
 func (u *Updater) orchestrateTrigger(ctx context.Context, force bool, m *SetupManifest) error {
 	u.platform()
-	u.mu.Lock()
-	if u.inProgress {
-		u.mu.Unlock()
+	if !beginOrchestrate() {
+		u.log().Info("update: orchestration already in progress; skipping trigger")
 		return nil
 	}
-	u.inProgress = true
-	u.mu.Unlock()
-	defer func() {
-		u.mu.Lock()
-		u.inProgress = false
-		u.mu.Unlock()
-	}()
+	defer endOrchestrate()
 
 	// 串行化（§9.3）：pending 存在时拒绝再次触发。
 	if p, ok := LoadPending(u.StateDir); ok {

@@ -34,6 +34,7 @@ const (
 	agentctlOpRegister   = "register"
 	agentctlOpDeregister = "deregister"
 	agentctlOpStatus     = "status"
+	agentctlOpUpgrade    = "upgrade"
 
 	agentctlStateUnregistered = "unregistered"
 	agentctlStateRegistered   = "registered"
@@ -47,16 +48,29 @@ type agentctlReq struct {
 	Server    string `json:"server,omitempty"`
 	ClusterID string `json:"clusterId,omitempty"`
 	JWT       string `json:"jwt,omitempty"`
+	Channel   string `json:"channel,omitempty"` // upgrade：目标频道 stable|dev
+}
+
+// agentctlUpdate 镜像 agent/agentctl.UpdateInfo（status 的在途更新进度，
+// 仅更新在途时出现）。
+type agentctlUpdate struct {
+	Phase string `json:"phase"` // checking | applying
+	From  string `json:"from,omitempty"`
+	To    string `json:"to,omitempty"`
 }
 
 type agentctlResp struct {
-	OK        bool   `json:"ok"`
-	NodeID    string `json:"nodeId,omitempty"`
-	State     string `json:"state,omitempty"`
-	Server    string `json:"server,omitempty"`
-	ClusterID string `json:"clusterId,omitempty"`
-	Version   string `json:"version,omitempty"`
-	Error     string `json:"error,omitempty"`
+	OK        bool            `json:"ok"`
+	NodeID    string          `json:"nodeId,omitempty"`
+	State     string          `json:"state,omitempty"`
+	Server    string          `json:"server,omitempty"`
+	ClusterID string          `json:"clusterId,omitempty"`
+	Channel   string          `json:"channel,omitempty"`
+	Version   string          `json:"version,omitempty"`
+	Triggered bool            `json:"triggered"`        // upgrade：false = 已在途（非错误，见 note）
+	Note      string          `json:"note,omitempty"`   // upgrade 在途说明
+	Update    *agentctlUpdate `json:"update,omitempty"` // status：在途更新进度
+	Error     string          `json:"error,omitempty"`
 }
 
 // agentctlDial 是拨号缝隙（测试换 net.Pipe 假服务端；生产 = winio）。
@@ -445,12 +459,23 @@ func newStatusCmd() *cobra.Command {
 				pairs = append(pairs, [2]string{"state", resp.State})
 				for _, p := range [][2]string{
 					{"nodeId", resp.NodeID}, {"clusterId", resp.ClusterID},
-					{"server", resp.Server}, {"version", resp.Version},
+					{"server", resp.Server}, {"channel", resp.Channel},
+					{"version", resp.Version},
 				} {
 					if p[1] != "" {
 						local[p[0]] = p[1]
 						pairs = append(pairs, p)
 					}
+				}
+				if resp.Update != nil {
+					u := map[string]any{"phase": resp.Update.Phase}
+					line := resp.Update.Phase
+					if resp.Update.From != "" || resp.Update.To != "" {
+						u["from"], u["to"] = resp.Update.From, resp.Update.To
+						line = resp.Update.Phase + " " + resp.Update.From + " -> " + resp.Update.To
+					}
+					local["update"] = u
+					pairs = append(pairs, [2]string{"update", line})
 				}
 			}
 

@@ -575,6 +575,37 @@ func TestStatusPipeUnreachableShowsSession(t *testing.T) {
 		"error":null}`, outJSON)
 }
 
+// status 渲染新增的 channel / update 字段（Task 8 wire 扩展；可缺省）。
+func TestStatusRendersChannelAndUpdate(t *testing.T) {
+	isolatedHome(t)
+	pipe := &fakeAgentctl{respond: func(req agentctlReq) agentctlResp {
+		return agentctlResp{OK: true, State: "online", NodeID: "n1", Server: "https://s",
+			ClusterID: "c1", Channel: "dev", Version: "0.6.2",
+			Update: &agentctlUpdate{Phase: "applying", From: "0.6.1", To: "0.6.2"}}
+	}}
+	pipe.install(t)
+
+	out, code := captureStdout(t, func() int {
+		return runCLI(t.Context(), []string{"status"})
+	})
+	require.Equal(t, 0, code)
+	assert.Contains(t, out, "dev")
+	assert.Contains(t, out, "applying")
+	assert.Contains(t, out, "0.6.1")
+	assert.Contains(t, out, "0.6.2")
+
+	outJSON, code2 := captureStdout(t, func() int {
+		return runCLI(t.Context(), []string{"status", "--json"})
+	})
+	require.Equal(t, 0, code2)
+	assert.JSONEq(t, `{"ok":true,"data":{
+		"local":{"reachable":true,"state":"online","nodeId":"n1",
+			"server":"https://s","clusterId":"c1","channel":"dev","version":"0.6.2",
+			"update":{"phase":"applying","from":"0.6.1","to":"0.6.2"}},
+		"session":{"server":"","email":"","token_present":false}},
+		"error":null}`, outJSON)
+}
+
 // ---- login 尾行提示（§10） ----
 
 func TestLoginTailRegisterHint(t *testing.T) {
@@ -664,12 +695,21 @@ func TestAgentctlRoundTripWire(t *testing.T) {
 	assert.Equal(t, "online", resp.State)
 	require.Len(t, pipe.reqs, 1)
 
-	// wire 字段名与 agent/agentctl.Request/Response 一致（op/server/clusterId/jwt）。
+	// wire 字段名与 agent/agentctl.Request/Response 一致（op/server/clusterId/jwt/channel）。
 	b, err := json.Marshal(agentctlReq{Op: "register", Server: "s", ClusterID: "c", JWT: "j"})
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"op":"register","server":"s","clusterId":"c","jwt":"j"}`, string(b))
 
+	b3, err := json.Marshal(agentctlReq{Op: "upgrade", Channel: "dev"})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"op":"upgrade","channel":"dev"}`, string(b3))
+
+	// triggered 恒输出（upgrade 在途 = {ok:true,triggered:false,note:...}）。
 	b2, err := json.Marshal(agentctlResp{OK: false, Error: "forbidden: admin required"})
 	require.NoError(t, err)
-	assert.JSONEq(t, `{"ok":false,"error":"forbidden: admin required"}`, string(b2))
+	assert.JSONEq(t, `{"ok":false,"triggered":false,"error":"forbidden: admin required"}`, string(b2))
+
+	b4, err := json.Marshal(agentctlResp{OK: true, Triggered: false, Note: "update already in progress"})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"ok":true,"triggered":false,"note":"update already in progress"}`, string(b4))
 }

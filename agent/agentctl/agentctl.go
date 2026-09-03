@@ -5,7 +5,8 @@
 //
 //	{op:"register", server, clusterId, jwt} → {ok:true, nodeId}
 //	{op:"deregister"}                        → {ok:true}（要求连接方为管理员）
-//	{op:"status"}                            → {ok:true, state, nodeId, server, clusterId, version}
+//	{op:"status"}                            → {ok:true, state, nodeId, server, clusterId, channel, version, update?}
+//	{op:"upgrade", channel?}                 → {ok:true, triggered}（§9.1 手动触发；channel 见 §9.5）
 //
 // jwt 仅在内存中经手（请求 → 编排层 HTTP 头），不落盘、不写日志；应答与
 // 错误串均不含 jwt。
@@ -28,10 +29,28 @@ const (
 	OpRegister   = "register"
 	OpDeregister = "deregister"
 	OpStatus     = "status"
+	OpUpgrade    = "upgrade"
 
 	StateUnregistered = "unregistered"
 	StateRegistered   = "registered"
 	StateOnline       = "online"
+)
+
+// 更新频道（§9.5 跨频道切换仅经 upgrade op；白名单外的值 → bad_request）。
+const (
+	ChannelStable = "stable"
+	ChannelDev    = "dev"
+)
+
+// ValidChannel 报告 ch 是否为合法频道（空 = 未指定，交由编排层按当前绑定）。
+func ValidChannel(ch string) bool {
+	return ch == "" || ch == ChannelStable || ch == ChannelDev
+}
+
+// update op 应答里 status.update.phase 的取值。
+const (
+	UpdatePhaseChecking = "checking"  // 触发后拉清单/下载中（agent 侧进程内标记）
+	UpdatePhaseApplying = "applying"  // pending 存在 = 安装器执行中/新 agent 自检中
 )
 
 // Request 单行 JSON 请求（多余字段忽略，前向兼容）。
@@ -40,19 +59,35 @@ type Request struct {
 	Server    string `json:"server,omitempty"`    // register：控制面基址
 	ClusterID string `json:"clusterId,omitempty"` // register：目标 cluster
 	JWT       string `json:"jwt,omitempty"`       // register：用户 JWT（内存传递，用后即弃）
+	Channel   string `json:"channel,omitempty"`   // upgrade：目标频道 stable|dev（空 = 当前频道）
 }
 
 // Response 单行 JSON 应答。失败：{"ok":false,"error":"<code>: <message>"}；
 // 错误码沿用服务端 proto 码（MACHINE_ID_CONFLICT 等），本地校验用小写码
 // （bad_request / forbidden / internal / not_registered）。
+//
+// Triggered 仅 upgrade op 有意义（恒输出，false = 更新已在途而非错误，配
+// note 说明）；Update 仅 status op 在更新在途时输出（进度信号，可缺省）。
 type Response struct {
-	OK        bool   `json:"ok"`
-	NodeID    string `json:"nodeId,omitempty"`
-	State     string `json:"state,omitempty"`
-	Server    string `json:"server,omitempty"`
-	ClusterID string `json:"clusterId,omitempty"`
-	Version   string `json:"version,omitempty"`
-	Error     string `json:"error,omitempty"`
+	OK        bool        `json:"ok"`
+	NodeID    string      `json:"nodeId,omitempty"`
+	State     string      `json:"state,omitempty"`
+	Server    string      `json:"server,omitempty"`
+	ClusterID string      `json:"clusterId,omitempty"`
+	Channel   string      `json:"channel,omitempty"`
+	Version   string      `json:"version,omitempty"`
+	Triggered bool        `json:"triggered"`
+	Note      string      `json:"note,omitempty"`
+	Update    *UpdateInfo `json:"update,omitempty"`
+	Error     string      `json:"error,omitempty"`
+}
+
+// UpdateInfo status op 的在途更新进度（CLI upgrade 轮询信号，尽力而为：
+// 仅覆盖手动触发与安装器执行窗口）。
+type UpdateInfo struct {
+	Phase string `json:"phase"` // checking | applying
+	From  string `json:"from,omitempty"`
+	To    string `json:"to,omitempty"`
 }
 
 // Errorf 构造失败应答（错误串格式 "<code>: <message>"）。
@@ -66,7 +101,9 @@ type Status struct {
 	NodeID    string
 	Server    string
 	ClusterID string
+	Channel   string // 生效频道（stable|dev；空绑定归一为 stable）
 	Version   string // machineinfo.Version（agent bundle 版本）
+	Update    *UpdateInfo
 }
 
 // Deps 管道操作到 agent 编排层的依赖注入（agent.Agent 实现）。实现自行保证
@@ -80,6 +117,11 @@ type Deps interface {
 	Deregister(ctx context.Context) error
 	// Status 本机注册/在线状态。
 	Status() Status
+	// Upgrade 立即检查并静默应用更新（§9.1 手动触发；channel 非空且异于
+	// 绑定频道时先原子切换 binding.channel，§9.5）。触发是异步的（编排器
+	// 后台执行），本调用快速返回：triggered=false 表示已有更新在途（非
+	// 错误，dispatch 配 note 应答）；错误（如未注册/绑定写失败）同步返回。
+	Upgrade(ctx context.Context, channel string) (triggered bool, err error)
 }
 
 // Server 控制管道服务端。Name 空 = PipeName；IsAdminConn 空 = 平台实现
@@ -112,7 +154,8 @@ const (
 	// 客户端占住唯一 accept 槽位。
 	connTimeout = 30 * time.Second
 	// opTimeout 单操作时限：register 含 HTTP 往返，deregister 含一次 WS
-	// 拨号认证，均给足余量；超时以 internal 错误回给 CLI。
+	// 拨号认证，均给足余量；upgrade 为异步触发（秒级返回），status 恒快。
+	// 超时以 internal 错误回给 CLI。
 	opTimeout = 60 * time.Second
 	// maxRequestLine 请求行上限（JWT 约 1KB；64KB 余量充足）。
 	maxRequestLine = 64 * 1024
@@ -151,8 +194,26 @@ func (s *Server) dispatch(ctx context.Context, conn net.Conn, req Request) Respo
 		st := s.Deps.Status()
 		return Response{
 			OK: true, State: st.State, NodeID: st.NodeID,
-			Server: st.Server, ClusterID: st.ClusterID, Version: st.Version,
+			Server: st.Server, ClusterID: st.ClusterID, Channel: st.Channel,
+			Version: st.Version, Update: st.Update,
 		}
+	case OpUpgrade:
+		// 频道白名单先于编排层（§9.5：仅 stable|dev，坏值不得触碰绑定）。
+		if !ValidChannel(req.Channel) {
+			return Errorf("bad_request: channel must be stable or dev")
+		}
+		// 无 admin 门：与 register 同级（任何交互用户可触发；改的是更新
+		// 频道而非节点归属，绑定写入本身在 agent/ SYSTEM 侧完成）。
+		triggered, err := s.Deps.Upgrade(ctx, req.Channel)
+		if err != nil {
+			return Errorf("%s", err.Error())
+		}
+		if !triggered {
+			// 已在途（pending 存在或一次触发未收线）= 非错误；CLI 渲染
+			// note 后转入 status 轮询（两端口径一致）。
+			return Response{OK: true, Triggered: false, Note: "update already in progress"}
+		}
+		return Response{OK: true, Triggered: true}
 	default:
 		return Errorf("bad_request: unknown op %q", req.Op)
 	}

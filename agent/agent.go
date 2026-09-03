@@ -49,8 +49,11 @@ type Agent struct {
 	connMu sync.Mutex
 	conn   *connect.Client // 当前连接周期的控制客户端（status online 判据）
 
-	updMu sync.Mutex
-	upd   *updater.Updater // 当前连接周期的更新编排器（UpdateNow/Task 8 复用）
+	// upgrading：手动触发（agentctl upgrade op）的后台 ForceCheck 进行中
+	// 标记（触发 → goroutine 返回的窗口）；与 pending 文件共同构成 update
+	// op 的在途判据（§9.3 串行化）。
+	upgradeMu sync.Mutex
+	upgrading bool
 }
 
 // rebindCh 返回（必要时创建）唤醒通道。
@@ -82,18 +85,6 @@ func (a *Agent) currentConn() *connect.Client {
 	a.connMu.Lock()
 	defer a.connMu.Unlock()
 	return a.conn
-}
-
-func (a *Agent) setUpdater(u *updater.Updater) {
-	a.updMu.Lock()
-	defer a.updMu.Unlock()
-	a.upd = u
-}
-
-func (a *Agent) currentUpdater() *updater.Updater {
-	a.updMu.Lock()
-	defer a.updMu.Unlock()
-	return a.upd
 }
 
 func (a *Agent) identityPath() string { return filepath.Join(a.StateDir, "identity.json") }
@@ -302,7 +293,6 @@ func (a *Agent) runConnected(ctx context.Context, b *binding.Binding) error {
 	// 与 6h 轮询随周期启动；WS 推送与目标版本信号经回调触发。
 	updater.CleanupStale(a.StateDir)
 	upd := updater.New(server, a.StateDir, info.AgentVersion, channelOf(b), slog.Default())
-	a.setUpdater(upd)
 	go upd.StartupPendingCheck(cycleCtx)
 	go func() {
 		t := time.NewTicker(updater.PollInterval)
@@ -320,7 +310,6 @@ func (a *Agent) runConnected(ctx context.Context, b *binding.Binding) error {
 	c := connect.NewClient(server, k, info)
 	a.setConn(c)
 	defer a.setConn(nil)
-	defer a.setUpdater(nil)
 	// 每次连接就绪（含重连）重建 engine：旧 engine 的 sendControl 绑定旧连接，
 	// 其 active 会话已随断连作废，重建即正确语义。
 	c.OnReady = func(sendControl func(m proto.Message) error) {
@@ -510,6 +499,9 @@ func (a *Agent) Deregister(ctx context.Context) error {
 
 // Status 实现 agentctl.Deps（spec §6.3 status op；xnc status 本机数据源）：
 // 无有效绑定 = unregistered；有绑定 = registered；控制连接就绪 = online。
+// Channel 报告生效频道（空绑定归一为 stable）；Update 在更新在途时给出
+// 进度信号（applying = pending 存在，安装器执行/新 agent 自检中；checking
+// = 手动触发的检查进行中）——xnc upgrade 轮询用，尽力而为。
 func (a *Agent) Status() agentctl.Status {
 	st := agentctl.Status{State: agentctl.StateUnregistered, Version: machineinfo.Version}
 	b, ok := a.currentBinding()
@@ -518,8 +510,15 @@ func (a *Agent) Status() agentctl.Status {
 	}
 	st.State = agentctl.StateRegistered
 	st.NodeID, st.Server, st.ClusterID = b.NodeID, b.Server, b.ClusterID
+	st.Channel = channelOf(b)
 	if c := a.currentConn(); c != nil && c.Connected() {
 		st.State = agentctl.StateOnline
+	}
+	if p, ok := updater.LoadPending(a.StateDir); ok {
+		st.Update = &agentctl.UpdateInfo{
+			Phase: agentctl.UpdatePhaseApplying, From: p.From, To: p.To}
+	} else if a.upgradeInFlight() {
+		st.Update = &agentctl.UpdateInfo{Phase: agentctl.UpdatePhaseChecking}
 	}
 	return st
 }
@@ -532,17 +531,78 @@ func channelOf(b *binding.Binding) string {
 	return b.Channel
 }
 
-// UpdateNow 立即检查并静默应用更新（spec §9.1 手动触发；Task 8 agentctl
-// upgrade op 的内核——CLI 自身不替换文件）。跳过退避（人工决策）；
-// 黑名单/降级保护/pending 串行化照常。无绑定 = 无更新源，直接报错。
-func (a *Agent) UpdateNow(ctx context.Context) error {
+func (a *Agent) beginUpgradeInFlight() bool {
+	a.upgradeMu.Lock()
+	defer a.upgradeMu.Unlock()
+	if a.upgrading {
+		return false
+	}
+	a.upgrading = true
+	return true
+}
+
+func (a *Agent) endUpgradeInFlight() {
+	a.upgradeMu.Lock()
+	defer a.upgradeMu.Unlock()
+	a.upgrading = false
+}
+
+func (a *Agent) upgradeInFlight() bool {
+	a.upgradeMu.Lock()
+	defer a.upgradeMu.Unlock()
+	return a.upgrading
+}
+
+// Upgrade 实现 agentctl.Deps（spec §9.1 手动触发 + §9.5 跨频道切换），
+// 快速返回：绑定校验与频道切换同步完成，检查本身在后台 goroutine 执行
+// （管道一问一答不等下载；且请求 ctx 随连接关闭失效，后台检查用独立
+// 生命周期）。串行化（§9.3）三层：pending 存在、本触发标记（原子
+// test-and-set，一次手动触发未收线 → triggered=false 非错误，dispatch 配
+// note 应答）、updater 包进程级编排互斥（与连接周期的轮询/推送编排跨
+// 实例互斥）。无绑定 = 无更新源，同步报错。
+//
+// 跨频道切换：原子改 binding（其余字段保持），audit 记维护操作
+// （update_channel {from,to}，log-only——T7 最小口径，无 DB/WS 通道），
+// 并 rebind 唤醒连接周期，运行中的 6h 轮询编排器按新频道重建；本次手动
+// 检查不依赖重建（自带新频道的独立 updater），rebind 只为周期轮询换代。
+// 手动 updater 不带 Report 闭包——成功后的 update_ok audit 落
+// update-audit.json，由安装完成重启后的新连接周期补报（与离线回滚同一
+// 延迟审计机制）。
+func (a *Agent) Upgrade(_ context.Context, channel string) (bool, error) {
 	b, ok := a.currentBinding()
 	if !ok {
-		return errors.New("not_registered: no binding")
+		return false, errors.New("not_registered: no binding")
 	}
-	u := a.currentUpdater()
-	if u == nil {
-		u = updater.New(b.Server, a.StateDir, machineinfo.Version, channelOf(b), slog.Default())
+	if _, pending := updater.LoadPending(a.StateDir); pending {
+		return false, nil
 	}
-	return u.ForceCheck(ctx)
+	if !a.beginUpgradeInFlight() {
+		return false, nil
+	}
+
+	effective := channelOf(b)
+	if channel != "" && channel != effective {
+		nb := *b
+		nb.Channel = channel
+		if err := binding.Save(a.StateDir, &nb); err != nil {
+			a.endUpgradeInFlight()
+			return false, fmt.Errorf("internal: save binding: %v", err)
+		}
+		slog.Info("audit: update_channel", "from", effective, "to", channel)
+		a.notifyRebind()
+		effective = channel
+	}
+
+	// 后台立即检查并静默应用（退避跳过 = 人工决策；黑名单/降级/pending
+	// 保护照常）。结果不回传（管道应答已返回）——CLI 经 status 轮询感知：
+	// version 变化或 update 进度字段；失败仅记日志。
+	server, stateDir := b.Server, a.StateDir
+	go func() {
+		defer a.endUpgradeInFlight()
+		u := updater.New(server, stateDir, machineinfo.Version, effective, slog.Default())
+		if err := u.ForceCheck(context.Background()); err != nil {
+			slog.Warn("update: manual trigger failed", "channel", effective, "err", err)
+		}
+	}()
+	return true, nil
 }
