@@ -42,6 +42,9 @@ func LoadConfig() (Config, error) {
 			if c.Token == "" {
 				c.Token = f.Token
 			}
+			if c.RememberedEmail == "" {
+				c.RememberedEmail = f.RememberedEmail
+			}
 		}
 	}
 	return c, nil

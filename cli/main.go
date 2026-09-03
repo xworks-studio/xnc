@@ -53,6 +53,7 @@ open remote desktops, and manage clusters.
 
 Quick start:
   xnc login                          connect to a server
+  xnc register                       bind this machine as a node
   xnc node list                      see your nodes
   xnc exec <node> "hostname"         run a command
   xnc exec <node> --shell bash "ls" run in bash (simplest quoting)
@@ -95,7 +96,8 @@ Exit codes:
 		// Node & cluster management
 		newNodeCmd(), newClusterCmd(), newTokenCmd(),
 		// Auth & info
-		newLoginCmd(), newWhoamiCmd(), newStatusCmd(), newVersionCmd(),
+		newLoginCmd(), newRegisterCmd(), newDeregisterCmd(),
+		newWhoamiCmd(), newStatusCmd(), newVersionCmd(),
 		// Admin & maintenance
 		newAuditCmd(), newUpdateCmd(),
 	)

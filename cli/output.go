@@ -3,8 +3,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"text/tabwriter"
+
+	"github.com/spf13/cobra"
 
 	"xnc/proto"
 )
@@ -39,4 +42,14 @@ func printKV(pairs [][2]string) {
 		rows[i] = []string{p[0], p[1]}
 	}
 	printTable([]string{"KEY", "VALUE"}, rows)
+}
+
+// outf writes a progress/prompt line for humans; --json mode diverts it to
+// stderr so stdout stays a single JSON envelope (Agent-First contract).
+func outf(cmd *cobra.Command, format string, args ...any) {
+	w := io.Writer(os.Stdout)
+	if jsonOut(cmd) {
+		w = os.Stderr
+	}
+	fmt.Fprintf(w, format, args...)
 }

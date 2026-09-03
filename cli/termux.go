@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/spf13/cobra"
 	"golang.org/x/term"
 
 	"xnc/proto"
@@ -77,4 +78,16 @@ func runLoginFlow(deps loginDeps, server, email string) (string, string, userDTO
 		fmt.Printf("xnc: login failed (%s), attempt %d of 3\n", apiErr.Message, attempt+1)
 	}
 	return "", "", userDTO{}, errLoginRetries
+}
+
+// loginFlowError 映射 runLoginFlow 的错误（login 与 register 内联登录共用）。
+func loginFlowError(cmd *cobra.Command, err error) error {
+	if errors.Is(err, errLoginRetries) {
+		return failAPI(cmd, proto.Err(240, proto.CodeUnauthorized, "too many failed attempts"))
+	}
+	var apiErr *proto.APIError
+	if errors.As(err, &apiErr) {
+		return failAPI(cmd, apiErr)
+	}
+	return failAPI(cmd, proto.Err(250, proto.CodeInternal, err.Error()))
 }

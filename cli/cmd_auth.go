@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -46,14 +45,7 @@ func newLoginCmd() *cobra.Command {
 				}
 				s, t, u, err := runLoginFlow(deps, server, email)
 				if err != nil {
-					if errors.Is(err, errLoginRetries) {
-						return failAPI(cmd, proto.Err(240, proto.CodeUnauthorized, "too many failed attempts"))
-					}
-					var apiErr *proto.APIError
-					if errors.As(err, &apiErr) {
-						return failAPI(cmd, apiErr)
-					}
-					return failAPI(cmd, proto.Err(250, proto.CodeInternal, err.Error()))
+					return loginFlowError(cmd, err)
 				}
 				server, token, user = s, t, u
 			} else {
@@ -81,10 +73,12 @@ func newLoginCmd() *cobra.Command {
 			if jsonOut(cmd) {
 				PrintJSON(true, map[string]any{"user": user, "server": server,
 					"token": token}, nil)
+				printRegisterHint(cmd) // 未注册尾行提示（spec §10；json 模式走 stderr）
 				return nil
 			}
 			fmt.Printf("Logged in to %s as %s (%s)\ntoken saved to %s\n",
 				server, user.Email, user.DisplayName, configPath())
+			printRegisterHint(cmd) // 未注册尾行提示（spec §10；管道不可达静默）
 			return nil
 		},
 	}
@@ -139,36 +133,6 @@ func newWhoamiCmd() *cobra.Command {
 				{"email", resp.User.Email},
 				{"display_name", resp.User.DisplayName},
 			})
-			return nil
-		},
-	}
-	addJSONFlag(cmd)
-	return cmd
-}
-
-func newStatusCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "status",
-		Short: "Check server reachability (no auth required)",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			cl, usage := dial(cmd, false)
-			if usage != "" {
-				return failUsage(cmd, usage)
-			}
-			var health struct {
-				Status  string `json:"status"`
-				Version string `json:"version"`
-			}
-			if e := cl.Do("GET", "/api/health", nil, &health); e != nil {
-				return failAPI(cmd, e)
-			}
-			if jsonOut(cmd) {
-				PrintJSON(true, map[string]any{"server": cl.Base,
-					"status": health.Status, "version": health.Version}, nil)
-				return nil
-			}
-			fmt.Printf("server %s %s (version %s)\n", cl.Base, health.Status, health.Version)
 			return nil
 		},
 	}
