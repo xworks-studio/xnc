@@ -13,6 +13,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"xnc/proto"
 	"xnc/server/internal/db/sqlc"
@@ -171,6 +172,17 @@ func (h *handlers) agentConnect(w http.ResponseWriter, r *http.Request) {
 			if err := m.Decode(&sr); err == nil && h.sess != nil {
 				h.sess.NotifyClose(sr.SessionID, "refused:"+sr.Code)
 			}
+		case proto.TypeNodeDelete:
+			// 机器自注销（spec §7 deregister）：本连接已按节点身份完成挑战-验签，
+			// 机器身份即凭据（无 JWT）。删除节点行 → 审计 → 逐出该节点全部在线
+			// 连接 → 关闭本连接（关闭即确认；失败先发 ERROR 帧再关闭）。
+			if err := h.nodeDelete(ctx, node); err != nil {
+				slog.Warn("node deregister failed", "node", node.ID, "err", err)
+				h.writeJSON(ctx, c, proto.TypeError, proto.ErrorPayload{
+					Code: proto.CodeInternal, Message: "deregister failed"})
+			}
+			_ = c.Close(websocket.StatusNormalClosure, "node deleted")
+			return
 		default:
 			h.writeJSON(ctx, c, proto.TypeError, proto.ErrorPayload{
 				Code: proto.CodeInternal, Message: "unexpected message"})
@@ -205,4 +217,30 @@ func (h *handlers) readMsg(ctx context.Context, c *websocket.Conn, timeout time.
 		return proto.Message{}, false
 	}
 	return m, true
+}
+
+// nodeDelete 处理已认证控制连接上的 NODE_DELETE（spec §7 机器自注销）：
+// 删除 0 行（节点已不存在）按幂等成功处理。审计 actor 为空（机器发起，
+// 无 user_id）。必须在取消本连接 ctx 之前完成 DB 操作——逐出在线连接会
+// Cancel 该节点（可能就是本连接）的 handler ctx。
+func (h *handlers) nodeDelete(ctx context.Context, node sqlc.Node) error {
+	if _, err := h.st.Q().DeleteNode(ctx, node.ID); err != nil {
+		return err
+	}
+	if err := h.st.Q().InsertAuditLog(ctx, sqlc.InsertAuditLogParams{
+		ClusterID: pgtype.UUID{Bytes: node.ClusterID, Valid: true},
+		NodeID:    pgtype.UUID{Bytes: node.ID, Valid: true},
+		Action:    "node.deregister", Metadata: []byte("{}"),
+	}); err != nil {
+		// 节点已删，审计失败不回滚注销（只记日志）。
+		slog.Warn("deregister audit failed", "node", node.ID, "err", err)
+	}
+	// 逐出该节点的在线连接（可能是另一条更早的活跃连接，也可能是本连接）：
+	// 先移除注册表项再 Cancel——被逐连接的延迟清理经 RemoveIf=false 跳过
+	// 对已删节点的 offline 落库。
+	if live := h.reg.Get(node.ID.String()); live != nil && live.Cancel != nil {
+		h.reg.Remove(node.ID.String())
+		live.Cancel()
+	}
+	return nil
 }

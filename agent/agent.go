@@ -2,13 +2,22 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
+	"xnc/agent/agentctl"
 	"xnc/agent/binding"
 	"xnc/agent/connect"
 	"xnc/agent/desktop"
@@ -28,6 +37,48 @@ type Agent struct {
 	// 身份覆盖；空值 = 生产行为完全不变。
 	HostnameOverride  string
 	MachineIDOverride string
+	// CtlPipeName 控制管道名（spec §6.3；空 = agentctl.PipeName，测试覆盖）。
+	CtlPipeName string
+
+	// rebind 唤醒通道（缓冲 1，非阻塞通知）：register 写入 binding / deregister
+	// 拆线时唤醒空转轮询或打断既有连接周期，使注册即时生效（<1s，而非等
+	// 5s 轮询）。懒初始化（Agent 以零值结构体构造），rebindMu 守护。
+	rebind   chan struct{}
+	rebindMu sync.Mutex
+
+	connMu sync.Mutex
+	conn   *connect.Client // 当前连接周期的控制客户端（status online 判据）
+}
+
+// rebindCh 返回（必要时创建）唤醒通道。
+func (a *Agent) rebindCh() chan struct{} {
+	a.rebindMu.Lock()
+	defer a.rebindMu.Unlock()
+	if a.rebind == nil {
+		a.rebind = make(chan struct{}, 1)
+	}
+	return a.rebind
+}
+
+// notifyRebind 非阻塞通知：无消费者时信号留驻缓冲，下一个进入等待的周期
+// 立即消费（空唤醒无害——重查 binding 后继续原状态）。
+func (a *Agent) notifyRebind() {
+	select {
+	case a.rebindCh() <- struct{}{}:
+	default:
+	}
+}
+
+func (a *Agent) setConn(c *connect.Client) {
+	a.connMu.Lock()
+	defer a.connMu.Unlock()
+	a.conn = c
+}
+
+func (a *Agent) currentConn() *connect.Client {
+	a.connMu.Lock()
+	defer a.connMu.Unlock()
+	return a.conn
 }
 
 func (a *Agent) identityPath() string { return filepath.Join(a.StateDir, "identity.json") }
@@ -138,7 +189,8 @@ func (a *Agent) synthesizeLegacyBinding() (*binding.Binding, bool) {
 
 // idleAwaitRegistration 未注册空转态（spec §6.1）：不发起任何外联、不做
 // 更新检查（更新源即 server，无绑定即无源）；仅周期重查 binding.json 并
-// 记 awaiting registration。ctx 取消（服务停止/Ctrl+C）即返回 ctx.Err()。
+// 记 awaiting registration。控制管道注册（Task 4）经 rebind 唤醒即时接续
+//（<1s，5s 轮询仅兜底）。ctx 取消（服务停止/Ctrl+C）即返回 ctx.Err()。
 func (a *Agent) idleAwaitRegistration(ctx context.Context) (*binding.Binding, error) {
 	slog.Info("awaiting registration", "stateDir", a.StateDir)
 	t := time.NewTicker(awaitBindingInterval)
@@ -147,6 +199,12 @@ func (a *Agent) idleAwaitRegistration(ctx context.Context) (*binding.Binding, er
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		case <-a.rebindCh():
+			if b, ok := a.currentBinding(); ok {
+				slog.Info("binding detected (woken); proceeding", "server", b.Server, "node", b.NodeID)
+				return b, nil
+			}
+			// 空唤醒（如 deregister 后的残留信号）：继续空转。
 		case <-t.C:
 			if b, ok := a.currentBinding(); ok {
 				slog.Info("binding detected; proceeding", "server", b.Server, "node", b.NodeID)
@@ -158,11 +216,50 @@ func (a *Agent) idleAwaitRegistration(ctx context.Context) (*binding.Binding, er
 }
 
 func (a *Agent) Run(ctx context.Context) error {
-	// 绑定是外联与自更新的前提：空转期间不触碰 updater/connect。
-	b, err := a.awaitBinding(ctx)
-	if err != nil {
-		return err
+	// 控制管道（spec §6.3）：空转期等待注册指令 / 运行期处理 deregister 与
+	// status。失败仅记日志（agent 主功能不因此阻断）。
+	a.startCtlPipe(ctx)
+	for {
+		// 绑定是外联与自更新的前提：空转期间不触碰 updater/connect。
+		b, err := a.awaitBinding(ctx)
+		if err != nil {
+			return err
+		}
+		if err := a.runConnected(ctx, b); err != nil {
+			return err
+		}
+		// runConnected 返回 nil = rebind 打断（register 覆盖绑定 / deregister
+		// 拆线）→ 回到循环头重新评估绑定（新绑定 → 新周期；无绑定 → 空转）。
 	}
+}
+
+// startCtlPipe 启动 agentctl 控制管道服务端（随 ctx 关闭）。
+func (a *Agent) startCtlPipe(ctx context.Context) {
+	s := &agentctl.Server{Deps: a, Log: slog.Default(), Name: a.CtlPipeName}
+	go func() {
+		if err := s.Listen(ctx); err != nil && ctx.Err() == nil {
+			slog.Error("agentctl pipe server exited", "err", err)
+		}
+	}()
+}
+
+// runConnected 一个连接周期：EnsureEnrolled → updater/connect 装配 →
+// c.Run 维持控制连接。rebind 信号打断周期（返回 nil，外层重评估绑定）；
+// 外层 ctx 取消按停机向上传递。
+func (a *Agent) runConnected(ctx context.Context, b *binding.Binding) error {
+	cycleCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		select {
+		case <-a.rebindCh():
+			cancel() // register/deregister：打断本周期
+		case <-cycleCtx.Done():
+		}
+	}()
+	defer func() { cancel(); <-watcherDone }()
+
 	// server 以机器级绑定为准（spec §5.2/§5.3 同一原则）：--server 仅在
 	// 绑定未提供时兜底；两者都有且不一致时以绑定为准并记警告。
 	server := a.ServerURL
@@ -173,8 +270,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		server = b.Server
 	}
 
-	k, info, err := a.EnsureEnrolled(ctx)
+	k, info, err := a.EnsureEnrolled(cycleCtx)
 	if err != nil {
+		if cycleCtx.Err() != nil && ctx.Err() == nil {
+			return nil // rebind 打断（新周期重走）
+		}
 		return err
 	}
 	if b.NodeID != "" && k.NodeID != b.NodeID {
@@ -191,6 +291,8 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 
 	c := connect.NewClient(server, k, info)
+	a.setConn(c)
+	defer a.setConn(nil)
 	// 每次连接就绪（含重连）重建 engine：旧 engine 的 sendControl 绑定旧连接，
 	// 其 active 会话已随断连作废，重建即正确语义。
 	c.OnReady = func(sendControl func(m proto.Message) error) {
@@ -229,5 +331,157 @@ func (a *Agent) Run(ctx context.Context) error {
 	c.UpdateOfferFunc = func(ctx context.Context, offer proto.UpdateOffer) {
 		upd.Handle(ctx, offer, c.CurrentSend())
 	}
-	return c.Run(ctx)
+	if err := c.Run(cycleCtx); err != nil && ctx.Err() == nil && cycleCtx.Err() == nil {
+		return err
+	}
+	if ctx.Err() != nil {
+		return ctx.Err() // 服务停止
+	}
+	return nil // rebind 打断（cycleCtx 取消）→ 外层重评估
+}
+
+// ---- agentctl 控制管道操作（spec §6.2/§6.3/§7；agentctl.Deps 实现）----
+
+// loadOrCreateIdentity 加载本机身份，不存在则生成（NodeID 空，注册成功后
+// 回写）。身份生成必须在 agent 进程内（SYSTEM 上下文的 DPAPI 保护；CLI 永不
+// 持有私钥）。损坏/不可解密的 identity 直接报错——静默重建会孤儿化既有注册。
+func (a *Agent) loadOrCreateIdentity() (*identity.Key, bool, error) {
+	k, err := identity.Load(a.identityPath())
+	if err == nil {
+		return k, false, nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return nil, false, err
+	}
+	return identity.Generate(), true, nil
+}
+
+// registerNode 调 Task 2 端点（spec §6.4）：
+// POST {server}/api/clusters/{id}/nodes/register，Authorization: 用户 JWT
+//（仅内存经手：进请求头、出函数体即弃，不落盘不写日志）；body 为 enroll 减
+// token（hostname/machineId/osVersion/agentVersion/publicKey）。成功返回
+// nodeId；失败返回 proto 错误码形态 "<code>: <message>"（管道应答直通）。
+func registerNode(ctx context.Context, server, clusterID, jwt, publicKeyB64 string, info machineinfo.Info) (string, error) {
+	body, err := json.Marshal(map[string]string{
+		"hostname": info.Hostname, "machineId": info.MachineID,
+		"osVersion": info.OSVersion, "agentVersion": info.AgentVersion,
+		"publicKey": publicKeyB64,
+	})
+	if err != nil {
+		return "", fmt.Errorf("internal: %v", err)
+	}
+	u := strings.TrimRight(server, "/") + "/api/clusters/" + url.PathEscape(clusterID) + "/nodes/register"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("internal: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("internal: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusCreated {
+		var out struct {
+			NodeID string `json:"nodeId"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return "", fmt.Errorf("internal: %v", err)
+		}
+		if out.NodeID == "" {
+			return "", fmt.Errorf("internal: missing nodeId in response")
+		}
+		return out.NodeID, nil
+	}
+	var e struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&e)
+	if e.Error.Code != "" {
+		return "", fmt.Errorf("%s: %s", e.Error.Code, e.Error.Message)
+	}
+	return "", fmt.Errorf("internal: status %d", resp.StatusCode)
+}
+
+// Register 实现 agentctl.Deps（spec §6.2 第 3 步）：load-or-create 身份 →
+// 用户 JWT 调注册端点（幂等：同 cluster+machineId+公钥由服务端复用 201）→
+// NodeID 回写 identity + 原子写 binding → rebind 唤醒连接路径（<1s 上线）。
+func (a *Agent) Register(ctx context.Context, server, clusterID, jwt string) (string, error) {
+	k, created, err := a.loadOrCreateIdentity()
+	if err != nil {
+		return "", fmt.Errorf("internal: load identity: %v", err)
+	}
+	if created {
+		// 生成即落盘（公钥发出前私钥必须已持久化——注册成功而身份丢失
+		// 会产生无法认证的孤儿节点）。
+		if err := identity.Save(k, a.identityPath()); err != nil {
+			return "", fmt.Errorf("internal: save identity: %v", err)
+		}
+	}
+	nodeID, err := registerNode(ctx, server, clusterID, jwt, k.PublicKeyB64(), a.info())
+	if err != nil {
+		return "", err
+	}
+	k.NodeID = nodeID
+	if err := identity.Save(k, a.identityPath()); err != nil {
+		return "", fmt.Errorf("internal: save identity: %v", err)
+	}
+	if err := binding.Save(a.StateDir, &binding.Binding{
+		Server: server, ClusterID: clusterID, NodeID: nodeID,
+		RegisteredAt: time.Now().UTC(),
+	}); err != nil {
+		return "", fmt.Errorf("internal: save binding: %v", err)
+	}
+	a.notifyRebind()
+	slog.Info("registered via agentctl", "node", nodeID, "server", server, "cluster", clusterID)
+	return nodeID, nil
+}
+
+// Deregister 实现 agentctl.Deps（spec §7）：一次性控制连接挑战认证（机器身份
+// 即凭据，无 JWT）→ NODE_DELETE → rebind 拆既有连接周期 → 删 binding.json
+//（保留 identity.json 供重注册复用）。服务端拒绝（ERROR 帧）时不删 binding，
+// 错误以 "<code>: <message>" 直通。
+func (a *Agent) Deregister(ctx context.Context) error {
+	b, ok := a.currentBinding()
+	if !ok {
+		return errors.New("not_registered: no binding")
+	}
+	k, err := identity.Load(a.identityPath())
+	if err != nil {
+		return fmt.Errorf("internal: load identity: %v", err)
+	}
+	if k.NodeID == "" {
+		return errors.New("internal: identity has no nodeId; cannot authenticate deregister")
+	}
+	c := connect.NewClient(b.Server, k, a.info())
+	if err := c.DeleteNode(ctx); err != nil {
+		return err
+	}
+	// 注销成功：拆既有连接周期（若有），回空转重评估。
+	a.notifyRebind()
+	if err := os.Remove(binding.Path(a.StateDir)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("internal: remove binding: %v", err)
+	}
+	slog.Info("deregistered via agentctl", "node", b.NodeID, "server", b.Server)
+	return nil
+}
+
+// Status 实现 agentctl.Deps（spec §6.3 status op；xnc status 本机数据源）：
+// 无有效绑定 = unregistered；有绑定 = registered；控制连接就绪 = online。
+func (a *Agent) Status() agentctl.Status {
+	st := agentctl.Status{State: agentctl.StateUnregistered, Version: machineinfo.Version}
+	b, ok := a.currentBinding()
+	if !ok {
+		return st
+	}
+	st.State = agentctl.StateRegistered
+	st.NodeID, st.Server, st.ClusterID = b.NodeID, b.Server, b.ClusterID
+	if c := a.currentConn(); c != nil && c.Connected() {
+		st.State = agentctl.StateOnline
+	}
+	return st
 }

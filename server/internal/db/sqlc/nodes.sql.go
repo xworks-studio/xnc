@@ -61,6 +61,20 @@ func (q *Queries) CreateNode(ctx context.Context, arg CreateNodeParams) (Node, e
 	return i, err
 }
 
+const deleteNode = `-- name: DeleteNode :execrows
+DELETE FROM nodes WHERE id = $1
+`
+
+// 机器自注销（spec §7：控制连接上 NODE_DELETE，机器身份即凭据）。返回删除
+// 行数：0 = 节点已不存在（重复注销按幂等成功处理）。
+func (q *Queries) DeleteNode(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteNode, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getMachineIDConflictCluster = `-- name: GetMachineIDConflictCluster :one
 SELECT c.name FROM nodes n JOIN clusters c ON c.id = n.cluster_id
 WHERE n.machine_id = $1 AND n.cluster_id <> $2 LIMIT 1

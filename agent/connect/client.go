@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -52,6 +53,9 @@ type Client struct {
 
 	sendMu      sync.Mutex
 	currentSend func(m proto.Message) error
+	// connReady 反映当前控制连接是否就绪（握手完成 true，连接终止 false）。
+	// agentctl status 的 "online" 判据。
+	connReady atomic.Bool
 }
 
 func NewClient(serverURL string, k *identity.Key, info machineinfo.Info) *Client {
@@ -122,6 +126,42 @@ func (c *Client) RunOnce(ctx context.Context) error {
 	return nil
 }
 
+// Connected 报告当前控制连接是否就绪（HELLO_ACK 后 true；连接终止/重连间隙
+// false）。agentctl status 的 "online" 判据；不触发拨号。
+func (c *Client) Connected() bool { return c.connReady.Load() }
+
+// DeleteNode 机器自注销（spec §7 deregister）：一次性控制连接——挑战认证
+// （机器身份即凭据）→ 发送 NODE_DELETE → 等待服务端关闭（关闭即删除确认；
+// ERROR 帧先到 = 删除失败，返回带错误码的 error）。不进入心跳循环，不影响
+// 可能并存的常驻连接（服务端注销后会自行逐出后者）。
+func (c *Client) DeleteNode(ctx context.Context) error {
+	ws, err := c.handshake(ctx)
+	if err != nil {
+		return err
+	}
+	defer ws.CloseNow()
+	if err := writeMsg(ctx, ws, proto.TypeNodeDelete, struct{}{}); err != nil {
+		return fmt.Errorf("send node_delete: %w", err)
+	}
+	for {
+		m, err := readMsg(ctx, ws, 30*time.Second)
+		if err != nil {
+			// ctx 取消属调用方超时/中止；其余读错误 = 对端关闭 = 删除确认。
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return nil
+		}
+		if m.Type == proto.TypeError {
+			var e proto.ErrorPayload
+			_ = m.Decode(&e)
+			// 服务端错误直通 "<code>: <message>"（agentctl 管道应答同一格式）。
+			return fmt.Errorf("%s: %s", e.Code, e.Message)
+		}
+		// 其他帧（迟到的心跳 ACK 等）：忽略，继续等关闭。
+	}
+}
+
 // handshake 拨号并完成认证：dial → CHALLENGE → CHALLENGE_RESPONSE → HELLO →
 // HELLO_ACK。成功返回就绪连接（调用方负责关闭）；任何失败路径连接已关闭。
 func (c *Client) handshake(ctx context.Context) (*websocket.Conn, error) {
@@ -181,6 +221,8 @@ func (c *Client) once(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	c.connReady.Store(true)
+	defer c.connReady.Store(false)
 	defer ws.CloseNow()
 
 	// 连接就绪（HELLO_ACK 已收到、读循环未启动）：把本条连接的控制写闭包经

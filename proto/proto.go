@@ -23,6 +23,10 @@ const (
 	// 自更新（agent 拉取 bundle 的指令走已认证控制通道，内容走 HTTPS）。
 	TypeUpdateOffer  = "UPDATE_OFFER"
 	TypeUpdateStatus = "UPDATE_STATUS"
+	// NODE_DELETE：agent → server 机器自注销（spec §7 deregister）。仅经已认证
+	// 控制连接发送——机器身份（挑战-应答签名）即凭据，无 JWT；服务端删除节点
+	// 行、逐出该节点全部在线连接并以关闭本连接作为确认（无独立 ack 帧）。
+	TypeNodeDelete = "NODE_DELETE"
 )
 
 func NewMsg(typ string, payload any) (Message, error) {
