@@ -158,4 +158,20 @@
 
 ## Results
 
-（实施时回填）
+### Task 6 (2026-09-03): Inno Setup 安装器 — real-machine verification, all green
+
+Artifacts: `installer/xnc.iss`, `installer/build.ps1`, Makefile `installer` target (CHANNEL/VERSION passthrough). Built `bin/xnc-setup-0.6.1.exe` (sha256 `2d39241788433450bf3f3cabb18fff68164287281d4fa0c4e4a0002e50be3c49`, sidecar `bin/xnc-setup-0.6.1.exe.sha256`) via build.ps1 end-to-end (agent 0.6.1 self-report check passed; native build.bat core+desktop; ISCC 6.7.3). Dev channel naming verified: `/DChannel=dev` → `xnc-setup-dev-<ver>.exe`.
+
+Pre-state: `XNCCore`/`XNCAgent` services both absent (sc error 1060) — machine left post-uninstall at the end, matching pre-state.
+
+Cycles (each `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`, elevated, session-safe, no UI):
+1. **install** exit 0 → XNCCore+XNCAgent exist, AUTO_START, RUNNING, recovery restart/5000×3 (reset 86400); 5 files in `C:\Program Files\XNC`; binPaths `..."xnc-agent.exe" run --server= --state-dir="C:\ProgramData\XNC"` (zero secrets) / `"xnc-core.exe" --service XNCCore --secret-file "C:\ProgramData\XNC\core-secret.hex"`; HKLM PATH appended; installer-cache holds exactly 1 exe; uninstall registry Channel=stable, DisplayVersion=0.6.1, InstallDate=20260903; core-secret.hex self-created by XNCCore first start. 21/21 asserts.
+2. **uninstall** exit 0 → services absent, app dir gone (incl. runtime `xnc-core-service.log` via [UninstallDelete]), PATH entry gone, _is1 key gone, `C:\ProgramData\XNC` KEPT (default keep). 6/6.
+3. **reinstall** exit 0 → full installed asserts green again (21/21).
+4. **silent same-version upgrade re-run** (services RUNNING + a held-open `xnc.exe` login prompt) exit 0 → prep log: stopped+deleted RUNNING XNCAgent→XNCCore, `renamed xnc.exe -> xnc.exe.old (in-use swap)`; post log: cache rewritten (count 1), XNCCore→XNCAgent recreated + Running. 21/21.
+5. **final `/SILENT` uninstall** exit 0 → defaults KEEP (no data prompt), ProgramData intact. 6/6.
+6. **`/PURGEDATA=true` cycle** (reinstall then purge-uninstall) exit 0 → `C:\ProgramData\XNC` fully deleted. 4/4.
+
+Post-run: no xnc processes, no leftover schtasks. Watchdog task name contract for T7: `XNCRollbackWatchdog` (uninstalled best-effort, tolerates absence).
+
+Fixes made to the inherited partial work (found by real-machine run): PS `[Parameter(Mandatory)]` on embedded scripts prompted in the hidden window (Mandatory ignores defaults) → hang; removed, values baked as param defaults. Inno 6.7 API drift: `HWND_BROADCAST` now predefined, `WPARAM` unknown → `UINT_PTR`, `CreateCustomForm` now takes 4 args. `[Registry]` Channel entry could never survive (Inno deletes pre-existing `_is1` key when saving uninstall info — after [Registry] created it) → written from ssPostInstall instead. Uninstall "Cancel" on the data dialog aborted nothing → now raises and stops the uninstall. Runtime `*.log`/`*.old` under {app} added to [UninstallDelete].
