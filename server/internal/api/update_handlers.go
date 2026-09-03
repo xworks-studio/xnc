@@ -62,10 +62,10 @@ func verifyBundle(r io.Reader, version string) error {
 			return err
 		}
 		if hdr.Typeflag != tar.TypeReg || hdr.Name != filepath_Base(hdr.Name) {
-			return proto.Err(0, proto.CodeInternal, "bundle contains non-flat entry: "+hdr.Name)
+			return proto.Err(400, proto.CodeInternal, "bundle contains non-flat entry: "+hdr.Name)
 		}
 		if hdr.Size > 64<<20 {
-			return proto.Err(0, proto.CodeInternal, "bundle entry too large")
+			return proto.Err(400, proto.CodeInternal, "bundle entry too large")
 		}
 		b, err := io.ReadAll(tr)
 		if err != nil {
@@ -75,23 +75,23 @@ func verifyBundle(r io.Reader, version string) error {
 	}
 	var mf bundleManifest
 	if err := json.Unmarshal(files["manifest.json"], &mf); err != nil {
-		return proto.Err(0, proto.CodeInternal, "bundle missing/invalid manifest.json")
+		return proto.Err(400, proto.CodeInternal, "bundle missing/invalid manifest.json")
 	}
 	if mf.Version != version {
-		return proto.Err(0, proto.CodeInternal, "manifest version mismatch")
+		return proto.Err(400, proto.CodeInternal, "manifest version mismatch")
 	}
 	if _, ok := files["xnc-agent.exe"]; !ok {
-		return proto.Err(0, proto.CodeInternal, "bundle missing xnc-agent.exe")
+		return proto.Err(400, proto.CodeInternal, "bundle missing xnc-agent.exe")
 	}
 	// 多余文件容忍（旧 bundle 含已退役的 xnc-screen-helper.exe 仍可通过）。
 	for _, f := range mf.Files {
 		b, ok := files[f.Name]
 		if !ok {
-			return proto.Err(0, proto.CodeInternal, "manifest references missing file: "+f.Name)
+			return proto.Err(400, proto.CodeInternal, "manifest references missing file: "+f.Name)
 		}
 		sum := sha256.Sum256(b)
 		if hex.EncodeToString(sum[:]) != f.SHA256 {
-			return proto.Err(0, proto.CodeInternal, "sha256 mismatch: "+f.Name)
+			return proto.Err(400, proto.CodeInternal, "sha256 mismatch: "+f.Name)
 		}
 	}
 	return nil

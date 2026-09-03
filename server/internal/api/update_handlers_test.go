@@ -231,6 +231,20 @@ func TestAdminUploadReleaseSetupArtifact(t *testing.T) {
 	resp = uploadRelease(t, srv.URL, admin, "0.10.3", map[string][]byte{"setup": setup})
 	require.Equal(t, 400, resp.StatusCode)
 	assert.NotContains(t, releaseVersions(t, srv.URL, admin), "0.10.3")
+
+	// 声称版本与 bundle manifest 不一致 → 干净 400（不是 WriteHeader(0)
+	// panic——真实演练发现的缺陷：verifyBundle 曾用 proto.Err(0,...)，
+	// respondError 对 status 0 直接 panic、连接空回复）。
+	resp = uploadRelease(t, srv.URL, admin, "0.10.4", map[string][]byte{
+		"bundle": buildTestBundle(t, "0.10.0"), // manifest 版本 0.10.0
+	})
+	require.Equal(t, 400, resp.StatusCode)
+	var e struct {
+		Error proto.APIError `json:"error"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&e))
+	assert.Contains(t, e.Error.Message, "manifest version mismatch")
+	assert.NotContains(t, releaseVersions(t, srv.URL, admin), "0.10.4")
 }
 
 // TestAdminDeleteReleaseForbidden：非 admin（无任何 cluster owner 身份）→ 403，
