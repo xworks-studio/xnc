@@ -49,8 +49,9 @@ type Client struct {
 	// TargetVersionFunc：快速版本检查回调（HELLO_ACK/心跳 ACK 目标版本）。
 	TargetVersionFunc func(target string)
 	// UpdateAvailableFunc：UPDATE_AVAILABLE 到达（独立 goroutine 分发，
-	// spec §9.1 触发①）。推送只是"立即检查"的提示，接收方自行拉取
-	// setup.json。nil 时静默忽略。
+	// spec §9.1 触发①）。推送载荷在推送路径（updater.HandlePush）下即
+	// 目标清单（URL+SHA256，已认证通道）；接收方也可选择忽略载荷、仅把
+	// 它当作"立即检查一轮"的信号（轮询路径拉 setup.json）。nil 时静默忽略。
 	UpdateAvailableFunc func(ctx context.Context, push proto.UpdateAvailable)
 
 	sendMu      sync.Mutex

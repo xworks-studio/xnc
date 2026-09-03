@@ -57,16 +57,14 @@ func (u *Updater) registerWatchdog(runAt time.Time) error {
 	return nil
 }
 
-// deleteWatchdog 删除看门狗任务（不存在/已过期删除失败均视同成功——
-// 任务是一次性的，残留不重触发，下一次注册 -Force 覆盖）。
-func deleteWatchdog() error {
+// deleteWatchdog 删除看门狗任务（void：不存在/删除失败均视同成功——
+// 任务是一次性的，残留不重触发，下一次注册 -Force 覆盖；失败仅记日志）。
+func deleteWatchdog() {
 	out, err := exec.Command("schtasks", "/Delete", "/TN", WatchdogTask, "/F").CombinedOutput()
 	if err != nil {
-		// 仅记日志：删除失败不影响更新收尾（见函数注释）。
 		slog.Default().Warn("update: watchdog task delete failed (non-fatal)",
 			"err", err, "out", strings.TrimSpace(string(out)))
 	}
-	return nil
 }
 
 // writeWatchdogScript 生成 watchdog.ps1（ASCII，PS 5.1 兼容；参数经烘焙
@@ -98,14 +96,13 @@ func writeWatchdogScript(stateDir, installDir string) error {
 	// 延迟审计标记（agent 无连接的失败上报——bundle 期 failed-marker 模式）。
 	b.WriteString("$audit = Join-Path $StateDir 'update-audit.json'\r\n")
 	b.WriteString("@{ event = 'update_rollback'; from = $from; to = $to; reason = 'watchdog deadline exceeded' } | ConvertTo-Json -Compress | Set-Content -Path $audit -Encoding ascii\r\n")
-	// 先删 pending 再执行回滚安装器：回滚后启动的旧 agent 不得再次触发
-	// 回滚（否则 from==to 死循环）。
-	b.WriteString("Remove-Item -Path $pending -Force\r\n")
 	b.WriteString("$cache = Join-Path $StateDir 'installer-cache'\r\n")
 	// 回滚源查找：顶层（更新从未发生的形态）→ rollback 子目录 stash
 	// （新安装器已把顶层修剪为新版本、agent 又没活到自检的形态）。
 	// 注意元素必须加括号：@('a'+$v+'b', ...) 不加括号时 PS 的逗号/加号
 	// 优先级会把表达式拼坏（真机发现：Test-Path 恒假 → 回滚源丢失）。
+	// 源找到才删 pending：三处皆缺时保留标记退出（非 0），24h 启动兜底
+	// 会在源重新出现后重试；先删标记则坏版本永远无人收拾。
 	b.WriteString("$exe = $null\r\n")
 	b.WriteString("foreach ($leaf in @(('xnc-setup-' + $from + '.exe'), ('xnc-setup-dev-' + $from + '.exe'))) {\r\n")
 	b.WriteString("    $t = Join-Path $cache $leaf\r\n")
@@ -118,7 +115,10 @@ func writeWatchdogScript(stateDir, installDir string) error {
 	b.WriteString("        if (Test-Path $t) { $exe = $t; break }\r\n")
 	b.WriteString("    }\r\n")
 	b.WriteString("}\r\n")
-	b.WriteString("if (-not $exe) { Log \"watchdog: rollback source missing for $from; cannot roll back\"; exit 1 }\r\n")
+	b.WriteString("if (-not $exe) { Log \"watchdog: rollback source missing for $from; keeping pending for backstop retry\"; exit 1 }\r\n")
+	// 执行前删 pending：回滚后启动的旧 agent 不得再次触发回滚（否则
+	// from==to 死循环）。
+	b.WriteString("Remove-Item -Path $pending -Force\r\n")
 	b.WriteString("Log \"watchdog: executing rollback installer in place: $exe\"\r\n")
 	b.WriteString("$proc = Start-Process -FilePath $exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',('/DIR=\"' + $InstallDir + '\"') -WindowStyle Hidden -Wait -PassThru\r\n")
 	b.WriteString("Log ('watchdog: rollback installer exit code ' + $proc.ExitCode)\r\n")

@@ -168,11 +168,10 @@ func newHarness(t *testing.T, version string) *harness {
 		h.regAt = append(h.regAt, at)
 		return nil
 	}
-	u.deleteWatchdogTask = func() error {
+	u.deleteWatchdogTask = func() {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		h.deletes++
-		return nil
 	}
 	u.Report = func(m proto.Message) error {
 		var a proto.UpdateAudit
@@ -672,6 +671,55 @@ func TestStartupVersionMismatchRollsBack(t *testing.T) {
 	}
 }
 
+// --- 场景 12b：回滚三源皆缺 → 保留 pending/看门狗等待兜底重试（评审
+// 修复 round 1 回归钉：先删标记会让坏版本永远无人收拾——24h 启动兜底
+// 以 pending 为判据）---
+
+func TestRollbackNoSourceKeepsPendingForBackstop(t *testing.T) {
+	h := newHarness(t, "0.6.2")
+	h.f.setVersion("0.6.2")
+	h.setHealth(&staticErr{"XNCCore state=Stopped"})
+	h.u.HealthWindow = 100 * time.Millisecond
+	SavePending(h.u.StateDir, &PendingUpdate{From: "0.6.1", To: "0.6.2",
+		StartedAt: time.Now().UTC(), Deadline: time.Now().UTC().Add(15 * time.Minute)})
+	// 不 seed 任何 0.6.1 安装器（顶层/stash/staging 全空）。
+
+	h.u.SelfCheck(context.Background())
+
+	// 回滚已开始（audit + 黑名单）但无源：pending 保留、看门狗保留。
+	if _, ok := LoadPending(h.u.StateDir); !ok {
+		t.Fatal("pending must SURVIVE when rollback has no source (backstop retry needs it)")
+	}
+	if paths, regAt, deletes, audits := h.snapshot(); deletes != 0 || len(paths) != 0 {
+		t.Fatalf("deletes=%d exec=%v, want 0/0 (nothing to run)", deletes, paths)
+	} else if len(regAt) != 0 || len(audits) != 1 || audits[0].Event != proto.UpdateEventRollback {
+		t.Fatalf("reg=%d audits=%+v, want 0/[rollback]", len(regAt), audits)
+	}
+	if _, bad := Blacklisted(h.u.StateDir, "0.6.2"); !bad {
+		t.Fatal("broken version must be blacklisted")
+	}
+
+	// 恢复路径：源重新出现（人工修复安装/操作员补拷）后，过期 pending 的
+	// 24h 启动兜底完成回滚。
+	seedCache(t, h.u.StateDir, "0.6.1", "recovered-source")
+	h.queue(h.fi.ok("rollback-late"))
+	SavePending(h.u.StateDir, &PendingUpdate{From: "0.6.1", To: "0.6.2",
+		StartedAt: time.Now().UTC().Add(-25 * time.Hour),
+		Deadline:  time.Now().UTC().Add(-24 * time.Hour - 45 * time.Minute)})
+
+	h.u.StartupPendingCheck(context.Background())
+
+	if _, ok := LoadPending(h.u.StateDir); ok {
+		t.Fatal("backstop must complete the rollback once a source reappears")
+	}
+	if !h.fi.ran("rollback-late") {
+		t.Fatal("backstop must execute the recovered rollback source")
+	}
+	if _, _, deletes, _ := h.snapshot(); deletes != 1 {
+		t.Fatalf("deletes=%d, want 1 (watchdog removed on completed rollback)", deletes)
+	}
+}
+
 // --- 场景 13：离线回滚 → 延迟审计标记（bundle 期 failed-marker 模式）---
 
 func TestOfflineRollbackWritesDeferredAudit(t *testing.T) {
@@ -804,6 +852,15 @@ func TestWriteWatchdogScriptContent(t *testing.T) {
 	paren := strings.Count(s, "@(('xnc-setup-' + $from + '.exe'), ('xnc-setup-dev-' + $from + '.exe'))")
 	if paren != 2 { // 顶层 + stash 两处查找
 		t.Errorf("parenthesized candidate arrays = %d, want 2", paren)
+	}
+	// 回归钉（评审 round 1）：源三处皆缺时必须保留 pending 退出——删除
+	// 只能发生在两轮查找与 not-found 退出之后。
+	lastLookup := strings.LastIndex(s, "if (-not $exe)")
+	noSrc := strings.Index(s, "keeping pending for backstop retry")
+	remove := strings.Index(s, "Remove-Item -Path $pending -Force")
+	if lastLookup < 0 || noSrc < lastLookup || remove < noSrc {
+		t.Errorf("watchdog script ordering: lastLookup=%d noSourceExit=%d removePending=%d; want lastLookup < noSourceExit < removePending",
+			lastLookup, noSrc, remove)
 	}
 	// 单引号路径转义。
 	if err := writeWatchdogScript(dir, `C:\O'Brien\XNC`); err != nil {

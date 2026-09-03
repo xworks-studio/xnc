@@ -1,11 +1,16 @@
 // build-bundle.go — 打包自更新 bundle（manifest + agent + core/desktop/shell → tar.gz）。
 // 用法: go run scripts/build-bundle.go [--include-helper] <binDir> <version> <out.tar.gz>
 //
+// 遗留工具（spec §14 迁移期）：新 agent（installer 编排，spec §9）不再消费
+// bundle；本脚本仅供存量 bundle agent 的最后一次升级发布（server
+// maybeOfferUpdate 的 bundle 兜底通道），全网切换后随 /api/agent/bundle
+// 一并退役。
+//
 // --include-helper: 额外打包 xnc-screen-helper.exe（从 <binDir> 读）。仅用于
 // 0.4.6 过渡 bundle——0.4.5 agent 的 requiredFiles 仍含已退役的 helper，
 // 缺它 stage 校验会拒收 0.4.6 bundle；0.4.6+ agent 的 requiredFiles 不含
-// helper，apply 只搬 4 个必需文件，helper 留在 staging（apply 成功/回滚都
-// 会清掉 staging，不落盘——见 agent/updater/apply_windows.go RunApply）。
+// helper，apply 只搬 4 个必需文件，helper 留在 staging（旧 bundle agent 的
+// apply-update 子进程会清掉 staging，不落盘）。
 //
 // 版本单一来源：manifest 版本必须与 agent 自报版本一致（agent 构建时经
 // -ldflags 注入 xnc/agent/machineinfo.Version；未注入回落 0.0.0-dev）。

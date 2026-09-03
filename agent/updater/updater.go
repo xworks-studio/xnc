@@ -112,10 +112,10 @@ type Updater struct {
 
 	// 平台缝（orchestrate_windows.go 提供真实现；orchestrate_other.go 桩；
 	// 单测注入假实现——假安装器即普通 .cmd）。
-	execInstaller       func(exePath string) error
-	serviceHealthy      func() error
+	execInstaller        func(exePath string) error
+	serviceHealthy       func() error
 	registerWatchdogTask func(runAt time.Time) error
-	deleteWatchdogTask  func() error
+	deleteWatchdogTask   func() // 删除失败仅记日志（任务一次性，残留不重触发）
 
 	now func() time.Time // 时钟缝（退避/过期测试注入）
 }
@@ -326,15 +326,18 @@ func (u *Updater) applyUpdate(ctx context.Context, m *SetupManifest) error {
 }
 
 // Rollback §9.4 回滚：静默原地重跑 installer-cache 中的 from 版本安装器
-// （顶层 → rollback 子目录 stash → staging 兜底）。先删 pending 与看门狗
-// （防旧 agent 重启后再次触发回滚），再执行；audit 尽力在线发送，离线落
-// 标记由下次连接补报；版本入黑名单。
+// （顶层 → rollback 子目录 stash → staging 兜底）。
+//
+// 顺序（评审修复，round 1）：先做回滚源查找——三处皆缺时**保留 pending
+// 与看门狗**（只 audit + 黑名单 + 报错）：pending 在，StartupPendingCheck
+// 的 24h 兜底会在之后的每次成功启动重试回滚，一旦源重新出现（人工修复
+// 安装/操作员补拷缓存）即恢复；先删标记则节点永远停在坏版本且无人知晓。
+// 源找到才删 pending+看门狗（防回滚后的旧 agent 再次触发回滚），再执行；
+// audit 尽力在线发送，离线落标记由下次连接补报；版本入黑名单。
 func (u *Updater) Rollback(p *PendingUpdate, reason string) error {
 	u.audit(&proto.UpdateAudit{Event: proto.UpdateEventRollback,
 		From: p.From, To: p.To, Reason: reason})
 	BlacklistVersion(u.StateDir, p.To, "rolled back: "+reason)
-	_ = DeletePending(u.StateDir)
-	_ = u.deleteWatchdogTask()
 	src := CachedInstaller(u.StateDir, p.From)
 	if src == "" {
 		src = CachedRollbackInstaller(u.StateDir, p.From)
@@ -343,10 +346,12 @@ func (u *Updater) Rollback(p *PendingUpdate, reason string) error {
 		src = StagedInstaller(u.StateDir, p.From)
 	}
 	if src == "" {
-		err := fmt.Errorf("rollback: no cached installer for %s", p.From)
-		u.log().Error("update: " + err.Error())
-		return err
+		u.log().Error("update: rollback source missing; keeping pending for backstop retry",
+			"from", p.From, "to", p.To)
+		return fmt.Errorf("rollback: no cached installer for %s", p.From)
 	}
+	_ = DeletePending(u.StateDir)
+	u.deleteWatchdogTask()
 	u.log().Warn("update: rolling back by re-running cached installer",
 		"from", p.From, "brokenTo", p.To, "installer", src, "reason", reason)
 	return u.execInstaller(src)
@@ -428,7 +433,7 @@ func (u *Updater) finalize(p *PendingUpdate) {
 			"version", p.To, "err", err)
 	}
 	_ = DeletePending(u.StateDir)
-	_ = u.deleteWatchdogTask()
+	u.deleteWatchdogTask()
 	clearRollbackStash(u.StateDir)
 	ClearThrottle(u.StateDir, p.To)
 	u.log().Info("update: complete", "from", p.From, "to", p.To)

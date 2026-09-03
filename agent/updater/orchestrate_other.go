@@ -27,7 +27,7 @@ func (u *Updater) platform() {
 		}
 	}
 	if u.deleteWatchdogTask == nil {
-		u.deleteWatchdogTask = func() error { return nil }
+		u.deleteWatchdogTask = func() {}
 	}
 }
 

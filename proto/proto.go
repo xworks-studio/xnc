@@ -21,8 +21,9 @@ const (
 	TypeSessionRefused = "SESSION_REFUSED"
 	TypeSessionClose   = "SESSION_CLOSE"
 	// 自更新（spec §9，安装器即更新器）。UPDATE_AVAILABLE：server → agent
-	// 新版本推送——仅是"立即检查一轮"的提示，setup.json 才是清单权威
-	// （版本/url/sha256 以 agent 自行拉取的 setup.json 为准）。
+	// 新版本推送。推送路径（HandlePush）下推送载荷即目标清单（见
+	// UpdateAvailable 注释）；轮询路径（6h / 目标版本信号）由 agent 自行
+	// 拉取 setup.json 作清单。两路收敛到同一编排。
 	TypeUpdateAvailable = "UPDATE_AVAILABLE"
 	// UPDATE_AUDIT：agent → server 更新结果审计（update_ok / update_rollback，
 	// spec §9.4）。仅经已认证控制连接发送；server 侧记审计日志。
@@ -81,9 +82,11 @@ type HeartbeatAck struct {
 	TargetVersion string `json:"targetVersion,omitempty"`
 }
 
-// UpdateAvailable 服务端 → agent：新版本推送提示（spec §9.1）。字段与
-// setup.json 对齐；agent 收到后立即拉取 setup.json 复核（哈希即真相，
-// 推送仅是触发信号，不作为下载凭证）。
+// UpdateAvailable 服务端 → agent：新版本推送（spec §9.1）。推送路径
+// （HandlePush）下载荷即目标清单：URL + SHA256 直接作为下载凭证与信任
+// 根——控制通道已经挑战-应答认证，sha256 即真相（与遗留 UPDATE_OFFER
+// 同一信任模型）；URL 须与 server 同源（agent 侧强制）。轮询路径则由
+// agent 自行拉取 setup.json 作清单。字段与 setup.json 对齐。
 type UpdateAvailable struct {
 	Version string `json:"version"`
 	URL     string `json:"url"` // /setup.exe?channel=<ch>（相对路径）
