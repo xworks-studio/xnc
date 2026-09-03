@@ -96,7 +96,7 @@ Exit codes:
 		// Node & cluster management
 		newNodeCmd(), newClusterCmd(), newTokenCmd(),
 		// Auth & info
-		newLoginCmd(), newRegisterCmd(), newDeregisterCmd(),
+		newLoginCmd(), newLogoutCmd(), newRegisterCmd(), newDeregisterCmd(),
 		newWhoamiCmd(), newStatusCmd(), newVersionCmd(),
 		// Admin & maintenance
 		newAuditCmd(), newUpdateCmd(), newUpgradeCmd(),

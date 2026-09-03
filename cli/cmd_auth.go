@@ -108,6 +108,61 @@ func readLine(r *os.File) (string, error) {
 	return strings.TrimSpace(line), err
 }
 
+// newLogoutCmd builds `xnc logout` (spec §7).
+//
+// Scope is the *user session* only: it deletes the JWT from
+// ~/.xnc/config.json while keeping server, remembered_email and channel. It
+// never touches the node binding under ProgramData, so an enrolled node keeps
+// running — logout is explicitly NOT deregister (会话(人) vs 注册(机器)).
+func newLogoutCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "logout",
+		Short: "Log out (remove the saved JWT; this node's registration and online state are unaffected)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, found := readConfigFile()
+			if !found || cfg.Token == "" {
+				// Idempotent: nothing to clear is a success, not an error.
+				if jsonOut(cmd) {
+					PrintJSON(true, map[string]any{"logged_out": false}, nil)
+				} else {
+					fmt.Println("not logged in")
+				}
+				printTokenEnvNote(cmd)
+				return nil
+			}
+			cfg.Token = "" // keep Server, RememberedEmail, Channel (spec §7)
+			if err := SaveConfig(cfg); err != nil {
+				return failAPI(cmd, proto.Err(0, proto.CodeInternal, "save config: "+err.Error()))
+			}
+			if jsonOut(cmd) {
+				PrintJSON(true, map[string]any{
+					"logged_out":       true,
+					"remembered_email": cfg.RememberedEmail,
+				}, nil)
+			} else {
+				fmt.Printf("Logged out (token removed from %s)\n", configPath())
+				if cfg.RememberedEmail != "" {
+					fmt.Printf("remembered email kept: %s\n", cfg.RememberedEmail)
+				}
+			}
+			printTokenEnvNote(cmd)
+			return nil
+		},
+	}
+	addJSONFlag(cmd)
+	return cmd
+}
+
+// printTokenEnvNote warns that an XNC_TOKEN env var keeps overriding the
+// (now-cleared) file token until it is unset. outf diverts to stderr in
+// --json mode so stdout stays a single envelope (Agent-First contract).
+func printTokenEnvNote(cmd *cobra.Command) {
+	if os.Getenv("XNC_TOKEN") != "" {
+		outf(cmd, "note: XNC_TOKEN is set in the environment; it still overrides the config file until unset\n")
+	}
+}
+
 func newWhoamiCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "whoami",

@@ -50,6 +50,21 @@ func LoadConfig() (Config, error) {
 	return c, nil
 }
 
+// readConfigFile reads the config file only — no env merge. Logout uses it to
+// detect a *file* token and to rewrite the file fields as-is (XNC_TOKEN in the
+// environment must not leak into the saved config).
+func readConfigFile() (Config, bool) {
+	b, err := os.ReadFile(configPath())
+	if err != nil {
+		return Config{}, false
+	}
+	var c Config
+	if json.Unmarshal(b, &c) != nil {
+		return Config{}, false
+	}
+	return c, true
+}
+
 // SaveConfig writes the config file with 0600 permissions.
 func SaveConfig(c Config) error {
 	if err := os.MkdirAll(filepath.Dir(configPath()), 0o700); err != nil {
