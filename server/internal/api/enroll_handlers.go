@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
@@ -91,6 +92,85 @@ type enrollReq struct {
 	PublicKey    string `json:"publicKey"`
 }
 
+// enrollNode 共用注册落库事务（spec §6.4：JWT 注册路径"等价于服务端铸造并
+// 消费一次性 enrollment token"——两条路径只差授权，落库语义同一）：
+//
+//	tx 开始 → 幂等：同 (cluster, machineId, publicKey) 复用既有节点（不烧
+//	token，不重复审计）→ tokenID 非 nil 时消费一次性 token → 节点名唯一化
+//	（hostname、hostname-2…）→ CreateNode → 审计 → commit。
+//
+// tokenID 由 token 授权路径（/api/agent/enroll）传入；用户 JWT 路径传 nil。
+// 审计 action 与 actor 由调用方给出（"node.enroll"/token 创建者 vs
+// "register"/调用用户）。幂等复用与同 machineId 异 key（409
+// NODE_ALREADY_ENROLLED）均在事务内判定。req.Token 字段在此路径被忽略。
+func (h *handlers) enrollNode(ctx context.Context, clusterID uuid.UUID, req enrollReq,
+	tokenID *uuid.UUID, auditAction string, auditActor uuid.UUID,
+) (sqlc.Node, *proto.APIError) {
+	tx, err := h.st.Pool().Begin(ctx)
+	if err != nil {
+		return sqlc.Node{}, proto.Err(500, proto.CodeInternal, "tx")
+	}
+	defer tx.Rollback(ctx)
+	q := sqlc.New(tx)
+
+	// 幂等：同 (cluster, machineId, publicKey) 复用既有节点。
+	if existing, err := q.GetNodeByIdentity(ctx, sqlc.GetNodeByIdentityParams{
+		ClusterID: clusterID, MachineID: req.MachineID}); err == nil {
+		if existing.PublicKey == req.PublicKey {
+			_ = tx.Commit(ctx)
+			return existing, nil
+		}
+		return sqlc.Node{}, proto.Err(409, proto.CodeNodeAlreadyEnrolled,
+			"machine already enrolled with a different key")
+	}
+
+	if tokenID != nil {
+		if _, err := q.ConsumeEnrollmentToken(ctx, *tokenID); err != nil {
+			return sqlc.Node{}, proto.Err(401, proto.CodeEnrollmentTokenInvalid, "token exhausted")
+		}
+	}
+
+	name := req.Hostname
+	for i := 2; ; i++ {
+		if _, err := q.GetNodeByNameInCluster(ctx, sqlc.GetNodeByNameInClusterParams{
+			ClusterID: clusterID, Name: name}); err != nil {
+			break
+		}
+		name = req.Hostname + "-" + strconv.Itoa(i)
+	}
+
+	node, err := q.CreateNode(ctx, sqlc.CreateNodeParams{
+		ID: uuid.New(), ClusterID: clusterID, Name: name, MachineID: req.MachineID,
+		Hostname: req.Hostname, OsVersion: req.OSVersion,
+		AgentVersion: req.AgentVersion, PublicKey: req.PublicKey,
+	})
+	if err != nil {
+		return sqlc.Node{}, proto.Err(500, proto.CodeInternal, "create node")
+	}
+	// audit_logs 的 user_id/cluster_id/node_id 为可空列，sqlc 生成 pgtype.UUID（见 Task 6 评审注记）。
+	if err := q.InsertAuditLog(ctx, sqlc.InsertAuditLogParams{
+		UserID:    pgtype.UUID{Bytes: auditActor, Valid: true},
+		ClusterID: pgtype.UUID{Bytes: clusterID, Valid: true},
+		NodeID:    pgtype.UUID{Bytes: node.ID, Valid: true},
+		Action:    auditAction, Metadata: []byte("{}"),
+	}); err != nil {
+		return sqlc.Node{}, proto.Err(500, proto.CodeInternal, "audit")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return sqlc.Node{}, proto.Err(500, proto.CodeInternal, "commit")
+	}
+	return node, nil
+}
+
+// respondEnrolled 统一两条注册路径的成功响应。
+func respondEnrolled(w http.ResponseWriter, node sqlc.Node) {
+	respondJSON(w, 201, map[string]string{
+		"nodeId": node.ID.String(), "clusterId": node.ClusterID.String(), "name": node.Name})
+}
+
+// agentEnroll 处理 POST /api/agent/enroll：一次性 enrollment token 授权的
+// 节点注册——token 查验/过期判定后走共用落库事务 enrollNode（token 在事务内
+// 幂等检查之后消费，幂等复用不烧 token）。
 func (h *handlers) agentEnroll(w http.ResponseWriter, r *http.Request) {
 	var req enrollReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -111,68 +191,10 @@ func (h *handlers) agentEnroll(w http.ResponseWriter, r *http.Request) {
 		respondError(w, proto.Err(400, proto.CodeInternal, "bad public key"))
 		return
 	}
-
-	ctx := r.Context()
-	tx, err := h.st.Pool().Begin(ctx)
-	if err != nil {
-		respondError(w, proto.Err(500, proto.CodeInternal, "tx"))
+	node, apiErr := h.enrollNode(r.Context(), tok.ClusterID, req, &tok.ID, "node.enroll", tok.CreatedBy)
+	if apiErr != nil {
+		respondError(w, apiErr)
 		return
 	}
-	defer tx.Rollback(ctx)
-	q := sqlc.New(tx)
-
-	// 幂等：同 (cluster, machineId, publicKey) 复用既有节点。
-	if existing, err := q.GetNodeByIdentity(ctx, sqlc.GetNodeByIdentityParams{
-		ClusterID: tok.ClusterID, MachineID: req.MachineID}); err == nil {
-		if existing.PublicKey == req.PublicKey {
-			_ = tx.Commit(ctx)
-			respondJSON(w, 201, map[string]string{
-				"nodeId": existing.ID.String(), "clusterId": existing.ClusterID.String(),
-				"name": existing.Name})
-			return
-		}
-		respondError(w, proto.Err(409, proto.CodeNodeAlreadyEnrolled,
-			"machine already enrolled with a different key"))
-		return
-	}
-
-	if _, err := q.ConsumeEnrollmentToken(ctx, tok.ID); err != nil {
-		respondError(w, proto.Err(401, proto.CodeEnrollmentTokenInvalid, "token exhausted"))
-		return
-	}
-
-	name := req.Hostname
-	for i := 2; ; i++ {
-		if _, err := q.GetNodeByNameInCluster(ctx, sqlc.GetNodeByNameInClusterParams{
-			ClusterID: tok.ClusterID, Name: name}); err != nil {
-			break
-		}
-		name = req.Hostname + "-" + strconv.Itoa(i)
-	}
-
-	node, err := q.CreateNode(ctx, sqlc.CreateNodeParams{
-		ID: uuid.New(), ClusterID: tok.ClusterID, Name: name, MachineID: req.MachineID,
-		Hostname: req.Hostname, OsVersion: req.OSVersion,
-		AgentVersion: req.AgentVersion, PublicKey: req.PublicKey,
-	})
-	if err != nil {
-		respondError(w, proto.Err(500, proto.CodeInternal, "create node"))
-		return
-	}
-	// audit_logs 的 user_id/cluster_id/node_id 为可空列，sqlc 生成 pgtype.UUID（见 Task 6 评审注记）。
-	if err := q.InsertAuditLog(ctx, sqlc.InsertAuditLogParams{
-		UserID:    pgtype.UUID{Bytes: tok.CreatedBy, Valid: true},
-		ClusterID: pgtype.UUID{Bytes: tok.ClusterID, Valid: true},
-		NodeID:    pgtype.UUID{Bytes: node.ID, Valid: true},
-		Action:    "node.enroll", Metadata: []byte("{}"),
-	}); err != nil {
-		respondError(w, proto.Err(500, proto.CodeInternal, "audit"))
-		return
-	}
-	if err := tx.Commit(ctx); err != nil {
-		respondError(w, proto.Err(500, proto.CodeInternal, "commit"))
-		return
-	}
-	respondJSON(w, 201, map[string]string{
-		"nodeId": node.ID.String(), "clusterId": node.ClusterID.String(), "name": node.Name})
+	respondEnrolled(w, node)
 }

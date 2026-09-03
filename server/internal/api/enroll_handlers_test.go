@@ -10,6 +10,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"xnc/server/internal/tokens"
 )
 
 func TestEnrollment(t *testing.T) {
@@ -100,4 +102,87 @@ func TestEnrollment(t *testing.T) {
 	assert.Contains(t, actions, "node.enroll")
 
 	_ = priv
+}
+
+// TestAgentEnrollRegression 抽取共用落库函数（enrollNode）前的行为钉子：
+// 覆盖 TestEnrollment 未钉住的分支——token 无效/过期、公钥格式、节点名去重
+// 后缀、审计列（actor=token 创建者）。重构前后此测试必须逐字不变地通过。
+func TestAgentEnrollRegression(t *testing.T) {
+	env := NewTestEnv(t)
+	srv := httptest.NewServer(env.Router)
+	defer srv.Close()
+	admin := env.AdminToken(t)
+	adminID := env.AdminUUID(t)
+	cluster := defaultClusterID(t, srv.URL, admin)
+
+	pub, _, _ := ed25519.GenerateKey(nil)
+	pubB64 := base64.StdEncoding.EncodeToString(pub)
+	enrollBody := func(token, pub, hostname, machineID string) *bytes.Buffer {
+		return bytes.NewBufferString(`{"token":"` + token + `","hostname":"` + hostname +
+			`","machineId":"` + machineID +
+			`","osVersion":"Windows","agentVersion":"0.1.0","publicKey":"` + pub + `"}`)
+	}
+	enroll := func(token, pub, hostname, machineID string) int {
+		t.Helper()
+		resp, err := http.Post(srv.URL+"/api/agent/enroll", "application/json",
+			enrollBody(token, pub, hostname, machineID))
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+	var errBody struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	enrollCode := func(token, pub, hostname, machineID string) string {
+		t.Helper()
+		resp, err := http.Post(srv.URL+"/api/agent/enroll", "application/json",
+			enrollBody(token, pub, hostname, machineID))
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		require.NoError(t, decodeJSON(resp.Body, &errBody))
+		return errBody.Error.Code
+	}
+
+	// 1. token 不存在 → 401 ENROLLMENT_TOKEN_INVALID
+	assert.Equal(t, 401, enroll("no-such-token", pubB64, "H", "m-reg-1"))
+	assert.Equal(t, "ENROLLMENT_TOKEN_INVALID", enrollCode("no-such-token", pubB64, "H", "m-reg-1"))
+
+	// 2. token 过期 → 410 ENROLLMENT_TOKEN_EXPIRED（DB 直改 expires_at）
+	expTok := env.CreateEnrollToken(t)
+	_, err := env.Store.Pool().Exec(t.Context(),
+		`UPDATE enrollment_tokens SET expires_at = now() - interval '1 minute'
+		 WHERE token_hash = $1`, tokens.Hash(expTok))
+	require.NoError(t, err)
+	assert.Equal(t, 410, enroll(expTok, pubB64, "H", "m-reg-2"))
+	assert.Equal(t, "ENROLLMENT_TOKEN_EXPIRED", enrollCode(expTok, pubB64, "H", "m-reg-2"))
+
+	// 3. 公钥格式非法 → 400（token 有效也不进入落库）
+	assert.Equal(t, 400, enroll(env.CreateEnrollToken(t), "not-base64!!", "H", "m-reg-3"))
+
+	// 4. 节点名冲突 → 后缀 -2（同 cluster 同 hostname 不同 machineId）
+	tok4 := env.CreateEnrollToken(t)
+	assert.Equal(t, 201, enroll(tok4, pubB64, "dup-host", "m-reg-4a"))
+	resp5, err := http.Post(srv.URL+"/api/agent/enroll", "application/json",
+		bytes.NewBufferString(`{"token":"`+env.CreateEnrollToken(t)+`","hostname":"dup-host",
+			"machineId":"m-reg-4b","osVersion":"Windows","agentVersion":"0.1.0","publicKey":"`+pubB64+`"}`))
+	require.NoError(t, err)
+	defer resp5.Body.Close()
+	require.Equal(t, 201, resp5.StatusCode)
+	var n5 struct {
+		NodeID string `json:"nodeId"`
+		Name   string `json:"name"`
+	}
+	require.NoError(t, decodeJSON(resp5.Body, &n5))
+	assert.Equal(t, "dup-host-2", n5.Name)
+
+	// 5. audit node.enroll 列：user_id=token 创建者（admin）、cluster_id、node_id
+	var actor, cid, nid string
+	require.NoError(t, env.Store.Pool().QueryRow(t.Context(),
+		`SELECT user_id::text, cluster_id::text, node_id::text FROM audit_logs
+		 WHERE action='node.enroll' AND node_id::text=$1`, n5.NodeID).Scan(&actor, &cid, &nid))
+	assert.Equal(t, adminID.String(), actor)
+	assert.Equal(t, cluster, cid)
+	assert.Equal(t, n5.NodeID, nid)
 }
