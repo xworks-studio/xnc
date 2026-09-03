@@ -1,4 +1,5 @@
-# M1-Slice2 dev topology overlay (docs: scripts/dev-topology.md).
+# Desktop/TURN dev topology overlay (docs: scripts/dev-topology.md; born as
+# the M1-Slice2 overlay, renamed when slice e2e scripts were retired).
 #
 # Adds, on top of the base + dev overlays:
 #   - coturn (static lt-cred dev user, non-TLS dev TURN; TLS/443 is M2)
@@ -9,7 +10,7 @@
 #
 # Up:
 #   cd deploy && docker compose -f docker-compose.yml -f docker-compose.dev.yml \
-#       -f docker-compose.slice2.yml up -d --build
+#       -f docker-compose.turn-dev.yml up -d --build
 #
 # Required env (deploy/.env is read automatically):
 #   XNC_DEV_EXTERNAL_IP   this host's LAN IP (advertised by coturn as
@@ -19,7 +20,7 @@ services:
     ports:
       - "18080:8080"
     environment:
-      # Dev-overlay default (10s) targets E2E offline windows; the slice2 dev
+      # Dev-overlay default (10s) targets E2E offline windows; the turn-dev
       # loop keeps a long-lived agent whose heartbeat is 30s — anything below
       # ~35s makes node status flap offline between beats.
       XNC_HEARTBEAT_TIMEOUT: ${XNC_HEARTBEAT_TIMEOUT:-45s}
@@ -44,7 +45,7 @@ services:
     # the checked-in template is prod-oriented and this overlay predates the
     # config file — see docker-compose.yml coturn comment).
     # -n: no pid file. --no-tls/--no-dtls: dev TURN is plain turn: ...?transport=tcp.
-    # Static lt-cred user (slice2 dev); M2 moves to REST-cred turnover.
+    # Static lt-cred user (dev); production moves to REST-cred turnover.
     command:
       - -n
       - --realm=xnc.dev

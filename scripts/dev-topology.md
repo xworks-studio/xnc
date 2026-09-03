@@ -25,12 +25,12 @@ XNC_DEV_EXTERNAL_IP=<LABS-DEV LAN IP, e.g. 192.168.1.12>   # advertised by cotur
 
 ```bash
 cd deploy && docker compose -f docker-compose.yml -f docker-compose.dev.yml \
-    -f docker-compose.slice2.yml up -d --build
+    -f docker-compose.turn-dev.yml up -d --build
 curl -s http://127.0.0.1:8080/api/health          # {"status":"ok",...}
 curl -s http://<LAN-IP>:18080/api/health          # LAN-reachable check
 ```
 
-`docker-compose.slice2.yml` adds: coturn (static lt-cred dev user
+`docker-compose.turn-dev.yml` adds: coturn (static lt-cred dev user
 `xncdev` / `xncdev-secret`, realm `xnc.dev`, non-TLS dev TURN), server port
 `0.0.0.0:18080 -> 8080` (LAN) alongside the dev overlay's `127.0.0.1:8080`, and
 `XNC_HEARTBEAT_TIMEOUT=45s` (dev default 10s flaps a 30s-heartbeat agent offline).
@@ -122,14 +122,14 @@ $XNC exec $NODE 'Get-Process xnc-agent,xnc-core,xnc-desktop -ErrorAction Silentl
 # hard-killed runs (task kill / reboot) leave temp dirs behind — sweep:
 $XNC exec $NODE 'Remove-Item C:\Users\LABS\AppData\Local\Temp\xnc-dev-agent-* -Recurse -Force -ErrorAction SilentlyContinue; exit 0'
 cd deploy && docker compose -f docker-compose.yml -f docker-compose.dev.yml \
-    -f docker-compose.slice2.yml down          # add -v to also reset the dev DB/nodes
+    -f docker-compose.turn-dev.yml down          # add -v to also reset the dev DB/nodes
 ```
 
 Notes:
 - Dev-server nodes accumulate (one per dev-agent run): harmless; `down -v` resets.
 - TURN credentials for T4/T5: `turn:<LAN-IP>:3478?transport=tcp`, user
   `xncdev` / `xncdev-secret` (static dev lt-cred; REST-cred is M2).
-- Desktop sessions (T5): the slice2 compose sets the server's
+- Desktop sessions (T5): the turn-dev compose sets the server's
   `XNC_TURN_URLS/XNC_TURN_USERNAME/XNC_TURN_CREDENTIAL` from the same static
   user — `POST /api/nodes/{id}/desktop` returns the config in the `turn` field
   and relays it in SESSION_OPEN params. Without it the endpoint answers
