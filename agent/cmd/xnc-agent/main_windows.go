@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -24,9 +25,11 @@ func runAgent(server, token, stateDir, serviceName, desktopCorePipe, desktopCore
 	}
 	// 首启迁移（仅当使用新默认目录时；显式 --state-dir 不迁移）：
 	// 必须先于服务日志打开——日志落在新目录，且日志句柄会占住目录使
-	// 搬移失败。
+	// 搬移失败。SCM 上下文里默认 logger 写向无效句柄，迁移消息由
+	// migrateLegacyStateDir 缓冲、待文件 logger 装好后回放（见下）。
+	var migrationLogs []migrationLog
 	if stateDir == defaultStateDir() {
-		stateDir = migrateLegacyStateDir(stateDir)
+		stateDir, migrationLogs = migrateLegacyStateDir(stateDir)
 	}
 	a := &agent.Agent{ServerURL: server, Token: token, StateDir: stateDir}
 	if svcapp.IsService() {
@@ -36,8 +39,11 @@ func runAgent(server, token, stateDir, serviceName, desktopCorePipe, desktopCore
 			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); ferr == nil {
 			slog.SetDefault(slog.New(slog.NewTextHandler(f, nil)))
 		}
+		// logger 已装好：回放迁移期间缓冲的诊断（此前默认句柄无效）。
+		replayMigrationLogs(migrationLogs)
 		return svcapp.Run(a, serviceName)
 	}
+	replayMigrationLogs(migrationLogs) // 前台模式：默认 stderr 句柄有效
 	return a.Run(cmdContext())
 }
 
@@ -90,6 +96,23 @@ func defaultStateDir() string {
 // legacyStateDirName 旧状态目录名（首启迁移源，设计 §14）。
 const legacyStateDirName = "XNCAgent"
 
+// migrationLog 一条延迟回放的迁移日志。迁移必须先于服务日志打开执行
+// （日志文件在新目录、句柄会占住目录使搬移失败），而 SCM 上下文里默认
+// logger 写向无效句柄——消息缓冲在此，待文件 logger 装好后回放，否则
+// 生产环境丢失「失败保留旧目录」等迁移诊断。
+type migrationLog struct {
+	level slog.Level
+	msg   string
+	args  []any
+}
+
+// replayMigrationLogs 回放缓冲的迁移日志（须在最终 logger 安装后调用）。
+func replayMigrationLogs(logs []migrationLog) {
+	for _, e := range logs {
+		slog.Log(context.Background(), e.level, e.msg, e.args...)
+	}
+}
+
 // migrateLegacyStateDir 首启状态目录迁移（设计 §14）：StateDir 统一为
 // %ProgramData%\XNC。规则：
 //   - 旧目录存在、新目录不存在 → 整体 rename 搬移（identity.json 等
@@ -100,26 +123,32 @@ const legacyStateDirName = "XNCAgent"
 //   - 都不存在 → 创建新目录（空转态也要写服务日志）。0700 与
 //     identity.Save 同一权限约定（Go 映射为 SYSTEM+Administrators+属主）。
 //
-// 返回本次运行实际使用的状态目录。
-func migrateLegacyStateDir(newDir string) string {
+// 返回本次运行实际使用的状态目录 + 缓冲待回放的日志（不直接写 slog：
+// 调用时最终 logger 可能尚未安装，见 migrationLog）。
+func migrateLegacyStateDir(newDir string) (string, []migrationLog) {
 	oldDir := filepath.Join(filepath.Dir(newDir), legacyStateDirName)
 	_, oldErr := os.Stat(oldDir)
 	_, newErr := os.Stat(newDir)
+	var logs []migrationLog
 	switch {
 	case oldErr == nil && newErr == nil:
-		slog.Warn("state dir: legacy and new both exist; using new",
-			"legacy", oldDir, "new", newDir)
+		logs = append(logs, migrationLog{slog.LevelWarn,
+			"state dir: legacy and new both exist; using new",
+			[]any{"legacy", oldDir, "new", newDir}})
 	case oldErr == nil:
 		if err := os.Rename(oldDir, newDir); err != nil {
-			slog.Warn("state dir migration failed; using legacy dir this run",
-				"legacy", oldDir, "new", newDir, "err", err)
-			return oldDir
+			logs = append(logs, migrationLog{slog.LevelWarn,
+				"state dir migration failed; using legacy dir this run",
+				[]any{"legacy", oldDir, "new", newDir, "err", err}})
+			return oldDir, logs
 		}
-		slog.Info("state dir migrated", "from", oldDir, "to", newDir)
+		logs = append(logs, migrationLog{slog.LevelInfo,
+			"state dir migrated", []any{"from", oldDir, "to", newDir}})
 	default:
 		if err := os.MkdirAll(newDir, 0o700); err != nil {
-			slog.Warn("state dir create failed", "dir", newDir, "err", err)
+			logs = append(logs, migrationLog{slog.LevelWarn,
+				"state dir create failed", []any{"dir", newDir, "err", err}})
 		}
 	}
-	return newDir
+	return newDir, logs
 }

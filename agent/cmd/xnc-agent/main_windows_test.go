@@ -3,6 +3,8 @@
 package main
 
 import (
+	"bytes"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -76,8 +78,10 @@ func TestMigrateLegacyStateDir(t *testing.T) {
 		write(old, "identity.json", "{}")
 		write(old, "agent-service.log", "log")
 
-		got := migrateLegacyStateDir(new)
+		got, logs := migrateLegacyStateDir(new)
 		assert.Equal(t, new, got)
+		require.Len(t, logs, 1, "successful move buffers exactly the info entry")
+		assert.Equal(t, slog.LevelInfo, logs[0].level)
 		assert.NoDirExists(t, old, "successful move removes the legacy dir (contents moved, not copied)")
 		for _, f := range []string{"identity.json", "agent-service.log"} {
 			assert.FileExists(t, filepath.Join(new, f), "%s must survive migration", f)
@@ -90,8 +94,11 @@ func TestMigrateLegacyStateDir(t *testing.T) {
 		write(old, "legacy-marker.txt", "old")
 		write(new, "new-marker.txt", "new")
 
-		got := migrateLegacyStateDir(new)
+		got, logs := migrateLegacyStateDir(new)
 		assert.Equal(t, new, got)
+		require.Len(t, logs, 1)
+		assert.Equal(t, slog.LevelWarn, logs[0].level,
+			"both-exist is the diagnostic the ruling requires to be logged")
 		assert.FileExists(t, filepath.Join(old, "legacy-marker.txt"))
 		assert.FileExists(t, filepath.Join(new, "new-marker.txt"))
 	})
@@ -99,8 +106,9 @@ func TestMigrateLegacyStateDir(t *testing.T) {
 	t.Run("neither exists: create new dir", func(t *testing.T) {
 		base := t.TempDir()
 		new := filepath.Join(base, "XNC")
-		got := migrateLegacyStateDir(new)
+		got, logs := migrateLegacyStateDir(new)
 		assert.Equal(t, new, got)
+		assert.Empty(t, logs, "uneventful first boot buffers nothing")
 		assert.DirExists(t, new, "idle-mode first boot still needs the dir for service logs")
 	})
 
@@ -112,9 +120,45 @@ func TestMigrateLegacyStateDir(t *testing.T) {
 		write(old, "identity.json", "{}")
 		t.Chdir(old) // 占用旧目录，让 rename 确定性失败
 
-		got := migrateLegacyStateDir(new)
+		got, logs := migrateLegacyStateDir(new)
 		assert.Equal(t, old, got, "must fall back to legacy dir this run")
+		require.Len(t, logs, 1)
+		assert.Equal(t, slog.LevelWarn, logs[0].level,
+			"ruling: migration failure must be logged (buffered for replay)")
+		assert.Contains(t, logs[0].msg, "migration failed")
 		assert.FileExists(t, filepath.Join(old, "identity.json"), "legacy identity must never be destroyed")
 		assert.NoDirExists(t, new)
 	})
+}
+
+// 服务路径的日志契约（评审 Important 修复）：迁移先于文件 logger 安装
+// 执行（日志文件在新目录、句柄会占住目录），SCM 上下文里默认 logger 写
+// 无效句柄——迁移消息必须缓冲、待 logger 装好后回放，否则生产丢失
+// 「失败保留旧目录」的诊断。此处不真起 SCM 服务，以捕获 logger 等价
+// 验证回放路径。
+func TestReplayMigrationLogsAfterLoggerInstall(t *testing.T) {
+	write := func(dir, name, content string) {
+		require.NoError(t, os.MkdirAll(dir, 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600))
+	}
+
+	// both-exist 场景缓冲一条 warn。
+	base := t.TempDir()
+	old, new := filepath.Join(base, "XNCAgent"), filepath.Join(base, "XNC")
+	write(old, "legacy-marker.txt", "old")
+	write(new, "new-marker.txt", "new")
+	_, entries := migrateLegacyStateDir(new)
+	require.NotEmpty(t, entries)
+
+	// 模拟 runAgent 的服务分支顺序：迁移 → 安装 logger → 回放。
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	replayMigrationLogs(entries)
+
+	out := buf.String()
+	assert.Contains(t, out, "both exist; using new", "buffered warning must reach the installed logger")
+	assert.Contains(t, out, old, "warning must carry the legacy path")
+	assert.Contains(t, out, new, "warning must carry the new path")
 }
