@@ -106,7 +106,7 @@ cd deploy && docker compose -f docker-compose.yml -f docker-compose.dev.yml up -
 ## 构建安装器与版本注入（版本单一来源）
 
 版本号只在构建时注入（agent 自报 / bundle manifest / 安装器同一来源；未注入回落
-`0.0.0-dev`）。安装器：`make installer VERSION=<v> [CHANNEL=stable|dev]`（构建四个
+`0.0.0-dev`）。安装器：`make installer VERSION=<v> [CHANNEL=stable|dev]`（构建五个
 exe 到 `bin/` 后经 Inno Setup 打包 `xnc-setup[-dev]-<v>.exe`）。
 
 ### 最后过渡 bundle（遗留，§14 迁移期）

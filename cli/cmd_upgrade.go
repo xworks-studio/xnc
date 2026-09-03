@@ -81,17 +81,17 @@ func runUpgrade(cmd *cobra.Command, channel string) error {
 	if !resp.OK {
 		return failPipeOp(cmd, resp)
 	}
-	if channel != "" {
-		outf(cmd, "switching channel %s -> %s\n", base.Channel, channel)
-	}
 	out := upgradeOutcome{Triggered: resp.Triggered, Version: base.Version, Channel: base.Channel}
 	if !resp.Triggered {
+		// agent 拒绝触发（更新在途）发生在频道切换之前：绑定未改，
+		// 不打印 switching，只渲染 note。
 		out.Note = resp.Note
 		if out.Note == "" {
 			out.Note = "update already in progress"
 		}
 		outf(cmd, "%s\n", out.Note)
 	} else if channel != "" {
+		outf(cmd, "switching channel %s -> %s\n", base.Channel, channel)
 		outf(cmd, "update triggered\n")
 	} else {
 		outf(cmd, "update triggered (channel %s)\n", base.Channel)

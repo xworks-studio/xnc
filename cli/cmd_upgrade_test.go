@@ -187,6 +187,27 @@ func TestUpgradeNoteWhenAlreadyInProgress(t *testing.T) {
 	assert.Contains(t, out, "0.6.2")
 }
 
+// 在途应答 + --channel：agent 在触碰频道绑定前即拒绝（pending/在途先于
+// 切换），频道实际未变——不得打印 switching channel，只渲染 note。
+func TestUpgradeNoteWhenAlreadyInProgressWithChannel(t *testing.T) {
+	isolatedHome(t)
+	shortenUpgradePolling(t)
+	newScriptPipe(t,
+		st("0.6.1", "online", "stable", nil),
+		agentctlResp{OK: true, Triggered: false, Note: "update already in progress"},
+		st("0.6.1", "online", "stable", &agentctlUpdate{Phase: "applying", From: "0.6.1", To: "0.6.2"}),
+		st("0.6.2", "online", "stable", nil),
+	)
+
+	out, code := captureStdout(t, func() int {
+		return runCLI(t.Context(), []string{"upgrade", "--channel", "dev"})
+	})
+	require.Equal(t, 0, code)
+	assert.Contains(t, out, "update already in progress")
+	assert.NotContains(t, out, "switching channel")
+	assert.Contains(t, out, "0.6.2")
+}
+
 // 检查完成但无更新可应用（update 字段消失、版本未变）：报 up to date，
 // exit 0。
 func TestUpgradeAlreadyUpToDate(t *testing.T) {

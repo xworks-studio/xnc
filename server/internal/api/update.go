@@ -91,12 +91,16 @@ func (h *handlers) targetReleaseFor(ctx context.Context, nodeID uuid.UUID) (sqlc
 	return rel, true
 }
 
-// maybeOfferUpdate — 版本落后则经控制通道下发 UPDATE_OFFER。
+// maybeOfferUpdate — 版本落后则经控制通道推送 UPDATE_AVAILABLE。
 // HELLO 握手、心跳、强制 rollout 三入口共用；幂等性由 agent 侧去重保证
 // （同版本重复推送静默跳过），服务端不做去重以保持无状态。
 //
 // 新协议：release 带 setup.exe 制品 → 推 UPDATE_AVAILABLE（安装器编排，
-// spec §9.1；推送只是"立即检查"的信号，agent 自行拉取 setup.json 复核）。
+// spec §9.1）。推送载荷 {version,url,sha256} 本身即完整清单：agent 的
+// updater.HandlePush 经已认证控制通道收到后直接编排，无需再拉
+// setup.json——sha256 即信任根（下载后校验，不符入黑名单），下载 url
+// 由 agent 强制与 server 同源；拉取 setup.json 是轮询路径（CheckNow）
+// 的清单来源，推送路径不经过。
 // 迁移期兜底：仅含 bundle.tar.gz 的历史 release → 推遗留 UPDATE_OFFER
 // （存量 bundle agent 的最后通道，spec §14；新 agent 对其前向兼容忽略）。
 func (h *handlers) maybeOfferUpdate(ctx context.Context, nodeID uuid.UUID, currentVersion string, send func(proto.Message) error) {
