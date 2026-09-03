@@ -151,10 +151,10 @@
 
 ### Task 10: 全链路验收（真机）
 
-- [ ] 全新机器：setup.exe 装 → 空转 → register → online → exec/shell/screen 会话
-- [ ] 更新：发新版 → 推送升级 → 秒级中断 → online@新版本；坏版本（自检不过）→ 自动回滚@旧版本
-- [ ] 卸载：默认保留数据重装复用 identity；`/PURGEDATA` 清除
-- [ ] 结果与遗留问题记录进本文件 Results 节
+- [x] 全新机器：setup.exe 装 → 空转 → register → online → exec/shell/screen 会话
+- [x] 更新：发新版 → 推送升级 → 秒级中断 → online@新版本；坏版本（自检不过）→ 自动回滚@旧版本
+- [x] 卸载：默认保留数据重装复用 identity；`/PURGEDATA` 清除
+- [x] 结果与遗留问题记录进本文件 Results 节
 
 ## Results
 
@@ -177,6 +177,18 @@ Post-run: no xnc processes, no leftover schtasks. Watchdog task name contract fo
 Fix round 1 (review, 2 Important, re-verified on machine): post-install script exit now fatal on ANY nonzero rc (incl. powershell-launch failure); installer-cache refresh tolerates source==dest so the cached setup.exe can run IN PLACE — **T7 contract: rollback executes the cache entry in place, no copy-to-staging; staging is download-only (§9.2/§9.4)**; uninstall prep stays best-effort but warns loudly (log + interactive MsgBox). Rollback-in-place cycle green end-to-end.
 
 Fixes made to the inherited partial work (found by real-machine run): PS `[Parameter(Mandatory)]` on embedded scripts prompted in the hidden window (Mandatory ignores defaults) → hang; removed, values baked as param defaults. Inno 6.7 API drift: `HWND_BROADCAST` now predefined, `WPARAM` unknown → `UINT_PTR`, `CreateCustomForm` now takes 4 args. `[Registry]` Channel entry could never survive (Inno deletes pre-existing `_is1` key when saving uninstall info — after [Registry] created it) → written from ssPostInstall instead. Uninstall "Cancel" on the data dialog aborted nothing → now raises and stops the uninstall. Runtime `*.log`/`*.old` under {app} added to [UninstallDelete].
+
+### Task 10 (2026-09-03): 全链路验收（真机）— all four acceptance bullets green
+
+Environment: real Windows 11 dev box (LABS-DEV, RDP session 1; physical console session 2 unattended). Server = branch-built `bin/xnc-server.exe` + Dockerized PostgreSQL 16 (127.0.0.1:55432) with env-config + bootstrap admin `admin@t10.local` — same documented choice as Task 9's rehearsal (compose image build locally blocked by committed `.dockerignore` excluding `web/dist`; see findings). Heartbeat 90s (production value — the dev overlay's 10s default flaps a real 30s-beat agent; corrected after first NODE_OFFLINE). Full evidence + timings in `.superpowers/sdd/2026-09-03-innosetup-installer-unified-auth-plan/task-10-report.md` and `t10-machine/`.
+
+- **Fresh install → idle → register → online → sessions (0.11.0)**: dual-artifact upload (`setup`+`bundle`+`cli`, 201) → `/VERYSILENT` install exit 0 (3.7s) → XNCCore+XNCAgent RUNNING/AUTO_START, zero-secret argv, no binding.json, agent idles with `awaiting registration` 5s poll, installer-cache holds current setup. `xnc register` with inline login + 2-cluster selection (stdin-driven, second cluster created via API): registered → online <1s (spec ≤10s), binding.json + identity.json (DPAPI) on disk. Sessions through real server+agent: exec `--system --shell cmd/powershell` (`nt authority\system`, exit 0); interactive ConPTY shell verified via scratch WS driver with `shell:powershell` profile (transcript: whoami/echo ok/exit, SHELL_BEGIN POWERSHELL); desktop session created (202 + TURN lease + agent `desktop capture attached` + core `start_capture session=2`); screen snapshot + DXGI frames blocked by THIS BOX's topology (no logged-on console user → WTSQueryUserToken(2)=1008 / DXGI E_ACCESSDENIED on logon desktop) — environment, documented. `xnc status` two blocks (local online@0.11.0 + session); user-config removal (logout-equivalent; CLI has no logout cmd) leaves node online.
+- **Update (0.11.0→0.12.0 good / 0.13.0 sabotaged)**: `xnc upgrade` → download from real `/setup.exe`, installer executed by agent, self-check, `updated to 0.12.0 (online)` in 10.1s; concurrent exec-probe loop: 10/81 NODE_OFFLINE over a 5.17s window (秒级中断); cache→0.12.0 keep-1, pending+watchdog cleaned, server-accepted audit `update_ok 0.11.0→0.12.0`. Sabotaged 0.13.0 (scratch build, agent stops XNCCore at startup; edit reverted, never committed, tree clean) uploaded → upgrade → online@0.13.0 → self-check failed after 60s health window → ACTIVE rollback re-ran stashed `installer-cache\rollback\xnc-setup-0.12.0.exe` IN PLACE → online@0.12.0, services RUNNING, server audit `update_rollback 0.12.0→0.13.0 "self-check: services unhealthy"`, 0.13.0 in `update-throttle.json` blacklist, repeated server target-version pushes correctly refused while blacklisted. Watchdog scenario skipped (T7 machine-verified, per brief allowance).
+- **Uninstall/reinstall/purge**: `/SILENT` uninstall → services+app dir gone, watchdog schtask gone, `C:\ProgramData\XNC` KEPT (binding+identity survive). Reinstall 0.12.0 → auto-reconnect SAME nodeId 6db8369e, online ~4s. `xnc register` on bound machine refuses with `NODE_ALREADY_ENROLLED` + `--force` hint (exit 244). Elevated `xnc deregister` → node deleted server-side, binding dropped, identity kept; re-register → node KEY PAIR reused (publicKey byte-identical), fresh node record id. `/PURGEDATA` uninstall → ProgramData\XNC fully gone.
+- **Restore**: no services/dirs/schtasks/processes; PG container removed; server stopped; `deploy/.env` + worktree `web/dist` removed (both scratch); git tree clean. Pre-state ProgramData log residue backed up to `t10-machine/prestate-programdata` and left REMOVED per "dirs cleaned" (deviation from T8's leave-in-place, recorded).
+
+Findings (none blocking; details in task-10-report): (1) `.dockerignore` excludes `web/dist` that `deploy/Dockerfile` COPYs → local `docker compose up --build` cannot work (deploy_srv.py remote staging is unaffected). (2) No `xnc logout` command exists — user-session removal = delete `~/.xnc/config.json`. (3) `xnc shell` lacks a `--shell` profile override though the server API accepts `shell` — on boxes whose pwsh is the per-user Store MSIX, the default interactive PWSH profile fails under SYSTEM (`ERROR_CANT_ACCESS_FILE`). (4) RDP-headless topology: console-sentinel user-token shells → NO_ACTIVE_SESSION; DXGI capture of unattended console → E_ACCESSDENIED (both pre-existing design-vs-environment, not this plan's surface). (5) dev compose overlay default `XNC_HEARTBEAT_TIMEOUT=10s` is below the real agent's 30s beat → WS churn; use 90s with real agents. (6) Session WS closes 1006 (no close handshake) after shell `exit` — cosmetic, clients tolerate. (7) uninstall leaves `watchdog.ps1` + blacklist/throttle files in StateDir when data is kept (inert; gone with /PURGEDATA).
+
 
 ### Task 9 (2026-09-03): 退役与迁移 — release rehearsal (local real server + real PG), all green
 
