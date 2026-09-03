@@ -296,11 +296,22 @@ begin
     '}' + #13#10 +
     'Set-Recovery ''XNCAgent''' + #13#10 +
     '# installer-cache: the running setup.exe is the rollback source for the' + #13#10 +
-    '# update orchestration (spec 9.2); keep exactly one copy.' + #13#10 +
+    '# update orchestration (spec 9.2); keep exactly one copy. The rollback' + #13#10 +
+    '# path (spec 9.4) executes the cached exe IN PLACE, so the cache refresh' + #13#10 +
+    '# must tolerate source == destination: Copy-Item onto itself throws under' + #13#10 +
+    '# Stop-preference (T6-T7 contract: rollback runs the cache entry directly,' + #13#10 +
+    '# no copy-to-staging first; staging is download-only, spec 9.2).' + #13#10 +
     '$cacheDir = Join-Path $StateDir ''installer-cache''' + #13#10 +
     'New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null' + #13#10 +
     '$leaf = Split-Path -Leaf $SetupExe' + #13#10 +
-    'Copy-Item -Path $SetupExe -Destination (Join-Path $cacheDir $leaf) -Force' + #13#10 +
+    '$dest = Join-Path $cacheDir $leaf' + #13#10 +
+    '$samePath = [string]::Equals([System.IO.Path]::GetFullPath($SetupExe), [System.IO.Path]::GetFullPath($dest), [System.StringComparison]::OrdinalIgnoreCase)' + #13#10 +
+    'if ($samePath) {' + #13#10 +
+    '    Log "post: setup running from installer-cache in place ($leaf); cache entry already current"' + #13#10 +
+    '} else {' + #13#10 +
+    '    Copy-Item -Path $SetupExe -Destination $dest -Force' + #13#10 +
+    '    Log "post: installer-cache refreshed with $leaf"' + #13#10 +
+    '}' + #13#10 +
     'Get-ChildItem -Path $cacheDir -Filter ''*.exe'' | Where-Object { $_.Name -ne $leaf } | Remove-Item -Force' + #13#10 +
     'Log "post: installer-cache holds $leaf"' + #13#10 +
     'if ($WithCore -eq ''1'') { Start-AndPoll ''XNCCore'' }' + #13#10 +
@@ -445,9 +456,13 @@ begin
 end;
 
 // Spec 3.2/9.3 steps 4-5: recreate services (full declaration), cache the
-// running installer, start services, then PATH. A failure to CREATE a
-// service fails the install (nonzero setup exit code for the update
-// orchestration); a service merely slow to reach Running is a warning.
+// running installer, start services, then PATH. ANY nonzero script exit is
+// fatal to the install (raises -> nonzero setup exit code, which the update
+// orchestration keys on, spec 9.3/9.4): that includes RunPsScript's -1
+// (powershell.exe could not be launched at all) and any unexpected PS
+// failure after services were created - silently succeeding with no
+// services/cache is the worst outcome. A service merely slow to reach
+// Running stays a warning (the script itself exits 0 in that case).
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   script, withCore: String;
@@ -466,12 +481,9 @@ begin
         ExpandConstant('{srcexe}'), XNCStateDir() + '\installer.log'), False) then
     RaiseException('Failed to write the XNC service script.');
   rc := RunPsScript(script);
-  if rc = 1 then
-    RaiseException('XNC service registration failed. See ' +
-      XNCStateDir() + '\installer.log')
-  else if rc <> 0 then
-    InstallerLog('WARN: post-install script exit ' + IntToStr(rc) +
-      ' (see installer.log)');
+  if rc <> 0 then
+    RaiseException('XNC service registration failed (script exit code ' +
+      IntToStr(rc) + '). See ' + XNCStateDir() + '\installer.log');
   AddAppDirToPath();
   // Channel marker in the uninstall entry (spec 3.2; DisplayVersion and
   // InstallDate are written by Inno itself). Deliberately NOT a [Registry]
@@ -617,8 +629,24 @@ begin
     begin
       rc := RunPsScript(script);
       if rc <> 0 then
+      begin
+        // Best-effort on purpose (spec 8 tolerance): a service that will not
+        // delete must not stop us removing what CAN be removed (PATH,
+        // registry, unlocked files) - aborting here would leave strictly more
+        // residue. The failure is not silent: if a service is still RUNNING
+        // its exe is locked and Inno's own file-deletion step fails the
+        // uninstall (nonzero exit); a stopped-but-undeletable (marked-for-
+        // deletion) service leaves a stale SCM entry until reboot, which this
+        // warning names, and re-running the uninstall usually clears.
         InstallerLog('WARN: uninstall prep script exit ' + IntToStr(rc) +
-          ' (see installer.log)');
+          ' (see installer.log; a stale SCM entry may remain until reboot)');
+        if not UninstallSilent() then
+          MsgBox('XNC uninstall could not fully clean up the XNCCore/XNCAgent ' +
+            'services (exit code ' + IntToStr(rc) + '). A stale service entry ' +
+            'may remain until the machine reboots; re-running the uninstall ' +
+            'usually clears it. See ' + XNCStateDir() + '\installer.log',
+            mbError, MB_OK);
+      end;
       DeleteFile(script);
     end;
     // Step 4: {app} files and the uninstall registry entry are removed by
