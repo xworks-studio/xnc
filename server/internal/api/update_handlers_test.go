@@ -1,7 +1,15 @@
 package api
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"mime/multipart"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -13,6 +21,54 @@ import (
 	"xnc/proto"
 	"xnc/server/internal/db/sqlc"
 )
+
+// buildTestBundle 构造能通过 verifyBundle 的最小 bundle.tar.gz
+// （manifest.json + xnc-agent.exe，哈希一致、版本匹配）。
+func buildTestBundle(t *testing.T, version string) []byte {
+	t.Helper()
+	agent := []byte("fake-agent-" + version)
+	sum := sha256.Sum256(agent)
+	mf := fmt.Sprintf(`{"version":%q,"files":[{"name":"xnc-agent.exe","sha256":%q,"size":%d}]}`,
+		version, hex.EncodeToString(sum[:]), len(agent))
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	for _, f := range []struct {
+		name string
+		data []byte
+	}{{"manifest.json", []byte(mf)}, {"xnc-agent.exe", agent}} {
+		require.NoError(t, tw.WriteHeader(&tar.Header{Name: f.name, Mode: 0o644, Size: int64(len(f.data))}))
+		_, err := tw.Write(f.data)
+		require.NoError(t, err)
+	}
+	require.NoError(t, tw.Close())
+	require.NoError(t, gz.Close())
+	return buf.Bytes()
+}
+
+// uploadRelease 经 multipart POST /api/admin/releases 上传；parts 为可选
+// 文件部件（bundle/setup/cli），键即部件名。
+func uploadRelease(t *testing.T, srvURL, token, version string, parts map[string][]byte) *http.Response {
+	t.Helper()
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	require.NoError(t, mw.WriteField("version", version))
+	for name, data := range parts {
+		fw, err := mw.CreateFormFile(name, name)
+		require.NoError(t, err)
+		_, err = fw.Write(data)
+		require.NoError(t, err)
+	}
+	require.NoError(t, mw.Close())
+	req, err := http.NewRequest("POST", srvURL+"/api/admin/releases", &body)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	return resp
+}
 
 // seedRelease 直接经 store 建 release + bundle/cli 制品（删除语义测试无需走
 // 上传端点的 multipart 校验）；相邻 seed 间隔 2ms 保证 created_at 严格递增
@@ -115,6 +171,66 @@ func TestAdminDeleteRelease(t *testing.T) {
 	require.Equal(t, 204, resp.StatusCode)
 	resp = doJSON(t, srv.URL, "GET", "/api/cli/latest?channel=stable", admin, "")
 	require.Equal(t, 404, resp.StatusCode)
+}
+
+// TestAdminUploadReleaseSetupArtifact：上传端点接受可选 setup 部件——
+// bundle + setup.exe 同 release 并存（§14 迁移期发布形态），setup 分发面
+// （/setup.exe /setup.json）立即可服务；纯 bundle 上传（现状）不受影响；
+// 非 PE setup → 400 且 release 不落库；缺 bundle 仍 400（现状保留）。
+func TestAdminUploadReleaseSetupArtifact(t *testing.T) {
+	env := NewTestEnv(t)
+	srv := httptest.NewServer(env.Router)
+	defer srv.Close()
+	admin := env.AdminToken(t)
+
+	setup := append([]byte("MZ"), []byte("fake-inno-setup-0.10.0-payload")...)
+
+	// bundle + setup 同 release → 201。
+	resp := uploadRelease(t, srv.URL, admin, "0.10.0", map[string][]byte{
+		"bundle": buildTestBundle(t, "0.10.0"),
+		"setup":  setup,
+	})
+	require.Equal(t, 201, resp.StatusCode)
+
+	// /setup.exe 直流刚上传的安装器，sha256 头与制品一致。
+	got, body := getSetup(t, srv.URL+"/setup.exe?channel=stable")
+	require.Equal(t, 200, got.StatusCode)
+	assert.Equal(t, setup, body)
+	assert.Equal(t, sha256Hex(body), got.Header.Get("X-Xnc-Sha256"))
+
+	// /setup.json 清单字段与制品一致。
+	mf := getSetupManifest(t, srv.URL+"/setup.json?channel=stable")
+	assert.Equal(t, "0.10.0", mf.Version)
+	assert.Equal(t, sha256Hex(setup), mf.SHA256)
+	assert.Equal(t, int64(len(setup)), mf.Size)
+
+	// bundle 制品同 release 并存（存量 agent 的 legacy 更新通道仍可用，§14）。
+	rel, err := env.Store.Q().GetReleaseByVersion(t.Context(), "0.10.0")
+	require.NoError(t, err)
+	ba, err := env.Store.Q().GetArtifact(t.Context(), sqlc.GetArtifactParams{ReleaseID: rel.ID, Name: bundleArtifactName})
+	require.NoError(t, err)
+	assert.Equal(t, sha256Hex(buildTestBundle(t, "0.10.0")), ba.Sha256)
+
+	// 纯 bundle 上传（无 setup，现状）→ 201；成为 latest 后 /setup.exe 404
+	// （bundle-only release 无 setup 制品，历史语义）。
+	time.Sleep(2 * time.Millisecond) // created_at 严格递增（同 seedRelease）
+	resp = uploadRelease(t, srv.URL, admin, "0.10.1", map[string][]byte{"bundle": buildTestBundle(t, "0.10.1")})
+	require.Equal(t, 201, resp.StatusCode)
+	r2, b2 := getSetup(t, srv.URL+"/setup.exe?channel=stable")
+	assert.Equal(t, 404, r2.StatusCode, "body: %s", b2)
+
+	// setup 非 PE（无 MZ 头）→ 400，release 不落库。
+	resp = uploadRelease(t, srv.URL, admin, "0.10.2", map[string][]byte{
+		"bundle": buildTestBundle(t, "0.10.2"),
+		"setup":  []byte("not-an-exe"),
+	})
+	require.Equal(t, 400, resp.StatusCode)
+	assert.NotContains(t, releaseVersions(t, srv.URL, admin), "0.10.2")
+
+	// 缺 bundle（仅 setup）→ 400（现状：bundle 仍是必需部件）。
+	resp = uploadRelease(t, srv.URL, admin, "0.10.3", map[string][]byte{"setup": setup})
+	require.Equal(t, 400, resp.StatusCode)
+	assert.NotContains(t, releaseVersions(t, srv.URL, admin), "0.10.3")
 }
 
 // TestAdminDeleteReleaseForbidden：非 admin（无任何 cluster owner 身份）→ 403，

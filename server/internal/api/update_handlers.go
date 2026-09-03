@@ -3,7 +3,9 @@
 //
 // 上传方是部署流水线（构建机 curl，admin JWT）——CLI 面向使用者不提供
 // 上传命令。制品经 multipart/form-data：version、notes、bundle（tar.gz，
-// 含 xnc-agent.exe + xnc-core/desktop/shell.exe + manifest.json）、cli（可选
+// 含 xnc-agent.exe + xnc-core/desktop/shell.exe + manifest.json）、setup
+// （可选 Inno Setup 安装器，固定制品名 setup.exe，设计 §4/§12：一次发布
+// 同时携带安装器与最后过渡 bundle，§14 迁移期形态）、cli（可选
 // xnc-windows-amd64.exe）。服务端校验 bundle 内容与 manifest 哈希一致
 // 后入库（bytea，随 pgdata 备份走）。
 package api
@@ -16,6 +18,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 
@@ -142,6 +145,25 @@ func (h *handlers) adminUploadRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// setup（可选）：Inno Setup 安装器（PE 镜像，MZ 魔数兜底校验）。读入并
+	// 校验先于 CreateRelease——非法输入不留半截 release。
+	var setupBytes []byte
+	if sf, _, serr := r.FormFile("setup"); serr == nil {
+		defer sf.Close()
+		setupBytes, serr = io.ReadAll(sf)
+		if serr != nil {
+			respondError(w, proto.Err(400, proto.CodeInternal, "read setup: "+serr.Error()))
+			return
+		}
+		if len(setupBytes) < 2 || setupBytes[0] != 'M' || setupBytes[1] != 'Z' {
+			respondError(w, proto.Err(400, proto.CodeInternal, "setup is not a Windows executable (MZ)"))
+			return
+		}
+	} else if !errors.Is(serr, http.ErrMissingFile) {
+		respondError(w, proto.Err(400, proto.CodeInternal, "read setup part: "+serr.Error()))
+		return
+	}
+
 	ctx := r.Context()
 	channel := r.FormValue("channel")
 	if channel == "" {
@@ -163,6 +185,20 @@ func (h *handlers) adminUploadRelease(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		respondError(w, proto.Err(500, proto.CodeInternal, "store bundle: "+err.Error()))
 		return
+	}
+
+	// setup.exe 与 bundle 同 release 并存（§14 迁移期）：maybeOfferUpdate
+	// 对新 agent 推安装器编排、对存量 agent 兜底 bundle；/setup.exe 与
+	// /setup.json 由 setup_handlers 动态服务该制品。
+	if setupBytes != nil {
+		ssum := sha256.Sum256(setupBytes)
+		if err := h.st.Q().PutArtifact(ctx, sqlc.PutArtifactParams{
+			ReleaseID: rel.ID, Name: setupArtifactName,
+			Sha256: hex.EncodeToString(ssum[:]), Size: int64(len(setupBytes)), Data: setupBytes,
+		}); err != nil {
+			respondError(w, proto.Err(500, proto.CodeInternal, "store setup: "+err.Error()))
+			return
+		}
 	}
 
 	if cf, _, cerr := r.FormFile("cli"); cerr == nil {
