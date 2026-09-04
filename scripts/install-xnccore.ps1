@@ -19,11 +19,9 @@
 # the string (including its embedded quotes) verbatim to the Win32 service
 # API.
 #
-# NOTE for update flows: agent swap/apply steps stop and restart this
-# service; XNCCore pauses (no pipe server) from service stop until the new
-# agent writes its connected marker - up to the ~3 min marker window max.
-#
-# Idempotent: existing service -> just ensure running.
+# NOTE: 安装器升级/回滚路径（installer/xnc.iss）负责服务的停止→删除→重建，
+# 不再经本脚本；本脚本保留为无安装器场景（如 dev 裸部署 xnc-core.exe）的
+# 手动 bootstrap/修复工具。幂等：服务已存在 -> 仅确保运行。
 param(
     [string]$InstallDir = $PSScriptRoot,
     [Parameter(Mandatory = $true)]
