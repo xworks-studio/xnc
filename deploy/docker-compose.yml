@@ -49,6 +49,20 @@ services:
         condition: service_healthy
     expose: ["8080"]
 
+  # Watchtower：轮询 GHCR 自动更新 xnc-server（label 圈定范围，仅此一个
+  # 服务被管理；5 分钟一轮；--cleanup 清旧镜像；不做滚动重启——单实例）。
+  # GHCR 私有包授权：宿主 root 已 docker login ghcr.io（Watchtower 挂载
+  # 同一 config.json）。
+  watchtower:
+    image: containrrr/watchtower:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /root/.docker/config.json:/config.json:ro
+    command: --label-enable --interval 300 --cleanup --revive-stopped
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    restart: unless-stopped
+
   caddy:
     image: caddy:2-alpine
     ports: ["80:80", "443:443"]
@@ -85,17 +99,3 @@ volumes:
   pgdata:
   caddy_data:
   caddy_config:
-
-  # Watchtower：轮询 GHCR 自动更新 xnc-server（label 圈定范围，仅此一个
-  # 服务被管理；5 分钟一轮；--cleanup 清旧镜像；不做滚动重启——单实例）。
-  # GHCR 私有包授权：宿主 root 已 docker login ghcr.io（Watchtower 挂载
-  # 同一 config.json）。
-  watchtower:
-    image: containrrr/watchtower:latest
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /root/.docker/config.json:/config.json:ro
-    command: --label-enable --interval 300 --cleanup --revive-stopped
-    labels:
-      com.centurylinklabs.watchtower.enable: "false"
-    restart: unless-stopped
