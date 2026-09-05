@@ -56,27 +56,26 @@ chi + sqlc + 真 PG 测试）· `agent`（节点侧，Windows 服务）· `cli` 
 - 遗留坑：`agent/session` 存在预存在的 GOOS=linux 构建失败（非 Windows 路径），
   与新改动无关时勿"顺手修"。
 
-## 4. 部署流程（server → xnc.app）
+## 4. 部署流程（server → xnc.app，GHCR + Watchtower 全自动）
 
-顺序固定，缺一步即事故（每条都是实战教训）：
+**部署 = 合并进 main，之后无需任何人工**：push main 触发
+`build-server.yml`（构建 web + 版本镜像 → 推 GHCR `:main`），SRV 上的
+Watchtower（compose 内独立容器，5 分钟轮询、label 圈定仅管 xnc-server）
+自动拉取重建。已实测：提交后 ~8 分钟线上版本翻转。
 
-1. **本地构建 web**：`cd web && npm run build`（服务器不跑 npm）。
-2. **同步代码**：`py deploy/deploy_srv.py push`（打包 proto/server/deploy/web
-   上传解压）。
-3. **⚠️ 删除型变更必须先清远端**：push 的 tar 解包**只覆盖不删除**。若本次
-   变更删过文件/目录：先备份远端 `deploy/.env` → 清空远端
-   `proto/ server/ deploy/ web/` → 重新 push → 恢复 `.env`。不清=新旧混编
-   编译失败、旧二进制假上线（曾发生过）。
-4. **版本**：改远端 `.env` 的 `XNC_VERSION`（`py deploy/deploy_srv.py env`
-   只增不改已有键）。server 版本与 agent release 版本相互独立。
-5. **构建上线**：远端 `docker compose -f deploy/docker-compose.yml build
-   xnc-server && up -d`。**检查构建退出码**——build 失败时 up 会用旧镜像
-   "成功"，必须看 BUILD_RC 或验证新行为（如新端点）真的生效。
-6. **Caddyfile 变更**需 `docker compose up -d --force-recreate caddy`——
-   push 用 tar 替换文件产生**新 inode**，restart 只重启进程、bind mount 仍
-   指旧 inode；必须重建容器重绑挂载（域名翻转时实战踩过）。
-7. 验证：`/api/health` 版本、新端点行为、SPA 哈希更新。
-8. 本机**禁止**运行 xnc-server 栈（spec 红线）；server 只活在 SRV 的 docker。
+- **验证**：`curl https://xnc.app/api/health` 的 version 应为
+  `main-<commit短哈希>`。
+- **锁版本/回滚**：改 compose 的镜像 tag 为 `:vX.Y.Z` 或 `:sha-<哈希>`
+  后 `up -d`（SRV 上直接改，改完记得回改仓库保持一致）。
+- **Caddyfile 变更**仍需 SSH：替换文件后 `docker compose up -d
+  --force-recreate caddy`（tar/编辑器换文件产生新 inode，restart 不够，
+  必须重建容器重绑挂载——域名翻转时实战踩过）。
+- 服务器上**没有源码、没有脚本、没有 cron**：`/opt/xnc` 只有 `deploy/`。
+  `deploy_srv.py` 的 push/up 等命令已退役为应急手段（远端无构建上下文，
+  仅 turnserver 渲染等还有用）。
+- GHCR 拉取授权：SRV root 的 docker config（PAT read:packages）；
+  watchtower 挂载同一 config。
+- 本机**禁止**运行 xnc-server 栈（spec 红线）；server 只活在 SRV 的 docker。
 
 ## 5. 发布流程（安装器/更新）
 
