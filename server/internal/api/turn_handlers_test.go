@@ -33,7 +33,9 @@ func TestTurnStatus(t *testing.T) {
 	assert.Equal(t, "urls", s["mode"])
 	assert.Equal(t, "relay", s["icePolicy"])
 	assert.NotEmpty(t, s["fallbackUrls"])
+	// 空池也必须是 [] 而非 null（web Monitor 对 pool/fallbackUrls 直接 .map）。
 	assert.Empty(t, s["pool"])
+	require.NotNil(t, s["pool"])
 	assert.Equal(t, "testuser", s["username"])   // TestEnv 注入值
 	assert.Equal(t, "testcred", s["credential"]) // 与会话下发同源
 }
@@ -78,6 +80,11 @@ func TestTurnStatusModes(t *testing.T) {
 	s = getTurnStatus(t, offEnv.AdminToken(t), offEnv)
 	assert.Equal(t, "unconfigured", s["mode"])
 	assert.Equal(t, "", s["username"])
+	// 非空数组契约同上：unconfigured 下两个字段均为 [] 而非 null。
+	assert.Empty(t, s["pool"])
+	require.NotNil(t, s["pool"])
+	assert.Empty(t, s["fallbackUrls"])
+	require.NotNil(t, s["fallbackUrls"])
 }
 
 // TestTurnStatusCountsDesktopSessions — desktop 会话计数生效（env.Sess 直建，

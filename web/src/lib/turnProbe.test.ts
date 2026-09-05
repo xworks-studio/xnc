@@ -7,9 +7,8 @@ import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { probeTurn, pcFactory } from "./turnProbe";
 import type { PCFactory } from "./turnProbe";
 
-/** 最小假 PC：两实例经模块级信箱交换 SDP/候选；getStats 返回固定 pair。 */
+/** 最小假 PC：假实现无需真实 ICE（本地描述就绪即产出候选）；getStats 返回固定 pair。 */
 function makeFakePC(rttSeconds: number) {
-  const mailboxes: Array<(msg: unknown) => void> = [];
   const mk = () => {
     const pc: Record<string, unknown> = {
       onicecandidate: null,
@@ -32,10 +31,7 @@ function makeFakePC(rttSeconds: number) {
   };
   const a = mk();
   const b = mk();
-  // 互通：A 的候选直接喂 B（假实现无需真实 ICE）。
-  const origA = a.onicecandidate;
-  void origA;
-  return { a, b, mailboxes };
+  return { a, b };
 }
 
 describe("probeTurn", () => {

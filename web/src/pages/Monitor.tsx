@@ -21,7 +21,7 @@ interface Row {
   healthy: boolean | null;
 }
 
-type ProbeState = "idle" | "probing" | number | "timeout" | "error";
+type ProbeState = "idle" | "probing" | number | "timeout" | "no rtt" | "error";
 
 const REFRESH_MS = 10_000;
 
@@ -66,8 +66,10 @@ export default function Monitor() {
         try {
           const ms = await probeTurn({ urls: row.urls, username: status.username, credential: status.credential });
           setProbes((p) => ({ ...p, [row.key]: ms }));
-        } catch {
-          setProbes((p) => ({ ...p, [row.key]: "timeout" }));
+        } catch (e) {
+          // 区分两类失败：relay 连通但无统计（"no rtt"）≠ 探测超时。
+          const msg = e instanceof Error ? e.message : "";
+          setProbes((p) => ({ ...p, [row.key]: msg === "no rtt" ? "no rtt" : "timeout" }));
         }
       }
     } finally {
@@ -87,7 +89,7 @@ export default function Monitor() {
     const s = probes[key];
     if (s === undefined || s === "idle") return "—";
     if (s === "probing") return "probing…";
-    if (s === "timeout" || s === "error") return s;
+    if (s === "timeout" || s === "no rtt" || s === "error") return s;
     return `${s} ms`;
   };
 
@@ -138,7 +140,7 @@ export default function Monitor() {
               {rows(status).map((row) => (
                 <tr key={row.key}>
                   <td className="mono">{row.label}</td>
-                  <td className="dim mono">{row.urls.some((u) => u.endsWith("udp")) ? "udp/tcp" : "tcp"}</td>
+                  <td className="dim mono">{row.urls.some((u) => !u.endsWith("?transport=tcp")) ? "udp/tcp" : "tcp"}</td>
                   <td className={row.healthy === false ? "form-error" : "dim"}>
                     {row.healthy === null ? "—" : row.healthy ? "healthy" : "unhealthy"}
                   </td>
