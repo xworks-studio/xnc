@@ -11,6 +11,7 @@ import Nodes from "./pages/Nodes";
 import NodeDetail from "./pages/NodeDetail";
 import Terminal from "./pages/Terminal";
 import Users from "./pages/Users";
+import Profile from "./pages/Profile";
 import DesktopLive from "./pages/DesktopLive";
 
 createRoot(document.getElementById("root")!).render(
@@ -38,6 +39,7 @@ createRoot(document.getElementById("root")!).render(
             {/* experimental, not in the sidebar — direct URL only */}
             <Route path="/desktop/:nodeId" element={<DesktopLive />} />
             <Route path="/users" element={<Users />} />
+            <Route path="/profile" element={<Profile />} />
           </Route>
         </Routes>
       </AuthProvider>

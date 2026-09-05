@@ -16,6 +16,7 @@ export interface Auth {
   user: UserDTO | null;
   login: (email: string, password: string) => Promise<void>;
   logout: () => void;
+  updateUser: (user: UserDTO) => void;
 }
 
 const AuthContext = createContext<Auth | null>(null);
@@ -49,7 +50,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(null);
   }, []);
 
-  const value = useMemo(() => ({ user, login, logout }), [user, login, logout]);
+  const updateUser = useCallback((user: UserDTO) => {
+    localStorage.setItem(USER_KEY, JSON.stringify(user));
+    setUser(user);
+  }, []);
+
+  const value = useMemo(
+    () => ({ user, login, logout, updateUser }),
+    [user, login, logout, updateUser],
+  );
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
 

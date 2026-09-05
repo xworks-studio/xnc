@@ -1,4 +1,4 @@
-import { NavLink, useNavigate } from "react-router-dom";
+import { Link, NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "../auth";
 
 /**
@@ -25,9 +25,9 @@ export default function Sidebar() {
       </nav>
       <div className="side-foot">
         {user && (
-          <div className="email" title={user.email}>
+          <Link className="email" to="/profile" title={user.email}>
             {user.email}
-          </div>
+          </Link>
         )}
         <button type="button" className="secondary" onClick={onLogout}>
           Sign out
