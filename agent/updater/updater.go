@@ -443,9 +443,9 @@ func (u *Updater) finalize(p *PendingUpdate) {
 			u.log().Warn("update: cache refresh from staging failed", "err", err)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(u.StateDir, cacheName, cacheInstallerName(p.To, u.Channel))); err != nil {
+	if CachedInstaller(u.StateDir, p.To) == "" {
 		u.log().Warn("update: installer-cache missing new version after finalize",
-			"version", p.To, "err", err)
+			"version", p.To)
 	}
 	_ = DeletePending(u.StateDir)
 	u.deleteWatchdogTask()
@@ -593,15 +593,16 @@ func (u *Updater) ensureRollbackSource(ctx context.Context, target *SetupManifes
 	return CopyToCache(u.StateDir, staged)
 }
 
-// ---- 安装器文件定位（T6 命名契约：xnc-setup[-dev]-<version>.exe）----
+// ---- 安装器文件定位（T6 命名契约：XNC-Setup[-dev]-<version>.exe）----
 
 // cacheInstallerName staging/缓存安装器文件名（与安装器
-// OutputBaseFilename 一致：dev 频道带 -dev 后缀）。
+// OutputBaseFilename 一致：dev 频道带 -dev 后缀）。findInstaller 的后缀
+// 匹配兼容旧命名（xnc-setup-*.exe，0.7.2 及之前），过渡期互认。
 func cacheInstallerName(version, channel string) string {
 	if channel == "dev" {
-		return "xnc-setup-dev-" + version + ".exe"
+		return "XNC-Setup-dev-" + version + ".exe"
 	}
-	return "xnc-setup-" + version + ".exe"
+	return "XNC-Setup-" + version + ".exe"
 }
 
 // findInstaller 在 dir 中查找 version 的安装器（精确候选 + "-<version>.exe"

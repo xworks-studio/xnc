@@ -73,8 +73,8 @@ WS 推送/周期轮询发现 → 下载校验 → 静默执行安装器完成升
 
 | 频道 | 文件名 | 说明 |
 |------|--------|------|
-| stable | `xnc-setup-<version>.exe` | 生产频道 |
-| dev | `xnc-setup-dev-<version>.exe` | 开发频道（对应现有 `-dev` bundle 频道） |
+| stable | `XNC-Setup-<version>.exe` | 生产频道 |
+| dev | `XNC-Setup-dev-<version>.exe` | 开发频道（对应现有 `-dev` bundle 频道） |
 
 `<version>` 与 agent 自报版本同源（构建期 `-ldflags` 注入
 `xnc/agent/machineinfo.Version`）。安装器是**唯一**发布产物：CI 构建五个
@@ -125,7 +125,7 @@ C:\ProgramData\XNC\                # 机器级状态（见 §5）
 ## 4. 下载分发
 
 - `GET /setup.exe?channel=stable|dev` → `302` 到当前频道最新
-  `xnc-setup[-dev]-<version>.exe`（release store 存放，与 bundle 同库）。
+  `XNC-Setup[-dev]-<version>.exe`（release store 存放，与 bundle 同库）。
 - `GET /setup.json?channel=…` → 版本清单：`{version, url, sha256, size,
   releasedAt}`，供 `xnc upgrade --check`、CI 与编排工具消费。
 - 官网/README 的入口统一为 `xnc.app/setup.exe`；`curl -L -o setup.exe
@@ -364,7 +364,7 @@ setup.json 的 `version` == agent 自报版本（`-ldflags` 注入，版本单�
 ## 12. 构建与发布流水线（增量）
 
 1. CI 构建五个二进制（版本注入）。
-2. Inno Setup（`ISCC.exe`）打包 `xnc-setup[-dev]-<version>.exe`（唯一发布
+2. Inno Setup（`ISCC.exe`）打包 `XNC-Setup[-dev]-<version>.exe`（唯一发布
    产物；签名接入后同一产物先签再上传）。
 3. release store 上传：setup.exe + setup.json（同一次发布原子提交）。
 4. `build-bundle.go` 与 server 的 bundle 发布/下载面**退役删除**；

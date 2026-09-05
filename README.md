@@ -68,7 +68,7 @@ xnc exec node1 --cwd C:\xnc --env DEBUG=1 "tool"   # env + cwd
 
 | 操作 | 命令 |
 |---|---|
-| 上传 release | `curl -X POST /api/admin/releases -H "Auth: Bearer $T" -F version=X -F setup=@xnc-setup-X.exe -F cli=@xnc-windows-amd64.exe` |
+| 上传 release | `curl -X POST /api/admin/releases -H "Auth: Bearer $T" -F version=X -F setup=@XNC-Setup-X.exe -F cli=@xnc-windows-amd64.exe` |
 | 灰度单节点 | `curl -X POST /api/admin/rollout -d '{"version":"X","nodeId":"..."}'` |
 | 切节点频道 | `curl -X POST /api/admin/rollout -d '{"nodeId":"...","channel":"dev"}'` |
 | 手动升级本机 | `xnc upgrade [--channel dev]` |
@@ -102,7 +102,7 @@ cd deploy && docker compose -f docker-compose.yml -f docker-compose.dev.yml up -
 
 版本号只在构建时注入（agent 自报 / 安装器打包同一来源；未注入回落
 `0.0.0-dev`）。安装器：`make installer VERSION=<v> [CHANNEL=stable|dev]`（构建五个
-exe 到 `bin/` 后经 Inno Setup 打包 `xnc-setup[-dev]-<v>.exe`）。
+exe 到 `bin/` 后经 Inno Setup 打包 `XNC-Setup[-dev]-<v>.exe`）。
 
 server 构建版本同理（`/api/health` 上报）：`deploy/.env` 设 `XNC_VERSION=<v>`
 后 `py deploy/deploy_srv.py env && py deploy/deploy_srv.py up`，compose 经

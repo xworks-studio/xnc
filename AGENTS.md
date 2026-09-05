@@ -81,7 +81,7 @@ chi + sqlc + 真 PG 测试）· `agent`（节点侧，Windows 服务）· `cli` 
 ## 5. 发布流程（安装器/更新）
 
 1. 构建：`powershell installer/build.ps1 -Version <v> -Channel stable|dev`
-   （或 `make installer VERSION=<v>`）——产 `bin/xnc-setup[-dev]-<v>.exe`
+   （或 `make installer VERSION=<v>`）——产 `bin/XNC-Setup[-dev]-<v>.exe`
    + sha256。五二进制（agent/core/desktop/shell/CLI）版本同源注入。
 2. 上传：admin 登录取 JWT → `POST /api/admin/releases`
    multipart：`version`/`notes`/`channel`/`setup=@...`。bundle 部分已退役

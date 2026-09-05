@@ -127,7 +127,7 @@ try {
 # 3) artifact + sha256 (stdout for CI; sidecar for release metadata).
 $suffix = ""
 if ($Channel -eq "dev") { $suffix = "-dev" }
-$name = "xnc-setup$suffix-$Version.exe"
+$name = "XNC-Setup$suffix-$Version.exe"
 $setup = Join-Path $bin $name
 if (-not (Test-Path $setup)) { throw "setup exe not found after ISCC: $setup" }
 Sign-Artifact $setup

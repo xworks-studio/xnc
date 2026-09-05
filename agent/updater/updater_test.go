@@ -105,16 +105,16 @@ func TestPendingRoundTrip(t *testing.T) {
 
 func TestInstallerFileNamingAndLookup(t *testing.T) {
 	dir := t.TempDir()
-	if got := cacheInstallerName("0.6.2", "stable"); got != "xnc-setup-0.6.2.exe" {
+	if got := cacheInstallerName("0.6.2", "stable"); got != "XNC-Setup-0.6.2.exe" {
 		t.Fatalf("stable name = %q", got)
 	}
-	if got := cacheInstallerName("0.6.2", "dev"); got != "xnc-setup-dev-0.6.2.exe" {
+	if got := cacheInstallerName("0.6.2", "dev"); got != "XNC-Setup-dev-0.6.2.exe" {
 		t.Fatalf("dev name = %q", got)
 	}
 	// 缓存查找：精确名 + 未来频道后缀的后缀匹配；版本前缀不得误配。
 	cache := filepath.Join(dir, cacheName)
 	os.MkdirAll(cache, 0o755)
-	os.WriteFile(filepath.Join(cache, "xnc-setup-0.6.1.exe"), []byte("a"), 0o644)
+	os.WriteFile(filepath.Join(cache, "XNC-Setup-0.6.1.exe"), []byte("a"), 0o644)
 	if got := CachedInstaller(dir, "0.6.1"); got == "" {
 		t.Fatal("exact stable name must be found")
 	}
@@ -124,10 +124,16 @@ func TestInstallerFileNamingAndLookup(t *testing.T) {
 	if got := CachedInstaller(dir, "0.6.2"); got != "" {
 		t.Fatalf("absent version must not be found, got %q", got)
 	}
-	// 后缀匹配兜底（未来频道后缀 xnc-setup-beta-0.6.3.exe）。
-	os.WriteFile(filepath.Join(cache, "xnc-setup-beta-0.6.3.exe"), []byte("a"), 0o644)
+	// 后缀匹配兜底（未来频道后缀 XNC-Setup-beta-0.6.3.exe）。
+	os.WriteFile(filepath.Join(cache, "XNC-Setup-beta-0.6.3.exe"), []byte("a"), 0o644)
 	if got := CachedInstaller(dir, "0.6.3"); got == "" {
 		t.Fatal("suffix fallback must find future channel variants")
+	}
+	// 旧命名兼容（0.7.2 及之前的 xnc-setup-*.exe 缓存/回滚源）：
+	// 大小写不敏感后缀匹配必须互认，过渡期不丢回滚源。
+	os.WriteFile(filepath.Join(cache, "xnc-setup-0.7.2.exe"), []byte("legacy"), 0o644)
+	if got := CachedInstaller(dir, "0.7.2"); got == "" {
+		t.Fatal("legacy xnc-setup-* name must still be found (transition)")
 	}
 }
 
@@ -135,24 +141,24 @@ func TestCopyToCachePrunesAndSamePathNoop(t *testing.T) {
 	dir := t.TempDir()
 	cache := filepath.Join(dir, cacheName)
 	os.MkdirAll(cache, 0o755)
-	os.WriteFile(filepath.Join(cache, "xnc-setup-0.6.0.exe"), []byte("old"), 0o644)
+	os.WriteFile(filepath.Join(cache, "XNC-Setup-0.6.0.exe"), []byte("old"), 0o644)
 
-	src := filepath.Join(dir, "xnc-setup-0.6.1.exe")
+	src := filepath.Join(dir, "XNC-Setup-0.6.1.exe")
 	os.WriteFile(src, []byte("new"), 0o644)
 	if err := CopyToCache(dir, src); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(cache, "xnc-setup-0.6.1.exe")); err != nil {
+	if _, err := os.Stat(filepath.Join(cache, "XNC-Setup-0.6.1.exe")); err != nil {
 		t.Fatal("new entry missing")
 	}
-	if _, err := os.Stat(filepath.Join(cache, "xnc-setup-0.6.0.exe")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(cache, "XNC-Setup-0.6.0.exe")); !os.IsNotExist(err) {
 		t.Fatal("cache must keep exactly one entry")
 	}
 	// 原地路径（源==目的）：不报错、不截断（回滚原地执行契约）。
-	if err := CopyToCache(dir, filepath.Join(cache, "xnc-setup-0.6.1.exe")); err != nil {
+	if err := CopyToCache(dir, filepath.Join(cache, "XNC-Setup-0.6.1.exe")); err != nil {
 		t.Fatalf("same-path copy must be a no-op, got %v", err)
 	}
-	b, _ := os.ReadFile(filepath.Join(cache, "xnc-setup-0.6.1.exe"))
+	b, _ := os.ReadFile(filepath.Join(cache, "XNC-Setup-0.6.1.exe"))
 	if string(b) != "new" {
 		t.Fatalf("same-path copy corrupted file: %q", b)
 	}
@@ -185,18 +191,18 @@ func TestCleanupStaleKeepsStagedInstallers(t *testing.T) {
 	os.MkdirAll(filepath.Join(dir, "update-staging-0.5.0"), 0o755) // bundle 期遗留
 	staging := filepath.Join(dir, stagingName)
 	os.MkdirAll(staging, 0o755)
-	os.WriteFile(filepath.Join(staging, "xnc-setup-0.6.2.exe"), []byte("keep"), 0o644)
-	os.WriteFile(filepath.Join(staging, "xnc-setup-0.6.3.exe.tmp-123"), []byte("partial"), 0o644)
+	os.WriteFile(filepath.Join(staging, "XNC-Setup-0.6.2.exe"), []byte("keep"), 0o644)
+	os.WriteFile(filepath.Join(staging, "XNC-Setup-0.6.3.exe.tmp-123"), []byte("partial"), 0o644)
 
 	CleanupStale(dir)
 
 	if _, err := os.Stat(filepath.Join(dir, "update-staging-0.5.0")); !os.IsNotExist(err) {
 		t.Fatal("legacy staging dir must be removed")
 	}
-	if _, err := os.Stat(filepath.Join(staging, "xnc-setup-0.6.2.exe.tmp-123")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(staging, "XNC-Setup-0.6.2.exe.tmp-123")); !os.IsNotExist(err) {
 		t.Fatal("partial download tmp must be removed")
 	}
-	if _, err := os.Stat(filepath.Join(staging, "xnc-setup-0.6.2.exe")); err != nil {
+	if _, err := os.Stat(filepath.Join(staging, "XNC-Setup-0.6.2.exe")); err != nil {
 		t.Fatal("staged installer must survive (self-check cache refresh needs it)")
 	}
 }

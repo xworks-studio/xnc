@@ -47,18 +47,26 @@ func (h *handlers) latestSetupArtifact(ctx context.Context, channel string) (sql
 }
 
 // setupDownload — GET /setup.exe?channel=stable|dev：频道最新安装器直流。
+// URL 保持短稳定（agent 更新契约不变），正式文件名经 Content-Disposition
+// 下发（XNC-Setup[-dev]-<version>.exe，浏览器另存为所见即所得）。
 func (h *handlers) setupDownload(w http.ResponseWriter, r *http.Request) {
 	channel, ok := setupChannel(r)
 	if !ok {
 		respondError(w, proto.Err(404, "NOT_FOUND", "unknown channel"))
 		return
 	}
-	_, art, aerr := h.latestSetupArtifact(r.Context(), channel)
+	rel, art, aerr := h.latestSetupArtifact(r.Context(), channel)
 	if aerr != nil {
 		respondError(w, aerr)
 		return
 	}
+	suffix := ""
+	if channel == "dev" {
+		suffix = "-dev"
+	}
 	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition",
+		`attachment; filename="XNC-Setup`+suffix+`-`+rel.Version+`.exe"`)
 	w.Header().Set("X-Xnc-Sha256", art.Sha256)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(art.Data)

@@ -104,13 +104,17 @@ func writeWatchdogScript(stateDir, installDir string) error {
 	// 源找到才删 pending：三处皆缺时保留标记退出（非 0），24h 启动兜底
 	// 会在源重新出现后重试；先删标记则坏版本永远无人收拾。
 	b.WriteString("$exe = $null\r\n")
-	b.WriteString("foreach ($leaf in @(('xnc-setup-' + $from + '.exe'), ('xnc-setup-dev-' + $from + '.exe'))) {\r\n")
+	// 候选含旧命名（xnc-setup-*，0.7.2 及之前）：升级后回滚源可能是
+	// 旧 agent 按旧命名缓存的文件，过渡期必须互认（与 Go 侧 findInstaller
+	// 的后缀匹配同一语义）。
+	b.WriteString("$cands = @(('XNC-Setup-' + $from + '.exe'), ('XNC-Setup-dev-' + $from + '.exe'), ('xnc-setup-' + $from + '.exe'), ('xnc-setup-dev-' + $from + '.exe'))\r\n")
+	b.WriteString("foreach ($leaf in $cands) {\r\n")
 	b.WriteString("    $t = Join-Path $cache $leaf\r\n")
 	b.WriteString("    if (Test-Path $t) { $exe = $t; break }\r\n")
 	b.WriteString("}\r\n")
 	b.WriteString("if (-not $exe) {\r\n")
 	b.WriteString("    $stash = Join-Path $cache 'rollback'\r\n")
-	b.WriteString("    foreach ($leaf in @(('xnc-setup-' + $from + '.exe'), ('xnc-setup-dev-' + $from + '.exe'))) {\r\n")
+	b.WriteString("    foreach ($leaf in $cands) {\r\n")
 	b.WriteString("        $t = Join-Path $stash $leaf\r\n")
 	b.WriteString("        if (Test-Path $t) { $exe = $t; break }\r\n")
 	b.WriteString("    }\r\n")
