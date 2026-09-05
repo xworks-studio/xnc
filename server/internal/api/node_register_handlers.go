@@ -34,7 +34,13 @@ type registerReq struct {
 // 化、NodeID 分配），audit 记 register {userId, clusterId}（取代 token 创建+
 // 使用两条审计的拼接）。
 //
-//	成员（viewer 亦可）→ 201 {nodeId, clusterId, name}（幂等复用同款 201）
+// 同 cluster 同 machineId 异 key → adopt（controller 批准设计）：201 复用既有
+// 节点行（同 nodeId、name 不变），重绑 public_key 并刷新机器字段，双审计
+// register + node_adopt。安全边界：同 cluster 成员即可 adopt——与注册新节点
+// 同一信任域（machineId 冲突即说明是同一台机器重装后换 key）；跨 cluster
+// 冲突不走 adopt（不同信任域），须管理端先删除原注册项（见 409 分支）。
+//
+//	成员（viewer 亦可）→ 201 {nodeId, clusterId, name}（幂等/adopt 复用同款 201）
 //	非成员 → 403 FORBIDDEN（spec 明示 403，不走 404 隐藏 cluster 存在性）
 //	404 CLUSTER_NOT_FOUND / 400 缺参、坏公钥或携带 token 字段
 //	409 MACHINE_ID_CONFLICT：machineId 已注册于其他 cluster（message 含冲突
@@ -79,11 +85,12 @@ func (h *handlers) userRegisterNode(w http.ResponseWriter, r *http.Request) {
 			"machineId already registered in cluster "+strconv.Quote(name)))
 		return
 	}
+	// allowAdopt=true：同 cluster 异 key → adopt（见上方注释；token 路径不开启）。
 	node, apiErr := h.enrollNode(r.Context(), c.ID, enrollReq{
 		Hostname: req.Hostname, MachineID: req.MachineID,
 		OSVersion: req.OSVersion, AgentVersion: req.AgentVersion,
 		PublicKey: req.PublicKey,
-	}, nil, "register", u.ID)
+	}, nil, true, "register", u.ID)
 	if apiErr != nil {
 		respondError(w, apiErr)
 		return

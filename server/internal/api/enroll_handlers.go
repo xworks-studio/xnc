@@ -96,15 +96,18 @@ type enrollReq struct {
 // 消费一次性 enrollment token"——两条路径只差授权，落库语义同一）：
 //
 //	tx 开始 → 幂等：同 (cluster, machineId, publicKey) 复用既有节点（不烧
-//	token，不重复审计）→ tokenID 非 nil 时消费一次性 token → 节点名唯一化
-//	（hostname、hostname-2…）→ CreateNode → 审计 → commit。
+//	token，不重复审计）→ 同 machineId 异 key：allowAdopt 时 adopt（重绑公钥、
+//	刷新机器字段复用既有节点行 + 双审计），否则 409 NODE_ALREADY_ENROLLED →
+//	tokenID 非 nil 时消费一次性 token → 节点名唯一化（hostname、hostname-2…）
+//	→ CreateNode → 审计 → commit。
 //
 // tokenID 由 token 授权路径（/api/agent/enroll）传入；用户 JWT 路径传 nil。
 // 审计 action 与 actor 由调用方给出（"node.enroll"/token 创建者 vs
-// "register"/调用用户）。幂等复用与同 machineId 异 key（409
-// NODE_ALREADY_ENROLLED）均在事务内判定。req.Token 字段在此路径被忽略。
+// "register"/调用用户）。allowAdopt 仅用户 JWT register 路径开启（controller
+// 批准的 adopt 语义）；token 路径异 key 维持 409（token 授权域不做身份接
+// 管）。req.Token 字段在此路径被忽略。
 func (h *handlers) enrollNode(ctx context.Context, clusterID uuid.UUID, req enrollReq,
-	tokenID *uuid.UUID, auditAction string, auditActor uuid.UUID,
+	tokenID *uuid.UUID, allowAdopt bool, auditAction string, auditActor uuid.UUID,
 ) (sqlc.Node, *proto.APIError) {
 	tx, err := h.st.Pool().Begin(ctx)
 	if err != nil {
@@ -120,8 +123,34 @@ func (h *handlers) enrollNode(ctx context.Context, clusterID uuid.UUID, req enro
 			_ = tx.Commit(ctx)
 			return existing, nil
 		}
-		return sqlc.Node{}, proto.Err(409, proto.CodeNodeAlreadyEnrolled,
-			"machine already enrolled with a different key")
+		// 同 machineId 异 key：adopt（重绑公钥/刷新机器字段复用既有节点行）或
+		// 409。adopt 双审计（同事务）：常规注册审计（如常）+ node_adopt（显式
+		// 可查的身份重绑记录）。
+		if !allowAdopt {
+			return sqlc.Node{}, proto.Err(409, proto.CodeNodeAlreadyEnrolled,
+				"machine already enrolled with a different key")
+		}
+		node, err := q.AdoptNodeIdentity(ctx, sqlc.AdoptNodeIdentityParams{
+			PublicKey: req.PublicKey, Hostname: req.Hostname,
+			OsVersion: req.OSVersion, AgentVersion: req.AgentVersion, ID: existing.ID,
+		})
+		if err != nil {
+			return sqlc.Node{}, proto.Err(500, proto.CodeInternal, "adopt node")
+		}
+		for _, action := range []string{auditAction, "node_adopt"} {
+			if err := q.InsertAuditLog(ctx, sqlc.InsertAuditLogParams{
+				UserID:    pgtype.UUID{Bytes: auditActor, Valid: true},
+				ClusterID: pgtype.UUID{Bytes: clusterID, Valid: true},
+				NodeID:    pgtype.UUID{Bytes: node.ID, Valid: true},
+				Action:    action, Metadata: []byte("{}"),
+			}); err != nil {
+				return sqlc.Node{}, proto.Err(500, proto.CodeInternal, "audit")
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return sqlc.Node{}, proto.Err(500, proto.CodeInternal, "commit")
+		}
+		return node, nil
 	}
 
 	if tokenID != nil {
@@ -191,7 +220,8 @@ func (h *handlers) agentEnroll(w http.ResponseWriter, r *http.Request) {
 		respondError(w, proto.Err(400, proto.CodeInternal, "bad public key"))
 		return
 	}
-	node, apiErr := h.enrollNode(r.Context(), tok.ClusterID, req, &tok.ID, "node.enroll", tok.CreatedBy)
+	node, apiErr := h.enrollNode(r.Context(), tok.ClusterID, req, &tok.ID, false,
+		"node.enroll", tok.CreatedBy)
 	if apiErr != nil {
 		respondError(w, apiErr)
 		return

@@ -18,6 +18,16 @@ SELECT * FROM nodes WHERE id = $1;
 SELECT c.name FROM nodes n JOIN clusters c ON c.id = n.cluster_id
 WHERE n.machine_id = $1 AND n.cluster_id <> $2 LIMIT 1;
 
+-- name: AdoptNodeIdentity :one
+-- 同 cluster 同 machineId 换 key 重注册（adopt，controller 批准设计）：重绑
+-- public_key 到新 key 并刷新机器字段（hostname/os_version/agent_version——与
+-- CreateNode 创建时设置的字段一致）；shell_type 清空（连接时 HELLO 重新探
+-- 测）、last_seen_at 置空（新 key 尚未连接）。用户可见 name 与 status 不动
+-- （adopt 不改名、不启停）。
+UPDATE nodes SET public_key = $1, hostname = $2, os_version = $3,
+                  agent_version = $4, shell_type = '', last_seen_at = NULL
+WHERE id = $5 RETURNING *;
+
 -- name: DeleteNode :execrows
 -- 机器自注销（spec §7：控制连接上 NODE_DELETE，机器身份即凭据）。返回删除
 -- 行数：0 = 节点已不存在（重复注销按幂等成功处理）。

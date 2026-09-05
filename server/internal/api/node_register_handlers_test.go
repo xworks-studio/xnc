@@ -3,13 +3,18 @@ package api
 import (
 	"crypto/ed25519"
 	"encoding/base64"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"xnc/proto"
+	"xnc/server/internal/db/sqlc"
 )
 
 // registerBody 构造 POST /api/clusters/{id}/nodes/register 请求体（与
@@ -23,7 +28,8 @@ func registerBody(hostname, machineID, pub string) string {
 // {userId, clusterId}；viewer 亦可（任一成员，非 admin-only）；非成员 403；
 // 未知 cluster 404；未认证 401；token 字段 400；缺参/坏公钥 400；machineId
 // 已属其他 cluster → 409 MACHINE_ID_CONFLICT（响应含冲突 cluster 名）；
-// 同 cluster 异 key → 409 NODE_ALREADY_ENROLLED（与跨 cluster 冲突可区分）。
+// 同 cluster 异 key → adopt（201 复用既有节点行，node_adopt 审计；细节语义
+// 见 TestUserNodeRegisterAdopt）。
 func TestUserNodeRegister(t *testing.T) {
 	env := NewTestEnv(t)
 	srv := httptest.NewServer(env.Router)
@@ -144,16 +150,126 @@ func TestUserNodeRegister(t *testing.T) {
 	assert.Equal(t, "MACHINE_ID_CONFLICT", conflict.Error.Code)
 	assert.Contains(t, conflict.Error.Message, `"default"`)
 
-	// 11. 同 cluster 同 machineId 异 key → 409 NODE_ALREADY_ENROLLED（共用
-	// enroll 落库路径，与跨 cluster 冲突码可区分）
+	// 11. 同 cluster 同 machineId 异 key → adopt（controller 批准设计）：201 复用
+	// 既有 nodeId（不新增节点行）、name 不变，审计含 node_adopt；与跨 cluster
+	// 冲突（409 MACHINE_ID_CONFLICT）可区分。字段刷新/连接接管等细节语义见
+	// TestUserNodeRegisterAdopt。
 	resp = register(admin, cluster, registerBody("WEB-03", "reg-mid-1",
 		base64.StdEncoding.EncodeToString(pub2)))
-	require.Equal(t, 409, resp.StatusCode)
-	var dup struct {
-		Error struct {
-			Code string `json:"code"`
-		} `json:"error"`
+	require.Equal(t, 201, resp.StatusCode)
+	var adopted struct {
+		NodeID string `json:"nodeId"`
+		Name   string `json:"name"`
 	}
-	require.NoError(t, decodeJSON(resp.Body, &dup))
-	assert.Equal(t, "NODE_ALREADY_ENROLLED", dup.Error.Code)
+	require.NoError(t, decodeJSON(resp.Body, &adopted))
+	assert.Equal(t, node.NodeID, adopted.NodeID, "adopt reuses the existing node row")
+	assert.Equal(t, "WEB-01", adopted.Name, "adopt must not rename the node")
+	var nAdopt int
+	require.NoError(t, env.Store.Pool().QueryRow(t.Context(),
+		`SELECT count(*) FROM audit_logs WHERE node_id=$1 AND action='node_adopt'`,
+		node.NodeID).Scan(&nAdopt))
+	assert.Equal(t, 1, nAdopt)
+}
+
+// TestUserNodeRegisterAdopt：同 cluster 同 machineId 异 key 的 adopt 全语义
+// （controller 批准设计：同 cluster 成员可接管节点身份——与注册新节点同一信任
+// 域；跨 cluster 冲突仍 409，须管理端先删）：201 复用既有 nodeId，公钥重绑为
+// 新 key，hostname/osVersion/agentVersion 刷新，shell_type 清空（连接时 HELLO
+// 重新探测），last_seen_at 置空（新 key 尚未连接），用户可见 name 不变；审计
+// register（如常）+ node_adopt（各一条）；旧 key 控制连接挑战验签失败，新 key
+// 握手成功。
+func TestUserNodeRegisterAdopt(t *testing.T) {
+	env := NewTestEnv(t)
+	srv := httptest.NewServer(env.Router)
+	defer srv.Close()
+	admin := env.AdminToken(t)
+	cluster := defaultClusterID(t, srv.URL, admin)
+
+	register := func(body string) *http.Response {
+		t.Helper()
+		return doJSON(t, srv.URL, "POST", "/api/clusters/"+cluster+"/nodes/register", admin, body)
+	}
+
+	pubA, privA, _ := ed25519.GenerateKey(nil)
+	pubB, privB, _ := ed25519.GenerateKey(nil)
+	keyA := base64.StdEncoding.EncodeToString(pubA)
+	keyB := base64.StdEncoding.EncodeToString(pubB)
+
+	// key A 首次注册 → 201 {nodeId, name=OLD-HOST}
+	resp := register(registerBody("OLD-HOST", "adopt-mid", keyA))
+	require.Equal(t, 201, resp.StatusCode)
+	var node struct {
+		NodeID string `json:"nodeId"`
+		Name   string `json:"name"`
+	}
+	require.NoError(t, decodeJSON(resp.Body, &node))
+	require.Equal(t, "OLD-HOST", node.Name)
+
+	// 预置"旧身份已连接过"的痕迹（shell_type 探测结果 + last_seen）：adopt 应
+	// 重置身份相关字段——shell_type 清空、last_seen_at 置空（新 key 未见过）。
+	nid := mustUUID(node.NodeID)
+	require.NoError(t, env.Store.Q().UpdateNodeMeta(t.Context(),
+		sqlc.UpdateNodeMetaParams{Hostname: "OLD-HOST", ShellType: "pwsh",
+			AgentVersion: "0.1.0", ID: nid}))
+	require.NoError(t, env.Store.Q().TouchNode(t.Context(), nid))
+
+	// 同 machineId 同 cluster 换 key B + 新机器字段 → 201 同 nodeId（adopt）
+	resp = register(fmt.Sprintf(
+		`{"hostname":"NEW-HOST","machineId":"adopt-mid","osVersion":"Windows 11",
+		 "agentVersion":"0.2.0","publicKey":%q}`, keyB))
+	require.Equal(t, 201, resp.StatusCode)
+	var adopted struct {
+		NodeID string `json:"nodeId"`
+		Name   string `json:"name"`
+	}
+	require.NoError(t, decodeJSON(resp.Body, &adopted))
+	assert.Equal(t, node.NodeID, adopted.NodeID, "adopt must reuse the existing node id")
+	assert.Equal(t, "OLD-HOST", adopted.Name, "adopt must not rename the node")
+
+	// 落库断言：公钥重绑、机器字段刷新、shell_type/last_seen 重置、name 不变。
+	var hostname, osVer, agentVer, shell, pub, name string
+	var lastSeen *time.Time
+	require.NoError(t, env.Store.Pool().QueryRow(t.Context(),
+		`SELECT hostname, os_version, agent_version, shell_type, public_key, name, last_seen_at
+		 FROM nodes WHERE id=$1`, node.NodeID).
+		Scan(&hostname, &osVer, &agentVer, &shell, &pub, &name, &lastSeen))
+	assert.Equal(t, "NEW-HOST", hostname)
+	assert.Equal(t, "Windows 11", osVer)
+	assert.Equal(t, "0.2.0", agentVer)
+	assert.Equal(t, "", shell, "shell_type cleared; re-probed on next connect")
+	assert.Equal(t, keyB, pub, "public key must be rebound to the new key")
+	assert.Equal(t, "OLD-HOST", name)
+	assert.Nil(t, lastSeen, "last_seen_at must not survive adopt (new key has not connected)")
+
+	// 审计：register（如常，共两条——首次创建 + adopt）+ node_adopt（显式可查，
+	// actor=调用用户、target=被接管节点）。
+	var nReg, nAdoptRows int
+	require.NoError(t, env.Store.Pool().QueryRow(t.Context(),
+		`SELECT count(*) FROM audit_logs WHERE node_id=$1 AND action='register'`,
+		node.NodeID).Scan(&nReg))
+	assert.Equal(t, 2, nReg)
+	require.NoError(t, env.Store.Pool().QueryRow(t.Context(),
+		`SELECT count(*) FROM audit_logs WHERE node_id=$1 AND action='node_adopt'`,
+		node.NodeID).Scan(&nAdoptRows))
+	assert.Equal(t, 1, nAdoptRows)
+	var adoptActor string
+	require.NoError(t, env.Store.Pool().QueryRow(t.Context(),
+		`SELECT user_id::text FROM audit_logs
+		 WHERE action='node_adopt' AND node_id=$1`, node.NodeID).Scan(&adoptActor))
+	assert.Equal(t, env.AdminUUID(t).String(), adoptActor)
+
+	// 旧 key A 挑战验签失败：服务端在校验后直接关闭连接（无 HELLO_ACK）。
+	c := dialAgentWS(t, "ws"+env.srv.URL[4:]+"/api/agent/connect")
+	m := readMsg(t, c)
+	require.Equal(t, proto.TypeChallenge, m.Type)
+	var ch proto.Challenge
+	require.NoError(t, m.Decode(&ch))
+	sigMsg, _ := proto.NewMsg(proto.TypeChallengeResponse, proto.ChallengeResponse{
+		NodeID: node.NodeID, Signature: ed25519.Sign(privA, []byte(ch.Nonce))})
+	writeMsg(t, c, sigMsg)
+	require.Error(t, readErr(t, c), "old key must fail the challenge after adopt")
+
+	// 新 key B 握手成功（dialControl 内完成挑战→验签→HELLO→HELLO_ACK）。
+	env.nodes[node.NodeID] = privB
+	_ = dialControl(t, env, node.NodeID)
 }

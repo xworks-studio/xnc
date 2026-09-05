@@ -11,6 +11,53 @@ import (
 	"github.com/google/uuid"
 )
 
+const adoptNodeIdentity = `-- name: AdoptNodeIdentity :one
+UPDATE nodes SET public_key = $1, hostname = $2, os_version = $3,
+                  agent_version = $4, shell_type = '', last_seen_at = NULL
+WHERE id = $5 RETURNING id, cluster_id, name, machine_id, hostname, os_version, agent_version, shell_type, public_key, status, last_seen_at, created_at, target_release, channel
+`
+
+type AdoptNodeIdentityParams struct {
+	PublicKey    string    `json:"public_key"`
+	Hostname     string    `json:"hostname"`
+	OsVersion    string    `json:"os_version"`
+	AgentVersion string    `json:"agent_version"`
+	ID           uuid.UUID `json:"id"`
+}
+
+// 同 cluster 同 machineId 换 key 重注册（adopt，controller 批准设计）：重绑
+// public_key 到新 key 并刷新机器字段（hostname/os_version/agent_version——与
+// CreateNode 创建时设置的字段一致）；shell_type 清空（连接时 HELLO 重新探
+// 测）、last_seen_at 置空（新 key 尚未连接）。用户可见 name 与 status 不动
+// （adopt 不改名、不启停）。
+func (q *Queries) AdoptNodeIdentity(ctx context.Context, arg AdoptNodeIdentityParams) (Node, error) {
+	row := q.db.QueryRow(ctx, adoptNodeIdentity,
+		arg.PublicKey,
+		arg.Hostname,
+		arg.OsVersion,
+		arg.AgentVersion,
+		arg.ID,
+	)
+	var i Node
+	err := row.Scan(
+		&i.ID,
+		&i.ClusterID,
+		&i.Name,
+		&i.MachineID,
+		&i.Hostname,
+		&i.OsVersion,
+		&i.AgentVersion,
+		&i.ShellType,
+		&i.PublicKey,
+		&i.Status,
+		&i.LastSeenAt,
+		&i.CreatedAt,
+		&i.TargetRelease,
+		&i.Channel,
+	)
+	return i, err
+}
+
 const createNode = `-- name: CreateNode :one
 INSERT INTO nodes (id, cluster_id, name, machine_id, hostname, os_version,
                    agent_version, shell_type, public_key)
