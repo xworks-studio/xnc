@@ -137,4 +137,42 @@ describe("Profile", () => {
     expect(fetchMock).toHaveBeenCalled();
     expect(container!.textContent).toContain("weak password");
   });
+
+  it("shows inline error on 401 wrong current password without logging out", async () => {
+    // 服务端防枚举：current_password 错误统一返回 401 invalid credentials。
+    // 此 401 是"凭据错误"而非"会话过期"，须页内展示且不踢出登录。
+    const fetchMock = vi.fn(async () =>
+      jsonRes({ error: { code: "UNAUTHORIZED", message: "invalid credentials" } }, 401),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    // 劫持 location.assign，断言未发生跳转 /login
+    const assignSpy = vi.spyOn(window.location, "assign");
+    await renderProfile();
+
+    const tokenBefore = localStorage.getItem("xnc_token");
+    const set = (name: string, value: string) => {
+      const el = container!.querySelector(`input[name="${name}"]`) as HTMLInputElement;
+      setInputValue(el, value);
+    };
+    await act(async () => {
+      set("current_password", "wrong-old");
+      set("new_password", "pw-654321");
+      set("confirm_password", "pw-654321");
+    });
+    const forms = container!.querySelectorAll("form");
+    const pwForm = forms[forms.length - 1];
+    await act(async () => {
+      pwForm.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+    await act(async () => {});
+
+    expect(fetchMock).toHaveBeenCalled();
+    // (a) 页内显示服务端错误文案
+    expect(container!.textContent).toContain("invalid credentials");
+    // (b) 会话未被清除：token 保持提交前的值
+    expect(localStorage.getItem("xnc_token")).toBe(tokenBefore);
+    // (c) 未触发"会话过期"跳转
+    expect(assignSpy).not.toHaveBeenCalled();
+    assignSpy.mockRestore();
+  });
 });

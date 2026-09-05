@@ -42,7 +42,6 @@ export default function Profile() {
 
   async function changePassword(e: FormEvent) {
     e.preventDefault();
-    setNameNotice("");
     if (newPassword !== confirmPassword) {
       setPwError("new passwords do not match");
       setPwNotice("");
@@ -54,6 +53,9 @@ export default function Profile() {
     try {
       await api("/api/auth/password", {
         method: "POST",
+        // 401=当前密码错误（服务端防枚举）而非会话过期：豁免自动登出，
+        // 由 catch 走 setPwError 页内展示服务端错误
+        on401: "throw",
         body: JSON.stringify({
           current_password: currentPassword,
           new_password: newPassword,
