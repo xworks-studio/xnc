@@ -34,6 +34,16 @@ std::wstring JoinSiblingPath(const std::wstring& dir, const std::wstring& name);
 // Directory containing xnc-core.exe (own module path minus basename).
 std::wstring OwnModuleDir();
 
+// 目标令牌派生环境块(userenv CreateEnvironmentBlock,bInherit=FALSE;
+// 纯包装,selftest 覆盖):APPDATA/TEMP/USERPROFILE 等随令牌用户走,与
+// xnc-core 自身(生产为 SYSTEM 服务)环境无关 —— 修复用户态子进程继承
+// systemprofile 环境的线上问题。产出 UTF-16 double-null 块,调用方
+// DestroyEnvironmentBlock 回收;喂给 CreateProcessAsUserW 时必须置
+// CREATE_UNICODE_ENVIRONMENT。失败返回 false(*env 置空,err 可选给
+// "what err=N")。
+bool BuildTokenEnvironment(HANDLE token, void** env,
+                           std::string* err = nullptr);
+
 // Join exe + argv[from..argc) into one child command line, quoting any
 // argument that contains whitespace (pure; --diag-spawn forwards the rest
 // of its own argv verbatim). Unsafe shapes are REJECTED, never escaped
@@ -52,7 +62,12 @@ bool BuildChildCommandLine(const wchar_t* exe, int argc, wchar_t** argv,
 
 // Spawn the whitelisted exe (validated and resolved next to xnc-core.exe)
 // with cmdline on the token's session and desktop ("winsta0\default").
-// token comes from TokenManager::SessionSystemToken. The child's stdio is
+// token comes from TokenManager::SessionSystemToken. 环境来源:子进程环境
+// 由目标令牌派生(BuildTokenEnvironment,含 CREATE_UNICODE_
+// ENVIRONMENT);构造失败时打日志降级为继承 xnc-core 自身环境,不阻断
+// spawn —— 生产 SYSTEM 服务的继承环境会让用户态子进程的 APPDATA/TEMP
+// 指向 systemprofile(线上 PSReadLine 写历史 Access denied 根因)。
+// The child's stdio is
 // redirected to this process's stdout/stderr via duplicated inheritable
 // handles (STARTF_USESTDHANDLES) so its XNC_LOG output reaches whatever
 // captured xnc-core - the remote diag gate depends on this; without valid

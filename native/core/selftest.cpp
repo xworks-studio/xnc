@@ -26,6 +26,8 @@
 #include "token_manager.h"
 #include "watchdog.h"
 
+#include <userenv.h>  // DestroyEnvironmentBlock(BuildTokenEnvironment 自测)
+
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -257,6 +259,63 @@ int SelftestMain() {
                              == L"C:\\xnc-diag\\xnc-desktop.exe");
       CHECK("join-empty-dir", JoinSiblingPath(L"", L"xnc-desktop.exe")
                              == L"xnc-desktop.exe");
+      // 令牌派生环境(spawn-env 修复):自身令牌 → 非空 UTF-16 块,含
+      // APPDATA=/USERPROFILE=/Path=(每用户变量与系统变量都在),块以
+      // double-null 收尾;空指针/非令牌句柄 → false 且 *env 置空。
+      {
+        HANDLE tok = nullptr;
+        CHECK("env-token-open",
+              OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok));
+        if (tok) {
+          void* block = nullptr;
+          std::string eerr;
+          CHECK("env-build", BuildTokenEnvironment(tok, &block, &eerr));
+          if (block) {
+            bool dbl = false, appdata = false, userprof = false, pathv = false;
+            std::wstring appdata_val;
+            const wchar_t* q = static_cast<const wchar_t*>(block);
+            for (int guard = 0; guard < 4096 && !dbl; guard++) {
+              const size_t n = std::wcslen(q);
+              if (n == 0) { dbl = true; break; }  // double-null 终结
+              const std::wstring e(q, n);
+              if (_wcsnicmp(e.c_str(), L"APPDATA=", 8) == 0) {
+                appdata = true;
+                appdata_val = e.substr(8);
+              } else if (_wcsnicmp(e.c_str(), L"USERPROFILE=", 12) == 0) {
+                userprof = true;
+              } else if (_wcsnicmp(e.c_str(), L"Path=", 5) == 0) {
+                pathv = true;
+              }
+              q += n + 1;
+            }
+            CHECK("env-block-dblnull", dbl);
+            CHECK("env-block-appdata", appdata);
+            // 修复的对象即每用户变量:APPDATA 非空且不是 systemprofile
+            // (SYSTEM 令牌/继承环境下的错误形态)。
+            CHECK("env-block-appdata-value",
+                  !appdata_val.empty() &&
+                      appdata_val.find(L"systemprofile") == std::wstring::npos);
+            CHECK("env-block-userprofile", userprof);
+            CHECK("env-block-path", pathv);
+            CHECK("env-block-destroy", DestroyEnvironmentBlock(block));
+          }
+          CloseHandle(tok);
+        }
+        // 失败路径:空指针与非令牌句柄(事件句柄)都返回 false,
+        // *env 一律置空(不产出半成品块)。
+        void* bad_block = (void*)1;
+        std::string bad_err;
+        CHECK("env-null-token-fails",
+              !BuildTokenEnvironment(nullptr, &bad_block, &bad_err) &&
+                  bad_block == nullptr);
+        HANDLE not_token = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (not_token) {
+          CHECK("env-bad-handle-fails",
+                !BuildTokenEnvironment(not_token, &bad_block, &bad_err) &&
+                    bad_block == nullptr);
+          CloseHandle(not_token);
+        }
+      }
       // 子命令行拼装(--diag-spawn 之后原样转发,含空格参数加引号)。
       {
         wchar_t a0[] = L"prog", a1[] = L"--console-diag", a2[] = L"--duration",

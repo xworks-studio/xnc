@@ -1,12 +1,19 @@
 // spawn.cpp - see spawn.h. Real spawn = CreateProcessAsUserW with the
 // session-retagged SYSTEM token; verified live on LABS-XIAOXIN (--diag-spawn
 // gate). Pure helpers are selftest-covered.
+// 环境来源(env provenance):子进程环境由目标令牌派生(userenv
+// CreateEnvironmentBlock,bInherit=FALSE),而非继承 xnc-core 自身的
+// SYSTEM 服务环境 —— 修复线上用户态子进程(APPDATA/TEMP 指向
+// systemprofile,ConPTY PSReadLine 写历史 Access denied)问题。构造
+// 失败时降级为继承环境(现状行为,打 error 日志保证可见),不阻断
+// spawn:可用的终端胜过死终端。
 #include "spawn.h"
 
 #include "../common/log.h"
 
 #include <cstdint>
 #include <cwchar>
+#include <userenv.h>  // CreateEnvironmentBlock / DestroyEnvironmentBlock
 #include <vector>
 
 namespace xnc {
@@ -91,6 +98,30 @@ std::string Narrow(const wchar_t* s) {
 
 }  // namespace
 
+// 目标令牌派生环境块(纯包装,userenv):以 token 所属用户的配置为源
+// (APPDATA/TEMP/USERPROFILE 等随令牌走),bInherit=FALSE —— 与 xnc-core
+// 自身(可能是 SYSTEM 服务)环境无关。产出 UTF-16 double-null 结尾块,
+// 调用方须 DestroyEnvironmentBlock 回收;CreateProcessAsUserW 消费时必须
+// 置 CREATE_UNICODE_ENVIRONMENT(否则按 ANSI 块解析损坏环境)。失败返回
+// false 且 *env 置空(err 给出 "what err=N"),不抛异常不改动调用方状态。
+bool BuildTokenEnvironment(HANDLE token, void** env, std::string* err) {
+  auto fail = [err](const char* what, DWORD e) {
+    if (err) *err = std::string(what) + " err=" + std::to_string(e);
+    return false;
+  };
+  if (!env) return fail("null argument", ERROR_INVALID_PARAMETER);
+  *env = nullptr;
+  if (!token) return fail("null argument", ERROR_INVALID_PARAMETER);
+  LPVOID block = nullptr;
+  if (CreateEnvironmentBlock(&block, token, FALSE) == FALSE || !block) {
+    const DWORD e = GetLastError();
+    if (block) DestroyEnvironmentBlock(block);
+    return fail("CreateEnvironmentBlock", e);
+  }
+  *env = block;
+  return true;
+}
+
 bool SpawnInSession(HANDLE token, const wchar_t* exe, const wchar_t* cmdline,
                     DWORD* pid, HANDLE* child_process, std::string* err,
                     HANDLE child_stdin) {
@@ -160,15 +191,36 @@ bool SpawnInSession(HANDLE token, const wchar_t* exe, const wchar_t* cmdline,
   }
 
   std::vector<wchar_t> cmd(cmdline, cmdline + std::wcslen(cmdline) + 1);
+  // 子进程环境 = 目标令牌派生(见文件头注释):CreateProcessAsUserW 若
+  // 传 nullptr 则继承 xnc-core(生产为 SYSTEM 服务,session 0)环境,
+  // 用户态子进程的 APPDATA/TEMP 会指向 systemprofile。构造失败降级为
+  // nullptr(继承,修复前行为)并打日志 —— log.h 只有 info/error 两级,
+  // 无 warn,降级用 error 保证可见。
+  LPVOID env = nullptr;
+  std::string env_err;
+  if (!BuildTokenEnvironment(token, &env, &env_err)) {
+    XNC_LOG_ERROR("spawn: token env block failed err=\"%s\"; child falls "
+                  "back to inherited (core) environment - per-user vars "
+                  "like APPDATA/TEMP may be wrong",
+                  env_err.c_str());
+    env = nullptr;
+  }
+  // 环境块为 UTF-16:必须加 CREATE_UNICODE_ENVIRONMENT,否则被按 ANSI
+  // 块解析而损坏(经典陷阱)。
+  const DWORD creation =
+      env ? (CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT) : CREATE_NO_WINDOW;
   PROCESS_INFORMATION pi{};
   // CREATE_NO_WINDOW: the child gets a hidden console instead of flashing
   // a window on the target session's desktop (logs travel via the
   // redirected handles above).
   const BOOL ok = CreateProcessAsUserW(
       token, full.c_str(), cmd.data(), nullptr, nullptr,
-      redirect || stdin_redirect /*bInheritHandles*/, CREATE_NO_WINDOW,
-      nullptr, nullptr, &si, &pi);
+      redirect || stdin_redirect /*bInheritHandles*/, creation,
+      env, nullptr, &si, &pi);
   const DWORD e = GetLastError();
+  // 环境块在 CreateProcess 内部已被复制,调用返回即可回收 —— 成功/失败
+  // 两条路径都经过这里,单一出口销毁。
+  if (env) DestroyEnvironmentBlock(env);
   if (err_dup != nullptr && err_dup != out_dup) CloseHandle(err_dup);
   if (out_dup) CloseHandle(out_dup);
   if (!ok) return fail("CreateProcessAsUserW", e);
