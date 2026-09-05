@@ -230,6 +230,14 @@ func endOrchestrate() {
 	orchestrateMu.Unlock()
 }
 
+// OrchestrationBusy 报告进程级编排门是否被占用（测试前置等待用：慢
+// runner 上前序测试的收尾可能尚未释放，直接触发会被判 in-progress）。
+func OrchestrationBusy() bool {
+	orchestrateMu.Lock()
+	defer orchestrateMu.Unlock()
+	return orchestrateInProgress
+}
+
 // orchestrateTrigger 节流闸门 + 编排主体（推送/轮询/手动共用）。
 func (u *Updater) orchestrateTrigger(ctx context.Context, force bool, m *SetupManifest) error {
 	u.platform()

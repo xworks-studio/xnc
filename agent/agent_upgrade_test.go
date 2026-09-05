@@ -222,8 +222,10 @@ func TestUpgradeDedupWhileRunning(t *testing.T) {
 	assert.False(t, triggered)
 
 	close(f.gate)
+	// 慢 runner（CI）上编排收尾可能远慢于本地——进程级门未释放时，后续
+	// 测试的 Upgrade 会被判 in-progress（triggered=false 假失败）。30s 上限。
 	require.Eventually(t, func() bool { return !a.upgradeInFlight() },
-		5*time.Second, 20*time.Millisecond)
+		30*time.Second, 50*time.Millisecond)
 	assert.Equal(t, []string{"dev"}, f.seenChannels(), "exactly one manifest fetch")
 }
 
@@ -245,6 +247,11 @@ func TestStatusChannelNormalized(t *testing.T) {
 // 6h 轮询器/编排器必须按新频道重建（runConnected 全链路由
 // TestRunCycleDeregister 覆盖；这里只证明信号已发）。
 func TestUpgradeChannelSwitchSignalsRebind(t *testing.T) {
+	// 前置：进程级编排门必须空闲——慢 runner 上前序测试可能尚未收尾，
+	// 残留 in-flight 会让本测试的 Upgrade 直接判 in-progress（triggered=false）。
+	require.Eventually(t, func() bool {
+		return !updater.OrchestrationBusy()
+	}, 15*time.Second, 10*time.Millisecond)
 	f := newFakeManifestServer(t, machineinfo.Version)
 	dir := t.TempDir()
 	seedBinding(t, dir, f.srv.URL, "") // 空 channel = stable
