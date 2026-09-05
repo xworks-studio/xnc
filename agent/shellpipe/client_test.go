@@ -217,11 +217,17 @@ func TestExecBudgetTotalCapFastConsumer(t *testing.T) {
 	dialPipe = func(_ context.Context, _ string) (net.Conn, error) { return clientConn, nil }
 	t.Cleanup(func() { dialPipe = oldDial })
 
+	// 闸门：等测试侧 SetExecBudget 完成后再放数据——net.Pipe 无缓冲，
+	// Dial 握手期间泵即可开始送帧；预算在 Dial 后设置，慢 runner 上会
+	// 输掉竞态（预算生效前已投递 >200B，断言假失败；生产路径无此窗口，
+	// 命令输出远晚于 oneshot 的预算设置）。
+	gate := make(chan struct{})
 	go func() {
 		defer serverConn.Close()
 		if err := ServerHandshake(serverConn, f.secret); err != nil {
 			return
 		}
+		<-gate
 		_ = ipc.WriteFrame(serverConn, &ipc.Frame{MessageType: msgShellBegin, Payload: EncodeBegin(80, 25, "CMD")})
 		// 100 帧 × 50B = 5000B stdout;预算 200B 必须总量封顶。
 		payload := EncodeData(StreamStdout, bytes.Repeat([]byte("x"), 50))
@@ -236,6 +242,7 @@ func TestExecBudgetTotalCapFastConsumer(t *testing.T) {
 	c, err := Dial("fake", []byte(secret))
 	require.NoError(t, err)
 	c.SetExecBudget(200)
+	close(gate)
 
 	// 快消费方:立即读(不制造任何积压)。
 	var stdout, stderr bytes.Buffer
