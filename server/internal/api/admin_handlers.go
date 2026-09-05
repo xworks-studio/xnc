@@ -94,6 +94,39 @@ func (h *handlers) deleteCluster(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// adminDeleteNode 处理 DELETE /api/nodes/{id}：admin-only（isAdminUser，与
+// adminDeleteRelease 同款判定）硬删除节点行——管理端清理残留注册项（跨
+// cluster machineId 冲突须先删后注册的出口）。落库复用 WS NODE_DELETE 的
+// DeleteNode；节点在线则逐出其控制连接（evictNodeConn：registry 移除 +
+// Cancel）；审计 node_delete {userId, nodeId}。非 admin 403；未知/非法 id
+// 404；成功 200（空 body）。
+func (h *handlers) adminDeleteNode(w http.ResponseWriter, r *http.Request) {
+	u := auth.UserFrom(r.Context())
+	if !isAdminUser(r.Context(), h.st, u.ID) {
+		respondError(w, proto.Err(403, proto.CodeForbidden, "admin required"))
+		return
+	}
+	nodeID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		respondError(w, proto.Err(404, proto.CodeNodeNotFound, "node not found"))
+		return
+	}
+	// 先查后删：审计需要 cluster 维度与节点名，行删除后不可再取。
+	node, err := h.st.Q().GetNodeByID(r.Context(), nodeID)
+	if err != nil {
+		respondError(w, proto.Err(404, proto.CodeNodeNotFound, "node not found"))
+		return
+	}
+	if _, err := h.st.Q().DeleteNode(r.Context(), node.ID); err != nil {
+		respondError(w, proto.Err(500, proto.CodeInternal, "delete node"))
+		return
+	}
+	h.auditNode(r, u.ID, node.ClusterID, node.ID, "node_delete",
+		map[string]string{"name": node.Name})
+	h.evictNodeConn(node.ID)
+	w.WriteHeader(http.StatusOK)
+}
+
 // auditNode 沿用 startSession 审计模式（独立 background ctx，不受客户端断连
 // 影响），附带 node 维度——disable/enable 均在写响应前同步落审计行。
 func (h *handlers) auditNode(_ *http.Request, actor, cluster, node uuid.UUID,

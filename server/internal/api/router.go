@@ -182,6 +182,9 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		// 管理动作：owner-only（handler 内经 requireMinRoleIgnoreDisabled 判定）
 		nr.Post("/{id}/disable", h.nodeDisable)
 		nr.Post("/{id}/enable", h.nodeEnable)
+		// 管理端硬删除节点：admin-only（handler 内 isAdminUser 判定），在线则
+		// 同时逐出其控制连接
+		nr.Delete("/{id}", h.adminDeleteNode)
 	})
 
 	// 内嵌 Web UI 兜底（Phase 7）：作为最后一条注册，chi 静态路由

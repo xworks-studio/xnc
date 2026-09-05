@@ -244,12 +244,18 @@ func (h *handlers) nodeDelete(ctx context.Context, node sqlc.Node) error {
 		// 节点已删，审计失败不回滚注销（只记日志）。
 		slog.Warn("deregister audit failed", "node", node.ID, "err", err)
 	}
-	// 逐出该节点的在线连接（可能是另一条更早的活跃连接，也可能是本连接）：
-	// 先移除注册表项再 Cancel——被逐连接的延迟清理经 RemoveIf=false 跳过
-	// 对已删节点的 offline 落库。
-	if live := h.reg.Get(node.ID.String()); live != nil && live.Cancel != nil {
-		h.reg.Remove(node.ID.String())
+	// 逐出该节点的在线连接（可能是另一条更早的活跃连接，也可能是本连接）。
+	h.evictNodeConn(node.ID)
+	return nil
+}
+
+// evictNodeConn 逐出节点当前在线控制连接（WS NODE_DELETE 与管理端
+// DELETE /api/nodes/{id} 共用）：先移除注册表项再 Cancel——被逐连接的延迟
+// 清理经 RemoveIf=false 跳过对已删节点的 offline 落库（节点行已删，不得
+// 再回写状态）。
+func (h *handlers) evictNodeConn(nodeID uuid.UUID) {
+	if live := h.reg.Get(nodeID.String()); live != nil && live.Cancel != nil {
+		h.reg.Remove(nodeID.String())
 		live.Cancel()
 	}
-	return nil
 }
