@@ -32,8 +32,9 @@ jobs:
             echo "=== $m ==="
             (cd "$m" && go vet ./... && go test ./... )
           done
-      - name: build shellhost (linux 编译门禁)
-        run: (cd shellhost && go build ./...)
+      - name: build shellhost root (linux 编译门禁)
+        run: (cd shellhost && go build .)
+        # cmd/xnc-shell-probe 依赖 winio（Windows-only），不在 linux 编译。
       - name: upload failure logs
         if: failure()
         uses: actions/upload-artifact@v4
