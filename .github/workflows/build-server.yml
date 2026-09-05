@@ -66,9 +66,8 @@ jobs:
           scp -i /tmp/srv_key -P ${{ secrets.SRV_SSH_PORT || 22 }} \
             "/tmp/ship/xnc-server-${ver}.tar.gz" \
             ${{ secrets.SRV_SSH_USER }}@${{ secrets.SRV_HOST }}:/opt/xnc/images/
-          $SSHBASE /bin/bash -s -- <<'REMOTE'
+          $SSHBASE "ver=$ver bash -s" <<'REMOTE'
           set -e
-          ver="$1"
           cd /opt/xnc
           # load 版本镜像并指向 compose 引用的本地 tag
           docker load -i "images/xnc-server-${ver}.tar.gz"
@@ -87,4 +86,4 @@ jobs:
           echo "::error::server did not report version $ver"
           docker compose -f deploy/docker-compose.yml logs xnc-server --tail 30
           exit 1
-          REMOTE _ "$ver"
+          REMOTE
