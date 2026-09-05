@@ -43,6 +43,28 @@ type turnServer struct {
 	failStreak int
 }
 
+// turnServerStatus Status() 的对外快照形态（监控端点用；同包直读）。
+type turnServerStatus struct {
+	IP      string
+	Port    int
+	URLs    []string
+	Healthy bool
+}
+
+// Status 返回池内各台的只读快照（ip/port/urls/healthy）。锁内浅拷贝；
+// 探测 goroutine 的状态更新与读方互不阻塞。
+func (m *TurnPoolManager) Status() []turnServerStatus {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]turnServerStatus, 0, len(m.servers))
+	for _, s := range m.servers {
+		out = append(out, turnServerStatus{
+			IP: s.IP, Port: s.Port, URLs: s.turnURLs(), Healthy: s.Healthy,
+		})
+	}
+	return out
+}
+
 // probeFunc 探测函数：addr = "ip:port"，返回是否可达。生产 = stunProbe；
 // 单测注入假实现（不发网络）。
 type probeFunc func(addr string) bool

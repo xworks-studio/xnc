@@ -227,6 +227,26 @@ func TestStunResponseOK(t *testing.T) {
 	assert.False(t, stunResponseOK(valid, otherTx), "transaction id 不符")
 }
 
+// TestTurnPoolStatusSnapshot：Status 返回池内容的锁内快照（ip/port/
+// urls(udp+tcp)/healthy），与构造输入一致；空池返回空切片。
+func TestTurnPoolStatusSnapshot(t *testing.T) {
+	m := NewTurnPoolManager([]string{"1.2.3.4", "5.6.7.8:443", "bad-entry"}, "u", "p")
+	snaps := m.Status()
+	require.Len(t, snaps, 2, "bad-entry 跳过")
+	assert.Equal(t, "1.2.3.4", snaps[0].IP)
+	assert.Equal(t, 3478, snaps[0].Port)
+	assert.True(t, snaps[0].Healthy)
+	wantURLs := []string{
+		"turn:1.2.3.4:3478?transport=udp",
+		"turn:1.2.3.4:3478?transport=tcp",
+	}
+	require.Len(t, snaps[0].URLs, 2)
+	assert.Equal(t, wantURLs[0], snaps[0].URLs[0])
+	assert.Equal(t, wantURLs[1], snaps[0].URLs[1])
+	assert.Equal(t, 443, snaps[1].Port)
+	assert.Empty(t, NewTurnPoolManager(nil, "u", "p").Status(), "空池 → 空切片")
+}
+
 // TestTurnConfigPoolPriority：turnConfig() 池优先——池分配成功返回池内单台；
 // 池空/全不健康回落到 XNC_TURN_URLS 全列表；无池走旧路径。
 func TestTurnConfigPoolPriority(t *testing.T) {

@@ -301,6 +301,27 @@ func TestDesktopNoMaxLifetime(t *testing.T) {
 	require.Len(t, s, 1, "desktop session must not be lifetime-closed by shell governance")
 }
 
+// TestCountActive：全表按 kind 计数（监控页聚合口径）——空表 0；混 kind
+// 只数目标 kind；跨节点聚合（与 countByNodeLocked 的 per-node 口径对照）。
+// registry 注入在线节点：Create 的 Online 检查在表操作之前。
+func TestCountActive(t *testing.T) {
+	reg := registry.New()
+	n1, n2 := uuid.New(), uuid.New()
+	reg.Add(&registry.NodeConn{NodeID: n1.String(), LastBeat: time.Now()})
+	reg.Add(&registry.NodeConn{NodeID: n2.String(), LastBeat: time.Now()})
+	m := New(reg, slog.Default())
+	defer m.Close()
+	require.Equal(t, 0, m.CountActive(proto.KindDesktop), "空表 = 0")
+	_, apiErr := m.Create(n1, uuid.New(), proto.KindDesktop, json.RawMessage(`{}`))
+	require.Nil(t, apiErr, "create desktop")
+	_, apiErr = m.Create(n1, uuid.New(), proto.KindDesktop, json.RawMessage(`{}`))
+	require.Nil(t, apiErr, "create desktop 2")
+	_, apiErr = m.Create(n2, uuid.New(), proto.KindShell, json.RawMessage(`{}`))
+	require.Nil(t, apiErr, "create shell")
+	assert.Equal(t, 2, m.CountActive(proto.KindDesktop))
+	assert.Equal(t, 1, m.CountActive(proto.KindShell))
+}
+
 // —— M2-Slice3 Task 4:per-node desktop lease 仲裁(spec §11.1)——
 
 // TestDesktopLeaseArbitration:单授予/并发拒绝/持有者关闭释放/再授予;

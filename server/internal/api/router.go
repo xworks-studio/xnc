@@ -118,6 +118,12 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		ur.Get("/", h.listUsers)
 	})
 
+	// TURN 服务状态（监控页）：用户 JWT；凭据与会话下发同源（设计 §3.1）。
+	r.Route("/api/turn", func(tr chi.Router) {
+		tr.Use(auth.Middleware(cfg.JWTSecret, st))
+		tr.Get("/status", h.turnStatus)
+	})
+
 	// 审计查询：admin-only，可选过滤 + 分页（handler 内判定）。
 	r.Route("/api/audit", func(ar chi.Router) {
 		ar.Use(auth.Middleware(cfg.JWTSecret, st))

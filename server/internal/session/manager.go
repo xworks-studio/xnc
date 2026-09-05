@@ -506,6 +506,20 @@ func (m *Manager) CountByNode(nodeID uuid.UUID, kind string) int {
 	return countByNodeLocked(m.sessions, nodeID, kind)
 }
 
+// CountActive 返回当前表中指定 kind 的会话数（监控页聚合口径；锁内遍历，
+// 与 countByNodeLocked 同型）。
+func (m *Manager) CountActive(kind string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, s := range m.sessions {
+		if s.Kind == kind {
+			n++
+		}
+	}
+	return n
+}
+
 // SessionsOf 返回某节点指定 kind 的会话只读视图快照。
 func (m *Manager) SessionsOf(nodeID uuid.UUID, kind string) []*Session {
 	m.mu.Lock()
