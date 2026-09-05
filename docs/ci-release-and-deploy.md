@@ -130,36 +130,29 @@ jobs:
 - 仓库分支保护（配套设置，非 workflow）：main 需 CI 绿 + 禁止 force
   push；tag 保护规则 `v*` 禁止删除与移动。
 
-## 4. Server 镜像化交付（build-server.yml + 服务器定时拉取）
+## 4. Server 镜像化交付（build-server.yml，无镜像仓库）
 
-**取代原"手动部署工作流"**：不再向服务器上传源码、不在远端构建。
+**取代原"手动部署工作流"**：不上传源码、不在远端构建、不经 registry。
 
-### 4.1 构建推送（CI，`build-server.yml`）
+### 4.1 流水线（push main / tag v* 触发）
 
-- 触发：push main（绿灯即出）+ tag `v*`。
-- 镜像：`ghcr.io/xworks-studio/xnc-server`，标签：
-  - main push → `main`（浮动）+ `sha-<短哈希>`（版本号 = `main-<短哈希>`）
-  - v* tag → `vX.Y.Z` + `latest`（版本号 = tag 版本）
-- 多阶段构建沿用 `deploy/Dockerfile`（web 构建 → go 注入版本 →
-  distroless），buildx GHA 缓存加速。
+1. CI 构建 web dist → docker build（`deploy/Dockerfile`，版本注入，
+   `main-<短哈希>` 或 tag 版本）。
+2. `docker save | gzip` → tar → SCP 直送 SRV `/opt/xnc/images/`
+   （凭据 SRV_SSH_*，与既有部署同源）。
+3. 服务器 `docker load` + `docker tag xnc-server:<ver> xnc-server:local`
+   + `docker compose up -d xnc-server`。
+4. 经 caddy 容器内网探测 `/api/health`，版本不符即 job 红（防假上线）。
+5. 版本 tar 保留最近 5 份。
 
-### 4.2 服务器侧（SRV 一次性安装，cron 自动拉取）
+### 4.2 服务器侧
 
-- compose 的 xnc-server 用 `image: …:main`（无 build 段）。
-- `/opt/xnc/deploy/pull-update.sh`（flock 防并发）：
-  `docker compose pull xnc-server && docker compose up -d xnc-server`；
-  cron `*/5` 执行——镜像无更新即 no-op，有更新 5 分钟内自动换版。
-- **回滚/锁版**：compose 里把 `:main` 改成 `:vX.Y.Z` 再 up -d。
-- GHCR 私有镜像：服务器需 `docker login ghcr.io`（read:packages 凭据，
-  存 root 的 docker config）；或把 package 设为 public 免登录。
-
-### 4.3 规则条文
-
-- 服务器上不再有源码目录；`/opt/xnc` 只剩 `deploy/`（compose/env/
-  Caddyfile/turnserver.conf）+ pull 脚本。
-- 版本验证：`/api/health` 的 version == 镜像内注入值。
-- Caddyfile 变更仍是 SSH 手工（换 inode 需 `--force-recreate`，见
-  AGENTS.md）。
+- compose 引用本地 tag `xnc-server:local` + `pull_policy: never`。
+- `/opt/xnc/images/` 存版本 tar；**回滚** = `docker tag
+  xnc-server:<旧版本> xnc-server:local && docker compose up -d`。
+- `/opt/xnc` 只剩 `deploy/`（compose/env/Caddyfile/turnserver.conf）+
+  `images/`——服务器上没有源码。
+- Caddyfile 变更仍是 SSH 手工（换 inode 需 `--force-recreate`）。
 
 ## 5. 配套设置清单（实施时一次做完）
 

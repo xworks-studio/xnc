@@ -1,8 +1,8 @@
-# build-server.yml — server 版本镜像构建与推送（设计文档 §4 重写后的
-# 镜像化交付）：CI 构建带版本标签的 xnc-server 镜像推 GHCR；服务器端
-# 由 cron 定时 docker compose pull 拉最新（不再上传源码远端构建）。
-#   push main → 镜像标签 main + sha-<short>（版本号 = main-<short>）
-#   tag  v*   → 镜像标签 v<version> + latest（版本号 = <version>）
+# build-server.yml — server 镜像化交付（绕过镜像仓库）：CI 构建带版本
+# 标签的镜像 → docker save 成 tar → SCP 直送 SRV → docker load + up -d。
+# 凭据仅用 SRV_SSH_*（与既有部署同源），无 registry 登录/可见性问题。
+#   push main → 版本 main-<短哈希>；tag v* → 版本 <tag 版本>
+# 服务器侧 /opt/xnc/images/ 保留最近若干版本 tar，可就地回滚。
 name: build-server
 
 on:
@@ -12,17 +12,22 @@ on:
 
 permissions:
   contents: read
-  packages: write # GHCR 推送
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE: ghcr.io/${{ github.repository_owner }}/xnc-server
+  IMAGE: xnc-server:local # 服务器 compose 引用的本地 tag（pull_policy: never）
 
 jobs:
-  build-push:
+  build-ship:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - id: meta
+        name: derive version
+        run: |
+          ref="${{ github.ref_name }}"
+          if [[ "$ref" == v* ]]; then ver="${ref#v}"; else ver="main-${GITHUB_SHA::7}"; fi
+          echo "version=${ver}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@v4
         with:
@@ -35,41 +40,50 @@ jobs:
           npm ci
           npm run build
 
-      - id: meta
-        name: derive version + image tags
+      - name: build image + save tar
         run: |
-          ref="${{ github.ref_name }}"
-          if [[ "$ref" == v* ]]; then
-            ver="${ref#v}"
-            tags="latest v${ver}"
-          else
-            sha="${GITHUB_SHA::7}"
-            ver="main-${sha}"
-            tags="main sha-${sha}"
-          fi
-          {
-            echo "version=${ver}"
-            echo "tags<<EOF"
-            for t in $tags; do echo "ghcr.io/${{ github.repository_owner }}/xnc-server:${t}"; done
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          ver="${{ steps.meta.outputs.version }}"
+          docker build -f deploy/Dockerfile --build-arg XNC_VERSION="${ver}" \
+            -t "${IMAGE}" -t "xnc-server:${ver}" .
+          mkdir -p /tmp/ship
+          docker save "xnc-server:${ver}" | gzip > "/tmp/ship/xnc-server-${ver}.tar.gz"
+          ls -lh /tmp/ship
 
-      - uses: docker/setup-buildx-action@v3
+      - name: stage ssh key
+        env:
+          SRV_KEY: ${{ secrets.SRV_SSH_KEY }}
+        run: |
+          printf '%s\n' "$SRV_KEY" > /tmp/srv_key
+          chmod 600 /tmp/srv_key
+          ssh-keyscan -H ${{ secrets.SRV_HOST }} >> ~/.ssh/known_hosts
 
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: deploy/Dockerfile
-          push: true
-          platforms: linux/amd64
-          build-args: |
-            XNC_VERSION=${{ steps.meta.outputs.version }}
-          tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: ship + load + up + verify
+        env:
+          SSHBASE: ssh -i /tmp/srv_key -p ${{ secrets.SRV_SSH_PORT || 22 }} ${{ secrets.SRV_SSH_USER }}@${{ secrets.SRV_HOST }}
+        run: |
+          ver="${{ steps.meta.outputs.version }}"
+          scp -i /tmp/srv_key -P ${{ secrets.SRV_SSH_PORT || 22 }} \
+            "/tmp/ship/xnc-server-${ver}.tar.gz" \
+            ${{ secrets.SRV_SSH_USER }}@${{ secrets.SRV_HOST }}:/opt/xnc/images/
+          $SSHBASE /bin/bash -s -- <<'REMOTE'
+          set -e
+          ver="$1"
+          cd /opt/xnc
+          # load 版本镜像并指向 compose 引用的本地 tag
+          docker load -i "images/xnc-server-${ver}.tar.gz"
+          docker tag "xnc-server:${ver}" "xnc-server:local"
+          docker compose -f deploy/docker-compose.yml up -d xnc-server
+          # 版本 tar 保留最近 5 份（回滚用）
+          ls -1t images/xnc-server-*.tar.gz | tail -n +6 | xargs -r rm --
+          # 等待健康检查报出新版本（60s 上限；经 caddy 容器内网探测——
+          # xnc-server 不发布宿主端口）。
+          for i in $(seq 1 12); do
+            h=$(docker compose -f deploy/docker-compose.yml exec -T caddy \
+              wget -qO- http://xnc-server:8080/api/health 2>/dev/null || true)
+            [ "$(echo "$h" | jq -r .version 2>/dev/null)" = "$ver" ] && { echo "live: $ver"; exit 0; }
+            sleep 5
+          done
+          echo "::error::server did not report version $ver"
+          docker compose -f deploy/docker-compose.yml logs xnc-server --tail 30
+          exit 1
+          REMOTE _ "$ver"

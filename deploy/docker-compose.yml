@@ -14,10 +14,13 @@ services:
       retries: 12
 
   xnc-server:
-    # 镜像化交付（build-server.yml 构建推送 GHCR；服务器 cron 定时
-    # docker compose pull 拉最新）。:main 跟踪 main 分支每次绿灯构建；
-    # 发版 tag 生成 vX.Y.Z 镜像，改 tag 即可锁版本回滚。
-    image: ghcr.io/xworks-studio/xnc-server:main
+    # 镜像化交付（无镜像仓库）：build-server.yml 在 CI 构建版本镜像 →
+    # docker save 成 tar → SCP 直送本机 /opt/xnc/images/ → docker load
+    # 并打 xnc-server:local 本地 tag。pull_policy: never——绝不向远端
+    # registry 拉取；回滚 = docker tag xnc-server:<旧版本> xnc-server:local
+    # 后 up -d（images/ 保留最近 5 份版本 tar）。
+    image: xnc-server:local
+    pull_policy: never
     environment:
       XNC_DATABASE_URL: postgres://xnc:${POSTGRES_PASSWORD}@postgres:5432/xnc
       XNC_JWT_SECRET: ${XNC_JWT_SECRET}
