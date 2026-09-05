@@ -55,6 +55,7 @@ jobs:
         run: |
           printf '%s\n' "$SRV_KEY" > /tmp/srv_key
           chmod 600 /tmp/srv_key
+          mkdir -p ~/.ssh
           ssh-keyscan -H ${{ secrets.SRV_HOST }} >> ~/.ssh/known_hosts
 
       - name: ship + load + up + verify
