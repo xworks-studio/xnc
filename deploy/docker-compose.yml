@@ -54,7 +54,9 @@ services:
   # GHCR 私有包授权：宿主 root 已 docker login ghcr.io（Watchtower 挂载
   # 同一 config.json）。
   watchtower:
-    image: containrrr/watchtower:latest
+    # containrrr 原版 2023 归档、旧 Docker API 与新引擎不兼容（client
+    # version 1.25 < 1.40）；nicholas-fedor 是维护中的接续 fork。
+    image: ghcr.io/nicholas-fedor/watchtower:latest
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /root/.docker/config.json:/config.json:ro
