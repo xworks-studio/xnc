@@ -16,7 +16,8 @@
 param(
     [string]$Version = "0.0.0-dev",
     [ValidateSet("stable", "dev")][string]$Channel = "stable",
-    [string]$ISCC = "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+    [string]$ISCC = "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
+    [switch]$ReuseNative
 )
 
 $ErrorActionPreference = "Stop"
@@ -48,14 +49,21 @@ Invoke-Step "build xnc-shell.exe (shellhost)" {
 }
 # Native build.bat scripts must run via cmd from their own directory (they
 # cd /d %~dp0 themselves, but Start-Process needs a sane working dir anyway).
-Invoke-Step "build xnc-core.exe" {
-    $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c build.bat" -WorkingDirectory (Join-Path $root "native\core") -NoNewWindow -Wait -PassThru
-    $global:LASTEXITCODE = $p.ExitCode
-}
-Invoke-Step "build xnc-desktop.exe" {
-    $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c build.bat" -WorkingDirectory (Join-Path $root "native\desktop") -NoNewWindow -Wait -PassThru
-    $global:LASTEXITCODE = $p.ExitCode
-}
+# -ReuseNative：bin 里已有 core/desktop 产物时跳过 MSVC（CI 缓存命中路径；
+# 缓存键 = native/** 哈希，未变即有效）。release 构建不传此开关——发版
+# 永远全量重建。
+if (-not ($ReuseNative -and (Test-Path (Join-Path $bin "xnc-core.exe")))) {
+    Invoke-Step "build xnc-core.exe" {
+        $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c build.bat" -WorkingDirectory (Join-Path $root "native\core") -NoNewWindow -Wait -PassThru
+        $global:LASTEXITCODE = $p.ExitCode
+    }
+} else { Write-Output "build.ps1: reuse cached xnc-core.exe" }
+if (-not ($ReuseNative -and (Test-Path (Join-Path $bin "xnc-desktop.exe")))) {
+    Invoke-Step "build xnc-desktop.exe" {
+        $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c build.bat" -WorkingDirectory (Join-Path $root "native\desktop") -NoNewWindow -Wait -PassThru
+        $global:LASTEXITCODE = $p.ExitCode
+    }
+} else { Write-Output "build.ps1: reuse cached xnc-desktop.exe" }
 
 # Version single-source check: the agent's self-reported version must equal
 # the version being packaged.

@@ -81,14 +81,25 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: build core + desktop (compile gate)
+      - name: restore native cache
+        id: nativecache
+        uses: actions/cache@v4
+        with:
+          path: |
+            bin/xnc-core.exe
+            bin/xnc-desktop.exe
+          key: native-${{ runner.os }}-${{ hashFiles('native/**') }}
+      - name: build core + desktop (compile gate, cache miss only)
+        if: steps.nativecache.outputs.cache-hit != 'true'
         shell: cmd
         run: |
           cd native\core && call build.bat
           cd ..\desktop && call build.bat
 
   installer-dryrun:
-    # 仅 main：保 .iss/build.ps1 可产安装器（无签名，无 pfx 依赖）
+    # 仅 main：保 .iss/build.ps1 可产安装器（无签名，无 pfx 依赖）。
+    # native 产物走 native/** 哈希缓存 + -ReuseNative——MSVC 只在 native
+    # 变更时重编（dryrun 的耗时大头）。
     if: github.event_name == 'push'
     runs-on: windows-latest
     steps:
@@ -96,14 +107,21 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.work
+      - name: restore native cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            bin/xnc-core.exe
+            bin/xnc-desktop.exe
+          key: native-${{ runner.os }}-${{ hashFiles('native/**') }}
       - name: install Inno Setup
         shell: pwsh
         run: choco install innosetup -y --no-progress
-      - name: build installer (unsigned)
+      - name: build installer (unsigned, reuse cached native)
         shell: pwsh
         run: |
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-          powershell -NoProfile -ExecutionPolicy Bypass -File installer\build.ps1 -Version 0.0.0-ci -Channel stable -ISCC $iscc
+          powershell -NoProfile -ExecutionPolicy Bypass -File installer\build.ps1 -Version 0.0.0-ci -Channel stable -ISCC $iscc -ReuseNative
       - name: upload artifact
         uses: actions/upload-artifact@v4
         with:
