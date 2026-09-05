@@ -25,7 +25,7 @@ jobs:
       - name: validate version format
         run: |
           v="${{ inputs.version }}"
-          echo "$v" | grep -qE '^\d{1,4}\.\d{1,4}\.\d{1,4}(-dev)?$' || {
+          echo "$v" | grep -qE '^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}(-dev)?$' || {
             echo "::error::bad version '$v' (want X.Y.Z[-dev], segments 1-4 digits)"; exit 1; }
 
       - uses: actions/setup-node@v4
