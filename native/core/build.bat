@@ -28,7 +28,7 @@ rem (WTSRegisterSessionNotificationEx also lives in wtsapi32.lib). The prod
 rem bootstrap adds secret_file.cpp (--secret-file persistence; the DACL lock
 rem uses sddl/advapi32, already linked). spawn-env fix adds userenv.lib
 rem (CreateEnvironmentBlock: token-derived child environment).
-cl /nologo /utf-8 /W3 /MT /std:c++17 /EHsc xnc-core.cpp service.cpp pipe_server.cpp wts_monitor.cpp token_manager.cpp spawn.cpp secret_file.cpp selftest.cpp ..\common\frame.cpp ..\common\handshake.cpp /Fe:..\..\bin\xnc-core.exe /Fo:..\..\bin\ /link bcrypt.lib advapi32.lib wtsapi32.lib user32.lib userenv.lib
+cl /nologo /utf-8 /W3 /MT /std:c++17 /EHsc /MP xnc-core.cpp service.cpp pipe_server.cpp wts_monitor.cpp token_manager.cpp spawn.cpp secret_file.cpp selftest.cpp ..\common\frame.cpp ..\common\handshake.cpp /Fe:..\..\bin\xnc-core.exe /Fo:..\..\bin\ /link bcrypt.lib advapi32.lib wtsapi32.lib user32.lib userenv.lib
 if errorlevel 1 exit /b 1
 
 echo [core] built ..\..\bin\xnc-core.exe

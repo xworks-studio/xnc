@@ -145,8 +145,10 @@ try {
 } finally { Pop-Location }
 
 # 3) artifact + sha256 (stdout for CI; sidecar for release metadata).
+# 版本号已带 -dev 后缀（新版本规则：dev 迭代走 PATCH+-dev）时不再重复
+# 频道后缀——否则产物名出现 XNC-Installer-dev-<v>-dev.exe。
 $suffix = ""
-if ($Channel -eq "dev") { $suffix = "-dev" }
+if ($Channel -eq "dev" -and -not $Version.EndsWith("-dev")) { $suffix = "-dev" }
 $name = "XNC-Installer$suffix-$Version.exe"
 $setup = Join-Path $bin $name
 if (-not (Test-Path $setup)) { throw "setup exe not found after ISCC: $setup" }

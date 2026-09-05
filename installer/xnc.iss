@@ -23,7 +23,8 @@
 #ifndef Channel
   #define Channel "stable"
 #endif
-#if Channel == "dev"
+// 版本号已带 -dev 后缀时不重复频道后缀（防 XNC-Installer-dev-<v>-dev.exe）。
+#if (Channel == "dev") && (Pos("-dev", Version) == 0)
   #define ChannelSuffix "-dev"
 #else
   #define ChannelSuffix ""
