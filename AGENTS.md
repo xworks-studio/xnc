@@ -72,8 +72,9 @@ chi + sqlc + 真 PG 测试）· `agent`（节点侧，Windows 服务）· `cli` 
 5. **构建上线**：远端 `docker compose -f deploy/docker-compose.yml build
    xnc-server && up -d`。**检查构建退出码**——build 失败时 up 会用旧镜像
    "成功"，必须看 BUILD_RC 或验证新行为（如新端点）真的生效。
-6. **Caddyfile 变更**需 `docker compose restart caddy`（单文件 bind mount 换
-   inode 后不重启不生效）。
+6. **Caddyfile 变更**需 `docker compose up -d --force-recreate caddy`——
+   push 用 tar 替换文件产生**新 inode**，restart 只重启进程、bind mount 仍
+   指旧 inode；必须重建容器重绑挂载（域名翻转时实战踩过）。
 7. 验证：`/api/health` 版本、新端点行为、SPA 哈希更新。
 8. 本机**禁止**运行 xnc-server 栈（spec 红线）；server 只活在 SRV 的 docker。
 
