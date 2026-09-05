@@ -30,20 +30,18 @@ jobs:
           ref="${{ github.ref_name }}"
           if [[ "$ref" == v* ]]; then
             ver="${ref#v}"
-            tags="latest,v${ver}"
+            tags="latest v${ver}"
           else
             sha="${GITHUB_SHA::7}"
             ver="main-${sha}"
-            tags="main,sha-${sha}"
+            tags="main sha-${sha}"
           fi
-          echo "version=${ver}" >> "$GITHUB_OUTPUT"
-          # 换行分隔的 tag 列表 → 构建参数
           {
-            for t in $tags; do echo "tag=$t" >> "$GITHUB_OUTPUT"; done
-          }
-          echo "tags<<EOF" >> "$GITHUB_OUTPUT"
-          for t in $tags; do echo "$REGISTRY_IMAGE:$t" | sed "s|REGISTRY_IMAGE|ghcr.io/${{ github.repository_owner }}/xnc-server|"; done >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+            echo "version=${ver}"
+            echo "tags<<EOF"
+            for t in $tags; do echo "ghcr.io/${{ github.repository_owner }}/xnc-server:${t}"; done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
 
