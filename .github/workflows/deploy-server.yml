@@ -1,0 +1,102 @@
+# deploy-server.yml — 手动部署 server（设计：docs/ci-release-and-deploy.md §4）
+# 只部署 server；agent/安装器一律走 release 流水线。force_clean 默认开，
+# 根治 tar 覆盖不删的陷阱；BUILD_RC 显式检查防"假上线"。
+name: deploy-server
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'XNC_VERSION（server 版本，如 0.8.0）'
+        required: true
+      force_clean:
+        description: '远端源码清空重建（删型变更必需；默认开）'
+        type: boolean
+        default: true
+      recreate_caddy:
+        description: '重建 caddy 容器（Caddyfile 变更时勾选）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  REMOTE_ROOT: /opt/xnc
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: build web
+        run: |
+          cd web
+          npm ci
+          npm run build
+
+      - name: stage ssh key
+        env:
+          SRV_KEY: ${{ secrets.SRV_SSH_KEY }}
+        run: |
+          printf '%s\n' "$SRV_KEY" > /tmp/srv_key
+          chmod 600 /tmp/srv_key
+          ssh-keyscan -H ${{ secrets.SRV_HOST }} >> ~/.ssh/known_hosts
+
+      - name: package and upload source
+        env:
+          SSH: ssh -i /tmp/srv_key -p ${{ secrets.SRV_SSH_PORT || 22 }} ${{ secrets.SRV_SSH_USER }}@${{ secrets.SRV_HOST }}
+        run: |
+          tar czf /tmp/push.tgz --exclude='.env' --exclude='node_modules' proto server deploy web
+          scp -i /tmp/srv_key -P ${{ secrets.SRV_SSH_PORT || 22 }} /tmp/push.tgz \
+            ${{ secrets.SRV_SSH_USER }}@${{ secrets.SRV_HOST }}:$REMOTE_ROOT/bundle.tgz
+
+      - name: remote extract (clean by default) + version + build + up
+        env:
+          FORCE_CLEAN: ${{ inputs.force_clean }}
+          RECREATE_CADDY: ${{ inputs.recreate_caddy }}
+        run: |
+          ssh -i /tmp/srv_key -p ${{ secrets.SRV_SSH_PORT || 22 }} ${{ secrets.SRV_SSH_USER }}@${{ secrets.SRV_HOST }} /bin/bash -s -- <<'REMOTE'
+          set -e
+          cd /opt/xnc
+          if [ "$FORCE_CLEAN" = "true" ]; then
+            cp deploy/.env /tmp/xnc-env-backup
+            rm -rf proto server deploy web bundle.tgz
+            mkdir -p /opt/xnc
+          fi
+          tar xzf bundle.tgz && rm bundle.tgz
+          if [ "$FORCE_CLEAN" = "true" ]; then
+            cp /tmp/xnc-env-backup deploy/.env
+          fi
+          sed -i "s/^XNC_VERSION=.*/XNC_VERSION=${{ inputs.version }}/" deploy/.env
+          docker compose -f deploy/docker-compose.yml build xnc-server > /tmp/b.log 2>&1
+          rc=$?
+          echo "BUILD_RC=$rc"
+          if [ $rc -ne 0 ]; then tail -40 /tmp/b.log; exit 1; fi
+          docker compose -f deploy/docker-compose.yml up -d >> /tmp/b.log 2>&1
+          if [ "$RECREATE_CADDY" = "true" ]; then
+            docker compose -f deploy/docker-compose.yml up -d --force-recreate caddy >> /tmp/b.log 2>&1
+          fi
+          docker compose -f deploy/docker-compose.yml ps --format 'table {{.Name}}\t{{.Status}}'
+          REMOTE
+
+      - name: verify deployment
+        run: |
+          for i in $(seq 1 12); do
+            v=$(curl -sf https://xnc.app/api/health | jq -r .version || true)
+            [ "$v" = "${{ inputs.version }}" ] && break
+            sleep 5
+          done
+          if [ "$v" != "${{ inputs.version }}" ]; then
+            echo "::error::health version=$v want=${{ inputs.version }}"
+            exit 1
+          fi
+          curl -sf "https://xnc.app/installer.json?channel=stable" | jq -e '.version and .sha256' > /dev/null
+          echo "deployed: $v"

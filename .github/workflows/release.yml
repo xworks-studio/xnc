@@ -1,0 +1,97 @@
+# release.yml — tag 驱动发布（设计：docs/ci-release-and-deploy.md §3）
+# v<tag> 且 tag 在 main 上 → 签名构建 → GitHub Release → 生产 release store
+# → 回读校验。版本不可变：同 tag 重推被拒。
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write # GitHub Release 附件
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 祖先校验需要
+
+      - name: validate tag (on main + format)
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -notmatch '^v\d{1,4}\.\d{1,4}\.\d{1,4}(-dev)?$') {
+            throw "bad tag format: $tag (want vMAJOR.MINOR.PATCH[-dev], segments 1-4 digits)"
+          }
+          git fetch origin main
+          git merge-base --is-ancestor "$tag" origin/main
+          if ($LASTEXITCODE -ne 0) { throw "tag $tag is not an ancestor of main" }
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+
+      - name: install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: restore signing cert
+        shell: pwsh
+        env:
+          PFX_B64: ${{ secrets.XNC_CODESIGN_PFX }}
+          PFX_PASS: ${{ secrets.XNC_CODESIGN_PASSWORD }}
+        run: |
+          if (-not $env:PFX_B64 -or -not $env:PFX_PASS) {
+            throw "secrets XNC_CODESIGN_PFX / XNC_CODESIGN_PASSWORD not configured"
+          }
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\codesign.pfx",
+            [Convert]::FromBase64String($env:PFX_B64))
+          "XNC_CODESIGN_PASSWORD=$env:PFX_PASS" | Out-File $env:GITHUB_ENV -Append utf8
+
+      - name: build + sign installer
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $ver = $tag.TrimStart('v')
+          $ch = if ($ver.EndsWith('-dev')) { 'dev' } else { 'stable' }
+          "VERSION=$ver" | Out-File $env:GITHUB_ENV -Append utf8
+          "CHANNEL=$ch" | Out-File $env:GITHUB_ENV -Append utf8
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          powershell -NoProfile -ExecutionPolicy Bypass -File installer\build.ps1 `
+            -Version $ver -Channel $ch -ISCC $iscc
+          $name = "XNC-Installer$(if ($ch -eq 'dev') {'-dev'})-$ver.exe"
+          "ARTIFACT=bin\$name" | Out-File $env:GITHUB_ENV -Append utf8
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ARTIFACT }}
+            ${{ env.ARTIFACT }}.sha256
+          body: ${{ github.event.head_commit.message }}
+
+      - name: upload to production release store + readback verify
+        shell: pwsh
+        env:
+          SERVER: ${{ secrets.XNC_SERVER_URL }}
+          EMAIL: ${{ secrets.XNC_ADMIN_EMAIL }}
+          PASSWD: ${{ secrets.XNC_ADMIN_PASSWORD }}
+        run: |
+          $jwt = (Invoke-RestMethod -Method Post "$env:SERVER/api/auth/login" `
+            -ContentType 'application/json' `
+            -Body (@{email=$env:EMAIL; password=$env:PASSWD} | ConvertTo-Json)).token
+          $sha = (Get-FileHash $env:ARTIFACT -Algorithm SHA256).Hash.ToLower()
+          $notes = "CI release from tag ${{ github.ref_name }}"
+          curl.exe -s -X POST "$env:SERVER/api/admin/releases" `
+            -H "Authorization: Bearer $jwt" `
+            -F "version=$env:VERSION" -F "notes=$notes" -F "channel=$env:CHANNEL" `
+            -F "setup=@$env:ARTIFACT;type=application/octet-stream" | Out-Null
+          # 回读校验：版本与 sha256 必须一致，否则本 job 红（防上传假成功）
+          $m = Invoke-RestMethod "$env:SERVER/installer.json?channel=$env:CHANNEL"
+          if ($m.version -ne $env:VERSION -or $m.sha256 -ne $sha) {
+            throw "readback mismatch: server=$($m.version)/$($m.sha256.Substring(0,8)) want=$env:VERSION/$($sha.Substring(0,8))"
+          }
+          Write-Host "release live: $env:VERSION ($env:CHANNEL) sha256=$sha"
+          Write-Host "download: $env:SERVER/download"

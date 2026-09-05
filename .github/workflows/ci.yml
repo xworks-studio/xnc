@@ -1,0 +1,112 @@
+# ci.yml — 测试门禁（设计：docs/ci-release-and-deploy.md §2）
+# PR 与 main push 全绿才能合并；concurrency 省额度。
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  go-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+      # agent 模块在 linux 有预存在构建失败（agent/session，非新债，
+      # 见设计 §2.3）——linux 只测跨平台模块，agent 归 go-windows。
+      - name: test (proto server cli mockagent shellsmoke tools)
+        run: |
+          for m in proto server cli mockagent shellsmoke tools/desktopreport tools/e2eviewer tools/nalcheck; do
+            echo "=== $m ==="
+            (cd "$m" && go vet ./... && go test ./... )
+          done
+      - name: build shellhost (linux 编译门禁)
+        run: (cd shellhost && go build ./...)
+      - name: upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-linux-logs
+          path: |
+            **/*.test.log
+          if-no-files-found: ignore
+
+  go-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+      # agent 全量（含 updater/orchestrate 真实进程语义测试）
+      - name: test agent
+        run: |
+          cd agent
+          go vet ./...
+          go test ./...
+      - name: test shellhost (windows integration)
+        run: |
+          cd shellhost
+          go vet ./...
+          go test ./...
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: lint + test + build
+        run: |
+          cd web
+          npm ci
+          npx oxlint
+          npm run test
+          npm run build
+
+  native:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build core + desktop (compile gate)
+        shell: cmd
+        run: |
+          cd native\core && call build.bat
+          cd ..\desktop && call build.bat
+
+  installer-dryrun:
+    # 仅 main：保 .iss/build.ps1 可产安装器（无签名，无 pfx 依赖）
+    if: github.event_name == 'push'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+      - name: install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+      - name: build installer (unsigned)
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          powershell -NoProfile -ExecutionPolicy Bypass -File installer\build.ps1 -Version 0.0.0-ci -Channel stable -ISCC $iscc
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-installer
+          path: bin/*.exe
+          if-no-files-found: error
