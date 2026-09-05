@@ -33,7 +33,7 @@ func newFakeManifestServer(t *testing.T, version string) *fakeManifestServer {
 	t.Helper()
 	f := &fakeManifestServer{version: version}
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /setup.json", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /installer.json", func(w http.ResponseWriter, r *http.Request) {
 		ch := r.URL.Query().Get("channel")
 		f.mu.Lock()
 		f.channels = append(f.channels, ch)
@@ -43,7 +43,7 @@ func newFakeManifestServer(t *testing.T, version string) *fakeManifestServer {
 			<-gate
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"version":"` + f.version + `","url":"/setup.exe?channel=` + ch + `","sha256":"00"}`))
+		_, _ = w.Write([]byte(`{"version":"` + f.version + `","url":"/installer?channel=` + ch + `","sha256":"00"}`))
 	})
 	f.srv = httptest.NewServer(mux)
 	t.Cleanup(f.srv.Close)

@@ -155,13 +155,13 @@ func TestAdminUploadRelease(t *testing.T) {
 	require.Equal(t, 201, resp.StatusCode)
 
 	// /setup.exe 直流刚上传的安装器，sha256 头与制品一致。
-	got, body := getSetup(t, srv.URL+"/setup.exe?channel=stable")
+	got, body := getSetup(t, srv.URL+"/installer?channel=stable")
 	require.Equal(t, 200, got.StatusCode)
 	assert.Equal(t, setup, body)
 	assert.Equal(t, sha256Hex(body), got.Header.Get("X-Xnc-Sha256"))
 
 	// /setup.json 清单字段与制品一致。
-	mf := getSetupManifest(t, srv.URL+"/setup.json?channel=stable")
+	mf := getSetupManifest(t, srv.URL+"/installer.json?channel=stable")
 	assert.Equal(t, "0.10.0", mf.Version)
 	assert.Equal(t, sha256Hex(setup), mf.SHA256)
 	assert.Equal(t, int64(len(setup)), mf.Size)

@@ -548,7 +548,7 @@ func TestDispatchesUpdateAvailable(t *testing.T) {
 
 	srv := fakeServerWithHooks(t, pub, func(write func(typ string, p any)) {
 		write(proto.TypeUpdateAvailable, proto.UpdateAvailable{
-			Version: "0.6.2", URL: "/setup.exe?channel=stable", SHA256: "abc"})
+			Version: "0.6.2", URL: "/installer?channel=stable", SHA256: "abc"})
 	})
 	defer srv.Close()
 
@@ -566,7 +566,7 @@ func TestDispatchesUpdateAvailable(t *testing.T) {
 	select {
 	case push := <-got:
 		assert.Equal(t, "0.6.2", push.Version)
-		assert.Equal(t, "/setup.exe?channel=stable", push.URL)
+		assert.Equal(t, "/installer?channel=stable", push.URL)
 		assert.Equal(t, "abc", push.SHA256)
 	case <-time.After(3 * time.Second):
 		t.Fatal("no UPDATE_AVAILABLE dispatched")
