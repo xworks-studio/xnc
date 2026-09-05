@@ -50,7 +50,7 @@ CLI ──WS(binary)── Server（会话中继，kind=tunnel）──WS── 
 
 ## 1. 实验环境
 
-- 控制面：`https://control.xnc.app`（v0.1.0），CLI `bin/xnc.exe`。
+- 控制面：`https://xnc.app`（v0.1.0），CLI `bin/xnc.exe`。
 - 节点（`xnc node list`）：LABS-TB16G7 / LABS-XIAOXIN / LABS-YOGAP7G11 在线；LABS-DEV 为本机（disabled）。
 - 所有实验经 `xnc exec`（auto shell 探测，支持 `--shell powershell/pwsh/cmd/bash`）、`xnc put/get`、`xnc screen --snap` 完成。
 
@@ -102,7 +102,7 @@ XIAOXIN / YOGAP7G11（RDP 禁用）：
 
 1. **数据面全链路验证通过**：CLI 侧 WS → server 中继 → agent → 127.0.0.1:3389 → TermService 的 X.224 Connection Confirm 原样返回。tunnel 对 RDP 协议字节完全透明（含协商头 0x08 选项位）。
 2. **失败是"快速失败"而非超时**：TermService 停止时 agent 拨 3389 立即 ECONNREFUSED → ERROR{RDP_NOT_AVAILABLE} 在 ~100-330ms 内返回（`agent/session/tunnel.go` 的 10s 超时只是兜底）。失败模式干净，但**发生时机太晚**：POST /tunnel 和 WS 拨号都成功，用户端 mstsc 已经弹出后才报错。
-3. **时延基线**：公网控制面（control.xnc.app）下，建链全程（REST+WS）约 400ms，X.224 首往返 135–353ms。这是所有"经 server 中继"方案共享的底价；RDP 图形会话建立后续是多轮往返，首次出画面预估 2–5s（未量化，属后续实验）。
+3. **时延基线**：公网控制面（xnc.app）下，建链全程（REST+WS）约 400ms，X.224 首往返 135–353ms。这是所有"经 server 中继"方案共享的底价；RDP 图形会话建立后续是多轮往返，首次出画面预估 2–5s（未量化，属后续实验）。
 4. 探针代码证明：**tunnel 通道可以被任意程序消费**（不限于 mstsc）——为"服务端/浏览器侧自研 RDP 客户端"（候选 D）保留了接口可行性。
 
 ### E2. screen 管线基线测量（进行中）

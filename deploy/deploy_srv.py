@@ -304,7 +304,7 @@ def cmd_env():
     # 仅供 coturn 自身用户配置（turnserver.conf 模板 user= 行），对已存在的远程
     # .env（旧部署含自定义 PASSWORD）此处不再写入，CREDENTIAL 回落读取旧值保持同步。
     turn = {
-        "XNC_TURN_URLS": env.get("XNC_TURN_URLS", "turn:control.xnc.app:3478?transport=tcp"),
+        "XNC_TURN_URLS": env.get("XNC_TURN_URLS", "turn:xnc.app:3478?transport=tcp"),
         "XNC_TURN_USERNAME": env.get("XNC_TURN_USERNAME", "xncdev"),
         "XNC_TURN_CREDENTIAL": env.get("XNC_TURN_CREDENTIAL", env.get("XNC_TURN_PASSWORD", "xncdev-secret")),
         # TURN 池（境内媒体中转）：逗号分隔 ip[:port]，空 = 未配置（沿用

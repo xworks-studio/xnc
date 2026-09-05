@@ -110,7 +110,7 @@ Dockerfile `ARG XNC_VERSION` 注入；未设回落 `0.0.0-dev`。
 
 ## 测试设备凭据
 
-`deploy/.env`（gitignored）：`cp .env.example .env` 后填入。server 端仅经 `py deploy/deploy_srv.py` 部署到 control.xnc.app，本机不部署 server。
+`deploy/.env`（gitignored）：`cp .env.example .env` 后填入。server 端仅经 `py deploy/deploy_srv.py` 部署到 xnc.app，本机不部署 server。
 
 ## 负载 smoke
 

@@ -2,7 +2,7 @@
 
 One page, copy-paste ready. Fully isolated from production: the dev agent never
 touches the XNCAgent service, its state lives only in `%TEMP%\xnc-dev-agent-<pid>`
-(removed on exit), and it talks to a throwaway dev server — not control.xnc.app.
+(removed on exit), and it talks to a throwaway dev server — not xnc.app.
 
 ```
 LABS-DEV (docker)                          LABS-XIAOXIN
@@ -136,7 +136,7 @@ Notes:
   503 `TURN_UNCONFIGURED`. One desktop session per node; idle (no signaling
   frames) for 5 min auto-closes (viewer may simply re-POST).
 
-## 生产端口清单(control.xnc.app / SRV,2026-08-24 retro P2#11 文档化)
+## 生产端口清单(xnc.app / SRV,2026-08-24 retro P2#11 文档化)
 
 安全组需开以下全部,否则对应功能失效(本次事故:3478 未开 → STUN/TURN
 全盲;coturn 配置见 deploy/turnserver.conf,模板由 deploy_srv.py `up` 渲染):

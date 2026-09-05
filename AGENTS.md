@@ -6,7 +6,7 @@
 
 ## 1. 仓库是什么
 
-XNC = Windows 节点远程管理平台：Go server（control.xnc.app）+ Windows agent
+XNC = Windows 节点远程管理平台：Go server（xnc.app）+ Windows agent
 （服务）+ Web UI + CLI（`xnc`）。安装器（Inno Setup）是唯一分发载体：安装、
 修复、升级、卸载共用一个 setup.exe；更新由 agent 编排静默安装器完成。
 
@@ -56,7 +56,7 @@ chi + sqlc + 真 PG 测试）· `agent`（节点侧，Windows 服务）· `cli` 
 - 遗留坑：`agent/session` 存在预存在的 GOOS=linux 构建失败（非 Windows 路径），
   与新改动无关时勿"顺手修"。
 
-## 4. 部署流程（server → control.xnc.app）
+## 4. 部署流程（server → xnc.app）
 
 顺序固定，缺一步即事故（每条都是实战教训）：
 
@@ -89,14 +89,14 @@ chi + sqlc + 真 PG 测试）· `agent`（节点侧，Windows 服务）· `cli` 
    WS 推送/6h 轮询/`xnc upgrade` 升级（秒级中断，失败自动回滚+拉黑）。
 4. **升级安全网**：看门狗 schtask + installer-cache 回滚源 + 24h 过期
    pending 兜底；发布坏版本的自愈路径已内建，无需人工回滚。
-5. 当前线上锚点：下载页 `https://control.xnc.app/download`；短域
+5. 当前线上锚点：下载页 `https://xnc.app/download`；短域
    `xnc.app/setup.exe`。
 
 ## 6. 用户安装 / 注册 / 卸载
 
-- **安装**：下载页或 `curl -LO https://control.xnc.app/setup.exe` → 运行
+- **安装**：下载页或 `curl -LO https://xnc.app/setup.exe` → 运行
   （管理员）→ 服务就位，**零凭据**，agent 空转 `awaiting registration`。
-- **注册**：`xnc register --server https://control.xnc.app`（新机首跑需
+- **注册**：`xnc register --server https://xnc.app`（新机首跑需
   --server；TTY 交互登录+选 cluster，非 TTY 用 --email + stdin 密码 +
   --yes）。成功后秒级 online。重装/换机身份 → adopt 沿用原节点。
 - **会话**：`xnc login/logout`（用户级）；`logout` 不影响节点在线。

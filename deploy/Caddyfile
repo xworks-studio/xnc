@@ -1,18 +1,6 @@
+# xnc.app — 唯一域名（原 control.xnc.app 已弃用；短域块随主域统一而移除）。
 {$XNC_DOMAIN} {
 	reverse_proxy xnc-server:8080 {
 		flush_interval -1
 	}
-}
-
-# xnc.app — 快捷安装短域（安装器分发端点直接响应；其余 301 到主域）
-{$XNC_SHORT_DOMAIN} {
-	# 安装器分发直通（不跳转——curl 下载 setup.exe 需要直接响应）
-	handle /setup.exe {
-		reverse_proxy xnc-server:8080
-	}
-	handle /setup.json {
-		reverse_proxy xnc-server:8080
-	}
-	# 其余路径 301 到主域名
-	redir https://{$XNC_DOMAIN}{uri} 301
 }

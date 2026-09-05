@@ -1897,7 +1897,7 @@ Internet → :443 Caddy(容器) → xnc-server(容器) → PostgreSQL(容器)
 ## 双域名
 
 ```text
-control.xnc.app    主域名：Web UI / REST / WS
+xnc.app    主域名：Web UI / REST / WS
 xnc.app            短域：快捷安装端点直接响应，其余 301 到主域
 ```
 
@@ -2831,12 +2831,12 @@ MockAgent 不再是第三份协议实现——就是 agent 核心包 + 内存虚
 
 ## 测试设备矩阵
 
-开发/测试依赖以下设备。凭据统一存放 `deploy/.env`（dotenv 格式、按设备前缀分节、已被 .gitignore 排除，当前已含 SRV 与 NODE_MAIN/NODE_XIAOXIN/NODE_YOGAP7G11 真实凭据），开发脚本与 AI Agent 从中读取；未启用的设备栏位留空，脚本跳过对应测试。server 端只部署在 SRV（control.xnc.app，经 `deploy/deploy_srv.py`），本机（开发机）禁止部署/运行 xnc-server 栈。
+开发/测试依赖以下设备。凭据统一存放 `deploy/.env`（dotenv 格式、按设备前缀分节、已被 .gitignore 排除，当前已含 SRV 与 NODE_MAIN/NODE_XIAOXIN/NODE_YOGAP7G11 真实凭据），开发脚本与 AI Agent 从中读取；未启用的设备栏位留空，脚本跳过对应测试。server 端只部署在 SRV（xnc.app，经 `deploy/deploy_srv.py`），本机（开发机）禁止部署/运行 xnc-server 栈。
 
 | 设备 | 系统 | 用途 | 阶段 |
 | ---- | ---- | ---- | ---- |
 | NODE_MAIN（主测试节点） | Windows 11 Pro（10.0.26200），LABS-TB16G7，23 GB；pwsh 7 暂未安装（当前走 powershell.exe 5.1 降级路径，如需 pwsh 用例再装）；管理通道 = WinRM PS Remoting | 主 Windows 测试节点：新版功能、RDP、桌面预览 helper 三态（capturing / locked / no_session） | 全程 |
-| SRV | Ubuntu，阿里云国际区域，域名 control.xnc.app | xnc-server / Caddy / PostgreSQL 真机部署验证；NAT 场景对端 | Phase 1 起 |
+| SRV | Ubuntu，阿里云国际区域，域名 xnc.app | xnc-server / Caddy / PostgreSQL 真机部署验证；NAT 场景对端 | Phase 1 起 |
 | NODE_XIAOXIN | Windows，LABS-XIAOXIN，console 会话 1 = LABS | 实机验收节点：M1 捕获脊柱、M2 稳定性 / shell-host E2E（diag-deploy、e2e-m2s2 等默认目标） | M1 起 |
 | NODE_YOGAP7G11 | Windows，LABS-YOGAP7G11 | 实机验证：多节点并发与弱网韧性观察 | M2 起 |
 
@@ -2848,7 +2848,7 @@ MockAgent 不再是第三份协议实现——就是 agent 核心包 + 内存虚
 * Scenario G（断连重连）：节点经手机热点联网即可模拟弱网。
 * WinRM/PS Remoting 会话内启动的进程属于 WSMan job object，会话结束即被终止——节点侧持久进程必须走 `xnc-agent install`（SCM 托管服务），不能 Start-Process。
 * NODE_MAIN 被 RDP 接管会锁定 console 会话——正好用于桌面预览"无扰动"对比验证（第 64 节）。
-* SRV 为阿里云国际区域（control.xnc.app → 47.243.209.52）：免 ICP 备案，.app 域名 + Let's Encrypt 直接可用。
+* SRV 为阿里云国际区域（xnc.app → 47.243.209.52）：免 ICP 备案，.app 域名 + Let's Encrypt 直接可用。
 * 负载测试（1000 agents）用 MockAgent 跑在开发机/SRV，不占真机。
 
 ## 功能测试矩阵

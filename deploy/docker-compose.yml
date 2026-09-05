@@ -37,7 +37,7 @@ services:
       # TURN relay config handed to desktop sessions (mirrors coturn below).
       # server 只读 XNC_TURN_CREDENTIAL(单一来源,config.go);XNC_TURN_PASSWORD
       # 仅供 coturn 自身用户配置(turnserver.conf 模板,见下),与 server env 无关。
-      XNC_TURN_URLS: ${XNC_TURN_URLS:-turn:control.xnc.app:3478?transport=tcp}
+      XNC_TURN_URLS: ${XNC_TURN_URLS:-turn:xnc.app:3478?transport=tcp}
       XNC_TURN_USERNAME: ${XNC_TURN_USERNAME:-xncdev}
       XNC_TURN_CREDENTIAL: ${XNC_TURN_CREDENTIAL:-xncdev-secret}
       # TURN 池（境内媒体中转）：逗号分隔 ip[:port]（缺省端口 3478），空 =
@@ -55,7 +55,6 @@ services:
     ports: ["80:80", "443:443"]
     environment:
       XNC_DOMAIN: ${XNC_DOMAIN}
-      XNC_SHORT_DOMAIN: ${XNC_SHORT_DOMAIN:-xnc.app}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
