@@ -12,6 +12,7 @@ import type { NodeDTO } from "../types";
 import { FrameCorrelator, decodeFrameMeta } from "../lib/desktopFrameMeta";
 import { lookupScan } from "./desktop/keymap";
 import { cursorDotStyle, decodeCursor, streamMapping } from "./desktop/cursor";
+import { turnRelayLabel } from "./desktop/turnLabel";
 import {
   LEASE_NOTICES,
   SAS_NOTICES,
@@ -202,6 +203,13 @@ export default function DesktopLive() {
     keyframesDecoded: 0,
     plis: 0,
   });
+  /** 网络面指标（1s 反馈环提升为 state 供展示；0/null = 尚无样本）。 */
+  const [net, setNet] = useState<{
+    rttMs: number;
+    availBps: number;
+    e2eP95Ms: number | null;
+    relay: string;
+  }>({ rttMs: 0, availBps: 0, e2eP95Ms: null, relay: "—" });
 
   // 逐帧诊断模式(?framediag=1):rVFC 每呈现一帧记录 {帧号, mediaTime,
   // 呈现间隔},getStats 全量指标每 2s 快照——验证播放顺序单调(无回退帧)、
@@ -642,11 +650,15 @@ export default function DesktopLive() {
       sample: FeedbackSample | null;
       rttMs: number;
       availBps: number;
+      relay: string;
     }> => {
-      if (!pc) return { sample: null, rttMs: 0, availBps: 0 };
+      if (!pc) return { sample: null, rttMs: 0, availBps: 0, relay: "—" };
       let sample: FeedbackSample | null = null;
       let rttMs = 0;
       let availBps = 0;
+      // local candidate 表 + selected pair：解析 TURN 中继路径（§3.3）。
+      const locals = new Map<string, { candidateType?: string; address?: string; relayProtocol?: string }>();
+      let selectedLocalId: string | undefined;
       try {
         const report = await pc.getStats();
         const corr = correlator.snapshot();
@@ -681,16 +693,23 @@ export default function DesktopLive() {
             if (typeof p.availableIncomingBitrate === "number" && p.availableIncomingBitrate > 0) {
               availBps = p.availableIncomingBitrate;
             }
+            // 既有 rtt/availBps 逻辑保持；另记 selected pair 的 local 引用。
+            if (p.nominated && p.state === "succeeded" && p.localCandidateId) {
+              selectedLocalId = p.localCandidateId;
+            }
+          } else if (st.type === "local-candidate") {
+            const c = st as { id?: string; candidateType?: string; address?: string; relayProtocol?: string };
+            if (c.id) locals.set(c.id, c);
           }
         });
       } catch {
         /* pc closing */
       }
-      return { sample, rttMs, availBps };
+      return { sample, rttMs, availBps, relay: turnRelayLabel(locals.get(selectedLocalId ?? "")) };
     };
     const sendFeedback = async (visible: boolean) => {
       if (!pc || disposed) return;
-      const { sample, rttMs, availBps } = await readFeedbackStats();
+      const { sample, rttMs, availBps, relay } = await readFeedbackStats();
       if (!sample || disposed) return;
       if (sample.framesDecoded <= 0 || !fbBase) {
         fbBase = sample; // no media yet / first sample only primes deltas
@@ -703,6 +722,16 @@ export default function DesktopLive() {
       const estimatedBps = availBps > 0 ? Math.round(availBps) : goodput;
       const base = fbBase;
       fbBase = sample; // advance the window even when we skip below
+      // [M4 deliverable] end-to-end p95 rides the same 1s report (host
+      // diag line + agent-side correlation); absent with no samples.
+      const corrSnap = correlator.snapshot();
+      // 展示面提升：无论本轮是否上报 agent，网络指标都刷新 UI。
+      setNet((n) => ({
+        rttMs: rttMs > 0 ? Math.round(rttMs * 10) / 10 : n.rttMs,
+        availBps: availBps > 0 ? Math.round(availBps / 1000) : n.availBps, // kbps 展示
+        e2eP95Ms: corrSnap.e2eP95Ms !== null ? Math.round(corrSnap.e2eP95Ms * 10) / 10 : n.e2eP95Ms,
+        relay: relay !== "—" ? relay : n.relay,
+      }));
       if (estimatedBps <= 0) return; // nothing measurable — 0 would look like congestion
       const emitted = sample.jitterEmitted - base.jitterEmitted;
       const queueMs = emitted > 0 ? ((sample.jitterDelay - base.jitterDelay) / emitted) * 1000 : 0;
@@ -721,9 +750,6 @@ export default function DesktopLive() {
         freezes: sample.freezes - base.freezes,
         presentedFps: Math.round((presentedDelta / elapsedS) * 10) / 10,
       };
-      // [M4 deliverable] end-to-end p95 rides the same 1s report (host
-      // diag line + agent-side correlation); absent with no samples.
-      const corrSnap = correlator.snapshot();
       if (corrSnap.e2eP95Ms !== null) {
         fb.e2eP95Ms = Math.round(corrSnap.e2eP95Ms * 10) / 10;
       }
@@ -1121,69 +1147,78 @@ export default function DesktopLive() {
   return (
     <div className="screen-preview">
       <div className="screen-bar">
-        <strong>{nodeName ?? nodeId}</strong>
-        <span className={`screen-state screen-state-${state}`}>{STATE_LABELS[state]}</span>
-        <span className="dim mono">ice:{iceState}</span>
-        {dims && <span className="dim mono">{dims}</span>}
-        {displays.length > 1 && (
-          <select
-            className="desktop-display-select mono"
-            value={displaySel}
-            onChange={(e) => sendSwitchDisplay(Number(e.target.value))}
-            title="capture display (switch_display)"
+        <div className="screen-bar-group">
+          <strong>{nodeName ?? nodeId}</strong>
+          <span className={`screen-state screen-state-${state}`}>{STATE_LABELS[state]}</span>
+          <span className="dim mono">ice:{iceState}</span>
+          {dims && <span className="dim mono">{dims}</span>}
+          {displays.length > 1 && (
+            <select
+              className="desktop-display-select mono"
+              value={displaySel}
+              onChange={(e) => sendSwitchDisplay(Number(e.target.value))}
+              title="capture display (switch_display)"
+            >
+              {displays.map((d) => (
+                <option key={d.index} value={d.index}>
+                  {`#${d.index} ${d.w}x${d.h}${d.primary ? " *" : ""}`}
+                </option>
+              ))}
+            </select>
+          )}
+          <span className="dim mono">{`h264/${iceModeRef.current ?? "relay"}`}</span>
+        </div>
+        <div className="screen-bar-group">
+          <span className="dim mono">{`fps ${stats.fps}`}</span>
+          <span className="dim mono">{`e2e p95 ${net.e2eP95Ms !== null ? `${net.e2eP95Ms}ms` : "—"}`}</span>
+          <span className="dim mono">{`rtt ${net.rttMs > 0 ? `${net.rttMs}ms` : "—"}`}</span>
+          <span className="dim mono">{net.relay}</span>
+        </div>
+        <div className="screen-bar-group">
+          {agentState && <span className="dim mono">{agentState}</span>}
+          <button onClick={sendPli} className="desktop-pli" type="button">PLI</button>
+          {/* SAS / lease 按钮、chips、notice、startError 原样移入本组 */}
+          <button
+            onClick={sendSas}
+            className="desktop-pli"
+            type="button"
+            disabled={sas.pending || sas.denied}
+            title={
+              sas.denied
+                ? "secure attention denied by the host core (--allow-sas gate)"
+                : "send Ctrl+Alt+Del (secure attention) to the remote desktop via xnc-core SendSAS"
+            }
           >
-            {displays.map((d) => (
-              <option key={d.index} value={d.index}>
-                {`#${d.index} ${d.w}x${d.h}${d.primary ? " *" : ""}`}
-              </option>
-            ))}
-          </select>
-        )}
-        <span className="dim mono">{`h264/${iceModeRef.current ?? "relay"}`}</span>
-        {agentState && <span className="dim mono">{agentState}</span>}
-        <button onClick={sendPli} className="desktop-pli" type="button">
-          PLI
-        </button>
-        <button
-          onClick={sendSas}
-          className="desktop-pli"
-          type="button"
-          disabled={sas.pending || sas.denied}
-          title={
-            sas.denied
-              ? "secure attention denied by the host core (--allow-sas gate)"
-              : "send Ctrl+Alt+Del (secure attention) to the remote desktop via xnc-core SendSAS"
-          }
-        >
-          {sas.pending ? "SAS…" : "Ctrl+Alt+Del"}
-        </button>
-        <button
-          onClick={requestLease}
-          className="desktop-pli"
-          type="button"
-          disabled={lease.status === "granted" || lease.status === "requested"}
-        >
-          {leaseLabel}
-        </button>
-        {lease.status === "granted" && lease.id && (
-          <span className="desktop-lease-chip ok mono">lease {lease.id.slice(0, 8)}</span>
-        )}
-        {lease.status === "denied" && (
-          <span className="desktop-lease-chip bad mono">denied:{lease.reason ?? "?"}</span>
-        )}
-        {lease.status === "revoked" && (
-          <span className="desktop-lease-chip bad mono">revoked:{lease.reason ?? "?"}</span>
-        )}
-        {notice && (
-          <span className="desktop-notice" role="status">
-            {notice}
-          </span>
-        )}
-        {startError && (
-          <span className="form-error" role="alert">
-            {startError}
-          </span>
-        )}
+            {sas.pending ? "SAS…" : "Ctrl+Alt+Del"}
+          </button>
+          <button
+            onClick={requestLease}
+            className="desktop-pli"
+            type="button"
+            disabled={lease.status === "granted" || lease.status === "requested"}
+          >
+            {leaseLabel}
+          </button>
+          {lease.status === "granted" && lease.id && (
+            <span className="desktop-lease-chip ok mono">lease {lease.id.slice(0, 8)}</span>
+          )}
+          {lease.status === "denied" && (
+            <span className="desktop-lease-chip bad mono">denied:{lease.reason ?? "?"}</span>
+          )}
+          {lease.status === "revoked" && (
+            <span className="desktop-lease-chip bad mono">revoked:{lease.reason ?? "?"}</span>
+          )}
+          {notice && (
+            <span className="desktop-notice" role="status">
+              {notice}
+            </span>
+          )}
+          {startError && (
+            <span className="form-error" role="alert">
+              {startError}
+            </span>
+          )}
+        </div>
       </div>
       <div className="desktop-textbar">
         <span className="dim">inject text</span>
@@ -1218,6 +1253,10 @@ export default function DesktopLive() {
         {cursorDot && <div className="desktop-cursor" style={cursorDot} />}
         <div className="desktop-stats mono">
           <div>fps {stats.fps}</div>
+          <div>e2e p95 {net.e2eP95Ms !== null ? `${net.e2eP95Ms}ms` : "—"}</div>
+          <div>rtt {net.rttMs > 0 ? `${net.rttMs}ms` : "—"}</div>
+          <div>rate {net.availBps > 0 ? `${net.availBps}kbps` : "—"}</div>
+          <div>{net.relay}</div>
           <div>first frame {stats.firstFrameMs ? `${stats.firstFrameMs}ms` : "—"}</div>
           <div>decoded {stats.framesDecoded}</div>
           <div>key {stats.keyframesDecoded}</div>

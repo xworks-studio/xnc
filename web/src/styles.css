@@ -506,6 +506,19 @@ h2 {
   flex-wrap: wrap;
 }
 
+/* 状态栏三组（会话信息｜媒体统计｜操作）：flex 分组 + 左分隔线。 */
+.screen-bar-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.screen-bar-group + .screen-bar-group {
+  border-left: 1px solid var(--border, #333);
+  padding-left: 10px;
+  margin-left: 2px;
+}
+
 .screen-canvas {
   flex: 1;
   min-height: 0;
