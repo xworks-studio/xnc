@@ -119,7 +119,7 @@ func (h *handlers) agentConnect(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	// 快速版本检查 ①：HELLO_ACK 回执携带目标版本；握手后版本落后则立即
-	// 下发 UPDATE_OFFER（重连/重启/开机场景秒级感知）。
+	// 下发 UPDATE_AVAILABLE（重连/重启/开机场景秒级感知）。
 	targetVer := ""
 	if rel, ok := h.targetReleaseFor(ctx, node.ID); ok {
 		targetVer = rel.Version
@@ -143,7 +143,7 @@ func (h *handlers) agentConnect(w http.ResponseWriter, r *http.Request) {
 			}
 			conn.Beats++
 			// 快速版本检查 ②：PING/PONG 搭车——agent 报当前版本，ACK
-			// 回目标版本；版本落后即推 OFFER（灰度改 pin 后一个保活周
+			// 回目标版本；版本落后即推送（灰度改 pin 后一个保活周
 			// 期内全网感知，零新增消息类型）。targetVer 每拍重解析:
 			// 握手时缓存的值在 pin 变更后对长连接永远过期(2026-08-24
 			// 生产事故:改 pin 后 agent 死循环在旧 target)。
@@ -167,11 +167,11 @@ func (h *handlers) agentConnect(w http.ResponseWriter, r *http.Request) {
 					"from", ua.From, "to", ua.To, "reason", ua.Reason)
 			}
 		case proto.TypeUpdateStatus:
-			// 遗留 bundle agent 阶段上报（spec §14 迁移期；最终确认 = 新版
-			// HELLO 版本）。
+			// 更新阶段上报（历史消息类型，容忍接收仅记日志；最终确认 =
+			// 新版 HELLO 上报的版本）。
 			var us proto.UpdateStatus
 			if m.Decode(&us) == nil {
-				slog.Info("agent update status (legacy)", "node", node.ID, "version", us.Version,
+				slog.Info("agent update status", "node", node.ID, "version", us.Version,
 					"phase", us.Phase, "err", us.Error)
 			}
 		case proto.TypeSessionRefused:

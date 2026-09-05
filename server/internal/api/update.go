@@ -1,4 +1,4 @@
-// update.go — 统一自更新的服务端逻辑：目标版本决策、下载令牌、OFFER 下发。
+// update.go — 统一自更新的服务端逻辑：目标版本决策、UPDATE_AVAILABLE 下发。
 //
 // 目标版本：COALESCE(nodes.target_release, 最新 release)。三个触发时机
 // （设计文档）：HELLO 握手回执、心跳 ACK 搭车、rollout 强制 —— 全部收敛
@@ -7,11 +7,7 @@ package api
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"log/slog"
-	"sync"
-	"time"
 
 	"github.com/google/uuid"
 
@@ -24,46 +20,6 @@ const (
 	bundleArtifactName = "bundle.tar.gz"
 	cliArtifactName    = "xnc-windows-amd64.exe"
 )
-
-// downloadTokens — agent bundle 下载令牌（短时效、单次、绑定节点）。
-// 单实例 server，进程内 map 足够；过期惰性清扫。
-var downloadTokens = struct {
-	sync.Mutex
-	m map[string]downloadToken
-}{m: map[string]downloadToken{}}
-
-type downloadToken struct {
-	NodeID    uuid.UUID
-	ReleaseID uuid.UUID
-	Expires   time.Time
-}
-
-func mintDownloadToken(nodeID, releaseID uuid.UUID) string {
-	b := make([]byte, 24)
-	_, _ = rand.Read(b)
-	tok := hex.EncodeToString(b)
-	downloadTokens.Lock()
-	downloadTokens.m[tok] = downloadToken{NodeID: nodeID, ReleaseID: releaseID, Expires: time.Now().Add(15 * time.Minute)}
-	// 顺带清扫过期项（量小，无需独立协程）。
-	for k, v := range downloadTokens.m {
-		if time.Now().After(v.Expires) {
-			delete(downloadTokens.m, k)
-		}
-	}
-	downloadTokens.Unlock()
-	return tok
-}
-
-func consumeDownloadToken(tok string, nodeID uuid.UUID) (uuid.UUID, bool) {
-	downloadTokens.Lock()
-	defer downloadTokens.Unlock()
-	v, ok := downloadTokens.m[tok]
-	if !ok || time.Now().After(v.Expires) || v.NodeID != nodeID {
-		return uuid.UUID{}, false
-	}
-	delete(downloadTokens.m, tok) // 单次
-	return v.ReleaseID, true
-}
 
 // targetReleaseFor — 节点的目标版本：pin 优先，否则节点所在频道的最新。
 // 无可用 release 时返回 false（不触发更新）。
@@ -95,14 +51,15 @@ func (h *handlers) targetReleaseFor(ctx context.Context, nodeID uuid.UUID) (sqlc
 // HELLO 握手、心跳、强制 rollout 三入口共用；幂等性由 agent 侧去重保证
 // （同版本重复推送静默跳过），服务端不做去重以保持无状态。
 //
-// 新协议：release 带 setup.exe 制品 → 推 UPDATE_AVAILABLE（安装器编排，
-// spec §9.1）。推送载荷 {version,url,sha256} 本身即完整清单：agent 的
+// 推送载荷 {version,url,sha256} 本身即完整清单：agent 的
 // updater.HandlePush 经已认证控制通道收到后直接编排，无需再拉
 // setup.json——sha256 即信任根（下载后校验，不符入黑名单），下载 url
 // 由 agent 强制与 server 同源；拉取 setup.json 是轮询路径（CheckNow）
 // 的清单来源，推送路径不经过。
-// 迁移期兜底：仅含 bundle.tar.gz 的历史 release → 推遗留 UPDATE_OFFER
-// （存量 bundle agent 的最后通道，spec §14；新 agent 对其前向兼容忽略）。
+//
+// 未上线直采终态（设计 §14）：更新唯一经安装器（setup.exe 制品）编排，
+// 遗留 bundle 通道已移除——release 不含 setup.exe 制品时不推送（仅告警，
+// 发布流水线漏传安装器属配置错误，应修复发布而非降级兜底）。
 func (h *handlers) maybeOfferUpdate(ctx context.Context, nodeID uuid.UUID, currentVersion string, send func(proto.Message) error) {
 	if currentVersion == "" {
 		return
@@ -111,34 +68,19 @@ func (h *handlers) maybeOfferUpdate(ctx context.Context, nodeID uuid.UUID, curre
 	if !ok || rel.Version == currentVersion {
 		return
 	}
-	q := h.st.Q()
-	if art, err := q.GetArtifact(ctx, sqlc.GetArtifactParams{ReleaseID: rel.ID, Name: setupArtifactName}); err == nil {
-		push, _ := proto.NewMsg(proto.TypeUpdateAvailable, proto.UpdateAvailable{
-			Version: rel.Version,
-			URL:     "/setup.exe?channel=" + rel.Channel,
-			SHA256:  art.Sha256,
-		})
-		if err := send(push); err != nil {
-			slog.Warn("update: push send failed", "node", nodeID, "err", err)
-		} else {
-			slog.Info("update: pushed", "node", nodeID, "from", currentVersion, "to", rel.Version)
-		}
-		return
-	}
-	art, err := q.GetArtifact(ctx, sqlc.GetArtifactParams{ReleaseID: rel.ID, Name: bundleArtifactName})
+	art, err := h.st.Q().GetArtifact(ctx, sqlc.GetArtifactParams{ReleaseID: rel.ID, Name: setupArtifactName})
 	if err != nil {
-		slog.Warn("update: setup/bundle artifact missing", "version", rel.Version, "err", err)
+		slog.Warn("update: setup artifact missing; not offering", "version", rel.Version, "err", err)
 		return
 	}
-	tok := mintDownloadToken(nodeID, rel.ID)
-	offer, _ := proto.NewMsg(proto.TypeUpdateOffer, proto.UpdateOffer{
+	push, _ := proto.NewMsg(proto.TypeUpdateAvailable, proto.UpdateAvailable{
 		Version: rel.Version,
-		URL:     "/api/agent/bundle?token=" + tok + "&node=" + nodeID.String(),
+		URL:     "/setup.exe?channel=" + rel.Channel,
 		SHA256:  art.Sha256,
 	})
-	if err := send(offer); err != nil {
-		slog.Warn("update: legacy offer send failed", "node", nodeID, "err", err)
+	if err := send(push); err != nil {
+		slog.Warn("update: push send failed", "node", nodeID, "err", err)
 	} else {
-		slog.Info("update: offered (legacy bundle)", "node", nodeID, "from", currentVersion, "to", rel.Version)
+		slog.Info("update: pushed", "node", nodeID, "from", currentVersion, "to", rel.Version)
 	}
 }

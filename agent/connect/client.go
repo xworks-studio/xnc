@@ -389,7 +389,7 @@ func readMsg(ctx context.Context, ws *websocket.Conn, timeout time.Duration) (pr
 // ---- 自更新接入（三入口回调）----
 
 // OnTargetVersion 快速版本检查回调：HELLO_ACK 回执与心跳 ACK 携带的目标
-// 版本到达时调用（nil 跳过）。与 OnUpdateOffer 收敛到同一处理方（updater
+// 版本到达时调用（nil 跳过）。与推送路径收敛到同一处理方（updater
 // 幂等去重），三入口（握手/心跳/强制）无需区分来源。
 func (c *Client) OnTargetVersion(target string) {
 	if c.TargetVersionFunc != nil {

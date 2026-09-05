@@ -28,10 +28,6 @@ const (
 	// UPDATE_AUDIT：agent → server 更新结果审计（update_ok / update_rollback，
 	// spec §9.4）。仅经已认证控制连接发送；server 侧记审计日志。
 	TypeUpdateAudit = "UPDATE_AUDIT"
-	// 遗留 bundle 更新通道（spec §14 迁移期）：仅存量 bundle agent 认识；
-	// 新 agent 对 UPDATE_OFFER 前向兼容忽略，存量 agent 对
-	// UPDATE_AVAILABLE 同样忽略。bundle agent 全网切换完成后删除。
-	TypeUpdateOffer  = "UPDATE_OFFER"
 	TypeUpdateStatus = "UPDATE_STATUS"
 	// NODE_DELETE：agent → server 机器自注销（spec §7 deregister）。仅经已认证
 	// 控制连接发送——机器身份（挑战-应答签名）即凭据，无 JWT；服务端删除节点
@@ -67,7 +63,7 @@ type Hello struct {
 }
 
 // HelloAck 携带目标版本（快速版本检查三通道之一）：agent 比对后若落后，
-// 服务端会紧随其后推 UPDATE_OFFER。
+// 服务端会紧随其后推 UPDATE_AVAILABLE。
 type HelloAck struct {
 	TargetVersion string `json:"targetVersion,omitempty"`
 }
@@ -84,9 +80,9 @@ type HeartbeatAck struct {
 
 // UpdateAvailable 服务端 → agent：新版本推送（spec §9.1）。推送路径
 // （HandlePush）下载荷即目标清单：URL + SHA256 直接作为下载凭证与信任
-// 根——控制通道已经挑战-应答认证，sha256 即真相（与遗留 UPDATE_OFFER
-// 同一信任模型）；URL 须与 server 同源（agent 侧强制）。轮询路径则由
-// agent 自行拉取 setup.json 作清单。字段与 setup.json 对齐。
+// 根——控制通道已经挑战-应答认证，sha256 即真相；URL 须与 server 同源
+// （agent 侧强制）。轮询路径则由 agent 自行拉取 setup.json 作清单。
+// 字段与 setup.json 对齐。
 type UpdateAvailable struct {
 	Version string `json:"version"`
 	URL     string `json:"url"` // /setup.exe?channel=<ch>（相对路径）
@@ -107,18 +103,8 @@ type UpdateAudit struct {
 	Reason string `json:"reason,omitempty"` // 回滚原因
 }
 
-// ---- 遗留 bundle 更新通道载荷（spec §14 迁移期，随 UPDATE_OFFER 退役）----
-
-// UpdateOffer 遗留 bundle 下载凭证（短时效单次令牌，绑定节点）。
-type UpdateOffer struct {
-	Version   string `json:"version"`
-	URL       string `json:"url"`
-	SHA256    string `json:"sha256"`
-	ExpiresAt string `json:"expiresAt,omitempty"`
-}
-
-// UpdateStatus 遗留阶段上报（bundle agent → server；最终确认由新版
-// HELLO 版本承担）。
+// UpdateStatus 更新阶段上报（agent → server；最终确认由新版 HELLO 上报
+// 的版本承担）。
 const (
 	UpdatePhaseDownloading = "downloading"
 	UpdatePhaseVerifying   = "verifying"

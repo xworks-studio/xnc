@@ -135,8 +135,6 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 	})
 	r.Post("/api/agent/enroll", h.agentEnroll)
 	r.Get("/api/agent/connect", h.agentConnect)
-	// 自更新数据面：agent bundle 下载（OFFER 携带的单次令牌即凭证，无 JWT）
-	r.Get("/api/agent/bundle", h.agentBundleDownload)
 	// 会话 WS（两侧均 token 即凭证，不走 JWT）
 	r.Get("/api/session/{id}", h.clientSessionWS)
 	r.Get("/api/agent/session", h.agentSessionWS)
@@ -158,22 +156,10 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 
 	// 安装器分发（设计 §4，无认证——产品首次下载入口）：频道最新 setup.exe
 	// 直流 + 动态版本清单 setup.json（供 xnc upgrade --check / CI 消费）。
+	// 安装器是唯一安装入口（未上线直采终态，设计 §14）：历史的一行流
+	// （/a/* /c* /install/*.ps1）已在上线前整体移除。
 	r.Get("/setup.exe", h.setupDownload)
 	r.Get("/setup.json", h.setupManifest)
-
-	// 快捷安装（无 JWT——token 是凭证；SPA 兜底之前注册）
-	// DEPRECATED（设计 §14）：一行流由 setup.exe + `xnc register` 取代
-	// （安装器是唯一安装入口）。迁移期保留 2 个 release 周期，随后连同
-	// install_handlers.go / install_scripts.go 一并删除。
-	// curl -sL xnc.app/a/<token> | cmd    → agent 安装（deprecated）
-	// curl -sL xnc.app/c | cmd           → CLI 安装（deprecated）
-	r.Get("/a/{token}", h.installAgentCmd)
-	r.Get("/a-dev/{token}", h.installAgentCmd)
-	r.Get("/c", h.installCliCmd)
-	r.Get("/c-dev", h.installCliCmd)
-	// 安装脚本本体（cmd 脚本内引用下载；deprecated，随上面的入口一同退役）
-	r.Get("/install/agent.ps1", h.serveAgentInstallPS)
-	r.Get("/install/cli.ps1", h.serveCliInstallPS)
 
 	r.Route("/api/nodes", func(nr chi.Router) {
 		nr.Use(auth.Middleware(cfg.JWTSecret, st))

@@ -1,13 +1,10 @@
-// update_handlers.go — 自更新 REST 面：admin 上传/灰度 + agent bundle
-// 下载（令牌） + CLI latest/下载（用户 JWT）。
+// update_handlers.go — 自更新 REST 面：admin 上传/灰度 + CLI latest/下载
+// （用户 JWT）。
 //
 // 上传方是部署流水线（构建机 curl，admin JWT）——CLI 面向使用者不提供
-// 上传命令。制品经 multipart/form-data：version、notes、bundle（tar.gz，
-// 含 xnc-agent.exe + xnc-core/desktop/shell.exe + manifest.json）、setup
-// （可选 Inno Setup 安装器，固定制品名 setup.exe，设计 §4/§12：一次发布
-// 同时携带安装器与最后过渡 bundle，§14 迁移期形态）、cli（可选
-// xnc-windows-amd64.exe）。服务端校验 bundle 内容与 manifest 哈希一致
-// 后入库（bytea，随 pgdata 备份走）。
+// 上传命令。制品经 multipart/form-data：version、notes、setup（Inno Setup
+// 安装器，固定制品名 setup.exe，设计 §4/§12）、cli（可选
+// xnc-windows-amd64.exe）。服务端校验后入库（bytea，随 pgdata 备份走）。
 package api
 
 import (
@@ -277,8 +274,8 @@ func (h *handlers) adminDeleteRelease(w http.ResponseWriter, r *http.Request) {
 }
 
 // adminRollout — POST /api/admin/rollout：
-//   {version, nodeId}                    pin 节点到版本 + 强制 OFFER
-//   {nodeId, channel: "dev"}             切节点频道 + 强制 OFFER（新频道的最新）
+//   {version, nodeId}                    pin 节点到版本 + 强制推送
+//   {nodeId, channel: "dev"}             切节点频道 + 强制推送（新频道的最新）
 //   {unpin: true}                        清除所有 pin（跟随频道最新）
 func (h *handlers) adminRollout(w http.ResponseWriter, r *http.Request) {
 	u := auth.UserFrom(r.Context())
@@ -356,7 +353,7 @@ func (h *handlers) adminRollout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 强制即时 OFFER：节点在线则立刻下发。
+	// 强制即时推送：节点在线则立刻下发。
 	offered := false
 	if nc := h.reg.Get(nodeID.String()); nc != nil {
 		node, err := h.st.Q().GetNodeByID(ctx, nodeID)
@@ -376,31 +373,6 @@ func (h *handlers) clearAllPins(ctx context.Context) error {
 
 // pgText — string → pgtype.Text。
 func pgText(s string) pgtype.Text { return pgtype.Text{String: s, Valid: true} }
-
-// agentBundleDownload — GET /api/agent/bundle?token=&node=（OFFER 令牌）。
-// node 参数为节点 ID（agent 知道自己的 NodeID），令牌与之绑定校验。
-func (h *handlers) agentBundleDownload(w http.ResponseWriter, r *http.Request) {
-	tok := r.URL.Query().Get("token")
-	nodeID, err := uuid.Parse(r.URL.Query().Get("node"))
-	if err != nil {
-		respondError(w, proto.Err(401, "UNAUTHORIZED", "invalid node"))
-		return
-	}
-	releaseID, ok := consumeDownloadToken(tok, nodeID)
-	if !ok {
-		respondError(w, proto.Err(401, "UNAUTHORIZED", "invalid or expired token"))
-		return
-	}
-	art, err := h.st.Q().GetArtifact(r.Context(), sqlc.GetArtifactParams{ReleaseID: releaseID, Name: bundleArtifactName})
-	if err != nil {
-		respondError(w, proto.Err(404, "NOT_FOUND", "bundle not found"))
-		return
-	}
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("X-Xnc-Sha256", art.Sha256)
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(art.Data)
-}
 
 // cliLatest — GET /api/cli/latest?channel=（用户 JWT）：CLI 自更新元信息。
 func (h *handlers) cliLatest(w http.ResponseWriter, r *http.Request) {
