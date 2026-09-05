@@ -143,5 +143,10 @@ func TestPumpRelayUpdatesActivity(t *testing.T) {
 	require.Equal(t, websocket.MessageBinary, typ)
 	assert.Equal(t, "ping", string(data))
 
-	assert.Greater(t, s.lastActivity.Load(), before, "relay must bump lastActivity per frame")
+	// pump goroutine 的 lastActivity store 在 Write 返回之后（pump.go 每帧
+	// 免锁刷新）——client 读到帧不保证 store 已被调度执行，慢 runner 上
+	// 即时断言会先于 store（CI 实测竞态）。轮询收敛，断言语义不变。
+	require.Eventually(t, func() bool {
+		return s.lastActivity.Load() > before
+	}, time.Second, 5*time.Millisecond, "relay must bump lastActivity per frame")
 }
