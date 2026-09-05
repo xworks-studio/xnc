@@ -32,3 +32,6 @@ __pycache__/
 
 # 测量产物（M4 才有意入库精选 gate 记录；日常记录见 SDD 任务报告）
 artifacts/
+
+# 代码签名私钥（仅本地，勿入库）
+installer/codesign.pfx

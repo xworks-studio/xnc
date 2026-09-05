@@ -64,6 +64,46 @@ if ($reported -ne $Version) {
     throw "agent self-reported version '$reported' != packaging version '$Version' (rebuild with matching -ldflags)"
 }
 
+# Authenticode signing (self-signed interim, spec §13): sign the five exes
+# BEFORE ISCC (the installer embeds them - installs land signed) and the
+# setup exe AFTER ISCC; sha256 sidecar is computed last so it covers the
+# signed artifact. Key material lives outside git: installer\codesign.pfx
+# (gitignored) + password in env XNC_CODESIGN_PASSWORD (deploy/.env on dev
+# machines). No pfx -> warn + unsigned build (never block keyless builders).
+$signCert = $null
+$pfxPath = Join-Path $PSScriptRoot "codesign.pfx"
+if (Test-Path $pfxPath) {
+    if (-not $env:XNC_CODESIGN_PASSWORD) { throw "codesign.pfx found but XNC_CODESIGN_PASSWORD is not set" }
+    $signCert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+        $pfxPath, $env:XNC_CODESIGN_PASSWORD)
+    Write-Output "build.ps1: signing with cert $($signCert.Subject)"
+} else {
+    Write-Warning "build.ps1: installer\codesign.pfx not found - building UNSIGNED"
+}
+function Sign-Artifact([string]$file) {
+    if (-not $signCert) { return }
+    # 时间戳服务器按序回退（境内网络对 digicert 常不可达，曾致构建挂死 20
+    # 分钟）；全部失败则免时间戳签名并告警——自签过渡期可接受，正式 CA 落
+    # 地后改为强制。
+    $sig = $null
+    foreach ($ts in @("http://timestamp.digicert.com",
+                      "http://timestamp.sectigo.com",
+                      "http://timestamp.globalsign.com/tsa/r6/advanced")) {
+        $sig = Set-AuthenticodeSignature -FilePath $file -Certificate $signCert -TimestampServer $ts
+        if ($sig.Status -eq "Valid") { break }
+        Write-Warning "build.ps1: timestamp server $ts failed ($($sig.StatusMessage)); trying next"
+    }
+    if ($sig.Status -ne "Valid") {
+        Write-Warning "build.ps1: all timestamp servers failed - signing WITHOUT timestamp"
+        $sig = Set-AuthenticodeSignature -FilePath $file -Certificate $signCert
+        if ($sig.Status -ne "Valid") { throw "signing $file failed: $($sig.Status) $($sig.StatusMessage)" }
+    }
+    Write-Output "build.ps1: signed $(Split-Path -Leaf $file)"
+}
+foreach ($exe in @("xnc-agent.exe", "xnc.exe", "xnc-shell.exe", "xnc-core.exe", "xnc-desktop.exe")) {
+    Sign-Artifact (Join-Path $bin $exe)
+}
+
 # VersionInfoVersion must be strictly numeric w.x.y.z ("0.6.1" -> "0.6.1.0",
 # "0.0.0-dev" -> "0.0.0.0").
 $numeric = ($Version -split "-")[0]
@@ -88,6 +128,7 @@ if ($Channel -eq "dev") { $suffix = "-dev" }
 $name = "xnc-setup$suffix-$Version.exe"
 $setup = Join-Path $bin $name
 if (-not (Test-Path $setup)) { throw "setup exe not found after ISCC: $setup" }
+Sign-Artifact $setup
 $hash = (Get-FileHash -Algorithm SHA256 $setup).Hash.ToLowerInvariant()
 "$hash  $name" | Set-Content -Path "$setup.sha256" -Encoding ascii
 Write-Output "installer: $setup"

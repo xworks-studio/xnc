@@ -120,6 +120,20 @@ chi + sqlc + 真 PG 测试）· `agent`（节点侧，Windows 服务）· `cli` 
 - **实验闭环惯例**：卸载→清残留（服务/进程/任务/目录/PATH/注册表八项核验）
   →全新安装→注册上线→验证→deregister→卸载→双端零残留。
 
+### 代码签名（自签过渡期）
+
+- **背景**：未签名 exe 会被 Defender 随机隔离（实战发生过：xnc.exe 消失）。
+- **证书**：`installer/codesign.cer`（公钥，入库）+ `installer/codesign.pfx`
+  （私钥，gitignored，**勿外传**）；密码在 `deploy/.env` 的
+  `XNC_CODESIGN_PASSWORD`。3 年有效期，续期用 `installer/make-cert.ps1`
+  重建并给全机群重导信任。
+- **构建**：`build.ps1` 自动签名（五 exe 在 ISCC 前签、setup 在其后、
+  sha256 覆盖签名后产物）；设 `XNC_CODESIGN_PASSWORD` 环境变量。时间戳
+  多服务器回退，全败则免时间戳签名+告警。
+- **新机入群**：导入 `codesign.cer` 到 LocalMachine 的 `Root` +
+  `TrustedPublisher`（否则 Defender 照拦——自签信任靠自己分发）。
+- **待办**：换正式 CA（EV）证书后，信任分发可整体退役。
+
 ## 8. 已知小缺口（勿重复发现，按需修）
 
 - `HEAD /setup.exe` 落到 SPA（chi Get 不含 Head）。
