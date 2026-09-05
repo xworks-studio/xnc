@@ -1,8 +1,8 @@
-# build-server.yml — server 镜像构建与发布（设计文档 §4）：CI 只产出并
-# 发布文件，不触碰服务器；SRV 侧 deploy/pull-server.sh 定时拉取部署。
-#   push main → 版本 main-<短哈希>；tag v* → 版本 <tag 版本>
-# 发布通道：release store 的 channel=server release，制品 server-image.tar.gz；
-# 下载端点 GET /server-image（响应头 X-Xnc-Version 供拉取脚本比对）。
+# build-server.yml — server 镜像构建推送 GHCR（设计文档 §4）：
+#   push main → 镜像标签 main + sha-<短哈希>（版本 main-<短哈希>）
+#   tag  v*   → 镜像标签 vX.Y.Z + latest（版本 = tag 版本）
+# 服务器侧由 Watchtower（compose 内独立容器）轮询 GHCR 自动拉取重建，
+# 与 server 产品本身零耦合。GHCR 私有包的服务器拉取授权见设计 §4.3。
 name: build-server
 
 on:
@@ -12,57 +12,60 @@ on:
 
 permissions:
   contents: read
+  packages: write # GHCR 推送
 
 jobs:
-  build-publish:
+  build-push:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - id: meta
-        name: derive version
+        name: derive version + image tags
         run: |
           ref="${{ github.ref_name }}"
-          if [[ "$ref" == v* ]]; then ver="${ref#v}"; else ver="main-${GITHUB_SHA::7}"; fi
-          echo "version=${ver}" >> "$GITHUB_OUTPUT"
+          if [[ "$ref" == v* ]]; then
+            ver="${ref#v}"
+            tags="latest v${ver}"
+          else
+            sha="${GITHUB_SHA::7}"
+            ver="main-${sha}"
+            tags="main sha-${sha}"
+          fi
+          {
+            echo "version=${ver}"
+            echo "tags<<EOF"
+            for t in $tags; do echo "ghcr.io/${{ github.repository_owner }}/xnc-server:${t}"; done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - name: build web (dist 进 docker 上下文)
+      - name: build web (dist 进 docker 上下文；服务器从不跑 npm)
         run: |
           cd web
           npm ci
           npm run build
 
-      - name: build image + save tar
-        run: |
-          ver="${{ steps.meta.outputs.version }}"
-          docker build -f deploy/Dockerfile --build-arg XNC_VERSION="${ver}" \
-            -t "xnc-server:${ver}" .
-          mkdir -p /tmp/ship
-          docker save "xnc-server:${ver}" | gzip > "/tmp/ship/server-image.tar.gz"
-          ls -lh /tmp/ship
+      - uses: docker/setup-buildx-action@v3
 
-      - name: publish to release store (channel=server) + verify
-        env:
-          SERVER: ${{ secrets.XNC_SERVER_URL }}
-          EMAIL: ${{ secrets.XNC_ADMIN_EMAIL }}
-          PASSWD: ${{ secrets.XNC_ADMIN_PASSWORD }}
-        run: |
-          ver="${{ steps.meta.outputs.version }}"
-          jwt=$(curl -sf -X POST "$SERVER/api/auth/login" \
-            -H 'Content-Type: application/json' \
-            -d "{\"email\":\"$EMAIL\",\"password\":\"$PASSWD\"}" | jq -r .token)
-          curl -sf -X POST "$SERVER/api/admin/releases" \
-            -H "Authorization: Bearer $jwt" \
-            -F "version=$ver" \
-            -F "notes=server image (CI build ${{ github.sha }})" \
-            -F "channel=server" \
-            -F "server=@/tmp/ship/server-image.tar.gz;type=application/gzip" > /dev/null
-          # 回读校验：版本头必须匹配（防上传假成功）
-          got=$(curl -sI "$SERVER/server-image?channel=server" | tr -d '\r' | awk -F': ' '/^X-Xnc-Version/{print $2}')
-          [ "$got" = "$ver" ] || { echo "::error::readback version=$got want=$ver"; exit 1; }
-          echo "published: $ver"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: true
+          platforms: linux/amd64
+          build-args: |
+            XNC_VERSION=${{ steps.meta.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

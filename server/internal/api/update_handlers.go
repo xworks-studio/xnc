@@ -99,26 +99,6 @@ func (h *handlers) adminUploadRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// server 镜像 tar.gz（channel=server 的 release；build-server.yml 上传）。
-	if imf, _, ierr := r.FormFile("server"); ierr == nil {
-		data, rerr := io.ReadAll(io.LimitReader(imf, maxUploadBytes))
-		if rerr != nil {
-			respondError(w, proto.Err(400, "BAD_REQUEST", "read server image: "+rerr.Error()))
-			return
-		}
-		if len(data) == 0 {
-			respondError(w, proto.Err(400, "BAD_REQUEST", "server image part is empty"))
-			return
-		}
-		sum := sha256.Sum256(data)
-		if err := h.st.Q().PutArtifact(r.Context(), sqlc.PutArtifactParams{
-			ReleaseID: rel.ID, Name: "server-image.tar.gz",
-			Sha256: hex.EncodeToString(sum[:]), Size: int64(len(data)), Data: data,
-		}); err != nil {
-			respondError(w, proto.Err(500, "INTERNAL", "store server image: "+err.Error()))
-			return
-		}
-	}
 	if cf, _, cerr := r.FormFile("cli"); cerr == nil {
 		defer cf.Close()
 		cliBytes, rerr := io.ReadAll(cf)

@@ -130,37 +130,38 @@ jobs:
 - 仓库分支保护（配套设置，非 workflow）：main 需 CI 绿 + 禁止 force
   push；tag 保护规则 `v*` 禁止删除与移动。
 
-## 4. Server 镜像化交付（CI 只发布，服务器拉取）
+## 4. Server 镜像化交付（GHCR + Watchtower）
 
-**架构**：CI 构建版本镜像并发布文件，不触碰服务器；SRV 侧脚本定时
-拉取比对、下载、`docker load`、`up -d`，失败自动回滚。无镜像仓库、
-无服务器登录凭据进 CI。
+**架构**：CI 构建版本镜像推 GHCR（GitHub 自带注册表）；服务器侧
+Watchtower（compose 内独立容器）轮询注册表自动拉取重建。与 server
+产品本身零耦合——不把基础设施交付嵌进产品 API。
 
-### 4.1 发布（`build-server.yml`，push main / tag v* 触发）
+### 4.1 构建推送（`build-server.yml`，push main / tag v* 触发）
 
-1. 构建 web dist → docker build（`deploy/Dockerfile`，版本
-   `main-<短哈希>` 或 tag 版本）→ `docker save | gzip`。
-2. 经 admin API 上传 **channel=server** 的 release，制品固定名
-   `server-image.tar.gz`（上传端接受 `server` multipart part）。
-3. 回读校验 `GET /server-image` 的 `X-Xnc-Version` 头，不符即 job 红。
+- 镜像 `ghcr.io/xworks-studio/xnc-server`：
+  - main push → 标签 `main`（浮动）+ `sha-<短哈希>`；版本 `main-<短哈希>`
+  - v* tag → 标签 `vX.Y.Z` + `latest`；版本 = tag 版本
+- 多阶段构建沿用 `deploy/Dockerfile`（workflow 先构建 web dist 进上下文；
+  服务器从不跑 npm），GITHUB_TOKEN 推送，buildx GHA 缓存。
 
-### 4.2 下载端点（server 侧，无认证产品分发面）
+### 4.2 服务器侧（Watchtower，compose 内独立服务）
 
-- `GET /server-image?channel=server` → 200 tar.gz 流 +
-  `X-Xnc-Version`（拉取脚本比对用，免解析 manifest）+ `X-Xnc-Sha256`。
-
-### 4.3 服务器侧（`deploy/pull-server.sh`，cron */5）
-
-- flock 防并发；`X-Xnc-Version` 对比**运行中服务自报的** `/api/health`
-  版本（经 caddy 容器内网探测），相同即 no-op。
-- 不同则下载 → sha256 校验 → `docker load` → `tag xnc-server:local` →
-  `up -d` → 60s 健康验证；失败自动 tag 回旧版本并 up（镜像 tar 保留
-  最近 5 份，`images/server-image-<版本>.tar.gz`）。
-- compose 引用本地 tag `xnc-server:local` + `pull_policy: never`；
-  服务器上没有源码，`/opt/xnc` = `deploy/` + `images/`。
-- **手动回滚**：`docker tag xnc-server:<旧版本> xnc-server:local &&
-  docker compose -f deploy/docker-compose.yml up -d xnc-server`。
+- 仅管理带 `com.centurylinklabs.watchtower.enable=true` 标签的服务
+  （当前只有 xnc-server）；5 分钟轮询；`--cleanup` 清旧镜像层。
+- compose 引用 `ghcr.io/...:main`；**锁版本/回滚** = 改成 `:vX.Y.Z`
+  或 `:sha-<哈希>` 后 `up -d`（版本不可变原则下的回滚姿势）。
+- `/opt/xnc` 只有 `deploy/`——无源码、无脚本、无 cron。
 - Caddyfile 变更仍 SSH 手工（换 inode 需 `--force-recreate`）。
+
+### 4.3 GHCR 私有包的服务器授权（一次性）
+
+服务器 `docker login ghcr.io` 需要只读凭据，二选一：
+- **PAT（推荐）**：GitHub → Settings → Developer settings →
+  Fine-grained PAT，仅 `contents/packages: read`，登 SRV 执行
+  `docker login ghcr.io -u <user>` 粘贴 PAT（存 /root/.docker/config.json，
+  Watchtower 挂载同一文件）。
+- **公开包**：首次推送后在包设置改 public，服务器匿名拉取
+  （代价：server 二进制公开可下载）。
 
 ## 5. 配套设置清单（实施时一次做完）
 

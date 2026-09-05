@@ -14,13 +14,12 @@ services:
       retries: 12
 
   xnc-server:
-    # 镜像化交付（无镜像仓库）：build-server.yml 在 CI 构建版本镜像 →
-    # docker save 成 tar → SCP 直送本机 /opt/xnc/images/ → docker load
-    # 并打 xnc-server:local 本地 tag。pull_policy: never——绝不向远端
-    # registry 拉取；回滚 = docker tag xnc-server:<旧版本> xnc-server:local
-    # 后 up -d（images/ 保留最近 5 份版本 tar）。
-    image: xnc-server:local
-    pull_policy: never
+    # 镜像化交付：CI（build-server.yml）推 GHCR，:main 跟踪 main 分支
+    # 构建；发版 tag 另产 vX.Y.Z 镜像——锁版本/回滚 = 改 tag 后 up -d。
+    # Watchtower（下方独立服务）轮询 GHCR 自动拉取重建本服务。
+    image: ghcr.io/xworks-studio/xnc-server:main
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
     environment:
       XNC_DATABASE_URL: postgres://xnc:${POSTGRES_PASSWORD}@postgres:5432/xnc
       XNC_JWT_SECRET: ${XNC_JWT_SECRET}
@@ -86,3 +85,17 @@ volumes:
   pgdata:
   caddy_data:
   caddy_config:
+
+  # Watchtower：轮询 GHCR 自动更新 xnc-server（label 圈定范围，仅此一个
+  # 服务被管理；5 分钟一轮；--cleanup 清旧镜像；不做滚动重启——单实例）。
+  # GHCR 私有包授权：宿主 root 已 docker login ghcr.io（Watchtower 挂载
+  # 同一 config.json）。
+  watchtower:
+    image: containrrr/watchtower:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /root/.docker/config.json:/config.json:ro
+    command: --label-enable --interval 300 --cleanup --revive-stopped
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    restart: unless-stopped
