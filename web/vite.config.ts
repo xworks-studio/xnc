@@ -9,6 +9,10 @@ export default defineConfig({
       // ws: true — shell session WebSockets (/api/session/...) must be
       // upgraded through the dev proxy too, not just http requests.
       "/api": { target: "http://localhost:8080", ws: true },
+      // Public installer endpoints live on the backend too — without these
+      // the /download page gets empty cards (vite itself serves no /setup.*).
+      "/setup.json": { target: "http://localhost:8080" },
+      "/setup.exe": { target: "http://localhost:8080" },
     },
   },
 })
