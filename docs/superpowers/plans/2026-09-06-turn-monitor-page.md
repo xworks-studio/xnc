@@ -176,24 +176,37 @@ func TestTurnStatus(t *testing.T) {
 	env := NewTestEnv(t)
 	token := env.AdminToken(t)
 
-	// 未认证 → 401
-	resp := doJSON(t, env.RouterServer(t), "GET", "/api/turn/status", "", "")
+	// 未认证 → 401（getTurnStatus：本文件 helper，见下）。
+	srv := httptest.NewServer(env.Router)
+	defer srv.Close()
+	resp := doJSON(t, srv.URL, "GET", "/api/turn/status", "", "")
 	assert.Equal(t, 401, resp.StatusCode)
-	_ = resp
 
-	// 默认（TurnURLs 配置、无池）→ urls 模式
-	assertTurnStatus(t, token, env, func(t *testing.T, s map[string]any) {
-		assert.Equal(t, "urls", s["mode"])
-		assert.Equal(t, "relay", s["icePolicy"])
-		assert.NotEmpty(t, s["fallbackUrls"])
-		assert.Empty(t, s["pool"])
-		assert.Equal(t, "testuser", s["username"])   // TestEnv 注入值
-		assert.Equal(t, "testcred", s["credential"]) // 与会话下发同源
-	})
+	// 默认（TurnURLs 配置、无池）→ urls 模式。
+	s := getTurnStatus(t, token, env)
+	assert.Equal(t, "urls", s["mode"])
+	assert.Equal(t, "relay", s["icePolicy"])
+	assert.NotEmpty(t, s["fallbackUrls"])
+	assert.Empty(t, s["pool"])
+	assert.Equal(t, "testuser", s["username"])   // TestEnv 注入值
+	assert.Equal(t, "testcred", s["credential"]) // 与会话下发同源
+}
+
+// getTurnStatus — helper：一次性 httptest server 包 env.Router，带 token
+// GET /api/turn/status 并解码为 map（勿改 testenv）。
+func getTurnStatus(t *testing.T, token string, env *TestEnv) map[string]any {
+	t.Helper()
+	srv := httptest.NewServer(env.Router)
+	t.Cleanup(srv.Close)
+	resp := doJSON(t, srv.URL, "GET", "/api/turn/status", token, "")
+	require.Equal(t, 200, resp.StatusCode)
+	var s map[string]any
+	require.NoError(t, decodeJSON(resp.Body, &s))
+	return s
 }
 ```
 
-（注：TestEnv 未暴露 httptest server URL——用 `env.Router` 经 httptest.NewServer 包一层，或直接对 Router 用 `httptest.NewRequest`+`ServeHTTP`。落在实现里取简：helper `serveJSON(t, env, method, path, token)` 内 `httptest.NewServer(env.Router)`；本文件内定义即可，勿改 testenv。若 testenv 已有 srv 导出方式则用之。）
+（imports 补 `net/http/httptest`。）
 
 pool/unconfigured 用 `newTestEnvWithCfg`：
 
@@ -279,9 +292,15 @@ func (h *handlers) turnStatus(w http.ResponseWriter, r *http.Request) {
 	if mode == "urls" && len(fallback) == 0 {
 		mode = "unconfigured"
 	}
+	// ICE 策略归一化（与 config.icePolicy 同法 fail-closed）：TestEnv 等直构
+	// config 不经 Load()，零值 "" 必须归到 "relay"，端点契约恒定。
+	policy := h.cfg.DesktopICEPolicy
+	if policy != "all" {
+		policy = "relay"
+	}
 	respondJSON(w, http.StatusOK, map[string]any{
 		"mode":                   mode,
-		"icePolicy":              h.cfg.DesktopICEPolicy,
+		"icePolicy":              policy,
 		"pool":                   pool,
 		"fallbackUrls":           fallback,
 		"username":               h.cfg.TurnUsername,
