@@ -80,25 +80,45 @@ if (Test-Path $pfxPath) {
 } else {
     Write-Warning "build.ps1: installer\codesign.pfx not found - building UNSIGNED"
 }
-function Sign-Artifact([string]$file) {
-    if (-not $signCert) { return }
-    # 时间戳服务器按序回退（境内网络对 digicert 常不可达，曾致构建挂死 20
-    # 分钟）；全部失败则免时间戳签名并告警——自签过渡期可接受，正式 CA 落
-    # 地后改为强制。
-    $sig = $null
+# 时间戳服务器：构建前用系统 curl.exe（独立于 WinHTTP 栈）3 秒探测选定一
+# 个可达者；全不可达则免时间戳（自签过渡期可接受，正式 CA 后改强制）。
+# 注：Set-AuthenticodeSignature 走 WinHTTP，本机曾对其偶发无限挂起（curl
+# 同址正常）——故签名包在 60 秒硬超时作业里，超时降级免时间戳，绝不卡死构建。
+$tsaUrl = $null
+if ($signCert) {
     foreach ($ts in @("http://timestamp.digicert.com",
                       "http://timestamp.sectigo.com",
                       "http://timestamp.globalsign.com/tsa/r6/advanced")) {
-        $sig = Set-AuthenticodeSignature -FilePath $file -Certificate $signCert -TimestampServer $ts
-        if ($sig.Status -eq "Valid") { break }
-        Write-Warning "build.ps1: timestamp server $ts failed ($($sig.StatusMessage)); trying next"
+        $host2 = ([uri]$ts).Host
+        $null = & curl.exe -s -m 3 -o NUL "http://$host2/" 2>$null
+        if ($LASTEXITCODE -eq 0) { $tsaUrl = $ts; break }
     }
-    if ($sig.Status -ne "Valid") {
-        Write-Warning "build.ps1: all timestamp servers failed - signing WITHOUT timestamp"
+    if (-not $tsaUrl) { Write-Warning "build.ps1: no timestamp server reachable - signing WITHOUT timestamps" }
+}
+function Sign-Artifact([string]$file) {
+    if (-not $signCert) { return }
+    $sig = $null
+    if ($tsaUrl) {
+        $job = Start-Job -ScriptBlock {
+            param($f, $pfx, $pw, $ts)
+            $c = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($pfx, $pw)
+            Set-AuthenticodeSignature -FilePath $f -Certificate $c -TimestampServer $ts
+        } -ArgumentList $file, $pfxPath, $env:XNC_CODESIGN_PASSWORD, $tsaUrl
+        if (Wait-Job $job -Timeout 60) {
+            $sig = Receive-Job $job
+        } else {
+            Write-Warning "build.ps1: timestamp signing timed out (60s) - plain signature; disabling timestamps for this build"
+            $script:tsaUrl = $null
+        }
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
+    }
+    if (-not $sig -or $sig.Status -ne "Valid") {
         $sig = Set-AuthenticodeSignature -FilePath $file -Certificate $signCert
         if ($sig.Status -ne "Valid") { throw "signing $file failed: $($sig.Status) $($sig.StatusMessage)" }
+        Write-Warning "build.ps1: $(Split-Path -Leaf $file) signed WITHOUT timestamp"
+    } else {
+        Write-Output "build.ps1: signed $(Split-Path -Leaf $file)"
     }
-    Write-Output "build.ps1: signed $(Split-Path -Leaf $file)"
 }
 foreach ($exe in @("xnc-agent.exe", "xnc.exe", "xnc-shell.exe", "xnc-core.exe", "xnc-desktop.exe")) {
     Sign-Artifact (Join-Path $bin $exe)
