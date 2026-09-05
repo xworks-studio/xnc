@@ -8,14 +8,10 @@
 package api
 
 import (
-	"archive/tar"
-	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 
@@ -28,82 +24,13 @@ import (
 	"xnc/server/internal/db/sqlc"
 )
 
-const maxUploadBytes = 128 << 20 // bundle+cli 合计上限
-
-type bundleManifest struct {
-	Version string `json:"version"`
-	Files   []struct {
-		Name   string `json:"name"`
-		SHA256 string `json:"sha256"`
-		Size   int64  `json:"size"`
-	} `json:"files"`
-}
-
-// verifyBundle 解包校验：tar.gz 内 manifest.json 与必需 exe 齐全，逐文件
-// 哈希与 manifest 一致，manifest 版本与声称版本一致。返回规范化后的
-// 文件名集合（防路径穿越：仅接受扁平文件名）。
-func verifyBundle(r io.Reader, version string) error {
-	gz, err := gzip.NewReader(r)
-	if err != nil {
-		return err
-	}
-	defer gz.Close()
-	tr := tar.NewReader(gz)
-	files := map[string][]byte{}
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		if hdr.Typeflag != tar.TypeReg || hdr.Name != filepath_Base(hdr.Name) {
-			return proto.Err(400, proto.CodeInternal, "bundle contains non-flat entry: "+hdr.Name)
-		}
-		if hdr.Size > 64<<20 {
-			return proto.Err(400, proto.CodeInternal, "bundle entry too large")
-		}
-		b, err := io.ReadAll(tr)
-		if err != nil {
-			return err
-		}
-		files[hdr.Name] = b
-	}
-	var mf bundleManifest
-	if err := json.Unmarshal(files["manifest.json"], &mf); err != nil {
-		return proto.Err(400, proto.CodeInternal, "bundle missing/invalid manifest.json")
-	}
-	if mf.Version != version {
-		return proto.Err(400, proto.CodeInternal, "manifest version mismatch")
-	}
-	if _, ok := files["xnc-agent.exe"]; !ok {
-		return proto.Err(400, proto.CodeInternal, "bundle missing xnc-agent.exe")
-	}
-	// 多余文件容忍（旧 bundle 含已退役的 xnc-screen-helper.exe 仍可通过）。
-	for _, f := range mf.Files {
-		b, ok := files[f.Name]
-		if !ok {
-			return proto.Err(400, proto.CodeInternal, "manifest references missing file: "+f.Name)
-		}
-		sum := sha256.Sum256(b)
-		if hex.EncodeToString(sum[:]) != f.SHA256 {
-			return proto.Err(400, proto.CodeInternal, "sha256 mismatch: "+f.Name)
-		}
-	}
-	return nil
-}
-
-func filepath_Base(name string) string {
-	for i := len(name) - 1; i >= 0; i-- {
-		if name[i] == '/' || name[i] == '\\' {
-			return name[i+1:]
-		}
-	}
-	return name
-}
+const maxUploadBytes = 128 << 20 // setup+cli 合计上限
 
 // adminUploadRelease — POST /api/admin/releases（multipart）。
+// 终态形态（未上线直采，设计 §12/§14）：setup（必填，Inno Setup 安装器，
+// 固定制品名 setup.exe，MZ 魔数兜底校验）+ cli（可选
+// xnc-windows-amd64.exe）。bundle 部件已随遗留更新通道退役——仍传入即
+// 400 明确报错（bundle channel retired），避免流水线静默降级到坏形态。
 func (h *handlers) adminUploadRelease(w http.ResponseWriter, r *http.Request) {
 	u := auth.UserFrom(r.Context())
 	if !isAdminUser(r.Context(), h.st, u.ID) {
@@ -122,42 +49,26 @@ func (h *handlers) adminUploadRelease(w http.ResponseWriter, r *http.Request) {
 	}
 	notes := r.FormValue("notes")
 
-	bf, _, err := r.FormFile("bundle")
-	if err != nil {
-		respondError(w, proto.Err(400, proto.CodeInternal, "bundle file required"))
-		return
-	}
-	defer bf.Close()
-	bundleBytes, err := io.ReadAll(bf)
-	if err != nil {
-		respondError(w, proto.Err(400, proto.CodeInternal, "read bundle: "+err.Error()))
-		return
-	}
-	if err := verifyBundle(bytes.NewReader(bundleBytes), version); err != nil {
-		if ae, ok := err.(*proto.APIError); ok {
-			respondError(w, ae)
-		} else {
-			respondError(w, proto.Err(400, proto.CodeInternal, err.Error()))
-		}
+	// bundle 部件已退役：明确拒绝而非忽略。
+	if len(r.MultipartForm.File["bundle"]) > 0 {
+		respondError(w, proto.Err(400, proto.CodeInternal, "bundle channel retired; upload setup.exe (installer) only"))
 		return
 	}
 
-	// setup（可选）：Inno Setup 安装器（PE 镜像，MZ 魔数兜底校验）。读入并
-	// 校验先于 CreateRelease——非法输入不留半截 release。
-	var setupBytes []byte
-	if sf, _, serr := r.FormFile("setup"); serr == nil {
-		defer sf.Close()
-		setupBytes, serr = io.ReadAll(sf)
-		if serr != nil {
-			respondError(w, proto.Err(400, proto.CodeInternal, "read setup: "+serr.Error()))
-			return
-		}
-		if len(setupBytes) < 2 || setupBytes[0] != 'M' || setupBytes[1] != 'Z' {
-			respondError(w, proto.Err(400, proto.CodeInternal, "setup is not a Windows executable (MZ)"))
-			return
-		}
-	} else if !errors.Is(serr, http.ErrMissingFile) {
-		respondError(w, proto.Err(400, proto.CodeInternal, "read setup part: "+serr.Error()))
+	// setup（必填）：读入并校验先于 CreateRelease——非法输入不留半截 release。
+	sf, _, err := r.FormFile("setup")
+	if err != nil {
+		respondError(w, proto.Err(400, proto.CodeInternal, "setup file required"))
+		return
+	}
+	defer sf.Close()
+	setupBytes, err := io.ReadAll(sf)
+	if err != nil {
+		respondError(w, proto.Err(400, proto.CodeInternal, "read setup: "+err.Error()))
+		return
+	}
+	if len(setupBytes) < 2 || setupBytes[0] != 'M' || setupBytes[1] != 'Z' {
+		respondError(w, proto.Err(400, proto.CodeInternal, "setup is not a Windows executable (MZ)"))
 		return
 	}
 
@@ -175,29 +86,17 @@ func (h *handlers) adminUploadRelease(w http.ResponseWriter, r *http.Request) {
 		respondError(w, proto.Err(500, proto.CodeInternal, "create release: "+err.Error()))
 		return
 	}
-	sum := sha256.Sum256(bundleBytes)
-	if err := h.st.Q().PutArtifact(ctx, sqlc.PutArtifactParams{
-		ReleaseID: rel.ID, Name: bundleArtifactName,
-		Sha256: hex.EncodeToString(sum[:]), Size: int64(len(bundleBytes)), Data: bundleBytes,
-	}); err != nil {
-		respondError(w, proto.Err(500, proto.CodeInternal, "store bundle: "+err.Error()))
-		return
-	}
 
-	// setup.exe 与 bundle 同 release 并存（§14 迁移期）：maybeOfferUpdate
-	// 按制品偏好决策——release 带 setup.exe 则全员推 UPDATE_AVAILABLE
-	// （安装器编排；存量 bundle agent 对其前向兼容忽略），仅 bundle-only
-	// release 才走遗留 UPDATE_OFFER（存量节点的最后升级通道）。
-	// /setup.exe 与 /setup.json 由 setup_handlers 动态服务该制品。
-	if setupBytes != nil {
-		ssum := sha256.Sum256(setupBytes)
-		if err := h.st.Q().PutArtifact(ctx, sqlc.PutArtifactParams{
-			ReleaseID: rel.ID, Name: setupArtifactName,
-			Sha256: hex.EncodeToString(ssum[:]), Size: int64(len(setupBytes)), Data: setupBytes,
-		}); err != nil {
-			respondError(w, proto.Err(500, proto.CodeInternal, "store setup: "+err.Error()))
-			return
-		}
+	// setup.exe 是安装/更新的唯一制品面：maybeOfferUpdate 仅按它推送
+	// UPDATE_AVAILABLE，/setup.exe 与 /setup.json 由 setup_handlers 动态
+	// 服务该制品。
+	ssum := sha256.Sum256(setupBytes)
+	if err := h.st.Q().PutArtifact(ctx, sqlc.PutArtifactParams{
+		ReleaseID: rel.ID, Name: setupArtifactName,
+		Sha256: hex.EncodeToString(ssum[:]), Size: int64(len(setupBytes)), Data: setupBytes,
+	}); err != nil {
+		respondError(w, proto.Err(500, proto.CodeInternal, "store setup: "+err.Error()))
+		return
 	}
 
 	if cf, _, cerr := r.FormFile("cli"); cerr == nil {

@@ -132,7 +132,7 @@ func TestSetupManifest(t *testing.T) {
 }
 
 // TestSetupNotFound：无 release 404；release 存在但无 setup.exe 制品
-// （历史 bundle/cli-only release）404；未知频道 404（该频道从未有 release）。
+// （仅 cli——异常发布形态）404；未知频道 404（该频道从未有 release）。
 func TestSetupNotFound(t *testing.T) {
 	env := NewTestEnv(t)
 	srv := httptest.NewServer(env.Router)
@@ -146,7 +146,7 @@ func TestSetupNotFound(t *testing.T) {
 		assert.Equal(t, 404, resp.StatusCode, p+"?channel=dev")
 	}
 
-	// release 存在但只有 bundle/cli 制品（seedRelease），无 setup.exe → 仍 404。
+	// release 存在但无 setup.exe 制品（seedRelease 仅带 cli）→ 仍 404。
 	seedRelease(t, env, "0.4.5")
 	for _, p := range []string{"/setup.exe", "/setup.json"} {
 		resp, _ := getSetup(t, srv.URL+p)

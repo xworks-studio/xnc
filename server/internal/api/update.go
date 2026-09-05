@@ -15,11 +15,8 @@ import (
 	"xnc/server/internal/db/sqlc"
 )
 
-// bundleArtifactName / cliArtifactName — release 制品的固定命名。
-const (
-	bundleArtifactName = "bundle.tar.gz"
-	cliArtifactName    = "xnc-windows-amd64.exe"
-)
+// cliArtifactName — CLI 制品的固定命名。
+const cliArtifactName = "xnc-windows-amd64.exe"
 
 // targetReleaseFor — 节点的目标版本：pin 优先，否则节点所在频道的最新。
 // 无可用 release 时返回 false（不触发更新）。
