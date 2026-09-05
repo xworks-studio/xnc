@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
+import { useAuth } from "../auth";
 import { formatRelativeTime } from "../reltime";
 
 /** /installer.json 清单结构（服务端动态生成，见 server setup_handlers.go）。 */
@@ -123,11 +124,12 @@ function ChannelCard({ channel, title, note }: { channel: string; title: string;
 
 /** 公开下载页：无侧栏的独立布局（与 Login 同级，在 LoginGuard 之外）。 */
 export default function Download() {
+  const { user } = useAuth();
   return (
     <div className="download-page">
       <header className="download-head">
         <span className="download-brand">XNC</span>
-        <Link to="/login">Sign in to console</Link>
+        <Link to={user ? "/nodes" : "/login"}>{user ? "Back to console" : "Sign in to console"}</Link>
       </header>
       <main className="download-main">
         <h1>Download the installer</h1>

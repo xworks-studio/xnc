@@ -10,6 +10,7 @@ import { createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { AuthProvider } from "../auth";
 import Download from "./Download";
 import type { SetupManifest } from "./Download";
 
@@ -43,17 +44,25 @@ afterEach(() => {
   container?.remove();
   container = null;
   root = null;
+  localStorage.clear();
   vi.unstubAllGlobals();
 });
 
-/** 挂载整页（MemoryRouter 提供 <Link> 上下文），并冲刷 fetch 微任务链。 */
+/** 挂载整页（MemoryRouter 提供 <Link> 上下文；AuthProvider 提供 useAuth），
+ *  并冲刷 fetch 微任务链。 */
 async function renderDownload() {
   container = document.createElement("div");
   document.body.appendChild(container);
   const r = createRoot(container);
   root = r;
   await act(async () => {
-    r.render(createElement(MemoryRouter, null, createElement(Download)));
+    r.render(
+      createElement(
+        MemoryRouter,
+        null,
+        createElement(AuthProvider, null, createElement(Download)),
+      ),
+    );
   });
   // useEffect 里的 fetch promise 链在渲染后的微任务里 resolve → 再冲刷一轮。
   await act(async () => {});
@@ -149,5 +158,18 @@ describe("Download page (mocked /installer.json)", () => {
     const text = container!.textContent ?? "";
     expect(text.match(/No release yet/g)?.length).toBe(2);
     expect(container!.querySelector("a.download-btn")).toBeNull();
+  });
+
+  it("shows 'Back to console' for signed-in users", async () => {
+    localStorage.setItem("xnc_token", "t");
+    localStorage.setItem(
+      "xnc_user",
+      JSON.stringify({ id: "u1", email: "admin@t.local", display_name: "" }),
+    );
+    vi.stubGlobal("fetch", vi.fn(async () => jsonRes({ status: "ok", version: "0.8.1" })));
+    await renderDownload();
+    const link = container!.querySelector("header a") as HTMLAnchorElement;
+    expect(link.getAttribute("href")).toBe("/nodes");
+    expect(link.textContent).toBe("Back to console");
   });
 });
