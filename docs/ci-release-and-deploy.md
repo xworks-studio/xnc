@@ -130,29 +130,37 @@ jobs:
 - 仓库分支保护（配套设置，非 workflow）：main 需 CI 绿 + 禁止 force
   push；tag 保护规则 `v*` 禁止删除与移动。
 
-## 4. Server 镜像化交付（build-server.yml，无镜像仓库）
+## 4. Server 镜像化交付（CI 只发布，服务器拉取）
 
-**取代原"手动部署工作流"**：不上传源码、不在远端构建、不经 registry。
+**架构**：CI 构建版本镜像并发布文件，不触碰服务器；SRV 侧脚本定时
+拉取比对、下载、`docker load`、`up -d`，失败自动回滚。无镜像仓库、
+无服务器登录凭据进 CI。
 
-### 4.1 流水线（push main / tag v* 触发）
+### 4.1 发布（`build-server.yml`，push main / tag v* 触发）
 
-1. CI 构建 web dist → docker build（`deploy/Dockerfile`，版本注入，
-   `main-<短哈希>` 或 tag 版本）。
-2. `docker save | gzip` → tar → SCP 直送 SRV `/opt/xnc/images/`
-   （凭据 SRV_SSH_*，与既有部署同源）。
-3. 服务器 `docker load` + `docker tag xnc-server:<ver> xnc-server:local`
-   + `docker compose up -d xnc-server`。
-4. 经 caddy 容器内网探测 `/api/health`，版本不符即 job 红（防假上线）。
-5. 版本 tar 保留最近 5 份。
+1. 构建 web dist → docker build（`deploy/Dockerfile`，版本
+   `main-<短哈希>` 或 tag 版本）→ `docker save | gzip`。
+2. 经 admin API 上传 **channel=server** 的 release，制品固定名
+   `server-image.tar.gz`（上传端接受 `server` multipart part）。
+3. 回读校验 `GET /server-image` 的 `X-Xnc-Version` 头，不符即 job 红。
 
-### 4.2 服务器侧
+### 4.2 下载端点（server 侧，无认证产品分发面）
 
-- compose 引用本地 tag `xnc-server:local` + `pull_policy: never`。
-- `/opt/xnc/images/` 存版本 tar；**回滚** = `docker tag
-  xnc-server:<旧版本> xnc-server:local && docker compose up -d`。
-- `/opt/xnc` 只剩 `deploy/`（compose/env/Caddyfile/turnserver.conf）+
-  `images/`——服务器上没有源码。
-- Caddyfile 变更仍是 SSH 手工（换 inode 需 `--force-recreate`）。
+- `GET /server-image?channel=server` → 200 tar.gz 流 +
+  `X-Xnc-Version`（拉取脚本比对用，免解析 manifest）+ `X-Xnc-Sha256`。
+
+### 4.3 服务器侧（`deploy/pull-server.sh`，cron */5）
+
+- flock 防并发；`X-Xnc-Version` 对比**运行中服务自报的** `/api/health`
+  版本（经 caddy 容器内网探测），相同即 no-op。
+- 不同则下载 → sha256 校验 → `docker load` → `tag xnc-server:local` →
+  `up -d` → 60s 健康验证；失败自动 tag 回旧版本并 up（镜像 tar 保留
+  最近 5 份，`images/server-image-<版本>.tar.gz`）。
+- compose 引用本地 tag `xnc-server:local` + `pull_policy: never`；
+  服务器上没有源码，`/opt/xnc` = `deploy/` + `images/`。
+- **手动回滚**：`docker tag xnc-server:<旧版本> xnc-server:local &&
+  docker compose -f deploy/docker-compose.yml up -d xnc-server`。
+- Caddyfile 变更仍 SSH 手工（换 inode 需 `--force-recreate`）。
 
 ## 5. 配套设置清单（实施时一次做完）
 

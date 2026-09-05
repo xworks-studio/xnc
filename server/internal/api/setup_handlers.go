@@ -100,3 +100,38 @@ func (h *handlers) setupManifest(w http.ResponseWriter, r *http.Request) {
 		"releasedAt": rel.CreatedAt,
 	})
 }
+
+// ---- server 镜像分发（设计文档 §4：CI 只发布文件，服务器脚本拉取）----
+
+// serverImageArtifactName — release 内 server 镜像 tar.gz 制品的固定命名
+//（channel=server 的 release 由 build-server.yml 上传）。
+const serverImageArtifactName = "server-image.tar.gz"
+
+// serverImageDownload — GET /server-image?channel=server：频道最新 server
+// 镜像 tar.gz 直流。响应头 X-Xnc-Version（拉取脚本与本地运行版本比对用，
+// 免解析 manifest）+ X-Xnc-Sha256。无认证——与 /installer 同级的产品分发面。
+func (h *handlers) serverImageDownload(w http.ResponseWriter, r *http.Request) {
+	ch := r.URL.Query().Get("channel")
+	if ch == "" {
+		ch = "server"
+	}
+	if ch != "server" {
+		respondError(w, proto.Err(404, "NOT_FOUND", "unknown channel"))
+		return
+	}
+	rel, err := h.st.Q().GetLatestReleaseByChannel(r.Context(), ch)
+	if err != nil {
+		respondError(w, proto.Err(404, "NOT_FOUND", "no releases"))
+		return
+	}
+	art, err := h.st.Q().GetArtifact(r.Context(), sqlc.GetArtifactParams{ReleaseID: rel.ID, Name: serverImageArtifactName})
+	if err != nil {
+		respondError(w, proto.Err(404, "NOT_FOUND", "no server-image artifact"))
+		return
+	}
+	w.Header().Set("Content-Type", "application/gzip")
+	w.Header().Set("X-Xnc-Version", rel.Version)
+	w.Header().Set("X-Xnc-Sha256", art.Sha256)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(art.Data)
+}
