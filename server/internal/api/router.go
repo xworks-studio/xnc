@@ -160,6 +160,8 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 	// （/a/* /c* /install/*.ps1）已在上线前整体移除。
 	r.Get("/installer", h.setupDownload)
 	r.Get("/installer.json", h.setupManifest)
+	// server 镜像分发（CI 构建、服务器拉取脚本消费，设计 §4）
+	r.Get("/server-image", h.serverImageDownload)
 
 	r.Route("/api/nodes", func(nr chi.Router) {
 		nr.Use(auth.Middleware(cfg.JWTSecret, st))
