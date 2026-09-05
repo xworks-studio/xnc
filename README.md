@@ -79,7 +79,7 @@ Agent (Windows 服务, SYSTEM)
 > Agent/工程师操作规范（硬性契约、部署、发布、签名）见 [AGENTS.md](AGENTS.md)；CI/版本/发布/部署设计见 [docs/ci-release-and-deploy.md](docs/ci-release-and-deploy.md)。
 
 - **测试门禁**：PR/push main → `ci.yml` 五矩阵（Linux Go + PG、Windows agent/shellhost、web、native、安装器试构建）。
-- **安装器发版**：打 tag `vX.Y.Z[-dev]` → `release.yml` 签名构建 → GitHub Release + 生产 release store，在线节点自动升级。
+- **安装器发版**：打 tag `vX.Y.Z[-dev]` → `release.yml` 签名构建 → GitHub Release（发布终点）；生产 server 由 installersync 定时拉取，在线节点自动升级。
 - **server 发版**：手动触发 `build-server` workflow 输入版本号 → GHCR `v<版本>+latest` → Watchtower 轮询 `:latest` 自动换版（5–10 分钟）。
 - **本地开发栈**：
 

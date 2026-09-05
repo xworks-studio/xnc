@@ -25,7 +25,8 @@ XNC = Windows 节点远程管理平台：Go server（xnc.app）+ Windows agent
 ```
 
 - **交付面**：agent/CLI 经 Inno Setup 安装器（tag `v*` → release.yml 签名
-  构建 → GitHub Release + 生产 release store，在线节点自更新）；
+  构建 → **GitHub Release 即发布终点**；生产 server 的 installersync 定时
+  拉回本地 release store，在线节点自更新）；
   server 经 build-server.yml（**手动触发、版本号输入** → GHCR
   `v<版本>+latest+sha` → Watchtower 轮询 `:latest` 自动换版）。
 - **信任**：自签 Authenticode（安装器内置信任装卸）；更新 sha256 强校验 +
@@ -104,17 +105,24 @@ label 圈定仅管 xnc-server，跟踪 `:latest`）自动拉取重建——触�
 
 ## 5. 发布流程（安装器/更新）
 
-1. 构建：`powershell installer/build.ps1 -Version <v> -Channel stable|dev`
-   （或 `make installer VERSION=<v>`）——产 `bin/XNC-Installer[-dev]-<v>.exe`
-   + sha256。五二进制（agent/core/desktop/shell/CLI）版本同源注入。
-2. 上传：admin 登录取 JWT → `POST /api/admin/releases`
-   multipart：`version`/`notes`/`channel`/`setup=@...`。bundle 部分已退役
-   （传了 400 是对的）。同版本重传=upsert 改道（注意）。
-3. 生效即达：上传后 `/installer.json` 与下载页立即指向新版；在线 agent 经
-   WS 推送/6h 轮询/`xnc upgrade` 升级（秒级中断，失败自动回滚+拉黑）。
-4. **升级安全网**：看门狗 schtask + installer-cache 回滚源 + 24h 过期
-   pending 兜底；发布坏版本的自愈路径已内建，无需人工回滚。
-5. 当前线上锚点：下载页 `https://xnc.app/download`；短域
+**发布 = 打 tag**：`git tag vX.Y.Z[-dev] && git push origin vX.Y.Z`（tag
+须在 main 上；格式 X.Y.Z，段 ≤4 位）→ release.yml 签名构建 → GitHub
+Release（附件安装器 + .sha256 边车；dev 频道标 prerelease）。**CI 的终点
+就是 GitHub Release，不直传生产**。
+
+1. 生效即达：生产 server 内置 installersync（默认 5 分钟轮询
+   `XNC_INSTALLER_SYNC_REPO`；`XNC_INSTALLER_SYNC_INTERVAL` / `XNC_GITHUB_TOKEN`
+   可调）把各频道最新安装器拉回本地 release store（sha256 边车强校验 +
+   事务入库，半截行自愈）；`/installer.json` 与下载页随后翻转。在线
+   agent 经 WS 推送/6h 轮询/`xnc upgrade` 升级（秒级中断，失败自动回滚+拉黑）。
+2. 本地构建（未发布验证/实验机手装）：`powershell installer/build.ps1
+   -Version <v> -Channel stable|dev`（或 `make installer VERSION=<v>`）——
+   产 `bin/XNC-Installer[-dev]-<v>.exe` + sha256。五二进制（agent/core/
+   desktop/shell/CLI）版本同源注入。
+3. **升级安全网**：看门狗 schtask + installer-cache 回滚源 + 24h 过期
+   pending 兜底；发布坏版本的自愈路径已内建（修复 = 新 PATCH tag，同版本
+   禁止重发）。
+4. 当前线上锚点：下载页 `https://xnc.app/download`；短域
    `xnc.app/installer`。
 
 ## 6. 用户安装 / 注册 / 卸载

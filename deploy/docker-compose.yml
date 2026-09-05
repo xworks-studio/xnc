@@ -25,6 +25,13 @@ services:
       XNC_JWT_SECRET: ${XNC_JWT_SECRET}
       XNC_ADMIN_EMAIL: ${XNC_ADMIN_EMAIL}
       XNC_ADMIN_PASSWORD: ${XNC_ADMIN_PASSWORD}
+      # installer 分发同步（installersync）：GitHub Releases 唯一事实源，
+      # server 定时拉回本地 release store（/installer 服务路径不变；CI 发布
+      # 只到 GitHub Release 为止）。REPO 空 = 关闭；INTERVAL 下限 1m；
+      # TOKEN 可选（匿名 60 req/h 已足够，防限额时配）。
+      XNC_INSTALLER_SYNC_REPO: ${XNC_INSTALLER_SYNC_REPO:-xworks-studio/xnc}
+      XNC_INSTALLER_SYNC_INTERVAL: ${XNC_INSTALLER_SYNC_INTERVAL:-5m}
+      XNC_GITHUB_TOKEN: ${XNC_GITHUB_TOKEN:-}
       # M4 金丝雀开关(§14): compose 此前未接线,M4-T4 部署缺口,生产 2026-08-28 补
       XNC_DESKTOP_MEDIA_V2_PERCENT: ${XNC_DESKTOP_MEDIA_V2_PERCENT:-0}
       XNC_DESKTOP_MEDIA_V2_ALLOWLIST: ${XNC_DESKTOP_MEDIA_V2_ALLOWLIST:-}

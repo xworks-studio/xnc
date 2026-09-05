@@ -110,12 +110,10 @@ jobs:
      XNC_CODESIGN_PASSWORD（env）→ build.ps1 自动签名（含时间戳探测）
    - 产物：bin/XNC-Installer-<v>[-dev].exe + .sha256
 4. 上传 GitHub Release（softprops/action-gh-release）：
-   附件 = 安装器 + .sha256；正文 = tag message（发版说明写进 tag）
-5. 上传生产 release store：
-   - Secrets: XNC_SERVER_URL=https://xnc.app, XNC_ADMIN_EMAIL/PASSWORD
-   - 登录取 JWT → POST /api/admin/releases（version/notes/channel/setup=@）
-   - 校验回读 /installer.json?channel= 的 version+sha256 与本地一致
-6. 通知：job summary 列出版本、sha256、频道、下载页链接
+   附件 = 安装器 + .sha256；正文 = tag message（发版说明写进 tag）；
+   dev 频道标 prerelease（GitHub "Latest" 只指向 stable，与下载页一致）
+5. 通知：job summary 列出版本、sha256、频道与验证命令
+   （curl /installer.json?channel=，约一个同步间隔内翻转）
 ```
 
 ### 3.3 发布规则条文
@@ -124,11 +122,33 @@ jobs:
   发布到 stable。
 - **不可变**：同 tag 重推被 CI 拒绝（步骤 1 校验 + GitHub tag 保护）；
   修坏版本 = 新 PATCH tag。
-- **发布窗口自检**：上传成功 ≠ 完成——步骤 5 的回读校验失败即 job
-  失败（并发出醒目 summary），防止"上传假成功"（部署事故教训）。
+- **CI 不触碰生产**：发布终点是 GitHub Release（唯一事实源）；
+  release.yml 不再持有任何 SRV_ 生产凭据，生产生效由 server 侧
+  installersync（§3.4）负责——拉取失败在 server 日志告警并按间隔
+  重试，无需流水线干预。
 - 在线节点拉取路径（推送/轮询/看门狗回滚）全部既有，无需流水线干预。
 - 仓库分支保护（配套设置，非 workflow）：main 需 CI 绿 + 禁止 force
   push；tag 保护规则 `v*` 禁止删除与移动。
+
+### 3.4 生产侧拉取（installersync，server 内置）
+
+`server/internal/installersync`：GitHub Releases → 本地 release store
+的定时拉取，/installer 与 /installer.json 服务路径与 agent 更新契约
+零改动。
+
+- **频道判定按 tag**（`vX.Y.Z` → stable，`vX.Y.Z-dev` → dev），不依赖
+  release 的 prerelease 标记——标记配错不影响分发正确性。
+- **同步范围**：各频道最新一条（列表端点一次调用双频道共用）；本地
+  已有（release 行 + setup 制品俱在）则跳过，release 行在而制品缺的
+  半截行会触发重新拉取补全（自愈直传时代遗留形态）。
+- **校验**：.sha256 边车强校验 + MZ 魔数 + 128MiB 上限（与 admin 上传
+  路径同限）；入库走事务（半截提交会让 latest 命中无制品行）。
+- **API 配额**：ETag 条件请求（304 不计限额）；匿名 60 req/h 对分钟级
+  轮询足够，`XNC_GITHUB_TOKEN` 可选兜底。
+- **旋钮**（deploy/docker-compose.yml 透传）：`XNC_INSTALLER_SYNC_REPO`
+  （默认 xworks-studio/xnc，空 = 关闭）、`XNC_INSTALLER_SYNC_INTERVAL`
+  （默认 5m，下限 1m）、`XNC_GITHUB_TOKEN`。
+- `POST /api/admin/releases` 上传端点保留为人工应急通道（语义不变）。
 
 ## 4. Server 镜像化交付（GHCR + Watchtower）
 
