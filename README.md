@@ -2,41 +2,33 @@
 
 Windows 节点统一运维入口：出站 443 反向连接（agent 主动连 server，不开入站端口）。为小团队和 AI Agent 设计。
 
-[完整规格](spec.md) · [计划文档](docs/) · [部署](deploy/)
+[完整规格](spec.md) · [计划文档](docs/) · [部署](deploy/) · [操作规范](AGENTS.md)
 
 ## 安装
 
-### 装 Agent + CLI（安装器，推荐）
+### 装 Agent + CLI（安装器，唯一入口）
 
-```cmd
-curl -LO https://xnc.app/installer && 运行安装器
-```
+浏览器打开 **<https://xnc.app/download>** 下载安装器并运行（需管理员）。
 
-或浏览器打开 <https://xnc.app/installer> 下载后双击。Inno Setup 安装器一次装齐 agent（Windows 服务 `XNCAgent`，Automatic）与 CLI（自动加 PATH）；安装期零凭据，装完服务空转等待注册（无 token、无需预先 admin 介入）。
+Inno Setup 安装器一次装齐 agent（Windows 服务 `XNCAgent`，Automatic）与 CLI（自动加 PATH），并自动安装代码签名信任；安装期零凭据，装完服务空转等待注册（无 token、无需预先 admin 介入）。
 
-首次使用在目标机执行（login → 选 cluster → 本机注册为节点，约 30 秒内上线）：
+首次使用在目标机执行（login → 选 cluster → 本机注册为节点，秒级上线；重装/换机沿用原节点记录）：
 
 ```bash
 xnc register
 ```
 
-### Dev 频道
-
-```cmd
-curl -LO "https://xnc.app/installer?channel=dev" && 运行安装器
-```
-
-安装器是唯一安装入口（未上线直采终态，[设计 §14](docs/superpowers/specs/2026-09-03-innosetup-installer-unified-auth-design.md)）：CLI 随安装器分发，无单独安装步骤。
+Dev 频道安装器在下载页选择，或 `curl -LO "https://xnc.app/installer?channel=dev"`。
 
 ## 快速上手
 
 ```bash
 xnc login                            # 连接 server
 xnc register                         # 本机注册为节点（未装 agent 时提示先装安装器）
+xnc status                           # 本机安装/注册/在线状态 + 当前会话
 xnc node list                        # 查看节点
 xnc exec <node> "hostname"           # 执行命令（自动选 shell）
 xnc exec <node> --shell bash "ls"    # bash（引号最简）
-xnc exec <node> --shell cmd "dir"    # cmd.exe
 xnc exec <node> --file deploy.ps1    # 脚本文件
 xnc shell <node>                     # 交互终端（~. 断开）
 xnc put <node> <local> <remote>      # 上传（sha256 校验）
@@ -44,7 +36,8 @@ xnc get <node> <remote> <local>      # 下载
 xnc screen <node> --snap out.jpg     # 屏幕截图
 xnc screen <node> --open             # 实时画面（浏览器）
 xnc rdp <node>                       # 远程桌面
-xnc update                           # CLI 自更新
+xnc upgrade [--channel dev]          # 手动触发本机升级
+xnc logout                           # 退出用户会话（节点不受影响）
 ```
 
 ## 多 Shell 执行
@@ -64,33 +57,31 @@ xnc exec node1 --cwd C:\xnc --env DEBUG=1 "tool"   # env + cwd
 
 ## 发布频道与自更新
 
-双频道：`stable`（正式）/ `dev`（开发测试）。Agent 收到推送后经安装器静默自更新（下载 installer → sha256 校验 → 静默安装 → 回滚保护），零手工干预；`xnc upgrade` 可随时手动触发。
-
-| 操作 | 命令 |
-|---|---|
-| 上传 release | `curl -X POST /api/admin/releases -H "Auth: Bearer $T" -F version=X -F setup=@XNC-Installer-X.exe -F cli=@xnc-windows-amd64.exe` |
-| 灰度单节点 | `curl -X POST /api/admin/rollout -d '{"version":"X","nodeId":"..."}'` |
-| 切节点频道 | `curl -X POST /api/admin/rollout -d '{"nodeId":"...","channel":"dev"}'` |
-| 手动升级本机 | `xnc upgrade [--channel dev]` |
-| CLI 自更新 | `xnc update [--channel dev]` |
+双频道：`stable`（正式）/ `dev`（开发测试）。Agent 收到推送后经安装器静默自更新（下载 installer → sha256 校验 → 静默安装 → 看门狗回滚保护），零手工干预；`xnc upgrade` 可随时手动触发。
 
 ## 架构
 
 ```
-Browser ──── Web UI / WebCodecs
+Browser ──── Web UI / WebCodecs / 下载页
     │
-Server (Go) ─── REST + WS relay + release store + install endpoints
-    │ (agent 主动出站 443)
-Agent (Windows 服务)
+Server (Go, xnc.app) ─── REST + WS 信令 + release store + 安装器分发
+    │ (agent 主动出站 443；媒体经 TURN 中继)
+Agent (Windows 服务, SYSTEM)
     ├─ exec engine (bash/pwsh/powershell/cmd)
     ├─ shell (ConPTY)
-    ├─ screen (DXGI Desktop Duplication → H.264)
+    ├─ screen (DXGI Desktop Duplication → H.264, 经 XNCCore)
+    ├─ agentctl 管道（register/deregister/status/upgrade 本地控制面）
     └─ self-updater (installer-orchestrated + rollback)
 ```
 
-## 开发
+## 开发与交付
 
-> Agent/工程师操作规范（开发、部署、发布、安装使用、硬性契约）见 [AGENTS.md](AGENTS.md)。
+> Agent/工程师操作规范（硬性契约、部署、发布、签名）见 [AGENTS.md](AGENTS.md)；CI/版本/发布/部署设计见 [docs/ci-release-and-deploy.md](docs/ci-release-and-deploy.md)。
+
+- **测试门禁**：PR/push main → `ci.yml` 五矩阵（Linux Go + PG、Windows agent/shellhost、web、native、安装器试构建）。
+- **安装器发版**：打 tag `vX.Y.Z[-dev]` → `release.yml` 签名构建 → GitHub Release + 生产 release store，在线节点自动升级。
+- **server 发版**：手动触发 `build-server` workflow 输入版本号 → GHCR `v<版本>+latest` → Watchtower 轮询 `:latest` 自动换版（5–10 分钟）。
+- **本地开发栈**：
 
 ```bash
 cd deploy && docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
@@ -98,19 +89,11 @@ cd deploy && docker compose -f docker-compose.yml -f docker-compose.dev.yml up -
 (cd agent && go build -o ../bin/xnc-agent.exe ./cmd/xnc-agent)
 ```
 
-## 构建安装器与版本注入（版本单一来源）
-
-版本号只在构建时注入（agent 自报 / 安装器打包同一来源；未注入回落
-`0.0.0-dev`）。安装器：`make installer VERSION=<v> [CHANNEL=stable|dev]`（构建五个
-exe 到 `bin/` 后经 Inno Setup 打包 `XNC-Installer[-dev]-<v>.exe`）。
-
-server 构建版本同理（`/api/health` 上报）：`deploy/.env` 设 `XNC_VERSION=<v>`
-后 `py deploy/deploy_srv.py env && py deploy/deploy_srv.py up`，compose 经
-Dockerfile `ARG XNC_VERSION` 注入；未设回落 `0.0.0-dev`。
+- **版本号**：`MAJOR.MINOR.PATCH[-dev]`，段 ≤4 位，git tag 为唯一发版动作（版本单一来源：tag → 构建注入 == installer.json == /api/health）。
 
 ## 测试设备凭据
 
-`deploy/.env`（gitignored）：`cp .env.example .env` 后填入。server 端仅经 `py deploy/deploy_srv.py` 部署到 xnc.app，本机不部署 server。
+`deploy/.env`（gitignored）：`cp .env.example .env` 后填入。server 只部署在 xnc.app（阿里云 SRV，镜像化交付），本机禁止运行 server 栈。
 
 ## 负载 smoke
 
