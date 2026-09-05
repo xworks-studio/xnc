@@ -19,6 +19,11 @@ import (
 
 const cliVersion = "0.3.0"
 
+// defaultServerURL 是 CLI 的固定生产控制面（设计 §3.4）：register/login
+// 不再询问 server；--server 与 XNC_SERVER 仅为开发/测试保留（MarkHidden，
+// 帮助文本不出现）。
+const defaultServerURL = "https://xnc.app"
+
 func main() {
 	cleanupOldCLI() // 自更新残留清扫（幂等）
 	os.Exit(runCLI(context.Background(), os.Args[1:]))
@@ -59,7 +64,6 @@ Quick start:
   xnc exec <node> --shell bash "ls" run in bash (simplest quoting)
 
 Global flags:
-  --server URL    server base (env XNC_SERVER, or config)
   --token TOKEN   auth token (env XNC_TOKEN, or config)
   --output FMT    table | json (affects data commands)
   --json          per-command shorthand for --output json
@@ -85,6 +89,7 @@ Exit codes:
 	}
 	root.PersistentFlags().String("server", "",
 		"XNC server base URL (env XNC_SERVER, then config file)")
+	_ = root.PersistentFlags().MarkHidden("server")
 	root.PersistentFlags().String("token", "",
 		"API bearer token (env XNC_TOKEN, then config file)")
 	root.PersistentFlags().String("output", "table", "output format: table or json")
@@ -147,12 +152,15 @@ func addJSONFlag(cmd *cobra.Command) {
 }
 
 // resolveServer/resolveToken apply precedence: flag > env > config file
-// (LoadConfig already merged env over file).
+// > 生产默认（server 恒非空；设计 §3.4）。
 func resolveServer(cmd *cobra.Command, cfg Config) string {
 	if v, _ := cmd.Flags().GetString("server"); v != "" {
 		return v
 	}
-	return cfg.Server
+	if cfg.Server != "" {
+		return cfg.Server
+	}
+	return defaultServerURL
 }
 
 func resolveToken(cmd *cobra.Command, cfg Config) string {
@@ -163,17 +171,14 @@ func resolveToken(cmd *cobra.Command, cfg Config) string {
 }
 
 // dial builds a Client from flag/env/file. The returned string, when
-// non-empty, is a usage error message (missing server or token).
+// non-empty, is a usage error message (missing token; server 恒有默认值).
 func dial(cmd *cobra.Command, needToken bool) (*Client, string) {
 	cfg, _ := LoadConfig()
-	server, token := resolveServer(cmd, cfg), resolveToken(cmd, cfg)
-	if server == "" {
-		return nil, "--server, XNC_SERVER, or xnc login required"
-	}
+	token := resolveToken(cmd, cfg)
 	if needToken && token == "" {
 		return nil, "--token, XNC_TOKEN, or xnc login required"
 	}
-	return NewClient(server, token), ""
+	return NewClient(resolveServer(cmd, cfg), token), ""
 }
 
 // aliasCmd 返回一个使用不同名称的命令浅拷贝（共享 RunE 与 flags）。

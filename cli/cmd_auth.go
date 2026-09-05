@@ -34,9 +34,6 @@ func newLoginCmd() *cobra.Command {
 			if term.IsTerminal(int(os.Stdin.Fd())) {
 				// 交互模式：缺省提示 + 掩码密码 + 401 重试。
 				deps := loginDeps{
-					promptServer: func() string {
-						return promptLine("Server URL", cfg.Server)
-					},
 					promptEmail: func() string {
 						return promptLine("Email", cfg.RememberedEmail)
 					},
@@ -50,9 +47,6 @@ func newLoginCmd() *cobra.Command {
 				server, token, user = s, t, u
 			} else {
 				// 非交互（Agent/脚本）：严格 flag + stdin 一行密码。
-				if server == "" {
-					return failUsage(cmd, "--server, XNC_SERVER, or config file required")
-				}
 				if email == "" {
 					return failUsage(cmd, "--email required in non-interactive mode")
 				}

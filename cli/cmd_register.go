@@ -205,14 +205,6 @@ machine. Polls until the node is online and prints the panel URL.`,
 				if cfg.RememberedEmail != "" {
 					outf(cmd, "using session %s\n", cfg.RememberedEmail)
 				}
-				if server == "" {
-					if !term.IsTerminal(int(os.Stdin.Fd())) {
-						return failUsage(cmd, "--server, XNC_SERVER, or config file required")
-					}
-					if server = promptLine("Server URL", ""); server == "" {
-						return failUsage(cmd, "server URL required")
-					}
-				}
 			}
 			cl := NewClient(server, token)
 
@@ -311,7 +303,6 @@ func registerLogin(cmd *cobra.Command, cfg Config, server, email string) (string
 	var user userDTO
 	if term.IsTerminal(int(os.Stdin.Fd())) {
 		deps := loginDeps{
-			promptServer:   func() string { return promptLine("Server URL", cfg.Server) },
 			promptEmail:    func() string { return promptLine("Email", cfg.RememberedEmail) },
 			promptPassword: promptPassword,
 			doLogin:        doLogin,
@@ -322,9 +313,6 @@ func registerLogin(cmd *cobra.Command, cfg Config, server, email string) (string
 		}
 		server, token, user = s, t, u
 	} else {
-		if server == "" {
-			return "", "", failUsage(cmd, "--server, XNC_SERVER, or config file required")
-		}
 		if email == "" {
 			return "", "", failUsage(cmd, "--email required in non-interactive mode")
 		}

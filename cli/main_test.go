@@ -5,6 +5,8 @@ import (
 	"io"
 	"os"
 	"testing"
+
+	"github.com/spf13/cobra"
 )
 
 // runCLIWithStdin pipes input into os.Stdin before running the CLI (used by
@@ -59,4 +61,16 @@ func captureFD(fd **os.File, t *testing.T, f func() int) (string, int) {
 		t.Fatal(err)
 	}
 	return string(b), code
+}
+
+// TestResolveServerDefault — 固定生产控制面兜底（设计 §3.4）：无
+// flag/env/config 时解析为 https://xnc.app；config 值仍优先于默认。
+func TestResolveServerDefault(t *testing.T) {
+	cmd := &cobra.Command{}
+	if got := resolveServer(cmd, Config{}); got != "https://xnc.app" {
+		t.Fatalf("default server = %q, want https://xnc.app", got)
+	}
+	if got := resolveServer(cmd, Config{Server: "https://cfg.example"}); got != "https://cfg.example" {
+		t.Fatalf("config server = %q, want https://cfg.example", got)
+	}
 }

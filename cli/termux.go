@@ -43,19 +43,16 @@ func promptPassword() (string, error) {
 var errLoginRetries = errors.New("login: too many failed attempts")
 
 // loginDeps 把登录编排的交互面收窄为可注入的函数，便于单测。
+// server 不再交互补齐（固定默认值，设计 §3.4）。
 type loginDeps struct {
-	promptServer   func() string
 	promptEmail    func() string
 	promptPassword func() (string, error)
 	doLogin        func(server, email, password string) (string, userDTO, *proto.APIError)
 }
 
 // runLoginFlow 交互式登录编排：缺省提示 → 掩码密码 → 401 重试（≤3 次）。
-// 返回补齐后的 server/token/user；非 401 错误立即失败。
+// server 由调用方解析（恒非空）；返回补齐后的 token/user；非 401 错误立即失败。
 func runLoginFlow(deps loginDeps, server, email string) (string, string, userDTO, error) {
-	if server == "" {
-		server = deps.promptServer()
-	}
 	if email == "" {
 		email = deps.promptEmail()
 	}

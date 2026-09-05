@@ -128,8 +128,7 @@ func TestRunLoginFlowRetryThenSuccess(t *testing.T) {
 	var calls int
 	answers := []string{"wrong", "right"}
 	deps := loginDeps{
-		promptServer: func() string { return "https://s.example" },
-		promptEmail:  func() string { return "u@example.com" },
+		promptEmail: func() string { return "u@example.com" },
 		promptPassword: func() (string, error) {
 			a := answers[0]
 			answers = answers[1:]
@@ -143,7 +142,7 @@ func TestRunLoginFlowRetryThenSuccess(t *testing.T) {
 			return "tok", userDTO{Email: email}, nil
 		},
 	}
-	server, tok, user, err := runLoginFlow(deps, "", "")
+	server, tok, user, err := runLoginFlow(deps, "https://s.example", "")
 	require.NoError(t, err)
 	assert.Equal(t, "https://s.example", server)
 	assert.Equal(t, "tok", tok)
@@ -153,7 +152,6 @@ func TestRunLoginFlowRetryThenSuccess(t *testing.T) {
 
 func TestRunLoginFlowExhaustsRetries(t *testing.T) {
 	deps := loginDeps{
-		promptServer:   func() string { return "https://s" },
 		promptEmail:    func() string { return "u" },
 		promptPassword: func() (string, error) { return "x", nil },
 		doLogin: func(_, _, _ string) (string, userDTO, *proto.APIError) {
@@ -167,7 +165,6 @@ func TestRunLoginFlowExhaustsRetries(t *testing.T) {
 func TestRunLoginFlowNonAuthFailsFast(t *testing.T) {
 	calls := 0
 	deps := loginDeps{
-		promptServer:   func() string { return "https://s" },
 		promptEmail:    func() string { return "u" },
 		promptPassword: func() (string, error) { return "x", nil },
 		doLogin: func(_, _, _ string) (string, userDTO, *proto.APIError) {
@@ -186,7 +183,6 @@ func TestRunLoginFlowNonAuthFailsFast(t *testing.T) {
 func TestRunLoginFlowEmptyPasswordRetries(t *testing.T) {
 	calls := 0
 	deps := loginDeps{
-		promptServer:   func() string { return "https://s" },
 		promptEmail:    func() string { return "u" },
 		promptPassword: func() (string, error) { return "", nil }, // 空密码不计入网络调用
 		doLogin: func(_, _, _ string) (string, userDTO, *proto.APIError) {
