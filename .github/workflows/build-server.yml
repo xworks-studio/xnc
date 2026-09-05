@@ -1,14 +1,16 @@
-# build-server.yml — server 镜像构建推送 GHCR（设计文档 §4）：
-#   push main → 镜像标签 main + sha-<短哈希>（版本 main-<短哈希>）
-#   tag  v*   → 镜像标签 vX.Y.Z + latest（版本 = tag 版本）
-# 服务器侧由 Watchtower（compose 内独立容器）轮询 GHCR 自动拉取重建，
-# 与 server 产品本身零耦合。GHCR 私有包的服务器拉取授权见设计 §4.3。
+# build-server.yml — server 版本镜像构建（手动触发，版本号驱动）：
+#   workflow_dispatch 输入 version（X.Y.Z[-dev]，段 ≤4 位）
+#   → 构建 web + 镜像（版本注入）→ 推 GHCR，标签 v<version> + latest + sha-<短哈希>
+# 服务器侧 Watchtower 跟踪 :latest 自动拉取重建——每次手动构建即一次发布。
+# （不再随 push main 自动构建：server 发布节奏由人决定，与 agent 发版对齐。）
 name: build-server
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'server 版本（X.Y.Z 或 X.Y.Z-dev，段 ≤4 位）'
+        required: true
 
 permissions:
   contents: read
@@ -20,24 +22,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - id: meta
-        name: derive version + image tags
+      - name: validate version format
         run: |
-          ref="${{ github.ref_name }}"
-          if [[ "$ref" == v* ]]; then
-            ver="${ref#v}"
-            tags="latest v${ver}"
-          else
-            sha="${GITHUB_SHA::7}"
-            ver="main-${sha}"
-            tags="main sha-${sha}"
-          fi
-          {
-            echo "version=${ver}"
-            echo "tags<<EOF"
-            for t in $tags; do echo "ghcr.io/${{ github.repository_owner }}/xnc-server:${t}"; done
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          v="${{ inputs.version }}"
+          echo "$v" | grep -qE '^\d{1,4}\.\d{1,4}\.\d{1,4}(-dev)?$' || {
+            echo "::error::bad version '$v' (want X.Y.Z[-dev], segments 1-4 digits)"; exit 1; }
 
       - uses: actions/setup-node@v4
         with:
@@ -65,7 +54,10 @@ jobs:
           push: true
           platforms: linux/amd64
           build-args: |
-            XNC_VERSION=${{ steps.meta.outputs.version }}
-          tags: ${{ steps.meta.outputs.tags }}
+            XNC_VERSION=${{ inputs.version }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/xnc-server:v${{ inputs.version }}
+            ghcr.io/${{ github.repository_owner }}/xnc-server:latest
+            ghcr.io/${{ github.repository_owner }}/xnc-server:sha-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
