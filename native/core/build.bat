@@ -9,7 +9,12 @@ rem   build.bat selftest   build + run bin\xnc-core.exe --selftest
 rem (Task 5 folded the old separate selftest exe into xnc-core.exe behind
 rem --selftest and removed the temporary selftest_main.cpp.)
 setlocal
-call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
+rem vcvars64 定位：vswhere（任意 VS2022 版本：Community/Enterprise/Pro/
+rem BuildTools——本地为 Community，GitHub runner 为 Enterprise）→ 固定路径兜底。
+set "VSVARS="
+for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2^>nul`) do set "VSVARS=%%i\VC\Auxiliary\Build\vcvars64.bat"
+if not defined VSVARS set "VSVARS=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+call "%VSVARS%" >nul 2>&1
 if errorlevel 1 (
   echo [core] vcvars64 not found - install VS2022 Build Tools ^(C++ workload^) 1>&2
   exit /b 1
