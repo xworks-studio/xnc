@@ -1,7 +1,7 @@
 # release.yml — tag 驱动发布（设计：docs/ci-release-and-deploy.md §3）
-# v<tag> 且 tag 在 main 上 → 签名构建 → GitHub Release（发布终点；生产
-# server 由 installersync 定时拉取，CI 不直传生产）。版本不可变：同 tag
-# 重推被拒。
+# v<tag> 且 tag 位于 main → 签名构建 → GitHub Release（发布终点；生产
+# server 由 installersync 定时拉取，CI 不直接上传生产）。版本不可变：
+# 同 tag 重复推送被拒绝。
 name: release
 
 on:
@@ -72,8 +72,8 @@ jobs:
             ${{ env.ARTIFACT }}
             ${{ env.ARTIFACT }}.sha256
           body: ${{ github.event.head_commit.message }}
-          # dev 频道标 prerelease：GitHub "Latest" 只指向 stable（人类视角
-          # 与下载页一致）。server 侧拉取按 tag 分类，不依赖此标记。
+          # dev 频道标记 prerelease：GitHub "Latest" 仅指向 stable（与
+          # 下载页展示一致）。server 侧同步按 tag 分类，不依赖该标记。
           prerelease: ${{ env.CHANNEL == 'dev' }}
 
       - name: summary
@@ -81,5 +81,5 @@ jobs:
         run: |
           $sha = (Get-FileHash $env:ARTIFACT -Algorithm SHA256).Hash.ToLower()
           Write-Host "released $env:VERSION ($env:CHANNEL) sha256=$sha"
-          Write-Host "GitHub Release = 发布终点；生产 server 由 installersync 在同步间隔内自动拉取"
-          Write-Host "验证：curl https://xnc.app/installer.json?channel=$env:CHANNEL （约 5 分钟内翻转）"
+          Write-Host "发布终点为 GitHub Release；生产 server 由 installersync 在一个同步间隔内自动拉取"
+          Write-Host "验证：curl https://xnc.app/installer.json?channel=$env:CHANNEL （约 5 分钟内生效）"

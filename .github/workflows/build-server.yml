@@ -1,8 +1,8 @@
 # build-server.yml — server 版本镜像构建（手动触发，版本号驱动）：
 #   workflow_dispatch 输入 version（X.Y.Z[-dev]，段 ≤4 位）
 #   → 构建 web + 镜像（版本注入）→ 推 GHCR，标签 v<version> + latest + sha-<短哈希>
-# 服务器侧 Watchtower 跟踪 :latest 自动拉取重建——每次手动构建即一次发布。
-# （不再随 push main 自动构建：server 发布节奏由人决定，与 agent 发版对齐。）
+# 服务器侧 Watchtower 跟踪 :latest 自动拉取重建——每次手动构建即为一次发布。
+# （不随 push main 自动构建：server 发布节奏由人工控制，与 agent 发版策略一致。）
 name: build-server
 
 on:
@@ -33,7 +33,7 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - name: build web (dist 进 docker 上下文；服务器从不跑 npm)
+      - name: build web (dist 进入 docker 上下文；服务器不执行 npm)
         run: |
           cd web
           npm ci

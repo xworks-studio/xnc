@@ -1,5 +1,5 @@
 # ci.yml — 测试门禁（设计：docs/ci-release-and-deploy.md §2）
-# PR 与 main push 全绿才能合并；concurrency 省额度。
+# PR 与 main push 全绿方可合并；concurrency 取消过期运行以节省配额。
 name: ci
 
 on:
@@ -22,10 +22,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.work
-      # agent 模块在 linux 有预存在构建失败（agent/session，非新债，
-      # 见设计 §2.3）——linux 只测跨平台模块，agent 归 go-windows。
-      # mockagent import agent/session 且本就是 Windows 负载工具，一并剔除。
-      # e2eviewer 依赖 Windows-only 的 agent/desktoppipe（linux 无该包）。
+      # agent 模块在 linux 存在预存在构建失败（agent/session，与新增
+      # 变更无关，见设计 §2.3）——linux 仅测试跨平台模块，agent 由
+      # go-windows 覆盖。mockagent 依赖 agent/session 且仅用于 Windows
+      # 负载测试，一并排除。e2eviewer 依赖 Windows-only 的
+      # agent/desktoppipe（linux 无该包）。
       - name: test (proto server cli shellsmoke tools)
         run: |
           for m in proto server cli shellsmoke tools/desktopreport tools/nalcheck; do
@@ -100,9 +101,9 @@ jobs:
           cd ..\desktop && call build.bat
 
   installer-dryrun:
-    # 仅 main：保 .iss/build.ps1 可产安装器（无签名，无 pfx 依赖）。
-    # native 产物走 native/** 哈希缓存 + -ReuseNative——MSVC 只在 native
-    # 变更时重编（dryrun 的耗时大头）。
+    # 仅 main：验证 .iss/build.ps1 可产出安装器（无签名，无 pfx 依赖）。
+    # native 产物使用 native/** 哈希缓存 + -ReuseNative——MSVC 仅在
+    # native 变更时重新编译（dryrun 的主要耗时来源）。
     if: github.event_name == 'push'
     runs-on: windows-latest
     steps:
