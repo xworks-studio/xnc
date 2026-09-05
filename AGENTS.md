@@ -10,6 +10,29 @@ XNC = Windows 节点远程管理平台：Go server（xnc.app）+ Windows agent
 （服务）+ Web UI + CLI（`xnc`）。安装器（Inno Setup）是唯一分发载体：安装、
 修复、升级、卸载共用一个安装器；更新由 agent 编排静默安装器完成。
 
+### 系统架构（固定基线，细节见 spec 与设计文档索引）
+
+```
+                 ┌─ SRV（阿里云，xnc.app）docker：caddy(TLS) ─ xnc-server ─ postgres
+                 │                                    coturn(TURN)   watchtower(自动更新)
+   浏览器 ───────┤  HTTPS/WS：Web UI / REST / WS 信令 / 桌面会话中继（SRTP 经 TURN）
+                 │  分发：/installer + /installer.json + /download 页（无认证）
+                 │
+   Windows 节点 ─┘  纯出站 wss 连接（agent 自报版本，server 推送更新）
+     XNCAgent(SYSTEM) + XNCCore(桌面采集/会话桥) + agentctl 管道(本地控制面)
+     状态：ProgramData\XNC（binding/identity/回滚缓存）；用户会话：~/.xnc
+     用户流：装安装器（零凭据）→ xnc register（登录→选 cluster→秒级上线）
+```
+
+- **交付面**：agent/CLI 经 Inno Setup 安装器（tag `v*` → release.yml 签名
+  构建 → GitHub Release + 生产 release store，在线节点自更新）；
+  server 经 build-server.yml（**手动触发、版本号输入** → GHCR
+  `v<版本>+latest+sha` → Watchtower 轮询 `:latest` 自动换版）。
+- **信任**：自签 Authenticode（安装器内置信任装卸）；更新 sha256 强校验 +
+  回滚看门狗；凭据唯一源 `deploy/.env`。
+- **开发流**：worktree 分支 → PR（ci.yml 五矩阵门禁）→ main。实验机
+  XIAOXIN/TB16G7（PS remoting），本机不装产品组件。
+
 模块地图（Go workspace，`go.work` 串联）：`proto`（协议）· `server`（控制面，
 chi + sqlc + 真 PG 测试）· `agent`（节点侧，Windows 服务）· `cli` · `shellhost`
 （ConPTY 宿主）· `mockagent`（负载/一致性测试用，**保留勿删**）· `shellsmoke` ·
@@ -56,15 +79,17 @@ chi + sqlc + 真 PG 测试）· `agent`（节点侧，Windows 服务）· `cli` 
 - 遗留坑：`agent/session` 存在预存在的 GOOS=linux 构建失败（非 Windows 路径），
   与新改动无关时勿"顺手修"。
 
-## 4. 部署流程（server → xnc.app，GHCR + Watchtower 全自动）
+## 4. 部署流程（server → xnc.app，GHCR + Watchtower）
 
-**部署 = 合并进 main，之后无需任何人工**：push main 触发
-`build-server.yml`（构建 web + 版本镜像 → 推 GHCR `:main`），SRV 上的
-Watchtower（compose 内独立容器，5 分钟轮询、label 圈定仅管 xnc-server）
-自动拉取重建。已实测：提交后 ~8 分钟线上版本翻转。
+**部署 = 手动触发 `build-server` workflow，输入版本号（X.Y.Z[-dev]）**：
+CI 构建当前 main 的 web + 版本镜像 → 推 GHCR（`v<版本>` + `latest` +
+`sha-<哈希>`）；SRV 上的 Watchtower（compose 内独立容器，5 分钟轮询、
+label 圈定仅管 xnc-server，跟踪 `:latest`）自动拉取重建——触发后约
+5–10 分钟线上换版。server 发布节奏由人决定，不随 push main 自动出。
 
-- **验证**：`curl https://xnc.app/api/health` 的 version 应为
-  `main-<commit短哈希>`。
+- **触发**：Actions → build-server → Run workflow → 填版本号（须先合入
+  main；版本格式 X.Y.Z[-dev]，段 ≤4 位）。
+- **验证**：`curl https://xnc.app/api/health` 的 version == 输入的版本号。
 - **锁版本/回滚**：改 compose 的镜像 tag 为 `:vX.Y.Z` 或 `:sha-<哈希>`
   后 `up -d`（SRV 上直接改，改完记得回改仓库保持一致）。
 - **Caddyfile 变更**仍需 SSH：替换文件后 `docker compose up -d

@@ -136,11 +136,13 @@ jobs:
 Watchtower（compose 内独立容器）轮询注册表自动拉取重建。与 server
 产品本身零耦合——不把基础设施交付嵌进产品 API。
 
-### 4.1 构建推送（`build-server.yml`，push main / tag v* 触发）
+### 4.1 构建推送（`build-server.yml`，**手动触发 + 版本号输入**）
 
-- 镜像 `ghcr.io/xworks-studio/xnc-server`：
-  - main push → 标签 `main`（浮动）+ `sha-<短哈希>`；版本 `main-<短哈希>`
-  - v* tag → 标签 `vX.Y.Z` + `latest`；版本 = tag 版本
+- workflow_dispatch 输入 `version`（X.Y.Z[-dev]，段 ≤4 位；须先合入
+  main——构建的是当前 main 代码）。server 发布节奏由人决定，不随
+  push 自动出（与 agent 发版对齐）。
+- 镜像 `ghcr.io/xworks-studio/xnc-server`：标签 `v<版本>` + `latest`
+  （Watchtower 跟踪）+ `sha-<短哈希>`（溯源）。
 - 多阶段构建沿用 `deploy/Dockerfile`（workflow 先构建 web dist 进上下文；
   服务器从不跑 npm），GITHUB_TOKEN 推送，buildx GHA 缓存。
 
