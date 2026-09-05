@@ -24,9 +24,10 @@ jobs:
           go-version-file: go.work
       # agent 模块在 linux 有预存在构建失败（agent/session，非新债，
       # 见设计 §2.3）——linux 只测跨平台模块，agent 归 go-windows。
-      - name: test (proto server cli mockagent shellsmoke tools)
+      # mockagent import agent/session 且本就是 Windows 负载工具，一并剔除。
+      - name: test (proto server cli shellsmoke tools)
         run: |
-          for m in proto server cli mockagent shellsmoke tools/desktopreport tools/e2eviewer tools/nalcheck; do
+          for m in proto server cli shellsmoke tools/desktopreport tools/e2eviewer tools/nalcheck; do
             echo "=== $m ==="
             (cd "$m" && go vet ./... && go test ./... )
           done
