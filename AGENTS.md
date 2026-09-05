@@ -129,9 +129,10 @@ Release（附件安装器 + .sha256 边车；dev 频道标 prerelease）。**CI 
 
 - **安装**：下载页或 `curl -LO https://xnc.app/installer` → 运行
   （管理员）→ 服务就位，**零凭据**，agent 空转 `awaiting registration`。
-- **注册**：`xnc register --server https://xnc.app`（新机首跑需
-  --server；TTY 交互登录+选 cluster，非 TTY 用 --email + stdin 密码 +
-  --yes）。成功后秒级 online。重装/换机身份 → adopt 沿用原节点。
+- **注册**：`xnc register`（server 固定 https://xnc.app，不再询问；
+  --server/XNC_SERVER 仅为开发保留且已从帮助隐藏。TTY 交互登录+选
+  cluster，非 TTY 用 --email + stdin 密码 + --yes）。成功后秒级 online。
+  重装/换机身份 → adopt 沿用原节点。
 - **会话**：`xnc login/logout`（用户级）；`logout` 不影响节点在线。
 - **反注册**：`xnc deregister`（需管理员终端；删服务端记录+本地绑定，
   保留身份）。WS 通道不通时改用服务端管理删除。
