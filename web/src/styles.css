@@ -629,3 +629,114 @@ h2 {
 .desktop-textbar input:disabled {
   opacity: 0.5;
 }
+
+/* Login card footer (installer download link) */
+
+.login-foot {
+  margin: -8px 0 0;
+  text-align: center;
+  font-size: 13px;
+}
+
+/* Download page (public installer download — standalone layout like Login) */
+
+.download-page {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.download-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 24px;
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--border);
+}
+
+.download-brand {
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: 2px;
+}
+
+.download-main {
+  width: min(720px, 100%);
+  margin: 0 auto;
+  padding: 32px 24px 48px;
+}
+
+.download-sub {
+  margin: -8px 0 20px;
+  font-size: 13px;
+}
+
+.download-channels {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.download-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.download-card-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.download-card-head h2 {
+  margin: 0;
+}
+
+/* sha256 行：完整值留在 DOM/title 中，视觉截断交给 CSS。 */
+.download-sha-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  min-width: 0;
+}
+
+.download-sha {
+  padding: 4px 8px;
+  min-width: 0;
+}
+
+.download-sha .mono {
+  display: inline-block;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
+/* 下载按钮：浏览器原生 <a> 直链，外观与 button 一致。 */
+.download-btn {
+  margin-top: auto;
+  align-self: flex-start;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 4px;
+  padding: 8px 16px;
+}
+
+.download-btn:hover {
+  background: var(--accent-hover);
+}
+
+.download-steps ol {
+  margin: 0;
+  padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}

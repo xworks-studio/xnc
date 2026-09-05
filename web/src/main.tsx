@@ -5,6 +5,7 @@ import "./styles.css";
 import App from "./App";
 import { AuthProvider, LoginGuard } from "./auth";
 import Login from "./pages/Login";
+import Download from "./pages/Download";
 import Clusters from "./pages/Clusters";
 import Nodes from "./pages/Nodes";
 import NodeDetail from "./pages/NodeDetail";
@@ -18,6 +19,8 @@ createRoot(document.getElementById("root")!).render(
       <AuthProvider>
         <Routes>
           <Route path="/login" element={<Login />} />
+          {/* 公开安装器下载页（LoginGuard 之外，无侧栏独立布局） */}
+          <Route path="/download" element={<Download />} />
           <Route
             path="/"
             element={
