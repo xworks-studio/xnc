@@ -90,6 +90,8 @@ Agent (Windows 服务)
 
 ## 开发
 
+> Agent/工程师操作规范（开发、部署、发布、安装使用、硬性契约）见 [AGENTS.md](AGENTS.md)。
+
 ```bash
 cd deploy && docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 (cd cli && go build -o ../bin/xnc.exe .)
