@@ -9,16 +9,20 @@
 ### 1.1 格式
 
 ```
-MAJOR.MINOR.PATCH[-prerelease]
-例：0.8.0 / 0.8.1 / 1.0.0 / 0.9.0-dev.1 / 0.9.0-dev.2
+MAJOR.MINOR.PATCH[-dev]
+段内 1–4 位数字；每段独立计数、独立扩容。
+例：0.8.0 / 0.8.1123 / 1.25.3386 / 0.9.0-dev
 ```
 
-- 严格 semver。**扩容点**：从现在裸 `X.Y.Z + 文件名频道后缀` 扩为
-  三段全量 + 预发布段；频道（stable/dev）由 release 元数据承载
-  （已是现状：上传时的 `channel` 字段），不再编码进版本字符串本身。
-- 预发布段仅 dev 频道使用：`-dev.N`，N 单调递增（0.9.0-dev.1 →
-  0.9.0-dev.2 → 0.9.0）。比较语义沿用 agent 现有 CompareVersions
-  （预发布低于同名正式版——已实现并有测试）。
+- **段宽 4 位（上限 9999/段）**：选型依据 Windows 版本资源的
+  VS_FIXEDFILEINFO 每段上限 65535——4 位留足余量且永不越界；regex
+  `^\d{1,4}\.\d{1,4}\.\d{1,4}(-dev)?$`（tag 带 `v` 前缀）。
+- **dev 后缀为裸 `-dev`，不带任何序号/其他字符**。dev 频道的迭代
+  靠**递增 PATCH**（0.9.0-dev → 0.9.1-dev → …），禁止同版本重发：
+  在线 agent 以版本号判断新旧，同号重传的内容变化不被感知（upsert
+  只影响新下载者）——该约束为硬规则。
+- 比较语义沿用 agent 现有 CompareVersions（无后缀 > `-dev`；数字段
+  任意长度数值比较——当前实现已满足本方案，无需改动）。
 
 ### 1.2 语义（何时 bump 谁）
 
@@ -27,16 +31,17 @@ MAJOR.MINOR.PATCH[-prerelease]
 | MAJOR | 协议/proto 破坏性变更 | agent↔server 不兼容窗口出现时；GA 前允许 0→1 一次性跨越 |
 | MINOR | 功能发布 | 跨组件新能力（安装器/CLI/server 联动） |
 | PATCH | 修复 | 单组件缺陷修复、重打包 |
-| prerelease | dev 频道迭代 | 同一目标版本的每次 dev 构建递增 N |
+| `-dev` 后缀 | dev 频道标记 | 裸后缀；该频道每次发布递增 PATCH |
 
 - **0.x 期（当前）**：MINOR 承担功能演进（0.8、0.9 …），PATCH 修缺陷；
-  `1.0.0` 留给 GA（对外承诺兼容性之时）。
+  `1.0.0` 留给 GA（对外承诺兼容性之时）。段内 4 位容量即"扩容"答案：
+  无需跳位规则，每段自然增长到 9999。
 - 版本单一来源铁律不变：git tag → 构建注入（agent ldflags / server
   XNC_VERSION / 安装器 `/DVersion`）== `installer.json.version`。
 
 ### 1.3 版本的载体与流转
 
-- **git tag `vX.Y.Z[-dev.N]` 是唯一发版动作**：打 tag 触发发布流水线
+- **git tag `vX.Y.Z[-dev]` 是唯一发版动作**：打 tag 触发发布流水线
   （§3）。tag 必须打在 main 上、不允许 force-push 已有 tag。
 - server 版本与 agent 版本**独立但 MINOR 对齐**（同一批发布的 server
   版本号 = agent 正式版号；PATCH 允许各自独立）。
@@ -92,7 +97,8 @@ jobs:
 
 - 触发：`push: tags: ['v*']`（仅 main 上的 tag——workflow 内校验
   `git merge-base --is-ancestor <tag> main`，否则 fail）。
-- tag 格式校验：`^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-dev\.\d+)?$`。
+- tag 格式校验：`^v\d{1,4}\.\d{1,4}\.\d{1,4}(-dev)?$`（段宽 ≤4 位，
+  dev 仅裸后缀；`-dev` tag 发布到 dev 频道）。
 
 ### 3.2 流水线（单 job，windows-latest，串行步骤）
 
@@ -102,7 +108,7 @@ jobs:
 3. build.ps1 -Version <tag去v前缀> -Channel <stable|dev 由 tag 推导>
    - 签名：XNC_CODESIGN_PFX（base64 secret → 文件）+
      XNC_CODESIGN_PASSWORD（env）→ build.ps1 自动签名（含时间戳探测）
-   - 产物：bin/XNC-Installer-<v>[-dev.N].exe + .sha256
+   - 产物：bin/XNC-Installer-<v>[-dev].exe + .sha256
 4. 上传 GitHub Release（softprops/action-gh-release）：
    附件 = 安装器 + .sha256；正文 = tag message（发版说明写进 tag）
 5. 上传生产 release store：
@@ -114,7 +120,7 @@ jobs:
 
 ### 3.3 发布规则条文
 
-- **tag 即版本**：无 tag 不发布；`-dev.N` 标签发布到 dev 频道，其余
+- **tag 即版本**：无 tag 不发布；`-dev` 标签发布到 dev 频道，其余
   发布到 stable。
 - **不可变**：同 tag 重推被 CI 拒绝（步骤 1 校验 + GitHub tag 保护）；
   修坏版本 = 新 PATCH tag。
