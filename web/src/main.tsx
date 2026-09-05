@@ -12,6 +12,7 @@ import NodeDetail from "./pages/NodeDetail";
 import Terminal from "./pages/Terminal";
 import Users from "./pages/Users";
 import Profile from "./pages/Profile";
+import Monitor from "./pages/Monitor";
 import DesktopLive from "./pages/DesktopLive";
 
 createRoot(document.getElementById("root")!).render(
@@ -40,6 +41,7 @@ createRoot(document.getElementById("root")!).render(
             <Route path="/desktop/:nodeId" element={<DesktopLive />} />
             <Route path="/users" element={<Users />} />
             <Route path="/profile" element={<Profile />} />
+            <Route path="/monitor" element={<Monitor />} />
           </Route>
         </Routes>
       </AuthProvider>

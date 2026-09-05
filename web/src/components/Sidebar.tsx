@@ -43,6 +43,7 @@ export default function Sidebar() {
         <NavLink to="/clusters">Clusters</NavLink>
         <NavLink to="/users">Users</NavLink>
         <NavLink to="/download">Download</NavLink>
+        <NavLink to="/monitor">Monitor</NavLink>
       </nav>
       <div className="side-foot">
         {serverVersion && <div className="dim server-version">server v{serverVersion}</div>}
