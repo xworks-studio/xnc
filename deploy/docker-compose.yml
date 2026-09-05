@@ -14,13 +14,10 @@ services:
       retries: 12
 
   xnc-server:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      args:
-        # server 构建版本注入（版本单一来源：构建时传入，与安装器打包版本
-        # 一致；未设回落 0.0.0-dev）。deploy/.env 设 XNC_VERSION 即生效。
-        XNC_VERSION: ${XNC_VERSION:-0.0.0-dev}
+    # 镜像化交付（build-server.yml 构建推送 GHCR；服务器 cron 定时
+    # docker compose pull 拉最新）。:main 跟踪 main 分支每次绿灯构建；
+    # 发版 tag 生成 vX.Y.Z 镜像，改 tag 即可锁版本回滚。
+    image: ghcr.io/xworks-studio/xnc-server:main
     environment:
       XNC_DATABASE_URL: postgres://xnc:${POSTGRES_PASSWORD}@postgres:5432/xnc
       XNC_JWT_SECRET: ${XNC_JWT_SECRET}

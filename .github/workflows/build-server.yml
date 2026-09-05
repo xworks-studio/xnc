@@ -1,0 +1,66 @@
+# build-server.yml — server 版本镜像构建与推送（设计文档 §4 重写后的
+# 镜像化交付）：CI 构建带版本标签的 xnc-server 镜像推 GHCR；服务器端
+# 由 cron 定时 docker compose pull 拉最新（不再上传源码远端构建）。
+#   push main → 镜像标签 main + sha-<short>（版本号 = main-<short>）
+#   tag  v*   → 镜像标签 v<version> + latest（版本号 = <version>）
+name: build-server
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+  packages: write # GHCR 推送
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/${{ github.repository_owner }}/xnc-server
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        name: derive version + image tags
+        run: |
+          ref="${{ github.ref_name }}"
+          if [[ "$ref" == v* ]]; then
+            ver="${ref#v}"
+            tags="latest,v${ver}"
+          else
+            sha="${GITHUB_SHA::7}"
+            ver="main-${sha}"
+            tags="main,sha-${sha}"
+          fi
+          echo "version=${ver}" >> "$GITHUB_OUTPUT"
+          # 换行分隔的 tag 列表 → 构建参数
+          {
+            for t in $tags; do echo "tag=$t" >> "$GITHUB_OUTPUT"; done
+          }
+          echo "tags<<EOF" >> "$GITHUB_OUTPUT"
+          for t in $tags; do echo "$REGISTRY_IMAGE:$t" | sed "s|REGISTRY_IMAGE|ghcr.io/${{ github.repository_owner }}/xnc-server|"; done >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: true
+          platforms: linux/amd64
+          build-args: |
+            XNC_VERSION=${{ steps.meta.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

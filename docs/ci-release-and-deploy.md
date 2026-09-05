@@ -130,40 +130,36 @@ jobs:
 - 仓库分支保护（配套设置，非 workflow）：main 需 CI 绿 + 禁止 force
   push；tag 保护规则 `v*` 禁止删除与移动。
 
-## 4. 手动部署 Server 工作流（`.github/workflows/deploy-server.yml`）
+## 4. Server 镜像化交付（build-server.yml + 服务器定时拉取）
 
-### 4.1 触发
+**取代原"手动部署工作流"**：不再向服务器上传源码、不在远端构建。
 
-- `workflow_dispatch`，inputs：
-  - `version`（必填，X.Y.Z；默认取最近 tag 去 v）
-  - `force_clean`（bool，默认 **true**：远端清空重建源码目录——
-    规避 tar 覆盖不删的已知陷阱）
-  - `recreate_caddy`（bool，默认 false；Caddyfile 变更时手动勾选）
+### 4.1 构建推送（CI，`build-server.yml`）
 
-### 4.2 流程（ubuntu-latest）
+- 触发：push main（绿灯即出）+ tag `v*`。
+- 镜像：`ghcr.io/xworks-studio/xnc-server`，标签：
+  - main push → `main`（浮动）+ `sha-<短哈希>`（版本号 = `main-<短哈希>`）
+  - v* tag → `vX.Y.Z` + `latest`（版本号 = tag 版本）
+- 多阶段构建沿用 `deploy/Dockerfile`（web 构建 → go 注入版本 →
+  distroless），buildx GHA 缓存加速。
 
-```
-1. 前置：secrets SRV_HOST/SRV_SSH_USER/SRV_SSH_KEY（ed25519 私钥）
-2. 本地构建 web（node 22 → npm ci → npm run build）
-3. 打包上传：tar(proto/server/deploy/web, 排除 .env/node_modules)
-4. force_clean=true 时：备份远端 deploy/.env → rm -rf 源码目录
-   → 解包 → 恢复 .env（把"删型变更须清场"从人工规程变为默认）
-5. 更新远端 .env 的 XNC_VERSION=<input.version>
-6. docker compose build xnc-server（显式检查 BUILD_RC——防"假上线"）
-   → up -d →（可选）up -d --force-recreate caddy
-7. 验证：GET /api/health 的 version == input.version；
-   GET /installer.json 200 且 sha256 与最新 release 一致；失败即 job 红
-8. 回滚预案：重跑 workflow 选上一版本号（版本不可变原则下，回滚=
-   重新部署旧 tag 的 server；DB 迁移向后兼容由 sqlc 变更纪律保证）
-```
+### 4.2 服务器侧（SRV 一次性安装，cron 自动拉取）
+
+- compose 的 xnc-server 用 `image: …:main`（无 build 段）。
+- `/opt/xnc/deploy/pull-update.sh`（flock 防并发）：
+  `docker compose pull xnc-server && docker compose up -d xnc-server`；
+  cron `*/5` 执行——镜像无更新即 no-op，有更新 5 分钟内自动换版。
+- **回滚/锁版**：compose 里把 `:main` 改成 `:vX.Y.Z` 再 up -d。
+- GHCR 私有镜像：服务器需 `docker login ghcr.io`（read:packages 凭据，
+  存 root 的 docker config）；或把 package 设为 public 免登录。
 
 ### 4.3 规则条文
 
-- 手动工作流**只部署 server**；agent/安装器分发全部走 release 流水线
-  （§3），不混用。
-- 部署后验证失败 → job 红 + summary 给出排查指引（远端 /tmp/b.log 的
-  tail 已在步骤输出）。
-- 该 workflow 需要 repo secret `SRV_*`；权限收敛为单一 deploy key。
+- 服务器上不再有源码目录；`/opt/xnc` 只剩 `deploy/`（compose/env/
+  Caddyfile/turnserver.conf）+ pull 脚本。
+- 版本验证：`/api/health` 的 version == 镜像内注入值。
+- Caddyfile 变更仍是 SSH 手工（换 inode 需 `--force-recreate`，见
+  AGENTS.md）。
 
 ## 5. 配套设置清单（实施时一次做完）
 
