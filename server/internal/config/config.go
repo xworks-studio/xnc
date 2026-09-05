@@ -22,14 +22,14 @@ type Config struct {
 
 	// —— M1-Slice2 desktop/TURN。TURN 缺省为空 = desktop 会话 503
 	// TURN_UNCONFIGURED（relay-only 无 TURN 不可用）；凭据绝不入日志。
-	TurnURLs           []string      // XNC_TURN_URLS，逗号分隔（turn:/turns: URL）
-	TurnUsername       string        // XNC_TURN_USERNAME（dev = lt-cred 静态用户）
-	TurnCredential     string        // XNC_TURN_CREDENTIAL（M2 换 REST 时效凭据）
+	TurnURLs       []string // XNC_TURN_URLS，逗号分隔（turn:/turns: URL）
+	TurnUsername   string   // XNC_TURN_USERNAME（dev = lt-cred 静态用户）
+	TurnCredential string   // XNC_TURN_CREDENTIAL（M2 换 REST 时效凭据）
 	// TurnPool 境内 TURN 中转池（XNC_TURN_POOL，逗号分隔 ip[:port]，缺省端口
 	// 3478）。空 = 未配置 → 沿用 TurnURLs 全列表（现状）。非空时 desktop 会话
 	// 从池中 round-robin 分配单台（udp 优先 + tcp 兜底两个 URL），凭据与
 	// TurnUsername/TurnCredential 共用。
-	TurnPool []string
+	TurnPool           []string
 	DesktopPerNode     int           // XNC_DESKTOP_PER_NODE，默认 4（对齐 agent host max_subs=4，多 viewer），0 = 不限
 	DesktopIdleTimeout time.Duration // XNC_DESKTOP_IDLE，默认 5m（无信令活动即关），0 = 不限
 
@@ -48,36 +48,49 @@ type Config struct {
 	DesktopMediaV2Percent   int      // XNC_DESKTOP_MEDIA_V2_PERCENT，0-100，默认 0（全 v1）；越界视为 0
 	DesktopMediaV2Allowlist []string // XNC_DESKTOP_MEDIA_V2_ALLOWLIST，逗号分隔节点 UUID（显式胜百分比）
 	DesktopMediaV2Rollback  bool     // XNC_DESKTOP_MEDIA_V2_ROLLBACK，true = 一切新会话钉回 v1（回滚开关）
+
+	// —— installer 分发同步（installersync）：GitHub Releases 是唯一事实
+	// 源，server 定时拉回本地 release store（/installer 服务路径不变）。
+	InstallerSyncRepo     string        // XNC_INSTALLER_SYNC_REPO，默认 xworks-studio/xnc；空 = 关闭同步
+	InstallerSyncInterval time.Duration // XNC_INSTALLER_SYNC_INTERVAL，默认 5m，下限 1m（保护 API 配额）
+	GitHubToken           string        // XNC_GITHUB_TOKEN，可选：匿名 60 req/h 已足够，防限额/私有库时配置
 }
 
 func Load() (Config, error) {
 	c := Config{
-		ListenAddr:         env("XNC_LISTEN", ":8080"),
-		DatabaseURL:        os.Getenv("XNC_DATABASE_URL"),
-		JWTSecret:          []byte(os.Getenv("XNC_JWT_SECRET")),
-		AdminEmail:         os.Getenv("XNC_ADMIN_EMAIL"),
-		AdminPassword:      os.Getenv("XNC_ADMIN_PASSWORD"),
-		HeartbeatTimeout:   envDur("XNC_HEARTBEAT_TIMEOUT", 90*time.Second),
-		EnrollTokenTTL:     envDur("XNC_ENROLL_TOKEN_TTL", 30*time.Minute),
-		ShellPerNode:       envInt("XNC_SHELL_PER_NODE", 10),
-		ShellIdleTimeout:   envDur("XNC_SHELL_IDLE", 30*time.Minute),
-		ShellMaxLifetime:   envDur("XNC_SHELL_MAX", 8*time.Hour),
-		TurnURLs:           envList("XNC_TURN_URLS"),
-		TurnUsername:       os.Getenv("XNC_TURN_USERNAME"),
-		TurnCredential:     os.Getenv("XNC_TURN_CREDENTIAL"),
-		TurnPool:           envList("XNC_TURN_POOL"),
-		DesktopPerNode:     envInt("XNC_DESKTOP_PER_NODE", 4),
-		DesktopIdleTimeout: envDur("XNC_DESKTOP_IDLE", 5*time.Minute),
-		DesktopICEPolicy:   icePolicy(os.Getenv("XNC_DESKTOP_ICE_POLICY")),
+		ListenAddr:              env("XNC_LISTEN", ":8080"),
+		DatabaseURL:             os.Getenv("XNC_DATABASE_URL"),
+		JWTSecret:               []byte(os.Getenv("XNC_JWT_SECRET")),
+		AdminEmail:              os.Getenv("XNC_ADMIN_EMAIL"),
+		AdminPassword:           os.Getenv("XNC_ADMIN_PASSWORD"),
+		HeartbeatTimeout:        envDur("XNC_HEARTBEAT_TIMEOUT", 90*time.Second),
+		EnrollTokenTTL:          envDur("XNC_ENROLL_TOKEN_TTL", 30*time.Minute),
+		ShellPerNode:            envInt("XNC_SHELL_PER_NODE", 10),
+		ShellIdleTimeout:        envDur("XNC_SHELL_IDLE", 30*time.Minute),
+		ShellMaxLifetime:        envDur("XNC_SHELL_MAX", 8*time.Hour),
+		TurnURLs:                envList("XNC_TURN_URLS"),
+		TurnUsername:            os.Getenv("XNC_TURN_USERNAME"),
+		TurnCredential:          os.Getenv("XNC_TURN_CREDENTIAL"),
+		TurnPool:                envList("XNC_TURN_POOL"),
+		DesktopPerNode:          envInt("XNC_DESKTOP_PER_NODE", 4),
+		DesktopIdleTimeout:      envDur("XNC_DESKTOP_IDLE", 5*time.Minute),
+		DesktopICEPolicy:        icePolicy(os.Getenv("XNC_DESKTOP_ICE_POLICY")),
 		DesktopMediaV2Percent:   envInt("XNC_DESKTOP_MEDIA_V2_PERCENT", 0),
 		DesktopMediaV2Allowlist: envList("XNC_DESKTOP_MEDIA_V2_ALLOWLIST"),
 		DesktopMediaV2Rollback:  envBool("XNC_DESKTOP_MEDIA_V2_ROLLBACK", false),
+		InstallerSyncRepo:       env("XNC_INSTALLER_SYNC_REPO", "xworks-studio/xnc"),
+		InstallerSyncInterval:   envDur("XNC_INSTALLER_SYNC_INTERVAL", 5*time.Minute),
+		GitHubToken:             os.Getenv("XNC_GITHUB_TOKEN"),
 	}
 	if c.DatabaseURL == "" {
 		return c, fmt.Errorf("XNC_DATABASE_URL is required")
 	}
 	if len(c.JWTSecret) < 32 {
 		return c, fmt.Errorf("XNC_JWT_SECRET must be at least 32 bytes")
+	}
+	// 下限钳制：更快的轮询只会烧 API 配额（匿名 60 req/h），同步收益为零。
+	if c.InstallerSyncInterval < time.Minute {
+		c.InstallerSyncInterval = time.Minute
 	}
 	return c, nil
 }
@@ -135,7 +148,7 @@ func envBool(k string, d bool) bool {
 }
 
 // icePolicy 归一化 XNC_DESKTOP_ICE_POLICY：仅 "all" 视为放开直连，其余
-//（空/未知值）fail closed 回 "relay"——缺省行为与旧版完全一致（不配置 =
+// （空/未知值）fail closed 回 "relay"——缺省行为与旧版完全一致（不配置 =
 // agent 侧强制 relay）。字面量对应 proto.DesktopIceAll（"all"），此处不引
 // proto 依赖以保持 config 只依赖标准库。
 func icePolicy(v string) string {

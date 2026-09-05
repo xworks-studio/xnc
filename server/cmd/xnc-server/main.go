@@ -15,6 +15,7 @@ import (
 	"xnc/server/internal/bootstrap"
 	"xnc/server/internal/config"
 	"xnc/server/internal/db"
+	"xnc/server/internal/installersync"
 	"xnc/server/internal/registry"
 )
 
@@ -53,6 +54,15 @@ func main() {
 	reg := registry.New()
 	app := api.NewApp(st, cfg, reg)
 	srv := &http.Server{Addr: cfg.ListenAddr, Handler: app, ReadHeaderTimeout: 10 * time.Second}
+
+	// installer 分发同步：GitHub Releases 唯一事实源，server 定时拉回本地
+	// release store（/installer、/installer.json 与 agent 更新契约不变）。
+	// 启动即同步一次（空库冷启动自填充）；repo 为空 = 显式关闭。
+	if cfg.InstallerSyncRepo != "" {
+		syncer := installersync.New(st, cfg.InstallerSyncRepo, cfg.GitHubToken,
+			cfg.InstallerSyncInterval, slog.Default())
+		go syncer.Run(ctx)
+	}
 
 	// 优雅停机（信号触发）：先停 TURN 池健康探测等后台 worker，再排空 HTTP
 	// 连接——顺序显式：探测 goroutine 不拖慢排空，也不在排空期间空转。
