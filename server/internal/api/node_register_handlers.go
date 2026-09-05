@@ -36,9 +36,11 @@ type registerReq struct {
 //
 // 同 cluster 同 machineId 异 key → adopt（controller 批准设计）：201 复用既有
 // 节点行（同 nodeId、name 不变），重绑 public_key 并刷新机器字段，双审计
-// register + node_adopt。安全边界：同 cluster 成员即可 adopt——与注册新节点
-// 同一信任域（machineId 冲突即说明是同一台机器重装后换 key）；跨 cluster
-// 冲突不走 adopt（不同信任域），须管理端先删除原注册项（见 409 分支）。
+// register + node_adopt；旧 key 的在线控制连接随 adopt 逐出（先于响应返回，
+// 防其继续收 SESSION_OPEN 或断开时回写状态）。安全边界：同 cluster 成员即可
+// adopt——与注册新节点同一信任域（machineId 冲突即说明是同一台机器重装后换
+// key）；跨 cluster 冲突不走 adopt（不同信任域），须管理端先删除原注册项
+// （见 409 分支）。
 //
 //	成员（viewer 亦可）→ 201 {nodeId, clusterId, name}（幂等/adopt 复用同款 201）
 //	非成员 → 403 FORBIDDEN（spec 明示 403，不走 404 隐藏 cluster 存在性）

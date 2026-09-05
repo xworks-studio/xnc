@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/ed25519"
 	"encoding/base64"
 	"fmt"
@@ -272,4 +273,61 @@ func TestUserNodeRegisterAdopt(t *testing.T) {
 	// 新 key B 握手成功（dialControl 内完成挑战→验签→HELLO→HELLO_ACK）。
 	env.nodes[node.NodeID] = privB
 	_ = dialControl(t, env, node.NodeID)
+}
+
+// TestUserNodeRegisterAdoptEvictsOldConn：adopt 必须逐出旧 key 的在线控制连
+// 接（评审 fix round 1）。旧连接若继续存活：(a) 会照常收到 SESSION_OPEN；
+// (b) 其断开清理（RemoveIf==true 的正常路径）会回写 offline + last_seen_at，
+// 覆盖 adopt 刚置空的 last_seen_at，破坏"新身份未见过"语义。逐出（先 Remove
+// 再 Cancel）后被逐连接的清理走 RemoveIf==false，跳过状态回写——断言连接被
+// 服务端关闭、registry 表项清除、last_seen_at 在清理跑完后仍为 NULL。
+func TestUserNodeRegisterAdoptEvictsOldConn(t *testing.T) {
+	env := NewTestEnv(t)
+	srv := httptest.NewServer(env.Router)
+	defer srv.Close()
+	admin := env.AdminToken(t)
+	cluster := defaultClusterID(t, srv.URL, admin)
+
+	// key A 注册并建立在线控制连接（旧身份在线；HELLO 已置 online + last_seen）。
+	pubA, privA, _ := ed25519.GenerateKey(nil)
+	keyA := base64.StdEncoding.EncodeToString(pubA)
+	resp := doJSON(t, srv.URL, "POST", "/api/clusters/"+cluster+"/nodes/register",
+		admin, registerBody("OLD-HOST", "adopt-evict-mid", keyA))
+	require.Equal(t, 201, resp.StatusCode)
+	var node struct {
+		NodeID string `json:"nodeId"`
+	}
+	require.NoError(t, decodeJSON(resp.Body, &node))
+	env.nodes[node.NodeID] = privA
+	live := dialControl(t, env, node.NodeID)
+	require.NotNil(t, env.reg.Get(node.NodeID), "old-key conn must be registered")
+
+	// adopt：同 machineId 换 key B → 201
+	pubB, _, _ := ed25519.GenerateKey(nil)
+	resp = doJSON(t, srv.URL, "POST", "/api/clusters/"+cluster+"/nodes/register",
+		admin, registerBody("NEW-HOST", "adopt-evict-mid",
+			base64.StdEncoding.EncodeToString(pubB)))
+	require.Equal(t, 201, resp.StatusCode)
+
+	// 逐出是同步的：201 返回时 registry 表项已移除、旧连接 ctx 已 Cancel。
+	assert.Nil(t, env.reg.Get(node.NodeID),
+		"old-key live conn must be evicted from the registry on adopt")
+
+	// 被逐连接读到关闭（服务端 Cancel → 读错误）。
+	require.Eventually(t, func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		_, _, err := live.Read(ctx)
+		return err != nil
+	}, 5*time.Second, 100*time.Millisecond, "old-key live conn must be closed after adopt")
+
+	// 断开清理已在此刻的 defer 链上执行（同一 goroutine）：留一个短窗口让
+	// 错误的回写（若存在）可见，再断言 last_seen_at 仍为 NULL（RemoveIf==
+	// false 跳过 TouchNode）。
+	time.Sleep(500 * time.Millisecond)
+	var lastSeen *time.Time
+	require.NoError(t, env.Store.Pool().QueryRow(t.Context(),
+		`SELECT last_seen_at FROM nodes WHERE id=$1`, node.NodeID).Scan(&lastSeen))
+	assert.Nil(t, lastSeen,
+		"evicted conn cleanup must not touch last_seen_at (RemoveIf==false skips write-back)")
 }

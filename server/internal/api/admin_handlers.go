@@ -96,7 +96,9 @@ func (h *handlers) deleteCluster(w http.ResponseWriter, r *http.Request) {
 
 // adminDeleteNode 处理 DELETE /api/nodes/{id}：admin-only（isAdminUser，与
 // adminDeleteRelease 同款判定）硬删除节点行——管理端清理残留注册项（跨
-// cluster machineId 冲突须先删后注册的出口）。落库复用 WS NODE_DELETE 的
+// cluster machineId 冲突须先删后注册的出口）。controller 评审确认采用平台级
+// admin 谓词而非 deleteCluster 的 per-cluster owner：跨 cluster/无 owner 的
+// 孤儿节点只有平台 admin 能清理。落库复用 WS NODE_DELETE 的
 // DeleteNode；节点在线则逐出其控制连接（evictNodeConn：registry 移除 +
 // Cancel）；审计 node_delete {userId, nodeId}。非 admin 403；未知/非法 id
 // 404；成功 200（空 body）。

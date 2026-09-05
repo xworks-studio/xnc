@@ -97,9 +97,9 @@ type enrollReq struct {
 //
 //	tx 开始 → 幂等：同 (cluster, machineId, publicKey) 复用既有节点（不烧
 //	token，不重复审计）→ 同 machineId 异 key：allowAdopt 时 adopt（重绑公钥、
-//	刷新机器字段复用既有节点行 + 双审计），否则 409 NODE_ALREADY_ENROLLED →
-//	tokenID 非 nil 时消费一次性 token → 节点名唯一化（hostname、hostname-2…）
-//	→ CreateNode → 审计 → commit。
+//	刷新机器字段复用既有节点行 + 双审计 + 提交后逐出旧 key 在线连接），否则
+//	409 NODE_ALREADY_ENROLLED → tokenID 非 nil 时消费一次性 token → 节点名
+//	唯一化（hostname、hostname-2…）→ CreateNode → 审计 → commit。
 //
 // tokenID 由 token 授权路径（/api/agent/enroll）传入；用户 JWT 路径传 nil。
 // 审计 action 与 actor 由调用方给出（"node.enroll"/token 创建者 vs
@@ -150,6 +150,12 @@ func (h *handlers) enrollNode(ctx context.Context, clusterID uuid.UUID, req enro
 		if err := tx.Commit(ctx); err != nil {
 			return sqlc.Node{}, proto.Err(500, proto.CodeInternal, "commit")
 		}
+		// 事务提交后逐出旧 key 的在线控制连接（评审 fix round 1）：旧连接验签
+		// 依据的是被替换的公钥，若放任存活 (a) 会继续收到 SESSION_OPEN；(b) 其
+		// 断开清理的正常路径会回写 offline + last_seen_at，覆盖 adopt 刚置空的
+		// last_seen_at。evictNodeConn 先 Remove 再 Cancel——被逐连接的清理走
+		// RemoveIf==false，跳过对已换绑节点的状态回写。
+		h.evictNodeConn(node.ID)
 		return node, nil
 	}
 
