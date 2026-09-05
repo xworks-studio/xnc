@@ -57,8 +57,8 @@ Invoke-Step "build xnc-desktop.exe" {
     $global:LASTEXITCODE = $p.ExitCode
 }
 
-# Version single-source check (same rule as scripts/build-bundle.go): the
-# agent's self-reported version must equal the version being packaged.
+# Version single-source check: the agent's self-reported version must equal
+# the version being packaged.
 $reported = (& (Join-Path $bin "xnc-agent.exe") --version | Out-String).Trim()
 if ($reported -ne $Version) {
     throw "agent self-reported version '$reported' != packaging version '$Version' (rebuild with matching -ldflags)"

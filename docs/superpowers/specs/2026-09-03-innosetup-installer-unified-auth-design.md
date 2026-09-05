@@ -359,7 +359,7 @@ setup.json 的 `version` == agent 自报版本（`-ldflags` 注入，版本单�
 | `GET /setup.exe?channel=` | 新 | 302 最新安装器 |
 | `GET /setup.json?channel=` | 新 | 版本清单（version/sha256/size/releasedAt） |
 | `POST /api/clusters/{id}/nodes/register` | 新 | 用户 JWT 授权的节点注册（§6.4） |
-| `GET /a/{token}` `/a-dev/…` `/c` `/c-dev` `/install/*` | **废弃** | 迁移期保留（§14），删除前 README/spec 同步 |
+| `GET /a/{token}` `/a-dev/…` `/c` `/c-dev` `/install/*` | 已移除 | 未上线直采终态（§14）：一行流在上线前整体删除，无存量迁移 |
 
 ## 12. 构建与发布流水线（增量）
 
@@ -380,18 +380,18 @@ setup.json 的 `version` == agent 自报版本（`-ldflags` 注入，版本单�
 | 用户 JWT 泄漏到机器级存储 | JWT 仅存用户 profile；register 时经管道内存传递、用后即弃 |
 | 恶意本地用户把陌生 server 注册到本机 | agentctl register 允许 Interactive（注册本身要改绑定需 admin？——注册新绑定允许普通用户，**改绑/反注册仅 Admins**；`--force` 重绑走 Admins） |
 | 恶意/损坏更新包在 SYSTEM 执行 | 下载后 sha256 强校验（setup.json 由 server 动态生成）+ 目标态 Authenticode 验签；执行前强制确认 installer-cache 回滚源就位（§9.2） |
-| 旧 token 流残留 | 迁移期后端点删除（§14）；token 创建 API 保留给编排场景 |
+| 旧 token 流残留 | 未上线直采终态：一行流端点已在上线前删除（§14）；token 创建 API 保留给编排场景 |
 
-## 14. 迁移与兼容
+## 14. 迁移与兼容（未上线直采终态）
 
-- **已上线的 token 安装节点**：不受影响（已注册，binding 迁移由新版 agent
-  首启完成：从服务 argv/StateDir 重建 `binding.json`）。
-- **存量 bundle 自更新节点**：发布**最后一个 bundle**（内含"安装器编排版"
-  agent），节点经 bundle 通道完成最后一次升级后永久切换到 §9 流程，随该版本
-  关闭 bundle 通道；切换成功判据 = installer-cache 就位且下一版本经安装器
-  完成（agent 上报 update_ok）。
-- **`/a/{token}`、`/c` 一行流**：README 换为 setup.exe 入口；一行流标记
-  deprecated 保留 2 个版本周期，随后删除（含 `install_handlers.go` 全套）。
+本规范在系统**上线前**直接采纳为终态：不存在已上线的 token 安装节点，
+也没有存量 bundle 自更新节点，因此**无任何迁移路径**——一行流
+（`/a/*`、`/c*`、`/install/*.ps1`）与遗留 bundle 更新通道（`UPDATE_OFFER`、
+`/api/agent/bundle`、上传端点的 bundle 必填部件、`build-bundle.go`）
+在上线前已整体移除，未经历"deprecated 2 个版本周期"的过渡期。
+release 上传仅接受 `setup`（必填）+ `cli`（可选）；仍传 bundle 部件
+会得到明确的 400（bundle channel retired）。
+
 - **CLI 老用户**（`~/.xnc` 已有 JWT）：装安装器后无需任何动作，config 继续
   有效；`server` 字段冲突时以 binding 为准。
 - **`feature/oneclick-install` 分支**：其 install/bundle 端点与 enroll 子命令

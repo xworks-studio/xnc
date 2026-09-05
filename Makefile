@@ -1,7 +1,7 @@
 MODULES := proto server agent cli mockagent shellsmoke
 
 # 版本注入（版本单一来源）：构建时经 -ldflags 注入，缺省回落 0.0.0-dev。
-# 例: make build-prod VERSION=0.4.6   （bundle 版本须与注入值一致）
+# 例: make build-prod VERSION=0.4.6   （安装器打包版本须与注入值一致）
 VERSION ?= 0.0.0-dev
 AGENT_LDFLAGS := -X xnc/agent/machineinfo.Version=$(VERSION)
 SERVER_LDFLAGS := -X xnc/server/internal/version.Version=$(VERSION)

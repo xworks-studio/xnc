@@ -544,10 +544,10 @@ screen.close
 
 # 8. 节点注册
 
-> **迁移注记（2026-09）**：常规注册入口已换为 **setup.exe 安装器 + `xnc register`**
+> **终态注记（2026-09）**：常规注册入口为 **setup.exe 安装器 + `xnc register`**
 > （安装期零凭据；register = 登录 → 选 cluster → 经 agentctl 管道注册，设计文档
 > `docs/superpowers/specs/2026-09-03-innosetup-installer-unified-auth-design.md` §6/§14）。
-> 下述 Enrollment Token 流程保留给编排/批量场景与迁移期一行流，不再是对用户的推荐路径。
+> 下述 Enrollment Token 流程保留给编排/批量场景，不再是对用户的推荐路径。
 
 首次注册通过 Enrollment Token 完成。
 
@@ -1831,14 +1831,15 @@ sql-01    offline
 
 # 45. Agent 更新（自更新系统）
 
-> **迁移注记（2026-09）**：现行更新机制为**安装器编排**——release 携带 setup.exe
-> 制品时 server 推 `UPDATE_AVAILABLE`，agent 自行拉 `/setup.json` 复核后下载
-> setup.exe（sha256 强校验、installer-cache 回滚源就位前置检查）→ 静默安装 →
-> 新版本 HELLO 上报（设计文档 §9）。下述 bundle 流程降为**迁移期兜底**：存量
-> bundle 节点经最后一个 bundle（内含编排版 agent）升级一次后永久切换到安装器
-> 更新，随该版本关闭 bundle 通道（设计文档 §14）。
+> **终态注记（2026-09，未上线直采）**：更新机制为**安装器编排**（唯一机制，
+> 设计文档 §9/§14）——release 携带 setup.exe 制品，server 推
+> `UPDATE_AVAILABLE`（或 agent 拉取 `/setup.json` 轮询路径），agent 下载
+> setup.exe（sha256 强校验、installer-cache 回滚源就位前置检查）→ 静默安装
+> → 新版本 HELLO 上报。历史上的 bundle 自更新流程（UPDATE_OFFER / 令牌
+> bundle 下载 / apply-update 子进程）已在**上线前**随遗留通道整体移除，
+> 无存量迁移。
 
-服务端驱动的全自动更新。Agent 收到 UPDATE_OFFER 后完成：下载 → sha256 校验 → staging（解包逐文件验哈希）→ apply（spawn --apply-update 子进程）→ 服务重启 → 新版本 HELLO 上报。
+服务端驱动的全自动更新。Agent 经安装器完成：下载 setup.exe → sha256 校验 → 静默安装（Inno Setup 静默模式）→ 新版本 HELLO 上报；失败走 installer-cache 回滚 + 看门狗兜底。
 
 ## 快速版本检查（三通道，零轮询）
 
@@ -1860,9 +1861,8 @@ dev       开发测试线
 ## 协议消息
 
 ```text
-UPDATE_OFFER  {version, url, sha256}         server → agent
-UPDATE_STATUS {version, phase, error}        agent → server
-phase: downloading | verifying | staging | applying | done | failed
+UPDATE_AVAILABLE {version, url, sha256}     server → agent（推送即完整清单）
+UPDATE_AUDIT     {event, from, to, reason}  agent → server（update_ok | update_rollback）
 ```
 
 ## CLI 自更新
@@ -1875,9 +1875,9 @@ Windows 自替换舞（rename 当前 exe → .old，写新 exe，.old 下次运�
 
 ## 安全
 
-* sha256 信任根 = 已认证控制通道（OFFER 哈希即真相）
-* bundle 下载走短时效单次令牌（绑定节点）
-* agent apply-update 子进程含回滚（connected 标记超时 → .old 恢复）
+* sha256 信任根 = 已认证控制通道（UPDATE_AVAILABLE 推送哈希即真相；轮询路径以 setup.json 为清单）
+* setup.exe 下载 url 强制与 server 同源（agent 侧校验）
+* 安装失败/自检不过 → installer-cache 回滚；看门狗兜底（服务未按期上线即回滚）
 
 ---
 
@@ -1914,17 +1914,8 @@ curl -LO "https://xnc.app/setup.exe?channel=dev"    :: dev 频道安装器
 
 安装期零凭据；装完在目标机执行 `xnc register`（登录 → 选 cluster → 上线）。
 
-> **迁移注记（2026-09）**：下面的一行流已 **deprecated**，由 setup.exe + register
-> 取代；保留 2 个 release 周期后删除（设计文档 §14）。
-
-```cmd
-curl -sL xnc.app/a/<enrollment-token> | cmd    :: agent 安装（deprecated）
-curl -sL xnc.app/c | cmd                       :: CLI 安装（deprecated）
-curl -sL xnc.app/a-dev/<token> | cmd           :: dev 频道 agent（deprecated）
-curl -sL xnc.app/c-dev | cmd                   :: dev 频道 CLI（deprecated）
-```
-
-返回 .cmd 批处理 → PS 脚本（ExecutionPolicy Bypass）→ 下载 bundle → 安装到 Program Files / LOCALAPPDATA → 注册服务 / 加 PATH。终端 UI 含 ASCII banner + 步骤编号 + 颜色。
+安装器是唯一安装入口（未上线直采终态，设计文档 §14）：历史的一行流
+（`/a/<token>`、`/c` | cmd 管道安装）已在上线前整体移除，无存量迁移。
 
 要求：
 
@@ -3004,7 +2995,7 @@ RDP 连接本身会改变会话状态。预览解决"先无扰动看一眼"。Ph
 screen 会话引擎 internal/session/screen (service, session 0)
    │ WTSQueryUserToken + CreateProcessAsUser
    ▼
-xnc-screen-helper.exe (user console session)   ← 已退役（0.4.6 起不再分发；bundle 4 exe，由 §65 desktop 引擎承接）
+xnc-screen-helper.exe (user console session)   ← 已退役（0.4.6 起不再分发；由 §65 desktop 引擎承接）
    │ xnc-dda.dll (C ABI, 嵌入 helper exe)      ← 随 helper 退役
    │   ├─ DXGI Desktop Duplication → GPU BGRA → CPU 读回
    │   ├─ 备援: WGC (Win10 1903+)

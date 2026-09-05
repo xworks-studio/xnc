@@ -29,8 +29,8 @@ func newRootCmd() *cobra.Command {
 		Short:        "XNC Windows node agent",
 		SilenceUsage: true,
 		// --version/-v 走 cobra 内建 flag：自报 machineinfo.Version
-		// （构建时 -ldflags 注入；未注入回落 0.0.0-dev）。build-bundle.go
-		// 依赖此输出做「bundle 版本 == agent 自报版本」校验。
+		// （构建时 -ldflags 注入；未注入回落 0.0.0-dev）。installer/build.ps1
+		// 依赖此输出做「构建注入版本 == agent 自报版本」校验。
 		Version: machineinfo.Version,
 	}
 	root.SetVersionTemplate("{{.Version}}\n")

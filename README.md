@@ -26,14 +26,7 @@ xnc register
 curl -LO "https://xnc.app/setup.exe?channel=dev" && setup.exe
 ```
 
-### 一行流（deprecated）
-
-```cmd
-curl -sL xnc.app/a/<enrollment-token> | cmd    :: agent（deprecated）
-curl -sL xnc.app/c | cmd                       :: CLI（deprecated）
-```
-
-已被 setup.exe + `xnc register` 取代（CLI 随安装器分发，无单独安装步骤）；保留 2 个 release 周期后删除。迁移细节见[统一认证设计 §14](docs/superpowers/specs/2026-09-03-innosetup-installer-unified-auth-design.md)。
+安装器是唯一安装入口（未上线直采终态，[设计 §14](docs/superpowers/specs/2026-09-03-innosetup-installer-unified-auth-design.md)）：CLI 随安装器分发，无单独安装步骤。
 
 ## 快速上手
 
@@ -71,11 +64,11 @@ xnc exec node1 --cwd C:\xnc --env DEBUG=1 "tool"   # env + cwd
 
 ## 发布频道与自更新
 
-双频道：`stable`（正式）/ `dev`（开发测试）。Agent 收到推送后经安装器静默自更新（下载 setup.exe → sha256 校验 → 静默安装 → 回滚保护），零手工干预；`xnc upgrade` 可随时手动触发。存量 bundle 节点经最后一个 bundle 升级一次后切换到安装器更新（[迁移说明](docs/superpowers/specs/2026-09-03-innosetup-installer-unified-auth-design.md) §14）。
+双频道：`stable`（正式）/ `dev`（开发测试）。Agent 收到推送后经安装器静默自更新（下载 setup.exe → sha256 校验 → 静默安装 → 回滚保护），零手工干预；`xnc upgrade` 可随时手动触发。
 
 | 操作 | 命令 |
 |---|---|
-| 上传 release | `curl -X POST /api/admin/releases -H "Auth: Bearer $T" -F version=X -F setup=@xnc-setup-X.exe -F bundle=@... -F cli=@...` |
+| 上传 release | `curl -X POST /api/admin/releases -H "Auth: Bearer $T" -F version=X -F setup=@xnc-setup-X.exe -F cli=@xnc-windows-amd64.exe` |
 | 灰度单节点 | `curl -X POST /api/admin/rollout -d '{"version":"X","nodeId":"..."}'` |
 | 切节点频道 | `curl -X POST /api/admin/rollout -d '{"nodeId":"...","channel":"dev"}'` |
 | 手动升级本机 | `xnc upgrade [--channel dev]` |
@@ -105,22 +98,9 @@ cd deploy && docker compose -f docker-compose.yml -f docker-compose.dev.yml up -
 
 ## 构建安装器与版本注入（版本单一来源）
 
-版本号只在构建时注入（agent 自报 / bundle manifest / 安装器同一来源；未注入回落
+版本号只在构建时注入（agent 自报 / 安装器打包同一来源；未注入回落
 `0.0.0-dev`）。安装器：`make installer VERSION=<v> [CHANNEL=stable|dev]`（构建五个
 exe 到 `bin/` 后经 Inno Setup 打包 `xnc-setup[-dev]-<v>.exe`）。
-
-### 最后过渡 bundle（遗留，§14 迁移期）
-
-仅供存量 bundle 节点的最后一次升级发布（bundle 携带编排版 agent，节点经 bundle
-升级一次后永久切换到安装器更新）：
-
-```bash
-cd agent && go build -ldflags "-X xnc/agent/machineinfo.Version=<v>" -o ../bin/xnc-agent.exe ./cmd/xnc-agent
-cd .. && go run scripts/build-bundle.go bin <v> bin/bundle-<v>.tar.gz   # 校验 agent 自报 == <v>
-```
-
-bundle 含 4 个 exe（xnc-agent + xnc-core/desktop/shell 三件套；screen-helper
-已退役，0.4.6 起不再分发）。全网切换后本工具随 bundle 通道一并退役。
 
 server 构建版本同理（`/api/health` 上报）：`deploy/.env` 设 `XNC_VERSION=<v>`
 后 `py deploy/deploy_srv.py env && py deploy/deploy_srv.py up`，compose 经
