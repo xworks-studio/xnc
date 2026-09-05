@@ -24,6 +24,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: build web (dist 进 docker 上下文；服务器从不跑 npm)
+        run: |
+          cd web
+          npm ci
+          npm run build
+
       - id: meta
         name: derive version + image tags
         run: |
