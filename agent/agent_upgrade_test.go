@@ -273,7 +273,11 @@ func TestUpgradeChannelSwitchSignalsRebind(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("channel switch must signal rebind")
 	}
-	// 未切换频道（同频道触发）不发信号。
+	// 未切换频道（同频道触发）不发信号。前置等待首次触发的后台检查收线
+	// ——慢 runner 上 goroutine 尚未结束，upgrading 仍真会让本次按设计
+	// 返回 (false,nil)（触发去重语义），断言 True 假失败。
+	require.Eventually(t, func() bool { return !a.upgradeInFlight() },
+		30*time.Second, 20*time.Millisecond)
 	triggered, err = a.Upgrade(t.Context(), "dev")
 	require.NoError(t, err)
 	assert.True(t, triggered)

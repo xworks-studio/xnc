@@ -21,7 +21,11 @@ func OpenTestStore(t *testing.T) *Store {
 	pg, err := postgres.Run(t.Context(), "postgres:16-alpine",
 		postgres.WithDatabase("xnc"), postgres.WithUsername("xnc"), postgres.WithPassword("test"),
 		testcontainers.WithWaitStrategy(
-			wait.ForListeningPort("5432/tcp").WithStartupTimeout(60*time.Second)),
+			// CI 慢 runner 上镜像拉取+初始化常超 60s（曾致容器启动抖动假失败）：
+			// 日志就绪（第二次 ready）比端口监听更可靠，超时放到 3 分钟。
+			wait.ForLog("database system is ready to accept connections").
+				WithOccurrence(2).
+				WithStartupTimeout(3*time.Minute)),
 	)
 	require.NoError(t, err)
 	// 注意：t.Context() 在 Cleanup 运行前已被取消，Terminate 需用独立 context。
