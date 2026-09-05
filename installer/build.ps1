@@ -115,10 +115,12 @@ while ($parts.Count -lt 4) { $parts += 0 }
 $setupVersion = $parts -join "."
 
 # 2) ISCC (relative paths in xnc.iss resolve from the installer dir).
+# CertThumb: 签名构建时传指纹，安装器据此装卸本机证书信任（xnc.iss）。
 if (-not (Test-Path $ISCC)) { throw "ISCC.exe not found at $ISCC (pass -ISCC <path>)" }
+$thumb = if ($signCert) { $signCert.Thumbprint } else { "" }
 Push-Location $PSScriptRoot
 try {
-    & $ISCC "/DVersion=$Version" "/DChannel=$Channel" "/DSetupVersion=$setupVersion" "xnc.iss"
+    & $ISCC "/DVersion=$Version" "/DChannel=$Channel" "/DSetupVersion=$setupVersion" "/DCertThumb=$thumb" "xnc.iss"
     if ($LASTEXITCODE -ne 0) { throw "ISCC failed (exit $LASTEXITCODE)" }
 } finally { Pop-Location }
 

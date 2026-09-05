@@ -123,16 +123,20 @@ chi + sqlc + 真 PG 测试）· `agent`（节点侧，Windows 服务）· `cli` 
 ### 代码签名（自签过渡期）
 
 - **背景**：未签名 exe 会被 Defender 随机隔离（实战发生过：xnc.exe 消失）。
-- **证书**：`installer/codesign.cer`（公钥，入库）+ `installer/codesign.pfx`
-  （私钥，gitignored，**勿外传**）；密码在 `deploy/.env` 的
-  `XNC_CODESIGN_PASSWORD`。3 年有效期，续期用 `installer/make-cert.ps1`
-  重建并给全机群重导信任。
+- **证书**：正式主体 `CN=XNC Code Signing, OU=Release Engineering,
+  O=XWorks Studio, C=CN`；`installer/codesign.cer`（公钥，入库）+
+  `installer/codesign.pfx`（私钥，gitignored，**勿外传**）；密码在
+  `deploy/.env` 的 `XNC_CODESIGN_PASSWORD`。3 年有效期，续期用
+  `installer/make-cert.ps1` 重建、重签并给存量机器重导信任。
 - **构建**：`build.ps1` 自动签名（五 exe 在 ISCC 前签、setup 在其后、
   sha256 覆盖签名后产物）；设 `XNC_CODESIGN_PASSWORD` 环境变量。时间戳
-  多服务器回退，全败则免时间戳签名+告警。
-- **新机入群**：导入 `codesign.cer` 到 LocalMachine 的 `Root` +
-  `TrustedPublisher`（否则 Defender 照拦——自签信任靠自己分发）。
-- **待办**：换正式 CA（EV）证书后，信任分发可整体退役。
+  多服务器回退，全败则免时间戳签名+告警。指纹经 `/DCertThumb` 传给
+  xnc.iss，供安装器装卸信任。
+- **信任分发（安装器内置）**：setup.exe 安装时自动 `certutil -addstore`
+  Root + TrustedPublisher（xnc.iss `InstallSignTrust`），卸载时按指纹
+  `delstore`。**新机零手工**；仅存量老安装需手动导入一次 cer。首装时
+  setup.exe 自身仍显示未知发布者（自签引导的固有鸡生蛋，正式 CA 后消失）。
+- **待办**：换正式 CA（EV）证书后，信任分发整体退役。
 
 ## 8. 已知小缺口（勿重复发现，按需修）
 

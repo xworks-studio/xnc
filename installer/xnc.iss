@@ -28,6 +28,10 @@
 #else
   #define ChannelSuffix ""
 #endif
+// 签名证书指纹（build.ps1 自动传入；空 = 本次构建未签名，跳过信任装卸）
+#ifndef CertThumb
+  #define CertThumb ""
+#endif
 
 [Setup]
 ; Fixed AppId: upgrades/uninstalls match previous installs (same id = same
@@ -75,6 +79,8 @@ Source: "..\bin\xnc.exe"; DestDir: "{app}"; Components: agent; Flags: ignorevers
 Source: "..\bin\xnc-core.exe"; DestDir: "{app}"; Components: desktop; Flags: ignoreversion
 Source: "..\bin\xnc-desktop.exe"; DestDir: "{app}"; Components: desktop; Flags: ignoreversion
 Source: "..\bin\xnc-shell.exe"; DestDir: "{app}"; Components: shell; Flags: ignoreversion
+; 签名公钥：安装时导入本机信任（自签过渡期的机群信任分发；正式 CA 后移除）
+Source: "codesign.cer"; DestDir: "{tmp}"; Flags: ignoreversion
 
 [UninstallDelete]
 ; Runtime-generated files under {app} that setup never copied and hence is
@@ -91,6 +97,8 @@ const
   // Rollback watchdog scheduled task name (spec 9.4; registered by the agent
   // updater, deleted here best-effort on uninstall).
   WatchdogTaskName = 'XNCRollbackWatchdog';
+  // 签名证书指纹（ISCC /DCertThumb 注入；空 = 未签名构建，跳过信任装卸）。
+  CertThumb = '{#CertThumb}';
   WM_SETTINGCHANGE = $001A;
   // HWND_BROADCAST ($FFFF) is predefined by Inno Setup 6.4+.
   SMTO_ABORTIFHUNG = $0002;
@@ -463,6 +471,26 @@ end;
 // failure after services were created - silently succeeding with no
 // services/cache is the worst outcome. A service merely slow to reach
 // Running stays a warning (the script itself exits 0 in that case).
+// InstallSignTrust: 自签证书入本机 Root + TrustedPublisher（certutil 免 PS
+// 依赖）。失败仅告警不中断——信任缺失的后果是 Defender 可能隔离，不该让
+// 安装失败；正式 CA 落地后本步骤整体退役。
+procedure InstallSignTrust();
+var
+  rc: Integer;
+begin
+  if CertThumb = '' then
+    Exit;
+  if not Exec(ExpandConstant('{sys}\certutil.exe'),
+      '-addstore Root "' + ExpandConstant('{tmp}\codesign.cer') + '"', '',
+      SW_HIDE, ewWaitUntilTerminated, rc) or (rc <> 0) then
+    InstallerLog('WARN: certutil addstore Root rc=' + IntToStr(rc) +
+      ' (Defender may quarantine unsigned-trust binaries)');
+  if not Exec(ExpandConstant('{sys}\certutil.exe'),
+      '-addstore TrustedPublisher "' + ExpandConstant('{tmp}\codesign.cer') +
+      '"', '', SW_HIDE, ewWaitUntilTerminated, rc) or (rc <> 0) then
+    InstallerLog('WARN: certutil addstore TrustedPublisher rc=' + IntToStr(rc));
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   script, withCore: String;
@@ -470,6 +498,7 @@ var
 begin
   if CurStep <> ssPostInstall then
     Exit;
+  InstallSignTrust();
   if WizardIsComponentSelected('desktop') then
     withCore := '1'
   else
@@ -655,6 +684,19 @@ begin
   if CurUninstallStep = usPostUninstall then
   begin
     RemoveAppDirFromPath();
+    // 移除签名信任（按指纹精确删；若有更新版本已装会重写——重装/升级都会
+    // 重新 addstore）。失败仅告警。
+    if CertThumb <> '' then
+    begin
+      if not Exec(ExpandConstant('{sys}\certutil.exe'),
+          '-delstore Root ' + CertThumb, '', SW_HIDE,
+          ewWaitUntilTerminated, rc) then
+        InstallerLog('WARN: certutil delstore Root failed');
+      if not Exec(ExpandConstant('{sys}\certutil.exe'),
+          '-delstore TrustedPublisher ' + CertThumb, '', SW_HIDE,
+          ewWaitUntilTerminated, rc) then
+        InstallerLog('WARN: certutil delstore TrustedPublisher failed');
+    end;
     if gPurgeData then
       DelTree(XNCStateDir(), True, True, True);
   end;

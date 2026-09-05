@@ -8,9 +8,9 @@ $cer = Join-Path $PSScriptRoot "codesign.cer"
 $pfx = Join-Path $PSScriptRoot "codesign.pfx"
 
 $cert = New-SelfSignedCertificate -Type CodeSigningCert `
-    -Subject "CN=XNC Code Signing,O=xworks-studio" `
+    -Subject "CN=XNC Code Signing, OU=Release Engineering, O=XWorks Studio, C=CN" `
     -KeyUsage DigitalSignature -KeySpec Signature `
-    -FriendlyName "XNC Code Signing (self-signed interim)" `
+    -FriendlyName "XNC Code Signing (XWorks Studio)" `
     -CertStoreLocation "Cert:\CurrentUser\My" `
     -NotAfter (Get-Date).AddYears(3)
 Export-Certificate -Cert $cert -FilePath $cer | Out-Null
