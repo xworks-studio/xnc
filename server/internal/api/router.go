@@ -158,8 +158,8 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 	// 直流 + 动态版本清单 setup.json（供 xnc upgrade --check / CI 消费）。
 	// 安装器是唯一安装入口（未上线直采终态，设计 §14）：历史的一行流
 	// （/a/* /c* /install/*.ps1）已在上线前整体移除。
-	r.Get("/setup.exe", h.setupDownload)
-	r.Get("/setup.json", h.setupManifest)
+	r.Get("/installer", h.setupDownload)
+	r.Get("/installer.json", h.setupManifest)
 
 	r.Route("/api/nodes", func(nr chi.Router) {
 		nr.Use(auth.Middleware(cfg.JWTSecret, st))

@@ -1,6 +1,6 @@
 // Package updater — agent 自更新编排（spec §9，安装器即更新器）。
 //
-// agent 不再解包搬文件：发现（/setup.json）→ 下载 sha256 校验（staging）
+// agent 不再解包搬文件：发现（/installer.json）→ 下载 sha256 校验（staging）
 // → 确认 installer-cache 回滚源 → 写 update-pending.json + 注册一次性
 // 看门狗计划任务 → SYSTEM 静默执行 setup.exe；新 agent 启动自检收尾
 // （成功：删 pending/看门狗、刷新缓存、audit update_ok；失败：主动回滚
@@ -9,7 +9,7 @@
 // 三触发（§9.1）：WS 推送 UPDATE_AVAILABLE（HandlePush）、6h 轮询
 // （CheckNow，agent 侧装配）、agentctl 管道手动（ForceCheck，Task 8）。
 // 推送携带 {version,url,sha256}（已认证控制通道，哈希即真相）；轮询以
-// setup.json 为准。
+// installer.json 为准。
 package updater
 
 import (
@@ -32,7 +32,7 @@ import (
 	"xnc/proto"
 )
 
-// SetupManifest — /setup.json?channel= 动态清单（T1 契约）。
+// SetupManifest — /installer.json?channel= 动态清单（T1 契约）。
 type SetupManifest struct {
 	Version    string `json:"version"`
 	URL        string `json:"url"`
@@ -92,7 +92,7 @@ var backoffSchedule = []time.Duration{time.Hour, 4 * time.Hour, 24 * time.Hour}
 // Updater 持有更新编排状态。单实例随 agent 连接周期存活；节流/黑名单/
 // pending 持久化在 StateDir，实例重建无损失。
 type Updater struct {
-	ServerURL  string // 控制面基址（setup.json/setup.exe 相对路径的拼接根）
+	ServerURL  string // 控制面基址（installer.json/installer 相对路径的拼接根）
 	StateDir   string // %ProgramData%\XNC
 	Version    string // 自报版本（machineinfo.Version，单一来源）
 	Channel    string // 绑定频道（stable|dev；空 = stable）
@@ -483,7 +483,7 @@ func (u *Updater) StartupPendingCheck(ctx context.Context) {
 
 // FetchManifest 拉取 /setup.json?channel=<channel>。
 func (u *Updater) FetchManifest(ctx context.Context) (*SetupManifest, error) {
-	uurl := strings.TrimRight(u.ServerURL, "/") + "/setup.json?channel=" + u.channel()
+	uurl := strings.TrimRight(u.ServerURL, "/") + "/installer.json?channel=" + u.channel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, uurl, nil)
 	if err != nil {
 		return nil, err
@@ -593,16 +593,16 @@ func (u *Updater) ensureRollbackSource(ctx context.Context, target *SetupManifes
 	return CopyToCache(u.StateDir, staged)
 }
 
-// ---- 安装器文件定位（T6 命名契约：XNC-Setup[-dev]-<version>.exe）----
+// ---- 安装器文件定位（T6 命名契约：XNC-Installer[-dev]-<version>.exe）----
 
 // cacheInstallerName staging/缓存安装器文件名（与安装器
 // OutputBaseFilename 一致：dev 频道带 -dev 后缀）。findInstaller 的后缀
 // 匹配兼容旧命名（xnc-setup-*.exe，0.7.2 及之前），过渡期互认。
 func cacheInstallerName(version, channel string) string {
 	if channel == "dev" {
-		return "XNC-Setup-dev-" + version + ".exe"
+		return "XNC-Installer-dev-" + version + ".exe"
 	}
-	return "XNC-Setup-" + version + ".exe"
+	return "XNC-Installer-" + version + ".exe"
 }
 
 // findInstaller 在 dir 中查找 version 的安装器（精确候选 + "-<version>.exe"

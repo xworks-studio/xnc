@@ -20,7 +20,7 @@ const SHA = "5a2d".repeat(16); // 64 位十六进制
 
 const STABLE: SetupManifest = {
   version: "0.4.5",
-  url: "http://xnc.app/setup.exe?channel=stable",
+  url: "http://xnc.app/installer?channel=stable",
   sha256: SHA,
   size: 12_582_912, // 12.0 MB
   releasedAt: new Date(Date.now() - 3_600_000).toISOString(), // "1h ago"
@@ -59,7 +59,7 @@ async function renderDownload() {
   await act(async () => {});
 }
 
-describe("Download page (mocked /setup.json)", () => {
+describe("Download page (mocked /installer.json)", () => {
   it("renders version, relative time, size, truncated sha and download hrefs", async () => {
     vi.stubGlobal(
       "fetch",
@@ -95,10 +95,10 @@ describe("Download page (mocked /setup.json)", () => {
 
     // 下载按钮 = 浏览器直下 <a>，不走 fetch+blob。
     expect(
-      container!.querySelector('a[href="/setup.exe?channel=stable"]'),
+      container!.querySelector('a[href="/installer?channel=stable"]'),
     ).not.toBeNull();
     expect(
-      container!.querySelector('a[href="/setup.exe?channel=dev"]'),
+      container!.querySelector('a[href="/installer?channel=dev"]'),
     ).not.toBeNull();
 
     // 顶部"登录控制台"入口。
@@ -127,13 +127,13 @@ describe("Download page (mocked /setup.json)", () => {
     // dev 卡片：占位，且没有下载按钮。
     expect(text).toContain("No release yet");
     expect(
-      container!.querySelector('a[href="/setup.exe?channel=dev"]'),
+      container!.querySelector('a[href="/installer?channel=dev"]'),
     ).toBeNull();
 
     // stable 卡片不受影响。
     expect(text).toContain("0.4.5");
     expect(
-      container!.querySelector('a[href="/setup.exe?channel=stable"]'),
+      container!.querySelector('a[href="/installer?channel=stable"]'),
     ).not.toBeNull();
   });
 

@@ -41,14 +41,14 @@ func startFakeSetupServer(t *testing.T, version string) *fakeSetupServer {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		switch r.URL.Path {
-		case "/setup.json":
+		case "/installer.json":
 			f.manifest++
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]any{
-				"version": f.version, "url": "/setup.exe?channel=stable",
+				"version": f.version, "url": "/installer?channel=stable",
 				"sha256": fileSHA256OrPanic(f.blob), "size": len(f.blob),
 			})
-		case "/setup.exe":
+		case "/installer":
 			f.download++
 			w.Write(f.blob)
 		default:
@@ -227,7 +227,7 @@ func (h *harness) snapshot() (execPaths []string, regAt []time.Time, deletes int
 func seedCache(t *testing.T, stateDir, version, content string) {
 	t.Helper()
 	os.MkdirAll(filepath.Join(stateDir, cacheName), 0o755)
-	os.WriteFile(filepath.Join(stateDir, cacheName, "XNC-Setup-"+version+".exe"), []byte(content), 0o644)
+	os.WriteFile(filepath.Join(stateDir, cacheName, "XNC-Installer-"+version+".exe"), []byte(content), 0o644)
 }
 
 // --- 场景 1：成功流程（假安装器退出 0）---
@@ -243,7 +243,7 @@ func TestOrchestrateSuccessFlow(t *testing.T) {
 	}
 
 	// staging 下载 + 校验通过。
-	staged := filepath.Join(h.u.StateDir, stagingName, "XNC-Setup-0.6.2.exe")
+	staged := filepath.Join(h.u.StateDir, stagingName, "XNC-Installer-0.6.2.exe")
 	if b, err := os.ReadFile(staged); err != nil || string(b) != "fake-installer-binary" {
 		t.Fatalf("staged installer missing/corrupt: %v %q", err, b)
 	}
@@ -309,7 +309,7 @@ func TestOrchestrateShaMismatchBlacklists(t *testing.T) {
 	seedCache(t, h.u.StateDir, "0.6.1", "cur")
 
 	push := proto.UpdateAvailable{Version: "0.6.2",
-		URL: "/setup.exe?channel=stable", SHA256: "0000000000000000000000000000000000000000000000000000000000000000"}
+		URL: "/installer?channel=stable", SHA256: "0000000000000000000000000000000000000000000000000000000000000000"}
 	err := h.u.HandlePush(context.Background(), push)
 	if err == nil || !strings.Contains(err.Error(), "sha256 mismatch") {
 		t.Fatalf("err = %v, want sha256 mismatch", err)
@@ -324,7 +324,7 @@ func TestOrchestrateShaMismatchBlacklists(t *testing.T) {
 		t.Fatal("no watchdog should have been registered/deleted")
 	}
 	// staging 残留清除。
-	if _, err := os.Stat(filepath.Join(h.u.StateDir, stagingName, "XNC-Setup-0.6.2.exe")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(h.u.StateDir, stagingName, "XNC-Installer-0.6.2.exe")); !os.IsNotExist(err) {
 		t.Fatal("corrupt download must be removed from staging")
 	}
 	// 同版本再推：黑名单直接跳过（不执行安装器）。
@@ -351,8 +351,8 @@ func TestOrchestrateInstallerFailureRollsBack(t *testing.T) {
 
 	execPaths, regAt, deletes, audits := h.snapshot()
 	// 第一次执行新安装器（失败），第二次原地执行缓存的 0.6.1 安装器。
-	wantCache := filepath.Join(h.u.StateDir, cacheName, "XNC-Setup-0.6.1.exe")
-	if len(execPaths) != 2 || execPaths[0] != filepath.Join(h.u.StateDir, stagingName, "XNC-Setup-0.6.2.exe") ||
+	wantCache := filepath.Join(h.u.StateDir, cacheName, "XNC-Installer-0.6.1.exe")
+	if len(execPaths) != 2 || execPaths[0] != filepath.Join(h.u.StateDir, stagingName, "XNC-Installer-0.6.2.exe") ||
 		execPaths[1] != wantCache {
 		t.Fatalf("exec = %v, want [staged 0.6.2, cached 0.6.1 in place]", execPaths)
 	}
@@ -476,7 +476,7 @@ func TestOrchestrateRollbackSourceDownloadedForPush(t *testing.T) {
 	// 不 seed cache：补源须走下载。
 
 	// 推送更高目标（pin 场景）：setup.json 供应的是回滚源而非目标。
-	push := proto.UpdateAvailable{Version: "0.7.0", URL: "/setup.exe?channel=stable",
+	push := proto.UpdateAvailable{Version: "0.7.0", URL: "/installer?channel=stable",
 		SHA256: fileSHA256OrPanic([]byte("fake-installer-binary"))}
 	if err := h.u.HandlePush(context.Background(), push); err != nil {
 		t.Fatalf("HandlePush: %v", err)
@@ -508,7 +508,7 @@ func TestSelfCheckFinalizes(t *testing.T) {
 	// staging 留着刚执行过的 0.6.2 安装器（自检从这刷新缓存）。
 	staging := filepath.Join(h.u.StateDir, stagingName)
 	os.MkdirAll(staging, 0o755)
-	os.WriteFile(filepath.Join(staging, "XNC-Setup-0.6.2.exe"), []byte("new-installer"), 0o644)
+	os.WriteFile(filepath.Join(staging, "XNC-Installer-0.6.2.exe"), []byte("new-installer"), 0o644)
 	// 预置一次失败记录：成功后清零。
 	BlacklistVersion(h.u.StateDir, "other", "x")
 	h.u.recordFailure("0.6.2", nil)
@@ -532,7 +532,7 @@ func TestSelfCheckFinalizes(t *testing.T) {
 	if b, _ := os.ReadFile(got); string(b) != "new-installer" {
 		t.Fatalf("cache content = %q", b)
 	}
-	if _, err := os.Stat(filepath.Join(h.u.StateDir, cacheName, "XNC-Setup-0.6.1.exe")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(h.u.StateDir, cacheName, "XNC-Installer-0.6.1.exe")); !os.IsNotExist(err) {
 		t.Fatal("old cache entry must be pruned")
 	}
 	// 退避清零。
@@ -595,7 +595,7 @@ func TestSelfCheckFailureRollsBackFromStash(t *testing.T) {
 	seedCache(t, h.u.StateDir, "0.6.2", "new-top-level")
 	stash := filepath.Join(h.u.StateDir, cacheName, rollbackName)
 	os.MkdirAll(stash, 0o755)
-	os.WriteFile(filepath.Join(stash, "XNC-Setup-0.6.1.exe"), []byte("stashed"), 0o644)
+	os.WriteFile(filepath.Join(stash, "XNC-Installer-0.6.1.exe"), []byte("stashed"), 0o644)
 
 	h.u.SelfCheck(context.Background())
 
@@ -603,7 +603,7 @@ func TestSelfCheckFailureRollsBackFromStash(t *testing.T) {
 		t.Fatal("rollback must run from the stash when top level was pruned")
 	}
 	paths, _, _, _ := h.snapshot()
-	if len(paths) != 1 || paths[0] != filepath.Join(stash, "XNC-Setup-0.6.1.exe") {
+	if len(paths) != 1 || paths[0] != filepath.Join(stash, "XNC-Installer-0.6.1.exe") {
 		t.Fatalf("exec = %v, want stash path", paths)
 	}
 }
@@ -807,12 +807,12 @@ func TestOrchestrateMutexAcrossInstances(t *testing.T) {
 	defer releaseA()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/setup.json":
+		case "/installer.json":
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]any{
-				"version": "2.0.0", "url": "/setup.exe?channel=stable",
+				"version": "2.0.0", "url": "/installer?channel=stable",
 				"sha256": sum, "size": len(blob)})
-		case "/setup.exe":
+		case "/installer":
 			if downloads.Add(1) == 1 { // 首个下载（A）挂起至放行
 				inDownload <- struct{}{}
 				<-release
@@ -932,7 +932,7 @@ func TestWriteWatchdogScriptContent(t *testing.T) {
 		"Start-Service -Name 'XNCAgent'",
 		"update-audit.json",
 		"update_rollback",
-		"XNC-Setup-' + $from + '.exe",
+		"-Filter ('*' + $from + '.exe')", // 通用后缀定位
 		"/VERYSILENT",
 		"installer-cache",
 		"rollback", // stash fallback lookup
@@ -945,16 +945,14 @@ func TestWriteWatchdogScriptContent(t *testing.T) {
 	if b[len(b)-1] != '\n' || b[len(b)-2] != '\r' {
 		t.Error("script must use CRLF")
 	}
-	// 回归钉（真机发现 2 例）：候选数组元素必须带括号，否则 PS 逗号/加号
-	// 优先级把表达式拼坏、Test-Path 恒假 → 看门狗找不到回滚源。
-	// 候选须含旧命名（xnc-setup-*，过渡期互认）且顶层/stash 两处都遍历
-	// 同一 $cands。
-	paren := strings.Count(s, "@(('XNC-Setup-' + $from + '.exe'), ('XNC-Setup-dev-' + $from + '.exe'), ('xnc-setup-' + $from + '.exe'), ('xnc-setup-dev-' + $from + '.exe'))")
-	if paren != 1 {
-		t.Errorf("four-way candidate array (new + legacy names) = %d, want 1", paren)
+	// 回归钉：回滚源定位必须是通用后缀匹配（*<version>.exe，任意前缀与
+	// 频道后缀都命中——替代旧的枚举候选，杜绝拼名与遗漏两类问题），
+	// 缓存与 rollback stash 两个目录按序查找。
+	if got := strings.Count(s, "-Filter ('*' + $from + '.exe')"); got != 1 {
+		t.Errorf("suffix-glob lookups = %d, want 1", got)
 	}
-	if got := strings.Count(s, "foreach ($leaf in $cands)"); got != 2 { // 顶层 + stash 两处查找
-		t.Errorf("candidate loops = %d, want 2", got)
+	if !strings.Contains(s, "@($cache, (Join-Path $cache 'rollback'))") {
+		t.Error("must scan cache then rollback stash")
 	}
 	// 回归钉（评审 round 1）：源三处皆缺时必须保留 pending 退出——删除
 	// 只能发生在两轮查找与 not-found 退出之后。

@@ -8,7 +8,7 @@
 
 XNC = Windows 节点远程管理平台：Go server（xnc.app）+ Windows agent
 （服务）+ Web UI + CLI（`xnc`）。安装器（Inno Setup）是唯一分发载体：安装、
-修复、升级、卸载共用一个 setup.exe；更新由 agent 编排静默安装器完成。
+修复、升级、卸载共用一个安装器；更新由 agent 编排静默安装器完成。
 
 模块地图（Go workspace，`go.work` 串联）：`proto`（协议）· `server`（控制面，
 chi + sqlc + 真 PG 测试）· `agent`（节点侧，Windows 服务）· `cli` · `shellhost`
@@ -20,7 +20,7 @@ chi + sqlc + 真 PG 测试）· `agent`（节点侧，Windows 服务）· `cli` 
 ## 2. 硬性契约（违反即事故）
 
 1. **版本单一来源**：agent 版本只经构建期 ldflags 注入 machineinfo.Version；
-   setup.json 的 version == agent 自报。发布前必须校验，不一致=发布失败。
+   installer.json 的 version == agent 自报。发布前必须校验，不一致=发布失败。
 2. **服务 argv 零密钥**：XNCAgent/XNCCore 的 binPath 里不得出现任何
    token/secret；凭据只经 StateDir 文件 + DACL。改服务=停→删→重建（无
    `sc.exe config` 路径；SID 由服务名派生，重建无损）。
@@ -32,7 +32,7 @@ chi + sqlc + 真 PG 测试）· `agent`（节点侧，Windows 服务）· `cli` 
    （CreateEnvironmentBlock）；子进程读 `XNC_*` 调试旋钮走注册表环境，服务
    环境不再透传（有意收窄）。
 5. **更新契约**：看门狗计划任务名 `XNCRollbackWatchdog`；回滚=原地执行
-   installer-cache 里的上一版 setup.exe（staging 只做下载）；安装器保证可重入。
+   installer-cache 里的上一版安装器（staging 只做下载）；安装器保证可重入。
    agent 不再解包搬文件——发现→sha256 校验→静默执行安装器→看门狗兜底。
 6. **machineId 语义**：同 cluster 同 machineId 异 key 的注册=**adopt**（沿用原
    nodeId、重绑公钥、驱逐旧连接）；同 key=幂等；跨 cluster=409（出路是管理端
@@ -81,21 +81,21 @@ chi + sqlc + 真 PG 测试）· `agent`（节点侧，Windows 服务）· `cli` 
 ## 5. 发布流程（安装器/更新）
 
 1. 构建：`powershell installer/build.ps1 -Version <v> -Channel stable|dev`
-   （或 `make installer VERSION=<v>`）——产 `bin/XNC-Setup[-dev]-<v>.exe`
+   （或 `make installer VERSION=<v>`）——产 `bin/XNC-Installer[-dev]-<v>.exe`
    + sha256。五二进制（agent/core/desktop/shell/CLI）版本同源注入。
 2. 上传：admin 登录取 JWT → `POST /api/admin/releases`
    multipart：`version`/`notes`/`channel`/`setup=@...`。bundle 部分已退役
    （传了 400 是对的）。同版本重传=upsert 改道（注意）。
-3. 生效即达：上传后 `/setup.json` 与下载页立即指向新版；在线 agent 经
+3. 生效即达：上传后 `/installer.json` 与下载页立即指向新版；在线 agent 经
    WS 推送/6h 轮询/`xnc upgrade` 升级（秒级中断，失败自动回滚+拉黑）。
 4. **升级安全网**：看门狗 schtask + installer-cache 回滚源 + 24h 过期
    pending 兜底；发布坏版本的自愈路径已内建，无需人工回滚。
 5. 当前线上锚点：下载页 `https://xnc.app/download`；短域
-   `xnc.app/setup.exe`。
+   `xnc.app/installer`。
 
 ## 6. 用户安装 / 注册 / 卸载
 
-- **安装**：下载页或 `curl -LO https://xnc.app/setup.exe` → 运行
+- **安装**：下载页或 `curl -LO https://xnc.app/installer` → 运行
   （管理员）→ 服务就位，**零凭据**，agent 空转 `awaiting registration`。
 - **注册**：`xnc register --server https://xnc.app`（新机首跑需
   --server；TTY 交互登录+选 cluster，非 TTY 用 --email + stdin 密码 +
@@ -132,17 +132,17 @@ chi + sqlc + 真 PG 测试）· `agent`（节点侧，Windows 服务）· `cli` 
   sha256 覆盖签名后产物）；设 `XNC_CODESIGN_PASSWORD` 环境变量。时间戳
   多服务器回退，全败则免时间戳签名+告警。指纹经 `/DCertThumb` 传给
   xnc.iss，供安装器装卸信任。
-- **信任分发（安装器内置）**：setup.exe 安装时自动 `certutil -addstore`
+- **信任分发（安装器内置）**：安装器运行时自动 `certutil -addstore`
   Root + TrustedPublisher（xnc.iss `InstallSignTrust`），卸载时按指纹
   `delstore`。**新机零手工**；仅存量老安装需手动导入一次 cer。首装时
-  setup.exe 自身仍显示未知发布者（自签引导的固有鸡生蛋，正式 CA 后消失）。
+  首装的 installer 自身仍显示未知发布者（自签引导的固有鸡生蛋，正式 CA 后消失）。
 - **待办**：换正式 CA（EV）证书后，信任分发整体退役。
 
 ## 8. 已知小缺口（勿重复发现，按需修）
 
-- `HEAD /setup.exe` 落到 SPA（chi Get 不含 Head）。
+- `HEAD /installer` 落到 SPA（chi Get 不含 Head）。
 - 安装器 PATH 写回会展开 REG_EXPAND_SZ 引用（触发于增删 XNC 项时）。
-- 同版本重传 release 不删除缺席制品（旧 setup.exe 可能残留可下载）。
+- 同版本重传 release 不删除缺席制品（旧制品可能残留可下载）。
 - `deploy_srv.py push` 未实现"先删后解"（本文 §4.3 的人工规程即其替代）。
 - `.dockerignore` 使本地 compose build 失败（部署用远端构建不受影响）。
 

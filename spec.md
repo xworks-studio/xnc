@@ -544,7 +544,7 @@ screen.close
 
 # 8. 节点注册
 
-> **终态注记（2026-09）**：常规注册入口为 **setup.exe 安装器 + `xnc register`**
+> **终态注记（2026-09）**：常规注册入口为 **installer 安装器 + `xnc register`**
 > （安装期零凭据；register = 登录 → 选 cluster → 经 agentctl 管道注册，设计文档
 > `docs/superpowers/specs/2026-09-03-innosetup-installer-unified-auth-design.md` §6/§14）。
 > 下述 Enrollment Token 流程保留给编排/批量场景，不再是对用户的推荐路径。
@@ -1832,14 +1832,14 @@ sql-01    offline
 # 45. Agent 更新（自更新系统）
 
 > **终态注记（2026-09，未上线直采）**：更新机制为**安装器编排**（唯一机制，
-> 设计文档 §9/§14）——release 携带 setup.exe 制品，server 推
-> `UPDATE_AVAILABLE`（或 agent 拉取 `/setup.json` 轮询路径），agent 下载
-> setup.exe（sha256 强校验、installer-cache 回滚源就位前置检查）→ 静默安装
+> 设计文档 §9/§14）——release 携带 installer 制品，server 推
+> `UPDATE_AVAILABLE`（或 agent 拉取 `/installer.json` 轮询路径），agent 下载
+> installer（sha256 强校验、installer-cache 回滚源就位前置检查）→ 静默安装
 > → 新版本 HELLO 上报。历史上的 bundle 自更新流程（UPDATE_OFFER / 令牌
 > bundle 下载 / apply-update 子进程）已在**上线前**随遗留通道整体移除，
 > 无存量迁移。
 
-服务端驱动的全自动更新。Agent 经安装器完成：下载 setup.exe → sha256 校验 → 静默安装（Inno Setup 静默模式）→ 新版本 HELLO 上报；失败走 installer-cache 回滚 + 看门狗兜底。
+服务端驱动的全自动更新。Agent 经安装器完成：下载 installer → sha256 校验 → 静默安装（Inno Setup 静默模式）→ 新版本 HELLO 上报；失败走 installer-cache 回滚 + 看门狗兜底。
 
 ## 快速版本检查（三通道，零轮询）
 
@@ -1875,8 +1875,8 @@ Windows 自替换舞（rename 当前 exe → .old，写新 exe，.old 下次运�
 
 ## 安全
 
-* sha256 信任根 = 已认证控制通道（UPDATE_AVAILABLE 推送哈希即真相；轮询路径以 setup.json 为清单）
-* setup.exe 下载 url 强制与 server 同源（agent 侧校验）
+* sha256 信任根 = 已认证控制通道（UPDATE_AVAILABLE 推送哈希即真相；轮询路径以 installer.json 为清单）
+* installer 下载 url 强制与 server 同源（agent 侧校验）
 * 安装失败/自检不过 → installer-cache 回滚；看门狗兜底（服务未按期上线即回滚）
 
 ---
@@ -1908,8 +1908,8 @@ Caddyfile 环境变量：`XNC_DOMAIN`（主域）、`XNC_SHORT_DOMAIN`（短域�
 现行安装入口（设计文档 §4）：
 
 ```cmd
-curl -LO https://xnc.app/setup.exe && setup.exe     :: 安装器（agent + CLI 一次装齐）
-curl -LO "https://xnc.app/setup.exe?channel=dev"    :: dev 频道安装器
+curl -LO https://xnc.app/installer && 运行安装器     :: 安装（agent + CLI 一次装齐）
+curl -LO "https://xnc.app/installer?channel=dev"    :: dev 频道安装器
 ```
 
 安装期零凭据；装完在目标机执行 `xnc register`（登录 → 选 cluster → 上线）。

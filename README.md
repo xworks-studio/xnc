@@ -9,10 +9,10 @@ Windows 节点统一运维入口：出站 443 反向连接（agent 主动连 ser
 ### 装 Agent + CLI（安装器，推荐）
 
 ```cmd
-curl -LO https://xnc.app/setup.exe && setup.exe
+curl -LO https://xnc.app/installer && 运行安装器
 ```
 
-或浏览器打开 <https://xnc.app/setup.exe> 下载后双击。Inno Setup 安装器一次装齐 agent（Windows 服务 `XNCAgent`，Automatic）与 CLI（自动加 PATH）；安装期零凭据，装完服务空转等待注册（无 token、无需预先 admin 介入）。
+或浏览器打开 <https://xnc.app/installer> 下载后双击。Inno Setup 安装器一次装齐 agent（Windows 服务 `XNCAgent`，Automatic）与 CLI（自动加 PATH）；安装期零凭据，装完服务空转等待注册（无 token、无需预先 admin 介入）。
 
 首次使用在目标机执行（login → 选 cluster → 本机注册为节点，约 30 秒内上线）：
 
@@ -23,7 +23,7 @@ xnc register
 ### Dev 频道
 
 ```cmd
-curl -LO "https://xnc.app/setup.exe?channel=dev" && setup.exe
+curl -LO "https://xnc.app/installer?channel=dev" && 运行安装器
 ```
 
 安装器是唯一安装入口（未上线直采终态，[设计 §14](docs/superpowers/specs/2026-09-03-innosetup-installer-unified-auth-design.md)）：CLI 随安装器分发，无单独安装步骤。
@@ -32,7 +32,7 @@ curl -LO "https://xnc.app/setup.exe?channel=dev" && setup.exe
 
 ```bash
 xnc login                            # 连接 server
-xnc register                         # 本机注册为节点（未装 agent 时提示装 setup.exe）
+xnc register                         # 本机注册为节点（未装 agent 时提示先装安装器）
 xnc node list                        # 查看节点
 xnc exec <node> "hostname"           # 执行命令（自动选 shell）
 xnc exec <node> --shell bash "ls"    # bash（引号最简）
@@ -64,11 +64,11 @@ xnc exec node1 --cwd C:\xnc --env DEBUG=1 "tool"   # env + cwd
 
 ## 发布频道与自更新
 
-双频道：`stable`（正式）/ `dev`（开发测试）。Agent 收到推送后经安装器静默自更新（下载 setup.exe → sha256 校验 → 静默安装 → 回滚保护），零手工干预；`xnc upgrade` 可随时手动触发。
+双频道：`stable`（正式）/ `dev`（开发测试）。Agent 收到推送后经安装器静默自更新（下载 installer → sha256 校验 → 静默安装 → 回滚保护），零手工干预；`xnc upgrade` 可随时手动触发。
 
 | 操作 | 命令 |
 |---|---|
-| 上传 release | `curl -X POST /api/admin/releases -H "Auth: Bearer $T" -F version=X -F setup=@XNC-Setup-X.exe -F cli=@xnc-windows-amd64.exe` |
+| 上传 release | `curl -X POST /api/admin/releases -H "Auth: Bearer $T" -F version=X -F setup=@XNC-Installer-X.exe -F cli=@xnc-windows-amd64.exe` |
 | 灰度单节点 | `curl -X POST /api/admin/rollout -d '{"version":"X","nodeId":"..."}'` |
 | 切节点频道 | `curl -X POST /api/admin/rollout -d '{"nodeId":"...","channel":"dev"}'` |
 | 手动升级本机 | `xnc upgrade [--channel dev]` |
@@ -102,7 +102,7 @@ cd deploy && docker compose -f docker-compose.yml -f docker-compose.dev.yml up -
 
 版本号只在构建时注入（agent 自报 / 安装器打包同一来源；未注入回落
 `0.0.0-dev`）。安装器：`make installer VERSION=<v> [CHANNEL=stable|dev]`（构建五个
-exe 到 `bin/` 后经 Inno Setup 打包 `XNC-Setup[-dev]-<v>.exe`）。
+exe 到 `bin/` 后经 Inno Setup 打包 `XNC-Installer[-dev]-<v>.exe`）。
 
 server 构建版本同理（`/api/health` 上报）：`deploy/.env` 设 `XNC_VERSION=<v>`
 后 `py deploy/deploy_srv.py env && py deploy/deploy_srv.py up`，compose 经

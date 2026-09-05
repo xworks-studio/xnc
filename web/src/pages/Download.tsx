@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { formatRelativeTime } from "../reltime";
 
-/** /setup.json 清单结构（服务端动态生成，见 server setup_handlers.go）。 */
+/** /installer.json 清单结构（服务端动态生成，见 server setup_handlers.go）。 */
 export interface SetupManifest {
   version: string;
   url: string;
@@ -22,7 +22,7 @@ type CardState =
   | { kind: "missing" }; // 无 release（404）或清单拉取失败
 
 /**
- * 单个频道的下载卡片。/setup.json 是公开端点（无需 JWT），不走 api()
+ * 单个频道的下载卡片。/installer.json 是公开端点（无需 JWT），不走 api()
  * 封装；fetch 失败只把本卡片置为"暂无发布"，不影响另一张卡片。
  */
 function ChannelCard({ channel, title, note }: { channel: string; title: string; note: string }) {
@@ -33,7 +33,7 @@ function ChannelCard({ channel, title, note }: { channel: string; title: string;
 
   useEffect(() => {
     let cancelled = false;
-    fetch(`/setup.json?channel=${channel}`)
+    fetch(`/installer.json?channel=${channel}`)
       .then(async (res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`); // 如 dev 频道尚无 release → 404
         return (await res.json()) as SetupManifest;
@@ -112,8 +112,8 @@ function ChannelCard({ channel, title, note }: { channel: string; title: string;
             {copyHint === "copied" && <span className="notice">Copied</span>}
             {copyHint === "select" && <span className="dim">Press Ctrl+C to copy</span>}
           </div>
-          <a className="download-btn" href={`/setup.exe?channel=${channel}`}>
-            Download setup.exe
+          <a className="download-btn" href={`/installer?channel=${channel}`}>
+            Download installer
           </a>
         </>
       )}
@@ -142,7 +142,7 @@ export default function Download() {
           <h2>Install in three steps</h2>
           <ol>
             <li>
-              <strong>Run setup.exe</strong> — download and run the installer
+              <strong>Run the installer</strong> — download and run it
               (administrator privileges required).
             </li>
             <li>

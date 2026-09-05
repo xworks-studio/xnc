@@ -48,7 +48,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 ; Serialize installer runs (update orchestration may race a manual install).
-SetupMutex=XNC-Setup
+SetupMutex=XNC-Installer
 ; Same-dir re-runs are the upgrade/repair path, not an accident.
 DirExistsWarning=no
 ; In-use xnc.exe is handled by the prep rename step, not Restart Manager.
@@ -57,7 +57,7 @@ DisableProgramGroupPage=yes
 UninstallDisplayName=XNC
 VersionInfoVersion={#SetupVersion}
 OutputDir=..\bin
-OutputBaseFilename=XNC-Setup{#ChannelSuffix}-{#Version}
+OutputBaseFilename=XNC-Installer{#ChannelSuffix}-{#Version}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern

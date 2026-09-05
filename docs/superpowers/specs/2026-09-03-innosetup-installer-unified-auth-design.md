@@ -26,7 +26,7 @@ sc.exe 建服务）有三个问题：
 - **G4** 首次使用时经 CLI 交互完成：账号密码登录 → 选择 cluster → 注册本机
   节点；登录/退出登录/注册/反注册语义统一、可逆。
 - **G5** 安装器是**唯一**分发与更新载体：安装、修复、升级、卸载全部使用
-  同一个 setup.exe；现有 bundle 自更新机制（build-bundle.go + agent/updater
+  同一个 installer；现有 bundle 自更新机制（build-bundle.go + agent/updater
   的 tar.gz apply）整体退役。
 
 非目标：
@@ -42,7 +42,7 @@ sc.exe 建服务）有三个问题：
 ```
 管理员/用户                         XNC Server                    本机
 ──────────────                     ────────────                  ──────────────
-1. 下载 setup.exe   ←─ /setup.exe?channel=… (302 最新版)
+1. 下载 installer ←─ /installer?channel=…（频道最新直流）
 2. 双击安装（admin）                                              Inno: 复制文件
                                                                  注册 XNCAgent
                                                                  注册 XNCCore
@@ -64,7 +64,7 @@ sc.exe 建服务）有三个问题：
 日常使用：`xnc <任意命令>` 复用机器级绑定 + 用户级会话。登出只清用户会话，
 节点照常在线。
 
-更新闭环（安装器即更新器，详见 §9）：server 发布新 setup.exe → agent 经
+更新闭环（安装器即更新器，详见 §9）：server 发布新 installer → agent 经
 WS 推送/周期轮询发现 → 下载校验 → 静默执行安装器完成升级（含回滚看门狗）。
 
 ## 3. 打包规范（Inno Setup）
@@ -73,12 +73,12 @@ WS 推送/周期轮询发现 → 下载校验 → 静默执行安装器完成升
 
 | 频道 | 文件名 | 说明 |
 |------|--------|------|
-| stable | `XNC-Setup-<version>.exe` | 生产频道 |
-| dev | `XNC-Setup-dev-<version>.exe` | 开发频道（对应现有 `-dev` bundle 频道） |
+| stable | `XNC-Installer-<version>.exe` | 生产频道 |
+| dev | `XNC-Installer-dev-<version>.exe` | 开发频道（对应现有 `-dev` bundle 频道） |
 
 `<version>` 与 agent 自报版本同源（构建期 `-ldflags` 注入
 `xnc/agent/machineinfo.Version`）。安装器是**唯一**发布产物：CI 构建五个
-二进制后仅打包 setup.exe（无 bundle），同一文件服务首装、修复、升级与
+二进制后仅打包 installer（无 bundle），同一文件服务首装、修复、升级与
 卸载；升级即"同 AppId 静默重跑"，见 §9。
 
 ### 3.2 安装器参数（Inno Setup 脚本要点)
@@ -115,7 +115,7 @@ C:\ProgramData\XNC\                # 机器级状态（见 §5）
   core-secret.hex    # core 管道共享密钥（core 自建，DACL: SYSTEM+Admins）
   update-pending.json  # 更新进行中标记（§9.3，回滚看门狗依据）
   logs\  staging\        # 运行日志 / 更新包下载暂存
-  installer-cache\      # 上一版本 setup.exe（回滚源，仅保留 1 份，§9.2）
+  installer-cache\      # 上一版本 installer（回滚源，仅保留 1 份，§9.2）
 %USERPROFILE%\.xnc\config.json     # 用户级会话（见 §5.3）
 ```
 
@@ -124,13 +124,13 @@ C:\ProgramData\XNC\                # 机器级状态（见 §5）
 
 ## 4. 下载分发
 
-- `GET /setup.exe?channel=stable|dev` → `302` 到当前频道最新
-  `XNC-Setup[-dev]-<version>.exe`（release store 存放，与 bundle 同库）。
-- `GET /setup.json?channel=…` → 版本清单：`{version, url, sha256, size,
+- `GET /installer?channel=stable|dev` → `302` 到当前频道最新
+  `XNC-Installer[-dev]-<version>.exe`（release store 存放，与 bundle 同库）。
+- `GET /installer.json?channel=…` → 版本清单：`{version, url, sha256, size,
   releasedAt}`，供 `xnc upgrade --check`、CI 与编排工具消费。
-- 官网/README 的入口统一为 `xnc.app/setup.exe`；`curl -L -o setup.exe
-  https://xnc.app/setup.exe` 与浏览器直下均可。
-- 安装器完整性：`setup.json` 提供 sha256；生产频道安装器目标为 Authenticode
+- 官网/README 的入口统一为 `xnc.app/installer`；`curl -LO https://xnc.app/installer
+  https://xnc.app/installer` 与浏览器直下均可。
+- 安装器完整性：`installer.json` 提供 sha256；生产频道安装器目标为 Authenticode
   签名（构建侧接入，未签名期间以 sha256 为准，见 §13）。
 
 ## 5. 状态与凭据模型
@@ -258,12 +258,12 @@ ProgramData。
      确认页明示"节点仍登记在 server，如需移除请先运行 xnc deregister"。
 6. 静默卸载（`/SILENT`）默认走"保留"（`/PURGEDATA` 自定义开关强制清除）。
 
-修复安装：setup.exe 检测到已安装同版本 → Inno 内建 repair；跨版本直接装
+修复安装：installer 检测到已安装同版本 → Inno 内建 repair；跨版本直接装
 （升级见 §9）。
 
 ## 9. 更新流程（安装器即更新器）
 
-setup.exe 是唯一分发载体：安装、修复、升级、卸载共用同一安装器与同一版本
+installer 是唯一分发载体：安装、修复、升级、卸载共用同一安装器与同一版本
 线。agent 的职责从"解包搬文件"退化为**更新编排**：发现 → 下载校验 → 静默
 执行安装器 → 看门狗兜底回滚。agent/updater 中 bundle 下载/校验/apply/回滚
 代码删除，保留编排骨架。
@@ -272,17 +272,17 @@ setup.exe 是唯一分发载体：安装、修复、升级、卸载共用同一�
 
 - **WS 推送**：server 发布新版本后经 agent 控制通道下发
   `update_available {version, sha256, url}`，agent 立即执行一轮检查。
-- **周期轮询**：agent 每 6h `GET /setup.json?channel=<绑定频道>` 兜底。
+- **周期轮询**：agent 每 6h `GET /installer.json?channel=<绑定频道>` 兜底。
 - **手动**：`xnc upgrade [--channel stable|dev]` 经 agentctl 管道要求立即
   检查并应用。
 - 节流：同一版本失败后指数退避（1h → 4h → 24h），成功清零；校验失败或
-  安装器退出码非 0 的版本记入本地黑名单，直至 setup.json 出现新 version。
+  安装器退出码非 0 的版本记入本地黑名单，直至 installer.json 出现新 version。
 
 ### 9.2 下载与校验
 
-1. 按 setup.json 的 `url + sha256` 下载到 `ProgramData\XNC\staging\`。
+1. 按 installer.json 的 `url + sha256` 下载到 `ProgramData\XNC\staging\`。
 2. SHA-256 比对；安装器完成 Authenticode 签名后追加验签（§13）。
-3. 回滚源确认：`installer-cache\` 中必须存在**当前版本**的 setup.exe
+3. 回滚源确认：`installer-cache\` 中必须存在**当前版本**的安装器
    （首装与每次成功更新后由安装器/agent 写入，仅保留最近 1 份）；缺失则
    先补拷（从 staging 或 server 重新下载当前版本安装器）再继续。
 
@@ -291,7 +291,7 @@ setup.exe 是唯一分发载体：安装、修复、升级、卸载共用同一�
 agent（SYSTEM）执行：
 
 ```
-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR="C:\Program Files\XNC"
+<installer> /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR="C:\Program Files\XNC"
 ```
 
 同一 AppId 检测到已安装 → 安装器走升级路径（`[Code]`）：
@@ -339,7 +339,7 @@ pending 存在时拒绝再次触发更新。
 
 ### 9.6 版本一致性
 
-setup.json 的 `version` == agent 自报版本（`-ldflags` 注入，版本单一来源
+installer.json 的 `version` == agent 自报版本（`-ldflags` 注入，版本单一来源
 不变）；安装器完成标记与 agent 自报不一致视为失败，走回滚。
 
 ## 10. CLI 命令面变更汇总
@@ -356,17 +356,17 @@ setup.json 的 `version` == agent 自报版本（`-ldflags` 注入，版本单�
 
 | 端点 | 类型 | 说明 |
 |------|------|------|
-| `GET /setup.exe?channel=` | 新 | 302 最新安装器 |
-| `GET /setup.json?channel=` | 新 | 版本清单（version/sha256/size/releasedAt） |
+| `GET /installer?channel=` | 新 | 302 最新安装器 |
+| `GET /installer.json?channel=` | 新 | 版本清单（version/sha256/size/releasedAt） |
 | `POST /api/clusters/{id}/nodes/register` | 新 | 用户 JWT 授权的节点注册（§6.4） |
 | `GET /a/{token}` `/a-dev/…` `/c` `/c-dev` `/install/*` | 已移除 | 未上线直采终态（§14）：一行流在上线前整体删除，无存量迁移 |
 
 ## 12. 构建与发布流水线（增量）
 
 1. CI 构建五个二进制（版本注入）。
-2. Inno Setup（`ISCC.exe`）打包 `XNC-Setup[-dev]-<version>.exe`（唯一发布
+2. Inno Setup（`ISCC.exe`）打包 `XNC-Installer[-dev]-<version>.exe`（唯一发布
    产物；签名接入后同一产物先签再上传）。
-3. release store 上传：setup.exe + setup.json（同一次发布原子提交）。
+3. release store 上传：installer 制品 + installer.json 清单（同一次发布原子提交，清单为动态端点）。
 4. `build-bundle.go` 与 server 的 bundle 发布/下载面**退役删除**；
    `deploy_srv.py` 无变化（release store 已由其管理）。
 
@@ -374,12 +374,12 @@ setup.json 的 `version` == agent 自报版本（`-ldflags` 注入，版本单�
 
 | 威胁 | 对策 |
 |------|------|
-| 安装包被替换/中间人 | HTTPS + setup.json sha256；目标态 Authenticode 签名（未签名期 sha256 为唯一手段，setup.json 由 server 动态生成） |
+| 安装包被替换/中间人 | HTTPS + installer.json sha256；目标态 Authenticode 签名（未签名期 sha256 为唯一手段，installer.json 由 server 动态生成） |
 | 安装期凭据泄漏面 | **安装期零凭据**（G3）：无 token、无密码、无绑定 |
 | 节点私钥被本机其他用户读取 | 私钥仅 SYSTEM 生成/持有（DPAPI SYSTEM + DACL），CLI 经管道间接使用 |
 | 用户 JWT 泄漏到机器级存储 | JWT 仅存用户 profile；register 时经管道内存传递、用后即弃 |
 | 恶意本地用户把陌生 server 注册到本机 | agentctl register 允许 Interactive（注册本身要改绑定需 admin？——注册新绑定允许普通用户，**改绑/反注册仅 Admins**；`--force` 重绑走 Admins） |
-| 恶意/损坏更新包在 SYSTEM 执行 | 下载后 sha256 强校验（setup.json 由 server 动态生成）+ 目标态 Authenticode 验签；执行前强制确认 installer-cache 回滚源就位（§9.2） |
+| 恶意/损坏更新包在 SYSTEM 执行 | 下载后 sha256 强校验（installer.json 由 server 动态生成）+ 目标态 Authenticode 验签；执行前强制确认 installer-cache 回滚源就位（§9.2） |
 | 旧 token 流残留 | 未上线直采终态：一行流端点已在上线前删除（§14）；token 创建 API 保留给编排场景 |
 
 ## 14. 迁移与兼容（未上线直采终态）

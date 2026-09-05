@@ -72,7 +72,7 @@ func (h *handlers) maybeOfferUpdate(ctx context.Context, nodeID uuid.UUID, curre
 	}
 	push, _ := proto.NewMsg(proto.TypeUpdateAvailable, proto.UpdateAvailable{
 		Version: rel.Version,
-		URL:     "/setup.exe?channel=" + rel.Channel,
+		URL:     "/installer?channel=" + rel.Channel,
 		SHA256:  art.Sha256,
 	})
 	if err := send(push); err != nil {

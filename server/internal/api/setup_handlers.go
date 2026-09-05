@@ -66,7 +66,7 @@ func (h *handlers) setupDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition",
-		`attachment; filename="XNC-Setup`+suffix+`-`+rel.Version+`.exe"`)
+		`attachment; filename="XNC-Installer`+suffix+`-`+rel.Version+`.exe"`)
 	w.Header().Set("X-Xnc-Sha256", art.Sha256)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(art.Data)
@@ -94,7 +94,7 @@ func (h *handlers) setupManifest(w http.ResponseWriter, r *http.Request) {
 	}
 	respondJSON(w, http.StatusOK, map[string]any{
 		"version":    rel.Version,
-		"url":        scheme + "://" + r.Host + "/setup.exe?channel=" + channel,
+		"url":        scheme + "://" + r.Host + "/installer?channel=" + channel,
 		"sha256":     art.Sha256,
 		"size":       art.Size,
 		"releasedAt": rel.CreatedAt,

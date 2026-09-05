@@ -68,7 +68,7 @@ func sha256Hex(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// TestSetupDownload：/setup.exe 双频道各两版本取最新；channel 缺省 stable；
+// TestSetupDownload：/installer 双频道各两版本取最新；channel 缺省 stable；
 // 200 直流 + application/octet-stream + X-Xnc-Sha256 与制品/响应体一致。
 func TestSetupDownload(t *testing.T) {
 	env := NewTestEnv(t)
@@ -81,26 +81,26 @@ func TestSetupDownload(t *testing.T) {
 	seedChannelRelease(t, env, "dev", "0.5.0-dev.3")
 
 	// channel 缺省 → stable 最新 0.4.5。
-	resp, body := getSetup(t, srv.URL+"/setup.exe")
+	resp, body := getSetup(t, srv.URL+"/installer")
 	require.Equal(t, 200, resp.StatusCode)
 	assert.Equal(t, "application/octet-stream", resp.Header.Get("Content-Type"))
 	assert.Equal(t, "setup-bytes-stable-0.4.5", string(body))
 	assert.Equal(t, sha256Hex(body), resp.Header.Get("X-Xnc-Sha256"))
 
 	// 显式 channel=stable 同结果。
-	resp, body = getSetup(t, srv.URL+"/setup.exe?channel=stable")
+	resp, body = getSetup(t, srv.URL+"/installer?channel=stable")
 	require.Equal(t, 200, resp.StatusCode)
 	assert.Equal(t, "setup-bytes-stable-0.4.5", string(body))
 
 	// dev 频道 → dev 最新 0.5.0-dev.3。
-	resp, body = getSetup(t, srv.URL+"/setup.exe?channel=dev")
+	resp, body = getSetup(t, srv.URL+"/installer?channel=dev")
 	require.Equal(t, 200, resp.StatusCode)
 	assert.Equal(t, "setup-bytes-dev-0.5.0-dev.3", string(body))
 	assert.Equal(t, sha256Hex(body), resp.Header.Get("X-Xnc-Sha256"))
 }
 
-// TestSetupManifest：setup.json 双频道各两版本取最新；channel 缺省 stable；
-// 字段与制品 sha256/size 一致；url 为同源绝对地址（/setup.exe?channel=<ch>）；
+// TestSetupManifest：installer.json 双频道各两版本取最新；channel 缺省 stable；
+// 字段与制品 sha256/size 一致；url 为同源绝对地址（/installer?channel=<ch>）；
 // releasedAt 为 release 的 created_at。
 func TestSetupManifest(t *testing.T) {
 	env := NewTestEnv(t)
@@ -113,9 +113,9 @@ func TestSetupManifest(t *testing.T) {
 	seedChannelRelease(t, env, "dev", "0.5.0-dev.3")
 
 	// channel 缺省 → stable 最新 0.4.5，url 指向 /setup.exe?channel=stable。
-	mf := getSetupManifest(t, srv.URL+"/setup.json")
+	mf := getSetupManifest(t, srv.URL+"/installer.json")
 	assert.Equal(t, "0.4.5", mf.Version)
-	assert.Equal(t, srv.URL+"/setup.exe?channel=stable", mf.URL)
+	assert.Equal(t, srv.URL+"/installer?channel=stable", mf.URL)
 	assert.Equal(t, sha256Hex([]byte("setup-bytes-stable-0.4.5")), mf.SHA256)
 	assert.Equal(t, int64(len("setup-bytes-stable-0.4.5")), mf.Size)
 	rel, err := env.Store.Q().GetReleaseByVersion(t.Context(), "0.4.5")
@@ -124,9 +124,9 @@ func TestSetupManifest(t *testing.T) {
 		"releasedAt = %v, want release created_at %v", mf.ReleasedAt, rel.CreatedAt)
 
 	// dev 频道 → dev 最新 0.5.0-dev.3。
-	mf = getSetupManifest(t, srv.URL+"/setup.json?channel=dev")
+	mf = getSetupManifest(t, srv.URL+"/installer.json?channel=dev")
 	assert.Equal(t, "0.5.0-dev.3", mf.Version)
-	assert.Equal(t, srv.URL+"/setup.exe?channel=dev", mf.URL)
+	assert.Equal(t, srv.URL+"/installer?channel=dev", mf.URL)
 	assert.Equal(t, sha256Hex([]byte("setup-bytes-dev-0.5.0-dev.3")), mf.SHA256)
 	assert.Equal(t, int64(len("setup-bytes-dev-0.5.0-dev.3")), mf.Size)
 }
@@ -139,7 +139,7 @@ func TestSetupNotFound(t *testing.T) {
 	defer srv.Close()
 
 	// 全新环境无任何 release → 两端点全 404。
-	for _, p := range []string{"/setup.exe", "/setup.json"} {
+	for _, p := range []string{"/installer", "/installer.json"} {
 		resp, _ := getSetup(t, srv.URL+p)
 		assert.Equal(t, 404, resp.StatusCode, p)
 		resp, _ = getSetup(t, srv.URL+p+"?channel=dev")
@@ -148,14 +148,14 @@ func TestSetupNotFound(t *testing.T) {
 
 	// release 存在但无 setup.exe 制品（seedRelease 仅带 cli）→ 仍 404。
 	seedRelease(t, env, "0.4.5")
-	for _, p := range []string{"/setup.exe", "/setup.json"} {
+	for _, p := range []string{"/installer", "/installer.json"} {
 		resp, _ := getSetup(t, srv.URL+p)
 		assert.Equal(t, 404, resp.StatusCode, p)
 	}
 
 	// 未知频道 → 404。
 	seedChannelRelease(t, env, "stable", "0.4.6")
-	for _, p := range []string{"/setup.exe", "/setup.json"} {
+	for _, p := range []string{"/installer", "/installer.json"} {
 		resp, _ := getSetup(t, srv.URL+p+"?channel=beta")
 		assert.Equal(t, 404, resp.StatusCode, p+"?channel=beta")
 	}
