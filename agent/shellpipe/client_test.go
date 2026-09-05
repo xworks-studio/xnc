@@ -227,8 +227,8 @@ func TestExecBudgetTotalCapFastConsumer(t *testing.T) {
 		if err := ServerHandshake(serverConn, f.secret); err != nil {
 			return
 		}
-		<-gate
 		_ = ipc.WriteFrame(serverConn, &ipc.Frame{MessageType: msgShellBegin, Payload: EncodeBegin(80, 25, "CMD")})
+		<-gate // 只闸数据帧：Dial 需先收到 shell_begin 才返回
 		// 100 帧 × 50B = 5000B stdout;预算 200B 必须总量封顶。
 		payload := EncodeData(StreamStdout, bytes.Repeat([]byte("x"), 50))
 		for i := 0; i < 100; i++ {
