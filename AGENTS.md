@@ -149,6 +149,7 @@ chi + sqlc + 真 PG 测试）· `agent`（节点侧，Windows 服务）· `cli` 
 ## 9. 索引
 
 - 产品 spec：`spec.md`（权威）· 快速上手：`README.md`
+- CI/版本号/发布/部署设计：`docs/ci-release-and-deploy.md`（实施规格）
 - 安装器/更新/凭据设计：`docs/superpowers/specs/2026-09-03-innosetup-installer-unified-auth-design.md`
 - 实施与真机验收记录：`docs/superpowers/plans/2026-09-03-…-plan.md`（Results 节）
 - 开发拓扑/凭据布局：`scripts/dev-topology.md` · `scripts/dev-services.md`
