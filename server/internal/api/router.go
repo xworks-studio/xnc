@@ -96,6 +96,8 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		ar.Group(func(g chi.Router) {
 			g.Use(auth.Middleware(cfg.JWTSecret, st))
 			g.Get("/me", h.me)
+			g.Patch("/me", h.updateMe)
+			g.Post("/password", h.changePassword)
 		})
 	})
 
