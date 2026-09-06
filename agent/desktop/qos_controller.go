@@ -40,9 +40,13 @@
 //     2026-08-29 本地环测:2.3Mbps 下 fps60 的 IDR 全被钳在 9.9KB,
 //     fps30 IDR 15.7-17.2KB)。fps 升不上去后,升档的富余自然流向
 //     bitrate(升档顺序首位)与 height —— 画质优先于帧率。
-//   - 旁观者暂停:旁观者 est < 35%×controller est → PauseSpectator(恰一
-//     次,幂等;无自动恢复——恢复通道是后续任务)。controller 自身与隐藏
-//     旁观者不受此规则约束。
+//   - 旁观者暂停/恢复(缺陷 C):旁观者 est < 35%×controller est →
+//     PauseSpectator(恰一次,幂等)。恢复通道(设计 §2.3):① est 恢复
+//     —— 暂停中连续 5s est > 50%×controller est → ResumeSpectator(迟
+//     滞:抖动重启累计窗,恢复恰一次);② 接任 —— controller 离场
+//     (detach/修剪)→ 在场可见 viewer 暂停位一律解除(暂停是相对离场
+//     者 est 的裁决,参照失效),下一拍补发 Resume,接任者不可能是
+//     spectator。controller 自身与隐藏旁观者不受 35% 规则约束。
 //   - 有效 est(缺陷 A):每 viewer 的带宽估计 = agent 侧 GCC 目标码率
 //     (pion SendSideBWE,新鲜 ≤qosAgentEstTTL)优先,浏览器 est 兜底 ——
 //     浏览器对 pion 发送流不暴露 availableIncomingBitrate(2026-09-06
@@ -58,7 +62,8 @@
 //
 // 有界状态:viewer 表按 lastSeen 修剪(2 分钟未见即删,controller 亦不例
 // 外——离场的主导者让位),上限 64 条(超出的新 viewer 按字典序挤掉最旧
-// 表项)。时钟注入(Now)使全部时间规则可确定性单测。
+// 表项);会话收线经 DetachViewer 即删(缺陷 C:不等修剪窗,reload 冷启
+// 动不撞陈旧表项)。时钟注入(Now)使全部时间规则可确定性单测。
 //
 // reset-recovery grace(M4 修正):max_w 变更的决策走 host 的 resolution
 // 重置(编码器重建、codec epoch 前进、首个恢复 IDR 之前无帧产出)。
@@ -100,6 +105,13 @@ const (
 	qosUpStepAddBps = 1_000_000
 	// qosSpectatorPauseFraction:旁观者暂停线(35% of controller est)。
 	qosSpectatorPauseFraction = 0.35
+	// qosResumeFraction / qosResumeSustain(缺陷 C,设计 §2.3):est 恢复
+	// 解暂停的判据 —— 暂停中的旁观者有效 est 持续 qosResumeSustain 高于
+	// controller est 的 qosResumeFraction → 恢复发送。迟滞:est 掉回线下
+	// 即清零累计窗(抖动重启 5s,不累计断续的恢复);恢复恰一次(解除后
+	// 不再进恢复分支,幂等)。50% 线与 35% 暂停线之间的带 = 双向死区。
+	qosResumeFraction = 0.50
+	qosResumeSustain  = 5 * time.Second
 	// qosMinBitrateBps / qosMaxBitrateBps:码率工作区 500kbps–15Mbps。
 	qosMinBitrateBps = 500_000
 	qosMaxBitrateBps = 15_000_000
@@ -229,13 +241,17 @@ const (
 	//(流级,ViewerID 空;session 侧走 KeyframeCoordinator 的 urgent 路径,
 	// 绕过常规冷却 —— epoch 变更类,见 qos_min.go 的 keyRequestIsUrgent 注释)。
 	actionRequestKeyframe
+	// actionResumeSpectator(缺陷 C,设计 §2.3):恢复 ViewerID 指定 viewer
+	// 的发送(PauseSpectator 的对偶;触发面 = est 恢复解暂停或 controller
+	// 离场的接任解暂停;发送器进入 waitIDR 重建参考链,session 侧分派)。
+	actionResumeSpectator
 )
 
 // Action 是一次决策的产物(Observe 返回;session 侧应用)。
 type Action struct {
 	Kind     actionKind
 	Config   VideoConfig // actionSetVideoConfig
-	ViewerID string      // actionPauseSpectator
+	ViewerID string      // actionPauseSpectator / actionResumeSpectator
 }
 
 // QoSControllerConfig 组装控制器。
@@ -265,6 +281,16 @@ type qosViewer struct {
 	// 码率与最近到达时刻;effectiveEst 据此在新鲜窗内覆盖浏览器 est。
 	agentEst   uint64
 	agentEstAt time.Time
+
+	// resumeSince(缺陷 C):est 恢复的累计窗锚点 —— 暂停中的旁观者有效
+	// est 持续 > qosResumeFraction×controllerBps 达 qosResumeSustain 即解
+	// 除;est 掉回线下即清零(迟滞)。零值 = 未在累计。
+	resumeSince time.Time
+	// pendingResume(缺陷 C):接任解暂停的补发标记 —— 主导者离场时在
+	// DetachViewer/handoverUnpause 里解除暂停并置位,该 viewer 的下一个
+	// Observe 拍恰一次补发 actionResumeSpectator(收线/修剪路径上不便
+	// 直接返回动作;session 侧分派恢复发送器)。
+	pendingResume bool
 }
 
 // AgentEstimate 记录该 viewer 会话的 agent 侧 GCC 目标码率(pion
@@ -416,6 +442,16 @@ func (c *QoSController) Observe(fb ViewerFeedback) []Action {
 	v.bps = fb.EstimatedBps
 
 	c.prune(now)
+	// 接任解暂停(缺陷 C,设计 §2.3):controller 表项被 TTL 修剪 = 主导
+	// 者离场的另一形态,与 DetachViewer 同款处理(会话收线那条路在
+	// streamQoS.detach 直调;此处在反馈拍上兜底,防「controller 修剪 +
+	// 全部在场 viewer 暂停 → 永久空位」的死锁 —— 暂停 viewer 不得接任,
+	// 空位下其反馈又不进任何分支)。
+	if c.controllerID != "" {
+		if _, ok := c.viewers[c.controllerID]; !ok {
+			c.handoverUnpause()
+		}
+	}
 	prevController := c.controllerID
 	c.promote()
 	if c.controllerID != prevController && c.controllerID != "" {
@@ -431,6 +467,13 @@ func (c *QoSController) Observe(fb ViewerFeedback) []Action {
 		c.emitted = true
 		acts = append(acts, Action{Kind: actionSetVideoConfig, Config: c.cur})
 	}
+	// 接任解暂停的补发(缺陷 C):DetachViewer/handoverUnpause 在收线/修剪
+	// 路径上不便返回动作,恢复标记在此兑现 —— 恰一次(标记消费即清,
+	// 接任者自身的反馈同样走到这里:发送器恢复对新旧角色一律必要)。
+	if v.pendingResume {
+		v.pendingResume = false
+		acts = append(acts, Action{Kind: actionResumeSpectator, ViewerID: fb.SessionID})
+	}
 
 	isController := fb.SessionID == c.controllerID && fb.Visible
 	switch {
@@ -441,9 +484,27 @@ func (c *QoSController) Observe(fb ViewerFeedback) []Action {
 	case !fb.Visible || c.controllerID == "":
 		// 隐藏 viewer / 无 controller:全局决策与暂停都不做。
 	default:
-		// 旁观者:唯一可能的动作是带宽不足暂停(见文件头;恰一次)。
-		// 比较用该 viewer 的有效 est(缺陷 A:agent est 新鲜则覆盖)。
-		if !v.paused && c.controllerBps > 0 &&
+		// 旁观者:带宽不足暂停(恰一次,幂等)与 est 恢复解暂停(缺陷 C,
+		// 带迟滞)都在本分支;两个判据都用该 viewer 的有效 est(缺陷 A:
+		// agent est 新鲜则覆盖)。
+		if v.paused {
+			// est 恢复:有效 est 持续 > qosResumeFraction×controllerBps 达
+			// qosResumeSustain → 解除 + 恰一次 Resume(解除后不再进本分
+			// 支 = 幂等);est 掉回线下 → 累计窗清零(迟滞:抖动重启
+			// 5s 窗,不累计断续的恢复)。
+			if c.controllerBps > 0 &&
+				float64(v.effectiveEst(now)) > qosResumeFraction*float64(c.controllerBps) {
+				if v.resumeSince.IsZero() {
+					v.resumeSince = now
+				} else if now.Sub(v.resumeSince) >= qosResumeSustain {
+					v.paused = false
+					v.resumeSince = time.Time{}
+					acts = append(acts, Action{Kind: actionResumeSpectator, ViewerID: fb.SessionID})
+				}
+			} else {
+				v.resumeSince = time.Time{}
+			}
+		} else if c.controllerBps > 0 &&
 			float64(v.effectiveEst(now)) < qosSpectatorPauseFraction*float64(c.controllerBps) {
 			v.paused = true
 			acts = append(acts, Action{Kind: actionPauseSpectator, ViewerID: fb.SessionID})
@@ -611,6 +672,50 @@ func (c *QoSController) HeldCuts() uint32 { return c.heldCuts }
 
 // ResetPending 报告 reset-grace 是否在途(只读观测点,测试/诊断用)。
 func (c *QoSController) ResetPending() bool { return c.resetPending }
+
+// IsPaused 报告该 viewer 是否处于网络暂停态(缺陷 C 的只读观测点:接任
+// 解暂停的断言面;表项缺席 = 未暂停)。
+func (c *QoSController) IsPaused(sessionID string) bool {
+	v, ok := c.viewers[sessionID]
+	return ok && v.paused
+}
+
+// DetachViewer 会话收线即删 viewer 表项(设计 §2.3):修前只靠 lastSeen
+// 2 分钟修剪 —— reload 后新 viewer 冷启动 est 与陈旧 controller 表项
+// 比对,35% 暂停误触发率极高且无恢复。被删者是 controller 时触发接任
+//(handoverUnpause 解除在场可见 viewer 的暂停位,promote 重选接任者 ——
+// 接任者不可能仍是 spectator),冷启动窗重锚(新主导者 = 新 transport-cc
+// 爬坡)。幂等:表项缺席(如从未上报反馈的会话)无事可做。
+func (c *QoSController) DetachViewer(sessionID string) {
+	delete(c.viewers, sessionID)
+	if c.controllerID != sessionID {
+		return // 旁观者离场:不触发接任
+	}
+	c.controllerID = ""
+	c.handoverUnpause()
+	c.promote()
+	if c.controllerID != "" {
+		c.controllerSince = c.now()
+	}
+}
+
+// handoverUnpause 主导者离场(detach / TTL 修剪)的接任解暂停(设计
+// §2.3):暂停位是相对「离场 controller est」的裁决,参照一走即失效 ——
+// 在场可见 viewer 的暂停位一律解除并挂 pendingResume(其下一拍恰一次补
+// 发 Resume,发送器恢复);参照 controllerBps 同步清零,由接任者的首个
+// decide 拍重建(间隙内暂停/恢复判据一律不动作 —— 绝不拿陈旧参照误伤
+// reload 冷启动的新 est)。隐藏的暂停 viewer 不动:其对决策面本就不可见,
+// 恢复交由其重回可见后的 est 恢复通道。
+func (c *QoSController) handoverUnpause() {
+	for _, v := range c.viewers {
+		if v.visible && v.paused {
+			v.paused = false
+			v.resumeSince = time.Time{}
+			v.pendingResume = true
+		}
+	}
+	c.controllerBps = 0
+}
 
 // CadenceHolds 返回节奏门抑制的 queueMs 拥塞拍累计数(可观测性)。
 func (c *QoSController) CadenceHolds() uint32 { return c.cadenceHolds }

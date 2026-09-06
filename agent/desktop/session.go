@@ -204,11 +204,15 @@ func (q *streamQoS) Current() VideoConfig {
 	return q.ctrl.Current()
 }
 
-// detach 注销会话端点(幂等)。
+// detach 注销会话端点(幂等)。缺陷 C:同时从控制器 viewer 表删该表项
+//(会话收线即删,不等 2 分钟 lastSeen 修剪 —— reload 冷启动的新 viewer
+// 不再与陈旧 controller 表项比对而被误暂停;被删者是 controller 时触发
+// 接任解暂停,见 QoSController.DetachViewer)。
 func (q *streamQoS) detach(sessionID string) {
 	q.mu.Lock()
 	delete(q.sessions, sessionID)
 	delete(q.keyframes, sessionID)
+	q.ctrl.DetachViewer(sessionID)
 	q.mu.Unlock()
 }
 
@@ -227,11 +231,19 @@ func (q *streamQoS) attachKeyframes(sessionID string, coord *KeyframeCoordinator
 // 与 pli/fir/connect/overflow/pacer/resume 同一 host 记账面)。
 const keyRequestReasonQoSReset = "qos-reset"
 
+// vocabStateSpectatorResumed(缺陷 C):接任/est 恢解暂停的稳定态
+//(spectator_network_paused 的对偶;经既有 state 帧形态,旧 viewer 按
+// 未知 code 忽略,向后兼容。词汇同伴都在 signaling.go,此条随缺陷 C 的
+// 分派落点留在 session.go,避免本任务扩散改动面)。
+const vocabStateSpectatorResumed = "spectator_network_resumed"
+
 // apply 应用一批动作:SetVideoConfig → 全体在场会话的 pacing 预算(裁决
 // 2:发送器预算来源 = controller 决策)+ 观察会话的 Source 下发(host 无
 // 能力 → 记一次 unsupported 即停发,决策仍留在 agent 侧);PauseSpectator
 // → 目标会话的 spectator_network_paused 稳定态 + ViewerSender.Pause();
-// RequestKeyframe → 各会话协调器的 urgent 请求(缺陷 B 逃逸阀)。
+// ResumeSpectator(缺陷 C)→ 目标会话的 spectator_network_resumed 稳定
+// 态 + 发送器恢复(Pause 的对偶);RequestKeyframe → 各会话协调器的
+// urgent 请求(缺陷 B 逃逸阀)。
 func (q *streamQoS) apply(acts []Action, src Source) {
 	for _, a := range acts {
 		switch a.Kind {
@@ -277,6 +289,16 @@ func (q *streamQoS) apply(acts []Action, src Source) {
 			if s != nil {
 				s.apply(a)
 			}
+		case actionResumeSpectator:
+			// 缺陷 C:与 PauseSpectator 同型(单目标会话;锁内快照,
+			// 锁外应用)。目标已收线(如恢复动作在途时会话关闭)→ 无害
+			// 跳过:发送器随会话关闭,无需恢复。
+			q.mu.Lock()
+			s := q.sessions[a.ViewerID]
+			q.mu.Unlock()
+			if s != nil {
+				s.apply(a)
+			}
 		case actionRequestKeyframe:
 			// 逃逸阀(缺陷 B):流级 urgent 关键帧请求直达各会话的协调器
 			//(与 SetVideoConfig 分派同型:锁内快照,锁外触发)。多会话时
@@ -312,6 +334,14 @@ func (s *qosSession) apply(a Action) {
 		s.w.write(s.ctx, stateFrame{
 			Type: vocabState, Code: vocabStateSpectatorPaused, Recoverable: true})
 		s.pub.Pause()
+	case actionResumeSpectator:
+		// 缺陷 C:暂停的对偶 —— 通知 viewer 恢复 + 发送器 Resume(进入
+		// waitIDR 重建参考链并恰一次合并关键帧请求,幂等)。直达
+		// pub.vs:Publisher 只有 Pause 转发(events.go 的 Stats 直达同款),
+		// 补一个 Resume 转发需动 transport.go —— 超出本任务的文件面。
+		s.w.write(s.ctx, stateFrame{
+			Type: vocabState, Code: vocabStateSpectatorResumed, Recoverable: true})
+		s.pub.vs.Resume()
 	}
 }
 

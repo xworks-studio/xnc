@@ -1249,3 +1249,68 @@ func TestResetGraceEscape(t *testing.T) {
 	}
 	t.Fatal("grace not force-released: congestion cuts still held after 9s+")
 }
+
+// ---- 缺陷 C:PauseSpectator 恢复通道 + viewer 表项即时清理 ----
+
+// hasAction 报告本批动作里是否含指定判别器(configOf 的同款遍历风格)。
+func hasAction(acts []Action, kind actionKind) bool {
+	for _, a := range acts {
+		if a.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// TestSpectatorResume — 恢复通道三路径(设计 §2.3):
+//  1. detach 即删表项:会话收线后 viewer 不再参与选举/比对
+//     (reload 冷启动不再撞 2 分钟陈旧 controller 表项)。
+//  2. 接任解暂停:controller 离场,暂停态 viewer 接任 → 立即恢复。
+//  3. est 恢复解暂停:暂停中的 spectator 连续 5s est > 50%×controller
+//     → 恢复(带迟滞)。
+//
+// (brief 草稿的 newTestController/now 局部变量是 newAgentEstTestController/
+// clk.advance 的机械改写 —— 与 Task 1/2 同一处理,断言不变;末尾的接任
+// 断言按 brief 注记落成导出的 IsPaused 观测 + Resume 动作在场双保险。)
+func TestSpectatorResume(t *testing.T) {
+	// 路径 1:detach 删表项。
+	c, _ := newAgentEstTestController(t, VideoConfig{Bitrate: 2_000_000, FPS: 30}, 1920, 1200)
+	c.Observe(ViewerFeedback{SessionID: "ctrl", Visible: true, EstimatedBps: 4_000_000})
+	c.DetachViewer("ctrl")
+	if c.ControllerID() == "ctrl" {
+		t.Fatal("detached viewer still controller")
+	}
+
+	// 路径 2+3:旁观者被暂停 → 接任/est 恢复 → Resume 动作恰好一次。
+	c2, clk := newAgentEstTestController(t, VideoConfig{Bitrate: 2_000_000, FPS: 30}, 1920, 1200)
+	c2.Observe(ViewerFeedback{SessionID: "ctrl", Visible: true, EstimatedBps: 4_000_000})
+	clk.advance(1 * time.Second)
+	acts := c2.Observe(ViewerFeedback{SessionID: "spec", Visible: true, EstimatedBps: 100_000})
+	if !hasAction(acts, actionPauseSpectator) {
+		t.Fatal("expected spectator pause (100k < 35% of 4M)")
+	}
+	// 路径 3:est 恢复(>50%×4M)持续 5s → Resume。
+	var resumed int
+	for i := 0; i < 8; i++ {
+		clk.advance(1 * time.Second)
+		for _, a := range c2.Observe(ViewerFeedback{SessionID: "spec", Visible: true, EstimatedBps: 3_000_000}) {
+			if a.Kind == actionResumeSpectator {
+				resumed++
+			}
+		}
+	}
+	if resumed != 1 {
+		t.Fatalf("resume actions = %d, want exactly 1 (hysteresis)", resumed)
+	}
+	// 路径 2:controller 离场(detach),暂停未恢复的另一 viewer 接任 →
+	// 接任即解暂停。
+	c2.Observe(ViewerFeedback{SessionID: "spec2", Visible: true, EstimatedBps: 200_000})
+	c2.DetachViewer("ctrl")
+	acts = c2.Observe(ViewerFeedback{SessionID: "spec2", Visible: true, EstimatedBps: 200_000})
+	if !hasAction(acts, actionResumeSpectator) {
+		t.Fatal("handover must emit a resume for the un-paused viewer")
+	}
+	if c2.IsPaused("spec2") { // spec2 接任后 paused 位必须为 false
+		t.Fatal("handover must clear pause on the new controller")
+	}
+}
