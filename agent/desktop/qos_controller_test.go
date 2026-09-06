@@ -1186,3 +1186,66 @@ func TestAgentEstimatePrecedence(t *testing.T) {
 		t.Fatalf("ControllerBps = %d, want fallback to browser est 600k", c.ControllerBps())
 	}
 }
+
+// ---- 缺陷 B:reset-grace 确认超时逃逸阀 ----
+
+// saturatingFeedback 构造发送侧真实拥塞的反馈(brief Step 1:
+// DeadlineDroppedRate 5% > 1% 阈值 = Fix 2 的第一类真证据,单独即可剪码;
+// est 取当前码率的 goodput 形态,带宽证据路径保持安静)。「重置在途但永无
+// 新代帧确认」的场景里,它是持续不变的拥塞拍。
+func saturatingFeedback(sid string, c *QoSController) ViewerFeedback {
+	f := fbCadence(sid, uint64(c.Current().Bitrate)*85/100, 5, 25)
+	f.Sender.DeadlineDroppedRate = 0.05
+	return f
+}
+
+// TestResetGraceEscape — 确认超时逃逸阀(设计 §2.2):重置在途 3s 未被
+// 新代帧确认 → urgent 关键帧请求(共 3 次机会:1+2 重发)→ 仍未确认则
+// 强制释放 grace,拥塞控制恢复(后续拥塞拍照常剪码,不再 held)。
+//(brief 草稿的 now 局部变量是 clk.advance 的机械改写,断言不变 —— 与
+// Task 1 的 TestAgentEstimatePrecedence 同一处理;控制器构造复用
+// newAgentEstTestController,即 brief 草稿 newTestController 的既有等价
+// helper。)
+func TestResetGraceEscape(t *testing.T) {
+	c, clk := newAgentEstTestController(t, VideoConfig{Bitrate: 4_000_000, FPS: 30}, 1920, 1200)
+	// 建流 + 制造一次 height 降档(reset 置位)。
+	c.Observe(ViewerFeedback{SessionID: "s1", Visible: true, EstimatedBps: 4_000_000})
+	clk.advance(2 * time.Second)
+	// 连续强拥塞证据(发送侧真实)直至 max_w 降档触发 resetPending。
+	for i := 0; i < 60 && !c.ResetPending(); i++ {
+		clk.advance(1 * time.Second)
+		c.Observe(saturatingFeedback("s1", c))
+	}
+	if !c.ResetPending() {
+		t.Fatal("expected a pending reset (max_w downshift)")
+	}
+	// 无新代帧确认:3s 超时 → 首个 urgent 请求;每再 3s 重发,共 2 次。
+	var keyReqs int
+	for i := 0; i < 7; i++ {
+		clk.advance(1 * time.Second)
+		acts := c.Observe(saturatingFeedback("s1", c))
+		for _, a := range acts {
+			if a.Kind == actionRequestKeyframe {
+				keyReqs++
+			}
+		}
+	}
+	if keyReqs < 1 {
+		t.Fatal("expected urgent keyframe request after 3s unconfirmed reset")
+	}
+	if keyReqs > 1+qosResetConfirmRetries {
+		t.Fatalf("keyReqs = %d, want ≤ 1+2", keyReqs)
+	}
+	// 第 3 次超时后(约 9s):grace 强制释放 —— 拥塞拍产生真实剪码动作
+	//(SetVideoConfig 降档)而非 held。
+	for i := 0; i < 5; i++ {
+		clk.advance(1 * time.Second)
+		acts := c.Observe(saturatingFeedback("s1", c))
+		for _, a := range acts {
+			if a.Kind == actionSetVideoConfig {
+				return // 拥塞控制已恢复
+			}
+		}
+	}
+	t.Fatal("grace not force-released: congestion cuts still held after 9s+")
+}

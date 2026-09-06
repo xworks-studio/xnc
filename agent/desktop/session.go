@@ -127,13 +127,17 @@ type streamQoS struct {
 	ctrl *QoSController
 
 	mu               sync.Mutex
-	sessions         map[string]*qosSession // sessionID → 应用端点(pub 建联后注册)
-	configSend       bool                   // host 未拒能力前持续下发
+	sessions         map[string]*qosSession          // sessionID → 应用端点(pub 建联后注册)
+	keyframes        map[string]*KeyframeCoordinator // sessionID → 关键帧协调器(缺陷 B)
+	configSend       bool                            // host 未拒能力前持续下发
 	unsupportedNoted bool
 }
 
 func newStreamQoS(cfg QoSControllerConfig, log *slog.Logger) *streamQoS {
-	return &streamQoS{log: log, ctrl: newQoSController(cfg), sessions: make(map[string]*qosSession), configSend: true}
+	return &streamQoS{log: log, ctrl: newQoSController(cfg),
+		sessions:   make(map[string]*qosSession),
+		keyframes:  make(map[string]*KeyframeCoordinator),
+		configSend: true}
 }
 
 // observe 消费一条反馈并返回决策(控制器互斥;动作应用在锁外)。grace
@@ -204,13 +208,30 @@ func (q *streamQoS) Current() VideoConfig {
 func (q *streamQoS) detach(sessionID string) {
 	q.mu.Lock()
 	delete(q.sessions, sessionID)
+	delete(q.keyframes, sessionID)
 	q.mu.Unlock()
 }
+
+// attachKeyframes 注册本会话的关键帧协调器(缺陷 B):setupPublisher 建好
+// 协调器即注册,独立于 attach 的应用端点表 —— 后者要求 pub 已建成,而
+// QoS 的 actionRequestKeyframe 在端点就位前就可能需要打 host。协调器的
+// urgent 请求不经 Publisher 的 keyRequestIsUrgent seam(那里只认 connect,
+// 见 qos_min.go),epoch 变更类请求由 QoS 动作直走 coordinator API。
+func (q *streamQoS) attachKeyframes(sessionID string, coord *KeyframeCoordinator) {
+	q.mu.Lock()
+	q.keyframes[sessionID] = coord
+	q.mu.Unlock()
+}
+
+// keyRequestReasonQoSReset 是逃逸阀 urgent 关键帧请求的 reason(≤31B,
+// 与 pli/fir/connect/overflow/pacer/resume 同一 host 记账面)。
+const keyRequestReasonQoSReset = "qos-reset"
 
 // apply 应用一批动作:SetVideoConfig → 全体在场会话的 pacing 预算(裁决
 // 2:发送器预算来源 = controller 决策)+ 观察会话的 Source 下发(host 无
 // 能力 → 记一次 unsupported 即停发,决策仍留在 agent 侧);PauseSpectator
-// → 目标会话的 spectator_network_paused 稳定态 + ViewerSender.Pause()。
+// → 目标会话的 spectator_network_paused 稳定态 + ViewerSender.Pause();
+// RequestKeyframe → 各会话协调器的 urgent 请求(缺陷 B 逃逸阀)。
 func (q *streamQoS) apply(acts []Action, src Source) {
 	for _, a := range acts {
 		switch a.Kind {
@@ -255,6 +276,22 @@ func (q *streamQoS) apply(acts []Action, src Source) {
 			q.mu.Unlock()
 			if s != nil {
 				s.apply(a)
+			}
+		case actionRequestKeyframe:
+			// 逃逸阀(缺陷 B):流级 urgent 关键帧请求直达各会话的协调器
+			//(与 SetVideoConfig 分派同型:锁内快照,锁外触发)。多会话时
+			// 每协调器各一条 —— sink 是同一 host 编码器,native 侧
+			// kIdrMinIntervalMs 合并;阀本身 ≤1+2 次/3s,量级可忽略。
+			q.mu.Lock()
+			coords := make([]*KeyframeCoordinator, 0, len(q.keyframes))
+			for _, kf := range q.keyframes {
+				coords = append(coords, kf)
+			}
+			q.mu.Unlock()
+			q.log.Info("desktop qos: reset confirmation timed out; requesting urgent keyframe",
+				"retries_cap", qosResetConfirmRetries)
+			for _, kf := range coords {
+				kf.Request(keyRequestReasonQoSReset, true)
 			}
 		}
 	}
@@ -528,6 +565,10 @@ func (h *Handler) setupPublisher(ctx context.Context, w *wsWriter, src Source,
 	if qos != nil {
 		pumpSrc = qosObservingSource{Source: pumpSrc,
 			onFrame: func(f Frame) { qos.frameObserved(f.CodecEpoch) }}
+		// 缺陷 B:共享 QoS 的逃逸阀 urgent 关键帧动作直达本会话的协调器
+		//(注册置于全部失败路径之后 —— setupPublisher 此后不再出错,端点
+		// 生命周期由 Handle 收线时的 detach 结清)。
+		qos.attachKeyframes(sessionID, coord)
 	}
 	go pumpFrames(ctx, log, pumpSrc, pub)
 	go pumpCursor(ctx, src, ictl)

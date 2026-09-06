@@ -66,7 +66,9 @@
 // 码一律挂起(held,不累积——阶梯是状态机,恢复确认后自然续降)。修
 // 前:每条拥塞反馈都再剪一档 max_w → 密集重置风暴 → 恢复 IDR 反复作废
 // → 观众饿死而 host 徒劳产 IDR(M3-T6 合成矩阵的假编码器无重启延迟,
-// 从未暴露此链)。
+// 从未暴露此链)。grace 不是无限期:确认超时逃逸阀(缺陷 B)先 urgent
+// 重钥(1+2 次机会),仍无确认则强制释放 —— 编码器重置彻底失败时拥塞
+// 控制也必须恢复(见 decide 拥塞分支)。
 package desktop
 
 import (
@@ -135,6 +137,13 @@ const (
 	// 2.3M 砍到 1.09M,4 拍到 500k 地板。真拥塞的证据在窗后仍然持续,
 	// 1/s 限速的阶梯照常响应 —— 代价只是约 8s 的决策延迟。
 	qosColdStartGuard = 8 * time.Second
+	// qosResetConfirmTimeout / qosResetConfirmRetries(缺陷 B,设计 §2.2):
+	// reset-grace 的确认超时逃逸阀 —— max_w 重置下发后 qosResetConfirmTimeout
+	// 内无新代帧确认,先 urgent 重钥(1+qosResetConfirmRetries 次机会,每
+	// 3s 重发一次),仍无确认则强制释放 grace:单次 native 编码器失败不得
+	// 劫持整条流的拥塞控制(2026-09-06 生产:held 15+ 分钟,整流冻结)。
+	qosResetConfirmTimeout = 3 * time.Second
+	qosResetConfirmRetries = 2
 	// qosViewerTTL:viewer 表项的修剪窗;qosMaxViewers:表大小上限。
 	qosViewerTTL  = 2 * time.Minute
 	qosMaxViewers = 64
@@ -216,6 +225,10 @@ const (
 	// actionPauseSpectator:向 ViewerID 指定的 viewer 发稳定态
 	// spectator_network_paused 并暂停其 ViewerSender。
 	actionPauseSpectator
+	// actionRequestKeyframe:reset-grace 确认超时逃逸阀的 urgent 关键帧请求
+	//(流级,ViewerID 空;session 侧走 KeyframeCoordinator 的 urgent 路径,
+	// 绕过常规冷却 —— epoch 变更类,见 qos_min.go 的 keyRequestIsUrgent 注释)。
+	actionRequestKeyframe
 )
 
 // Action 是一次决策的产物(Observe 返回;session 侧应用)。
@@ -317,6 +330,13 @@ type QoSController struct {
 	lastCodecEpoch  uint64
 	graceCodecEpoch uint64
 	heldCuts        uint32
+
+	// 逃逸阀(缺陷 B,设计 §2.2):resetAt 是 grace 置位(或最近一次
+	// urgent 重发)的时刻,resetRetries 是已发出的 urgent 关键帧请求数 ——
+	// qosResetConfirmTimeout 内无新代帧确认 → 重发(≤qosResetConfirmRetries
+	// 次);再超时 → 强制释放 grace(见 decide 拥塞分支)。
+	resetAt      time.Time
+	resetRetries uint32
 
 	// cadenceHolds(M4 节奏门):queueMs 越线但因呈现节奏稀疏被抑制的
 	// 拥塞拍数(可观测性:streamQoS 观测并记日志;与 heldCuts 对偶——
@@ -483,15 +503,30 @@ func (c *QoSController) decide(fb ViewerFeedback, v *qosViewer, now time.Time) [
 		// 把上一代的恢复 IDR 作废)。挂起不累积:阶梯是状态机,确认后
 		// 的下一条拥塞反馈自然续降。
 		if c.resetPending {
-			c.heldCuts++
-			return nil
+			// 逃逸阀(设计 §2.2):确认超时先重发 urgent 关键帧请求
+			//(≤qosResetConfirmRetries 次),再超时强制释放 grace——
+			// 单次 native 编码器失败不得劫持整条流的拥塞控制
+			//(2026-09-06 生产:held 15+ 分钟,整流冻结)。
+			if now.Sub(c.resetAt) >= qosResetConfirmTimeout {
+				if c.resetRetries < qosResetConfirmRetries {
+					c.resetRetries++
+					c.resetAt = now // 重臂:下一次超时再判
+					c.heldCuts++
+					return []Action{{Kind: actionRequestKeyframe}}
+				}
+				c.resetPending = false // force-release:拥塞控制恢复
+				// 落回本拍拥塞证据,继续常规剪码(不 return,直落下方剪码路径)。
+			} else {
+				c.heldCuts++
+				return nil
+			}
 		}
 		if now.Sub(c.lastDownAt) < qosDownMinInterval {
 			return nil // 同一 1/s 限速(与常规降档通道共用 lastDownAt)
 		}
 		if next := c.stepDown(); next != c.cur {
 			c.stableSince = time.Time{}
-			c.noteMaxWChange(next)
+			c.noteMaxWChange(next, now)
 			c.cur = next
 			c.lastDownAt = now
 			return []Action{{Kind: actionSetVideoConfig, Config: c.cur}}
@@ -526,7 +561,7 @@ func (c *QoSController) decide(fb ViewerFeedback, v *qosViewer, now time.Time) [
 		// height 升档同样改变 max_w → 同样触发 host 重置:置 grace
 		//(升档本就要求 10s 稳定窗 + 3s 限速,任何降档之后 ≥10s,天然
 		// 满足降档限速,无需独立的 max_w 间隔记账 —— Fix 3 的净删除)。
-		c.noteMaxWChange(next)
+		c.noteMaxWChange(next, now)
 		c.cur = next
 		c.lastUpAt = now
 		return []Action{{Kind: actionSetVideoConfig, Config: c.cur}}
@@ -536,15 +571,18 @@ func (c *QoSController) decide(fb ViewerFeedback, v *qosViewer, now time.Time) [
 
 // noteMaxWChange 判定 next 是否为 reset-triggering 决策(max_w 变更):
 // 是则置 grace(resetPending)并快照当前已见 codec epoch(grace 的解除
-// 资格线:只认严格新于它的帧,见 FrameObserved)。非 max_w 决策
-// (bitrate/fps 热更新)不动 grace。决策节奏由调用方限速(降档 =
+// 资格线:只认严格新于它的帧,见 FrameObserved),同时锚定逃逸阀的确认
+// 超时起点(缺陷 B:resetAt=now,重发计数清零)。非 max_w 决策
+//(bitrate/fps 热更新)不动 grace。决策节奏由调用方限速(降档 =
 // lastDownAt 的 1/s;升档 = 10s 稳定窗 + 3s)。
-func (c *QoSController) noteMaxWChange(next VideoConfig) {
+func (c *QoSController) noteMaxWChange(next VideoConfig, now time.Time) {
 	if next.MaxW == c.cur.MaxW {
 		return
 	}
 	c.resetPending = true
 	c.graceCodecEpoch = c.lastCodecEpoch
+	c.resetAt = now
+	c.resetRetries = 0
 }
 
 // FrameObserved 通知决策器「流又产出了一帧(codecEpoch)」(session 帧泵
@@ -570,6 +608,9 @@ func (c *QoSController) ResetConfirmed() { c.resetPending = false }
 
 // HeldCuts 返回 grace 挂起的拥塞剪码累计数(可观测性)。
 func (c *QoSController) HeldCuts() uint32 { return c.heldCuts }
+
+// ResetPending 报告 reset-grace 是否在途(只读观测点,测试/诊断用)。
+func (c *QoSController) ResetPending() bool { return c.resetPending }
 
 // CadenceHolds 返回节奏门抑制的 queueMs 拥塞拍累计数(可观测性)。
 func (c *QoSController) CadenceHolds() uint32 { return c.cadenceHolds }
