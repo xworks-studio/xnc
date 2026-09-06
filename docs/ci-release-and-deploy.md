@@ -41,8 +41,9 @@ MAJOR.MINOR.PATCH[-dev]
 
 ### 1.3 版本的载体与流转
 
-- **git tag `vX.Y.Z[-dev]` 是唯一发版动作**：打 tag 触发发布流水线
-  （§3）。tag 必须打在 main 上、不允许 force-push 已有 tag。
+- **手动触发 release workflow（输入版本号）是唯一发版动作**（§3）：
+  CI 在当前 main HEAD 创建并推 tag `vX.Y.Z[-dev]` 锚定版本——tag 仍由
+  CI 产生且不可移动，但发版节奏由人经 Actions 触发决定。
 - server 版本与 agent 版本**独立但 MINOR 对齐**（同一批发布的 server
   版本号 = agent 正式版号；PATCH 允许各自独立）。
 - 回滚 = 发一个新的 PATCH 版本，**永不**删除/移动已发布 tag 或同版本
@@ -95,40 +96,47 @@ jobs:
 
 ### 3.1 触发与前置校验
 
-- 触发：`push: tags: ['v*']`（仅 main 上的 tag——workflow 内校验
-  `git merge-base --is-ancestor <tag> main`，否则 fail）。
-- tag 格式校验：`^v\d{1,4}\.\d{1,4}\.\d{1,4}(-dev)?$`（段宽 ≤4 位，
-  dev 仅裸后缀；`-dev` tag 发布到 dev 频道）。
+- 触发：`workflow_dispatch` 输入 `version`（X.Y.Z[-dev]，段 ≤4 位）；
+  须选 main 分支——workflow 校验 HEAD == origin/main，否则 fail。
+- 版本不可变预检：`v<version>` tag 已存在即拒绝（`git ls-remote` 预检；
+  修复 = 新 PATCH 版本）。
+- `-dev` 后缀发布到 dev 频道，其余 stable（与触发方式无关，按输入推导）。
 
 ### 3.2 流水线（单 job，windows-latest，串行步骤）
 
 ```
-1. checkout(tag) + 校验 tag 在 main 上 + 格式合法
+1. checkout(main, fetch-depth 0) + 校验版本格式 / HEAD == origin/main /
+   tag 未占用；Release 正文取 main HEAD 提交信息（手动触发无
+   head_commit 事件，经 GITHUB_ENV 多行段传递）
 2. 装 Inno Setup 6（choco install innosetup）
-3. build.ps1 -Version <tag去v前缀> -Channel <stable|dev 由 tag 推导>
+3. build.ps1 -Version <输入> -Channel <stable|dev 由输入推导>
    - 签名：XNC_CODESIGN_PFX（base64 secret → 文件）+
      XNC_CODESIGN_PASSWORD（env）→ build.ps1 自动签名（含时间戳探测）
    - 产物：bin/XNC-Installer-<v>[-dev].exe + .sha256
-4. 上传 GitHub Release（softprops/action-gh-release）：
-   附件 = 安装器 + .sha256；正文 = tag message（发版说明写进 tag）；
+4. 在 main HEAD 创建并推 tag v<version>（annotated，xnc-release-bot
+   身份）——构建成功后才打：构建/签名失败不产生孤儿 tag，可直接重触发
+5. GitHub Release（softprops/action-gh-release，tag_name 显式指向新
+   tag——手动触发的 ref 是 main 而非 tag）：
+   附件 = 安装器 + .sha256；正文 = main HEAD 提交信息；
    dev 频道标 prerelease（GitHub "Latest" 只指向 stable，与下载页一致）
-5. 通知：job summary 列出版本、sha256、频道与验证命令
-   （curl /installer.json?channel=，约一个同步间隔内翻转）
+6. 通知：job summary 列出版本、sha256、频道与验证命令
+   （curl /installer.json?channel=，约一个同步间隔内生效）
 ```
 
 ### 3.3 发布规则条文
 
-- **tag 即版本**：无 tag 不发布；`-dev` 标签发布到 dev 频道，其余
-  发布到 stable。
-- **不可变**：同 tag 重推被 CI 拒绝（步骤 1 校验 + GitHub tag 保护）；
-  修坏版本 = 新 PATCH tag。
+- **手动触发即发布**：无 workflow_dispatch 不发布；发布节奏由人决定，
+  与 build-server（server 镜像）一致。
+- **不可变**：tag 已存在即被预检拒绝（+ GitHub tag 保护）；修坏版本 =
+  新 PATCH 版本。极端恢复：tag 已推而 Release 步骤失败时，管理员删 tag
+  后重触发，或直接发下一 PATCH 版本。
 - **CI 不触碰生产**：发布终点是 GitHub Release（唯一事实源）；
   release.yml 不再持有任何 SRV_ 生产凭据，生产生效由 server 侧
   installersync（§3.4）负责——拉取失败在 server 日志告警并按间隔
   重试，无需流水线干预。
 - 在线节点拉取路径（推送/轮询/看门狗回滚）全部既有，无需流水线干预。
 - 仓库分支保护（配套设置，非 workflow）：main 需 CI 绿 + 禁止 force
-  push；tag 保护规则 `v*` 禁止删除与移动。
+  push；tag 保护规则 `v*` 禁止删除与移动（CI 创建的 tag 同受保护）。
 
 ### 3.4 生产侧拉取（installersync，server 内置）
 
