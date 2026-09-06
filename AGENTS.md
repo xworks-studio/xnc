@@ -96,6 +96,11 @@ label 圈定仅管 xnc-server，跟踪 `:latest`）自动拉取重建——触�
 - **Caddyfile 变更**仍需 SSH：替换文件后 `docker compose up -d
   --force-recreate caddy`（tar/编辑器换文件产生新 inode，restart 不够，
   必须重建容器重绑挂载——域名翻转时实战踩过）。
+- **turnserver.conf 是模板**：`${VAR}` 须经 `deploy_srv.py up` 渲染才可用。
+  `push` 的 tar 会把未渲染模板直接盖到 SRV——之后 recreate coturn 前必须
+  先渲染，否则字面量 `${...}` 入配置（2026-09-06 发现的隐患）。relay-ip
+  已刻意移除：静态容器 IP 会随 compose 网络重建漂移，导致所有 TURN 分配
+  508（生产实测）；coturn 自动选本机地址，公网映射只靠 external-ip。
 - 服务器上**没有源码、没有脚本、没有 cron**：`/opt/xnc` 只有 `deploy/`。
   `deploy_srv.py` 的 push/up 等命令已退役为应急手段（远端无构建上下文，
   仅 turnserver 渲染等还有用）。
