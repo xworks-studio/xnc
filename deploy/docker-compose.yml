@@ -98,10 +98,11 @@ services:
     command: ["-c", "/etc/coturn/turnserver.conf"]
     volumes:
       - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
-    ports:
-      - "3478:3478/tcp"
-      - "3478:3478/udp"
-      - "49160-49200:49160-49200/udp"
+    # host 网络（无 docker NAT）：NAT + external-ip 映射形态下 coturn 拒绝
+    # "对端=自身公网映射地址"的中继（浏览器回环探测 403/disconnected，
+    # 2026-09-06 生产实测）——两端都经同一台 TURN 的会话同样命中。host
+    # 直挂（对齐池机形态）后正常；3478 与 49160-49200 直接监听宿主端口。
+    network_mode: host
     restart: unless-stopped
 
 volumes:
