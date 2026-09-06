@@ -706,18 +706,28 @@ bool DxgiCapture::Acquire(FrameBlob& blob, std::string* err, uint32_t timeout_ms
     return false;
   }
 
+  // QI to the texture interface is mandatory (see file header); a raw cast
+  // makes CopyResource silently no-op against the wrong vtable. Hoisted above
+  // the LastPresentTime gate so the rebuild's first-frame fallback below can
+  // see whether the frame actually carries a texture.
+  ComPtr<ID3D11Texture2D> tex;
+  const bool has_tex = res.Get() != nullptr && SUCCEEDED(res.As(&tex));
+  // 重建后首帧行内容兜底（修 D1，对齐 GDI rung「重建后首帧必为帧」契约，
+  // gdi_capture.cpp）：静态桌面上 DDA 的首帧可能 LastPresentTime==0 却仍
+  // 携带整幅桌面（可 QI 纹理或 AccumulatedFrames>0）。尚无基础帧时按内容
+  // 处理，否则重建后永远等不到第一帧、恢复 IDR 无载体（latest 已被重置，
+  // keepalive 也无帧可喂）。
+  const bool first_frame_content =
+      !have_base_frame_ && info.LastPresentTime.QuadPart == 0 &&
+      (has_tex || info.AccumulatedFrames > 0);
   // No present since the last frame (cursor/metadata-only): treat as no
   // change per spec §7.4 - no encode, no blob.
-  if (info.LastPresentTime.QuadPart == 0) {
+  if (info.LastPresentTime.QuadPart == 0 && !first_frame_content) {
     impl_->dupl->ReleaseFrame();
     if (err) *err = "err_timeout";
     return false;
   }
-
-  // QI to the texture interface is mandatory (see file header); a raw cast
-  // makes CopyResource silently no-op against the wrong vtable.
-  ComPtr<ID3D11Texture2D> tex;
-  if (!res || FAILED(res.As(&tex))) {
+  if (!has_tex) {
     impl_->dupl->ReleaseFrame();
     if (err) *err = "err_timeout";  // cursor-only frame, no new texture
     return false;
@@ -899,17 +909,26 @@ CaptureStatus DxgiCapture::AcquireSurface(LatestSurface& latest,
     return CaptureStatus::kFatal;
   }
 
+  ComPtr<ID3D11Texture2D> tex;
+  const bool has_tex = res.Get() != nullptr && SUCCEEDED(res.As(&tex));
+  // 重建后首帧行内容兜底（修 D1，对齐 GDI rung「重建后首帧必为帧」契约，
+  // gdi_capture.cpp）：静态桌面上 DDA 的首帧可能 LastPresentTime==0 却仍
+  // 携带整幅桌面（可 QI 纹理或 AccumulatedFrames>0）。尚无基础帧时按内容
+  // 处理：否则重置后（latest.Reset() 已杀掉 keepalive 的喂帧源）静态桌面
+  // 永远等不到 kFrame，"rebuild" 武装悬空、无任何新 epoch 帧。
+  const bool first_frame_content =
+      !have_surface_base_ && info.LastPresentTime.QuadPart == 0 &&
+      (has_tex || info.AccumulatedFrames > 0);
   // Cursor/metadata-only (LastPresentTime == 0) is NOT content (ruling 1b):
   // no copy, no stamp, no content increment - ReleaseFrame immediately and
   // report no-change. A present without a QI-able texture is the same.
-  if (info.LastPresentTime.QuadPart == 0) {
+  if (info.LastPresentTime.QuadPart == 0 && !first_frame_content) {
     impl_->dupl->ReleaseFrame();
     if (err) *err = "err_timeout";
     if (id) *id = last_surface_id_;
     return CaptureStatus::kNoChange;
   }
-  ComPtr<ID3D11Texture2D> tex;
-  if (!res || FAILED(res.As(&tex))) {
+  if (!has_tex) {
     impl_->dupl->ReleaseFrame();
     if (err) *err = "err_timeout";
     if (id) *id = last_surface_id_;
