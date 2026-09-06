@@ -75,7 +75,9 @@ ir.Add(ccInterceptor)
 qos_controller 增加在途重置的确认时限（默认 3s，时钟注入可测）：
 
 - 超时未确认 → 经 KeyframeCoordinator 发 **urgent** 关键帧请求
-  （epoch 变更类，绕过常规冷却），至多重发 2 次（共 3 次机会）。
+  （epoch 变更类，绕过常规冷却）：agent 侧至多重发 2 次 urgent 请求，
+  加上 native 编码器重建自身的一次恢复尝试（隐式的首次机会），
+  共 3 次恢复机会。
 - 仍未确认 → **强制释放 grace**（拥塞控制恢复），日志 WARN
   `encoder reset confirmation timeout; grace force-released`
   （挂起计数清零、后续拥塞照常剪码）——单次 native 失败不再劫持整条

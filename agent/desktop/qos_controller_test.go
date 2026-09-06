@@ -1314,3 +1314,54 @@ func TestSpectatorResume(t *testing.T) {
 		t.Fatal("handover must clear pause on the new controller")
 	}
 }
+
+// TestPausedSpectatorResumeSurvivesAgentEstTTL — 终审 Important#1:被暂停旁
+// 观者的恢复通道不得被自己的暂停饿死。ViewerSender.Pause() 丢尽帧 → 无出
+// 向 RTP → 无 TWCC 反馈 → agent 侧 GCC 静默 → agentEst 按 10s TTL 过期 →
+// 有效 est 回落浏览器 goodput(暂停的接收端 ≈ 100k)→ 恢复判据
+//(>50%×controllerBps)永不可达。修:暂停期间 agentEst 免 TTL —— 沉默是
+// 发送侧自致的,最后一次 agent 估计仍是该路径的最佳带宽认知。
+//
+// 与 TestSpectatorResume 的关键差异:暂停期间浏览器 est 一直停在暂停级低
+// 值(100k),agent est 暂停前捕获(3M)后不再刷新 —— 恢复只能来自免
+// TTL 的旧 agent est(TestSpectatorResume 在暂停期间注入 3M 浏览器 est,
+// 把本缺陷掩盖了)。
+func TestPausedSpectatorResumeSurvivesAgentEstTTL(t *testing.T) {
+	c, clk := newAgentEstTestController(t, VideoConfig{Bitrate: 2_000_000, FPS: 30}, 1920, 1200)
+	// controller est 4M(pre-pause 捕获;controllerBps = 4M)。
+	c.Observe(ViewerFeedback{SessionID: "ctrl", Visible: true, EstimatedBps: 4_000_000})
+	// spec 就位(高浏览器 est 防即刻暂停),随后注入 agent est 3M —— 本
+	// 用例中 spec 唯一的健康带宽认知,此后不再刷新。
+	c.Observe(ViewerFeedback{SessionID: "spec", Visible: true, EstimatedBps: 3_000_000})
+	c.AgentEstimate("spec", 3_000_000)
+
+	// 推过 agent est TTL(10s):非暂停 viewer 的 TTL 照常生效(与
+	// TestAgentEstimatePrecedence 对拍)—— 有效 est 回落浏览器 est
+	// 100k < 35%×4M → 暂停(本拍断言即「TTL 对非暂停 viewer 仍生效」)。
+	clk.advance(qosAgentEstTTL + time.Second)
+	acts := c.Observe(ViewerFeedback{SessionID: "spec", Visible: true, EstimatedBps: 100_000})
+	if !hasAction(acts, actionPauseSpectator) {
+		t.Fatal("stale agent est must fall back to browser est for a NON-paused viewer (pause expected)")
+	}
+
+	// 暂停期间:浏览器 est 停在 100k,agent est 不再注入,时钟推过剩余
+	// TTL + 5s 恢复累计窗 —— 免 TTL 的旧 agent est(3M > 50%×4M)必须仍
+	// 驱动 Resume;修前回落 100k,Resume 永不触发。在 Resume 当拍即断:
+	// 单测里浏览器 est 钉在 100k,再推一拍会(正确地)再次触发 35% 暂停
+	// —— 生产上恢复后帧流复启、GCC 会重新刷新 agent est,不构成回环。
+	var resumed int
+	for i := 0; i < 10 && resumed == 0; i++ {
+		clk.advance(1 * time.Second)
+		for _, a := range c.Observe(ViewerFeedback{SessionID: "spec", Visible: true, EstimatedBps: 100_000}) {
+			if a.Kind == actionResumeSpectator {
+				resumed++
+			}
+		}
+	}
+	if resumed != 1 {
+		t.Fatalf("resume actions = %d, want exactly 1 (agent est must survive the TTL while paused)", resumed)
+	}
+	if c.IsPaused("spec") {
+		t.Fatal("spectator must be un-paused after the resume action")
+	}
+}

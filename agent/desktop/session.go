@@ -131,6 +131,10 @@ type streamQoS struct {
 	keyframes        map[string]*KeyframeCoordinator // sessionID → 关键帧协调器(缺陷 B)
 	configSend       bool                            // host 未拒能力前持续下发
 	unsupportedNoted bool
+
+	// lastEstSource(终审 Minor#3):上一次观测到的 controller 有效 est 来源
+	//(agent/browser;空 = 尚未见 decide 拍)—— 切换检测,DEBUG 观测线。
+	lastEstSource string
 }
 
 func newStreamQoS(cfg QoSControllerConfig, log *slog.Logger) *streamQoS {
@@ -143,7 +147,9 @@ func newStreamQoS(cfg QoSControllerConfig, log *slog.Logger) *streamQoS {
 // observe 消费一条反馈并返回决策(控制器互斥;动作应用在锁外)。grace
 // 挂起的拥塞剪码记一条 INFO(重置风暴诊断的核心观测线);节奏门抑制的
 // 假拥塞拍记 DEBUG(M4:静态会话下每秒一条,INFO 会刷屏 —— 计数器
-// CadenceHolds 提供聚合观测)。
+// CadenceHolds 提供聚合观测);controller 有效 est 来源切换(agent ↔
+// browser)记 DEBUG(终审 Minor#3:恢复/回落判定的可观测性,仅切换拍
+// 一条,1/s 反馈节奏下无刷屏风险)。
 func (q *streamQoS) observe(fb ViewerFeedback) []Action {
 	q.mu.Lock()
 	before := q.ctrl.HeldCuts()
@@ -151,6 +157,17 @@ func (q *streamQoS) observe(fb ViewerFeedback) []Action {
 	acts := q.ctrl.Observe(fb)
 	held := q.ctrl.HeldCuts() - before
 	holds := q.ctrl.CadenceHolds() - beforeHolds
+	// 终审 Minor#3:est 来源切换检测 —— estSource 只在 decide 拍推进,
+	// 检测必然落在 controller 自己的反馈拍上;首拍(空 → 有来源)不算
+	// 切换,不打日志。数值取当拍 controllerBps(切换后的有效 est)。
+	var srcFrom, srcTo string
+	var srcBps uint64
+	if src := q.ctrl.EstSource(); src != q.lastEstSource {
+		if q.lastEstSource != "" {
+			srcFrom, srcTo, srcBps = q.lastEstSource, src, q.ctrl.ControllerBps()
+		}
+		q.lastEstSource = src
+	}
 	q.mu.Unlock()
 	if held > 0 {
 		q.log.Info("desktop qos: congestion cut held (encoder reset in flight)", "held_total", held)
@@ -158,6 +175,10 @@ func (q *streamQoS) observe(fb ViewerFeedback) []Action {
 	if holds > 0 {
 		q.log.Debug("desktop qos: browser queue congestion suppressed (sparse cadence)",
 			"queue_ms", fb.QueueMs, "presented_fps", fb.PresentedFps, "holds_total", holds)
+	}
+	if srcTo != "" {
+		q.log.Debug("desktop qos: est source switched",
+			"session", fb.SessionID, "from", srcFrom, "to", srcTo, "est_bps", srcBps)
 	}
 	return acts
 }

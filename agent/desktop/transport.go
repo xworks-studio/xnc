@@ -146,11 +146,17 @@ func newDesktopAPI() (*webrtc.API, error) {
 // 无法归位;故对每个 viewer 会话复刻 newDesktopAPI 的默认件(NACK/
 // SenderReport/TWCC 头扩展/统计)。装配顺序照官方示例
 // (webrtc/examples/bandwidth-estimation-from-disk):cc 拦截器 Add 在
-// ConfigureTWCCHeaderExtensionSender 与 RegisterDefaultInterceptors 之前
-// —— 拦截器链按 Add 逆序包裹出向 RTP,cc 在最外层才能让 GCC 的 OnSent
-// 读到 TWCC 头扩展已盖章的序列号(反序会令每个包报 missing extension
-// 而丢弃)。InitialBitrate 取流当前码率(未建回退 bitrateForWidth(1920)),
-// MaxBitrate 取 qosMaxBitrateBps。
+// ConfigureTWCCHeaderExtensionSender 与 RegisterDefaultInterceptors 之前。
+// 链序语义(终审 Minor#2a:修前注释把 cc 说成「最外层」是反的):链按
+// Add 顺序层层包裹 —— 后 Add 的在外层(出向 RTP 上先见包),先 Add 的
+// 在内层、最贴近 wire(interceptor.Chain 的 BindLocalStream 依序
+// writer = next.BindLocalStream(writer),最终 writer = 最后 Add 者)。
+// cc 先 Add = 出向路径最内层(出向上最后一个见包):TWCC 头扩展拦截器
+//(后 Add,外层)先给出向包的序列号盖好章,cc 的 OnSent 才能读到带
+// TWCC 扩展的序列号;入向 RTCP(TWCC 反馈)上 cc 同样是最贴近 wire 的
+// 一层(反序则 cc 在出向上最先见包、扩展未盖章 → GCC 对每个包报
+// missing extension 而丢弃)。InitialBitrate 取流当前码率(未建回退
+// bitrateForWidth(1920)),MaxBitrate 取 qosMaxBitrateBps。
 func newSessionAPI(qos *streamQoS, sessionID string) (*webrtc.API, error) {
 	m := &webrtc.MediaEngine{}
 	if err := RegisterDesktopCodecs(m); err != nil {

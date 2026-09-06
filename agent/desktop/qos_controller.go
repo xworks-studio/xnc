@@ -72,8 +72,10 @@
 // 前:每条拥塞反馈都再剪一档 max_w → 密集重置风暴 → 恢复 IDR 反复作废
 // → 观众饿死而 host 徒劳产 IDR(M3-T6 合成矩阵的假编码器无重启延迟,
 // 从未暴露此链)。grace 不是无限期:确认超时逃逸阀(缺陷 B)先 urgent
-// 重钥(1+2 次机会),仍无确认则强制释放 —— 编码器重置彻底失败时拥塞
-// 控制也必须恢复(见 decide 拥塞分支)。
+// 重钥 —— agent 侧至多 2 次,加上 native 编码器重建自身的一次恢复尝试
+//(隐式的首次机会),共 3 次恢复机会(终审 Minor#2b:措辞按机会来源
+// 精确化)—— 仍无确认则强制释放:编码器重置彻底失败时拥塞控制也必须
+// 恢复(见 decide 拥塞分支)。
 package desktop
 
 import (
@@ -151,9 +153,10 @@ const (
 	qosColdStartGuard = 8 * time.Second
 	// qosResetConfirmTimeout / qosResetConfirmRetries(缺陷 B,设计 §2.2):
 	// reset-grace 的确认超时逃逸阀 —— max_w 重置下发后 qosResetConfirmTimeout
-	// 内无新代帧确认,先 urgent 重钥(1+qosResetConfirmRetries 次机会,每
-	// 3s 重发一次),仍无确认则强制释放 grace:单次 native 编码器失败不得
-	// 劫持整条流的拥塞控制(2026-09-06 生产:held 15+ 分钟,整流冻结)。
+	// 内无新代帧确认,agent 侧至多 qosResetConfirmRetries(2)次 urgent 重钥
+	//(每 3s 一次),加上 native 编码器重建自身的一次恢复尝试(隐式的首次
+	// 机会),共 3 次恢复机会,随后强制释放 grace:单次 native 编码器失败
+	// 不得劫持整条流的拥塞控制(2026-09-06 生产:held 15+ 分钟,整流冻结)。
 	qosResetConfirmTimeout = 3 * time.Second
 	qosResetConfirmRetries = 2
 	// qosViewerTTL:viewer 表项的修剪窗;qosMaxViewers:表大小上限。
@@ -306,13 +309,30 @@ func (c *QoSController) AgentEstimate(sessionID string, bps int) {
 	}
 }
 
-// effectiveEst 该 viewer 的有效带宽估计:agent est 新鲜则用之,否则
-// 浏览器 est 兜底(设计 §2.1)。
+// effectiveEst 该 viewer 的有效带宽估计:agent est 新鲜(或 viewer 处于
+// 暂停态 —— 免 TTL,见下)则用之,否则浏览器 est 兜底(设计 §2.1)。
 func (v *qosViewer) effectiveEst(now time.Time) uint64 {
-	if v.agentEst > 0 && now.Sub(v.agentEstAt) <= qosAgentEstTTL {
+	// 暂停期间免 TTL(终审 Important#1):暂停是发送侧自致的沉默(无帧→
+	// 无 TWCC→GCC 静默),最后一次 agent 估计仍是该路径的最佳带宽认知;若
+	// 按 10s 过期回落浏览器 goodput(暂停的接收端 ≈0),恢复判据
+	//(>50%×controllerBps)永不可达 —— 恢复通道被自己的暂停饿死。非暂停
+	// viewer 的 TTL 照常生效(TestAgentEstimatePrecedence 钉死)。
+	if v.agentEst > 0 && (v.paused || now.Sub(v.agentEstAt) <= qosAgentEstTTL) {
 		return v.agentEst
 	}
 	return v.bps
+}
+
+// 有效 est 来源的判别值(终审 Minor#3 的观测面,仅日志用;不参与决策)。
+const (
+	qosEstSourceAgent   = "agent"
+	qosEstSourceBrowser = "browser"
+)
+
+// estFromAgent 报告当前有效 est 是否取自 agent 估计(effectiveEst 的同款
+// 判据;终审 Minor#3:decide 据此记录 est 来源,session 侧打切换日志)。
+func (v *qosViewer) estFromAgent(now time.Time) bool {
+	return v.agentEst > 0 && (v.paused || now.Sub(v.agentEstAt) <= qosAgentEstTTL)
 }
 
 // QoSController 见文件头。零时钟缺省 time.Now;Observe 可从任意 goroutine
@@ -368,6 +388,11 @@ type QoSController struct {
 	// 拥塞拍数(可观测性:streamQoS 观测并记日志;与 heldCuts 对偶——
 	// 那是「真拥塞但重置在途」,这是「假拥塞」)。
 	cadenceHolds uint32
+
+	// estSource(终审 Minor#3):最近一拍 decide 所用的有效 est 来源
+	//(qosEstSourceAgent/Browser;空 = 尚无 decide 拍)。只读观测点,
+	// 不参与任何决策;EstSource() 供 session 侧打切换日志。
+	estSource string
 
 	// C1 迟滞参考:上一拍 controller 观测的 (est, 该拍生效码率[动作前])。
 	// 以动作前码率为参考,我们自己降档后 goodput 的等比例回落(比率回
@@ -426,6 +451,11 @@ func (c *QoSController) ControllerID() string { return c.controllerID }
 // ControllerBps 返回最近一拍 decide 所用的有效带宽估计(agent est 新鲜
 // 时为其值,否则浏览器 est;缺陷 A 的观测点,单测与诊断用)。
 func (c *QoSController) ControllerBps() uint64 { return c.controllerBps }
+
+// EstSource 返回最近一拍 decide 所用的有效 est 来源(qosEstSourceAgent/
+// qosEstSourceBrowser;空 = 尚无 controller decide 拍)。终审 Minor#3 的
+// 观测点:session 侧据此打 est 源切换日志。
+func (c *QoSController) EstSource() string { return c.estSource }
 
 // Observe 消费一条 viewer 反馈,返回本次决策的 Action 列表(可为空:
 // 无反馈/无变化 → 无动作,default-safe)。
@@ -523,6 +553,13 @@ func (c *QoSController) decide(fb ViewerFeedback, v *qosViewer, now time.Time) [
 	// 逐字节等价。
 	est := v.effectiveEst(now)
 	c.controllerBps = est
+	// 终审 Minor#3:记录本拍有效 est 的来源(agent est / 浏览器 est)——
+	// 只读观测点;estFromAgent 与 effectiveEst 同款判据,行为零变化。
+	if v.estFromAgent(now) {
+		c.estSource = qosEstSourceAgent
+	} else {
+		c.estSource = qosEstSourceBrowser
+	}
 
 	// C1 迟滞(final-fixwave):降档判据从恒真式改为「带证据的降」。
 	// goodput 形反馈(est ≈ 0.85×码率 —— pacing 令牌桶速率的直接投影)
