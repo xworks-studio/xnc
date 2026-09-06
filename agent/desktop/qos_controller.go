@@ -43,6 +43,12 @@
 //   - 旁观者暂停:旁观者 est < 35%×controller est → PauseSpectator(恰一
 //     次,幂等;无自动恢复——恢复通道是后续任务)。controller 自身与隐藏
 //     旁观者不受此规则约束。
+//   - 有效 est(缺陷 A):每 viewer 的带宽估计 = agent 侧 GCC 目标码率
+//     (pion SendSideBWE,新鲜 ≤qosAgentEstTTL)优先,浏览器 est 兜底 ——
+//     浏览器对 pion 发送流不暴露 availableIncomingBitrate(2026-09-06
+//     生产实测),自指 goodput 会把控制器锁死在 500k 地板。全部 est 消费
+//     面(降档证据、升档目标、controllerBps、旁观者暂停比较)统一走
+//     有效 est;无 agent 注入时与浏览器 est 逐字节等价。
 //   - 首个 controller 出现时恰一次下发初始配置(驱动 pacing 预算接线:
 //     「无反馈 → 保持 ViewerSender 缺省预算」的边界由 session 侧保证)。
 //
@@ -132,6 +138,12 @@ const (
 	// qosViewerTTL:viewer 表项的修剪窗;qosMaxViewers:表大小上限。
 	qosViewerTTL  = 2 * time.Minute
 	qosMaxViewers = 64
+	// qosAgentEstTTL(缺陷 A):agent 侧 GCC 估计(pion SendSideBWE 的
+	// OnTargetBitrateChange)的新鲜窗。浏览器对我们的 pion 发送流不暴露
+	// availableIncomingBitrate,web 上报的 est 是自指 goodput —— agent est
+	// 在窗内是 est 的主真相源;GCC 回调只在目标变化时触发,链路稳态下的
+	// 静默不应把旧值永锁,过期回落浏览器 est。
+	qosAgentEstTTL = 10 * time.Second
 )
 
 // bitrateForWidth 是 native diag.h BitrateForDims 的 Go 镜像(初始码率的
@@ -235,6 +247,33 @@ type qosViewer struct {
 	bps      uint64
 	paused   bool
 	lastSeen time.Time
+
+	// agentEst/agentEstAt(缺陷 A):该 viewer 会话的 agent 侧 GCC 目标
+	// 码率与最近到达时刻;effectiveEst 据此在新鲜窗内覆盖浏览器 est。
+	agentEst   uint64
+	agentEstAt time.Time
+}
+
+// AgentEstimate 记录该 viewer 会话的 agent 侧 GCC 目标码率(pion
+// SendSideBWE OnTargetBitrateChange;设计 §2.1)。浏览器侧
+// availableIncomingBitrate 对 pion 发送流不暴露(2026-09-06 生产实测),
+// 此值是 est 的主真相源;TTL 内新鲜,过期回落浏览器 est。
+func (c *QoSController) AgentEstimate(sessionID string, bps int) {
+	if sessionID == "" || bps <= 0 {
+		return
+	}
+	if v := c.viewers[sessionID]; v != nil {
+		v.agentEst, v.agentEstAt = uint64(bps), c.now()
+	}
+}
+
+// effectiveEst 该 viewer 的有效带宽估计:agent est 新鲜则用之,否则
+// 浏览器 est 兜底(设计 §2.1)。
+func (v *qosViewer) effectiveEst(now time.Time) uint64 {
+	if v.agentEst > 0 && now.Sub(v.agentEstAt) <= qosAgentEstTTL {
+		return v.agentEst
+	}
+	return v.bps
 }
 
 // QoSController 见文件头。零时钟缺省 time.Now;Observe 可从任意 goroutine
@@ -338,6 +377,10 @@ func (c *QoSController) Current() VideoConfig { return c.cur }
 // ControllerID 返回当前优先 viewer(空 = 无可见 viewer)。
 func (c *QoSController) ControllerID() string { return c.controllerID }
 
+// ControllerBps 返回最近一拍 decide 所用的有效带宽估计(agent est 新鲜
+// 时为其值,否则浏览器 est;缺陷 A 的观测点,单测与诊断用)。
+func (c *QoSController) ControllerBps() uint64 { return c.controllerBps }
+
 // Observe 消费一条 viewer 反馈,返回本次决策的 Action 列表(可为空:
 // 无反馈/无变化 → 无动作,default-safe)。
 func (c *QoSController) Observe(fb ViewerFeedback) []Action {
@@ -372,15 +415,16 @@ func (c *QoSController) Observe(fb ViewerFeedback) []Action {
 	isController := fb.SessionID == c.controllerID && fb.Visible
 	switch {
 	case isController:
-		if more := c.decide(fb, now); len(more) > 0 {
+		if more := c.decide(fb, v, now); len(more) > 0 {
 			acts = append(acts, more...)
 		}
 	case !fb.Visible || c.controllerID == "":
 		// 隐藏 viewer / 无 controller:全局决策与暂停都不做。
 	default:
 		// 旁观者:唯一可能的动作是带宽不足暂停(见文件头;恰一次)。
+		// 比较用该 viewer 的有效 est(缺陷 A:agent est 新鲜则覆盖)。
 		if !v.paused && c.controllerBps > 0 &&
-			float64(fb.EstimatedBps) < qosSpectatorPauseFraction*float64(c.controllerBps) {
+			float64(v.effectiveEst(now)) < qosSpectatorPauseFraction*float64(c.controllerBps) {
 			v.paused = true
 			acts = append(acts, Action{Kind: actionPauseSpectator, ViewerID: fb.SessionID})
 		}
@@ -389,22 +433,28 @@ func (c *QoSController) Observe(fb ViewerFeedback) []Action {
 }
 
 // decide 是 controller 反馈的全局决策(降/升档 + 限速;见文件头决策表)。
-// 调用前提:fb 来自当前可见的 controller。
-func (c *QoSController) decide(fb ViewerFeedback, now time.Time) []Action {
-	c.controllerBps = fb.EstimatedBps
+// 调用前提:fb 来自当前可见的 controller;v 是其 viewer 表项(有效 est
+// 的选择需要 agent est 状态,缺陷 A)。
+func (c *QoSController) decide(fb ViewerFeedback, v *qosViewer, now time.Time) []Action {
+	// 有效 est(缺陷 A,设计 §2.1):agent est 新鲜则覆盖浏览器 est ——
+	// 本函数及其后的全部 est 消费面(headroom/decay/deep/target/
+	// lastEstBps/controllerBps)统一走 est,无 agent 注入时与浏览器值
+	// 逐字节等价。
+	est := v.effectiveEst(now)
+	c.controllerBps = est
 
 	// C1 迟滞(final-fixwave):降档判据从恒真式改为「带证据的降」。
 	// goodput 形反馈(est ≈ 0.85×码率 —— pacing 令牌桶速率的直接投影)
 	// 令 0.85×est < 码率恒真;headroom 比率的衰减边沿 + 深亏线把「带宽
 	// 证据」与「发送速率的影子」区分开(常数文档见上)。
-	headroom := float64(fb.EstimatedBps) / float64(c.cur.Bitrate)
+	headroom := float64(est) / float64(c.cur.Bitrate)
 	decay := c.estRefKnown &&
 		headroom < qosDownRatioDecayGuard*(float64(c.lastEstBps)/float64(c.lastRefBps))
 	deep := headroom < qosDownDeepRatio
 	// 参考值记录当拍动作前的码率(decide 自此至动作只读 c.cur)。
-	c.lastEstBps, c.lastRefBps, c.estRefKnown = fb.EstimatedBps, c.cur.Bitrate, true
+	c.lastEstBps, c.lastRefBps, c.estRefKnown = est, c.cur.Bitrate, true
 
-	target := qosTargetBitrate(fb.EstimatedBps)
+	target := qosTargetBitrate(est)
 	// 冷启动保护(2026-08-30 XIAOXIN 事故):窗内不降档 —— est 低估与
 	// 首个 IDR 的桶欠债在头几秒都是噪声而非拥塞。窗后证据照常驱动
 	// 1/s 阶梯;保护窗内的拍继续累计稳定窗(est 低时升档本就无目标

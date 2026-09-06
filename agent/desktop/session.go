@@ -184,6 +184,22 @@ func (q *streamQoS) attach(sessionID string, ctx context.Context, w *wsWriter, p
 	pub.SetPacingBudget(int(cur.Bitrate))
 }
 
+// AgentEstimate 会话的 agent 侧 GCC 估计回调入口(transport 层
+// OnTargetBitrateChange 直调;任意 goroutine 安全)。
+func (q *streamQoS) AgentEstimate(sessionID string, bps int) {
+	q.mu.Lock()
+	q.ctrl.AgentEstimate(sessionID, bps)
+	q.mu.Unlock()
+}
+
+// Current 返回共享流当前生效的编码参数(transport 层 per-会话 GCC 的
+// InitialBitrate 来源,缺陷 A;q.mu 即 ctrl 的串行锁)。
+func (q *streamQoS) Current() VideoConfig {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.ctrl.Current()
+}
+
 // detach 注销会话端点(幂等)。
 func (q *streamQoS) detach(sessionID string) {
 	q.mu.Lock()
@@ -420,7 +436,9 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 	}
 }
 
-// setupPublisher 建 PeerConnection、接好回调和帧泵,并返回 answer。
+// setupPublisher 建 PeerConnection、接好回调和帧泵,并返回 answer。qos
+// 非空时本会话的 PC 走 per-会话 API(发送侧 GCC 估计器,缺陷 A;估计经
+// sessionID 路由回共享决策点)。
 // ictl 在 offer 应答前 attach 三条输入/光标 DataChannel(必须先于
 // HandleOffer 建立),frame-meta 遥测通道(M3 Task 4)随后同一约束建立,
 // 并在 answer 后启动 cursor 泵(0x0109 → cursor 通道)。
@@ -432,7 +450,7 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 // 帧观测——reset-recovery grace 由新代帧流解除(见 qos_controller.go)。
 func (h *Handler) setupPublisher(ctx context.Context, w *wsWriter, src Source,
 	p *proto.DesktopParams, offerSDP string, defDur time.Duration,
-	ictl *inputController, qos *streamQoS, log *slog.Logger) (*Publisher, error) {
+	ictl *inputController, sessionID string, qos *streamQoS, log *slog.Logger) (*Publisher, error) {
 	relay := p.IceTransportPolicy != proto.DesktopIceAll
 	var ice []webrtc.ICEServer
 	if p.Turn != nil {
@@ -449,6 +467,8 @@ func (h *Handler) setupPublisher(ctx context.Context, w *wsWriter, src Source,
 		ICEServers:      ice,
 		RelayOnly:       relay,
 		DefaultDuration: defDur,
+		QoS:             qos,       // 缺陷 A:非空 → per-会话 GCC 估计装配
+		SessionID:       sessionID, // 估计回调的路由键(OnTargetBitrateChange 闭包捕获)
 		Log:             log,
 	})
 	if err != nil {

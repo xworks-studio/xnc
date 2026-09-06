@@ -1133,3 +1133,56 @@ func TestQoSStabilitySurvivesNoOpFloorEvidence(t *testing.T) {
 		t.Fatal("upshift must fire once stability survives the no-op evidence tick")
 	}
 }
+
+// ---- 缺陷 A:agent 侧 GCC 估计是 est 的主真相源 ----
+
+// newAgentEstTestController 是 TestAgentEstimatePrecedence 的控制器构造
+// (brief Step 1;brief 草稿名 newTestController 与 input_test.go 的既有
+// helper 撞名,就近改名):manualClock 注入,initial.MaxW 缺省取 aspectW
+// (镜像 qosManager 的建流参数)。返回时钟供测试推进节拍(brief 草稿里
+// 的 now 局部变量在本套件里是 clk.advance 的机械改写,断言不变)。
+func newAgentEstTestController(t *testing.T, initial VideoConfig, aspectW, aspectH uint32) (*QoSController, *manualClock) {
+	t.Helper()
+	clk := newManualClock()
+	if initial.MaxW == 0 {
+		initial.MaxW = aspectW
+	}
+	return newQoSController(QoSControllerConfig{
+		Initial:  initial,
+		AspectW:  aspectW,
+		AspectH:  aspectH,
+		Now:      clk.Now,
+	}), clk
+}
+
+// TestAgentEstimatePrecedence — 有效 est 选择(设计 §2.1):agentEst 新鲜
+// (≤qosAgentEstTTL=10s)→ 用之;过期/为 0 → 浏览器 est 兜底。控制器的
+// 全部 est 消费面(降档证据、升档目标、controllerBps)都走有效 est。
+func TestAgentEstimatePrecedence(t *testing.T) {
+	c, clk := newAgentEstTestController(t, VideoConfig{Bitrate: 2_000_000, FPS: 30}, 1920, 1200)
+
+	// agent est 注入:2Mbps 流,GCC 说有 8M 可用 → 升档目标应按 8M 推导。
+	c.AgentEstimate("s1", 8_000_000)
+	c.Observe(ViewerFeedback{SessionID: "s1", Visible: true, EstimatedBps: 600_000})
+	// 浏览器 est 600k(自指 goodput)被 agent est 8M 覆盖:非拥塞拍 +
+	// 稳定窗后应升档(85%×8M=6.8M,单步 +1M → 3M),而非被 600k 拖到地板。
+	// 每 1s 节拍重申 agent est:GCC 的 OnTargetBitrateChange 只在目标变化
+	// 时回调,爬坡期逐拍变化——测试以节拍重放这一形态。
+	for i := 0; i < 40; i++ { // 稳定窗 + 多个 3s 升档步
+		clk.advance(1 * time.Second)
+		c.AgentEstimate("s1", 8_000_000)
+		c.Observe(ViewerFeedback{SessionID: "s1", Visible: true, EstimatedBps: 600_000})
+	}
+	if c.Current().Bitrate <= 2_000_000 {
+		t.Fatalf("bitrate = %d, want ramp above initial with agent est 8M", c.Current().Bitrate)
+	}
+
+	// agent est 过期:时钟推进 >10s 无新 agent est → 回落浏览器 est。
+	clk.advance(11 * time.Second)
+	c.Observe(ViewerFeedback{SessionID: "s1", Visible: true, EstimatedBps: 600_000})
+	// 此拍起有效 est = 600k:0.85×600k < 2M(已升到的码率)构成降档水平
+	// 判据——不为断言具体档位,断言 controllerBps 已回落到浏览器值。
+	if c.ControllerBps() != 600_000 {
+		t.Fatalf("ControllerBps = %d, want fallback to browser est 600k", c.ControllerBps())
+	}
+}
