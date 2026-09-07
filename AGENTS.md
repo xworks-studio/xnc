@@ -160,11 +160,6 @@ Release 步骤失败时，管理员删 tag 后重触发，或直接发下一 PAT
   待办是轮询兜底通道。
 - **实验闭环惯例**：卸载→清残留（服务/进程/任务/目录/PATH/注册表八项核验）
   →全新安装→注册上线→验证→deregister→卸载→双端零残留。
-- **桌面流 QoS（2026-09-06 落地）**：est 真相源 = agent 侧 GCC（TWCC 驱动；
-  浏览器 availableIncomingBitrate 对 pion 流不暴露——生产实测，浏览器 est 仅
-  兜底）；reset-grace 确认 3s 超时逃逸阀；旁观者暂停恢复三路径（detach 即删
-  表项 / 接任解暂停 / est 恢复解暂停）；native 编码器 IDR 三小修见
-  docs/superpowers/plans/2026-09-06-native-idr-investigation.md。
 
 ### 代码签名（自签过渡期）
 

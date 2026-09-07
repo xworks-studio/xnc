@@ -923,14 +923,7 @@ bool UnitSubmitTexture(Unit& u, ID3D11Texture2D* tex, int64_t time_100ns,
     VARIANT v{};
     v.vt = VT_UI4;
     v.ulVal = 1;
-    // 失败可见（修 B1 观测面）：硬件 MFT 拒绝/忽略 force-key 此前是静默
-    // 白吃（无 HRESULT 检查、无日志）；与软件 rung 的 force_key_set_rejected
-    // 打点对齐（mf_encoder.cpp），把「force 被吃但无 IDR」变成可判定证据。
-    const HRESULT fhr =
-        u.codec_api->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &v);
-    if (FAILED(fhr))
-      XNC_LOG_INFO("gpu_force_key_set_rejected hr=0x%08x (request consumed regardless)",
-                   static_cast<unsigned int>(fhr));
+    u.codec_api->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &v);
   }
   hr = u.mft->ProcessInput(0, sample.Get(), 0);
   return SUCCEEDED(hr);

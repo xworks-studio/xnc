@@ -23,8 +23,6 @@ import (
 	"time"
 
 	"github.com/pion/interceptor"
-	"github.com/pion/interceptor/pkg/cc"
-	"github.com/pion/interceptor/pkg/gcc"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -45,12 +43,7 @@ type PublisherConfig struct {
 	// defaultPacingBudgetBps)。令牌桶按其 pacingBudgetFraction(M4 起
 	// ×1.05)铺开帧内突发。
 	PacingBudgetBps int
-	// QoS + SessionID(缺陷 A):QoS 非空时本会话的 PC 走 per-会话 API
-	// (newSessionAPI,发送侧 GCC 估计器);SessionID 是估计回调的路由键
-	// (OnTargetBitrateChange 闭包捕获,估计汇入 QoS.AgentEstimate)。
-	QoS       *streamQoS
-	SessionID string
-	Log       *slog.Logger
+	Log             *slog.Logger
 }
 
 // Publisher 承载一个 viewer 会话的发送侧 PeerConnection + H264 视频轨,
@@ -133,66 +126,6 @@ func newDesktopAPI() (*webrtc.API, error) {
 	return webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(ir)), nil
 }
 
-// newSessionAPI 组装 per-会话 webrtc.API(缺陷 A,设计 §2.1):在
-// newDesktopAPI 的默认件之上加装 pion 发送侧 GCC 估计器 —— 浏览器对我们
-// 的 pion→Chrome 流不暴露 availableIncomingBitrate(2026-09-06 生产实
-// 测),web 上报的 est 是自指 goodput,QoS 控制器会被拖到 500k 地板。
-// GCC 由浏览器回传的 TWCC 反馈驱动(ConfigureTWCCHeaderExtensionSender
-// 已开出发向头扩展),OnTargetBitrateChange 把目标码率按 sessionID 汇入
-// 共享 streamQoS。
-//
-// per-会话 Registry + API:估计回调闭包捕获 sessionID —— 共享 registry
-// 的 OnNewPeerConnection id 与我们会话 id 无对应关系,多 viewer 时估计
-// 无法归位;故对每个 viewer 会话复刻 newDesktopAPI 的默认件(NACK/
-// SenderReport/TWCC 头扩展/统计)。装配顺序照官方示例
-// (webrtc/examples/bandwidth-estimation-from-disk):cc 拦截器 Add 在
-// ConfigureTWCCHeaderExtensionSender 与 RegisterDefaultInterceptors 之前。
-// 链序语义(终审 Minor#2a:修前注释把 cc 说成「最外层」是反的):链按
-// Add 顺序层层包裹 —— 后 Add 的在外层(出向 RTP 上先见包),先 Add 的
-// 在内层、最贴近 wire(interceptor.Chain 的 BindLocalStream 依序
-// writer = next.BindLocalStream(writer),最终 writer = 最后 Add 者)。
-// cc 先 Add = 出向路径最内层(出向上最后一个见包):TWCC 头扩展拦截器
-//(后 Add,外层)先给出向包的序列号盖好章,cc 的 OnSent 才能读到带
-// TWCC 扩展的序列号;入向 RTCP(TWCC 反馈)上 cc 同样是最贴近 wire 的
-// 一层(反序则 cc 在出向上最先见包、扩展未盖章 → GCC 对每个包报
-// missing extension 而丢弃)。InitialBitrate 取流当前码率(未建回退
-// bitrateForWidth(1920)),MaxBitrate 取 qosMaxBitrateBps。
-func newSessionAPI(qos *streamQoS, sessionID string) (*webrtc.API, error) {
-	m := &webrtc.MediaEngine{}
-	if err := RegisterDesktopCodecs(m); err != nil {
-		return nil, err
-	}
-	initial := int(bitrateForWidth(1920))
-	if cur := int(qos.Current().Bitrate); cur > 0 {
-		initial = cur
-	}
-	ir := &interceptor.Registry{}
-	ccInterceptor, err := cc.NewInterceptor(func() (cc.BandwidthEstimator, error) {
-		est, err := gcc.NewSendSideBWE(
-			gcc.SendSideBWEInitialBitrate(initial),
-			gcc.SendSideBWEMaxBitrate(qosMaxBitrateBps),
-		)
-		if err != nil {
-			return nil, err
-		}
-		// 回调闭包捕获 sessionID:估计直接路由到本会话的 viewer 表项
-		//(pion 在 goroutine 里触发,streamQoS.AgentEstimate 自带串行)。
-		est.OnTargetBitrateChange(func(bps int) { qos.AgentEstimate(sessionID, bps) })
-		return est, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	ir.Add(ccInterceptor)
-	if err := webrtc.ConfigureTWCCHeaderExtensionSender(m, ir); err != nil {
-		return nil, err
-	}
-	if err := webrtc.RegisterDefaultInterceptors(m, ir); err != nil {
-		return nil, err
-	}
-	return webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(ir)), nil
-}
-
 // NewPublisher 建立 PeerConnection 与视频轨,并启动 RTCP 泵(qos_min.go)。
 // RelayOnly 时必须给出至少一个 ICE(TURN)server,否则直接报错。
 func NewPublisher(cfg PublisherConfig) (*Publisher, error) {
@@ -207,15 +140,7 @@ func NewPublisher(cfg PublisherConfig) (*Publisher, error) {
 			return nil, errors.New("desktop: relay-only publisher requires TURN ICE servers")
 		}
 	}
-	// 缺陷 A:有共享 QoS 的会话走 per-会话 API(发送侧 GCC 估计器,
-	// newSessionAPI);无 QoS(无 HOST_HELLO 的测试拓扑)保持原装配。
-	var api *webrtc.API
-	var err error
-	if cfg.QoS != nil {
-		api, err = newSessionAPI(cfg.QoS, cfg.SessionID)
-	} else {
-		api, err = newDesktopAPI()
-	}
+	api, err := newDesktopAPI()
 	if err != nil {
 		return nil, fmt.Errorf("desktop: api: %w", err)
 	}

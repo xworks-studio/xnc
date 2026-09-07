@@ -440,11 +440,6 @@ struct MediaPipelineV2::Impl {
   bool have_key = false;
   bool idr_in_flight = false;   // armed IDR (subscriber/keepalive) until the key AU
   uint32_t idr_feeds = 0;       // keepalive feeds under the in-flight IDR
-  // 在途武装期间成功提交的帧数（活跃流出界计数）：idr_feeds 只在静态屏
-  // keepalive 里增长，活跃内容（keepalive 不运行）下武装的 force 被编码器
-  // 白吃（B1/B2）时闩将永久吞掉后续请求 —— 此计数让 PollIdrRequest 也能按
-  // idr_feed_bound 出界（对齐 keepalive 的既有出界语义）。
-  uint32_t idr_forced_submits = 0;
   uint64_t last_initiated_idr_ms = 0;
   // Start time of the last accepted submission. Scheduling from the end of
   // conversion/Submit adds that processing cost to every frame period and
@@ -829,7 +824,6 @@ class Loop {
                      static_cast<unsigned long long>(out.id.encode_seq));
         im_.idr_in_flight = false;
         im_.idr_feeds = 0;
-        im_.idr_forced_submits = 0;  // 本次武装已落地，出界计数归零
       }
     }
     return true;
@@ -848,17 +842,6 @@ class Loop {
   void PollIdrRequest() {
     const char* pending = im_.sink().PendingIdrReason();
     if (pending == nullptr) return;
-    // 活跃流出界（修 C 闩死）：keepalive 的 feeds 出界只在静态屏运行，活跃
-    // 内容下一次武装的 force 被白吃后（B1/B2），idr_in_flight 闩把之后所有
-    // PLI/sub_join 请求全部吞掉。这里按武装以来的成功提交数出界：≥ 一个
-    // lookahead 深度（idr_feed_bound）仍无 key AU 即清除重试，最坏退化为
-    // 每 ~1 个 lookahead 深度重试一次。
-    if (im_.idr_in_flight && im_.idr_forced_submits >= im_.idr_feed_bound) {
-      XNC_LOG_INFO("idr_emergence_exhausted submits=%u bound=%u",
-                   im_.idr_forced_submits, im_.idr_feed_bound);
-      im_.idr_in_flight = false;
-      im_.idr_forced_submits = 0;
-    }
     if (!im_.have_key || im_.idr_in_flight ||
         NowMs() - im_.last_initiated_idr_ms < kIdrMinIntervalMs)
       return;
@@ -866,7 +849,6 @@ class Loop {
     im_.mbox.ArmIdr(pending);
     im_.idr_in_flight = true;
     im_.idr_feeds = 0;
-    im_.idr_forced_submits = 0;
     im_.sink().ConsumePendingIdr(pending);
     XNC_LOG_INFO("idr_request reason=%s min_interval_ms=%llu", pending,
                  static_cast<unsigned long long>(kIdrMinIntervalMs));
@@ -1089,7 +1071,6 @@ class Loop {
       im_.keepalive_idr_ms = NowMs();
       im_.idr_in_flight = true;
       im_.idr_feeds = 0;
-      im_.idr_forced_submits = 0;  // 新武装：出界计数归零
       im_.mbox.ArmIdr("keepalive");
       XNC_LOG_INFO("keepalive_idr armed min_interval_ms=%llu (decoder warm, twcc alive)",
                    static_cast<unsigned long long>(kKeepaliveIdrMs));
@@ -1103,7 +1084,6 @@ class Loop {
                    im_.idr_feed_bound);
       im_.idr_in_flight = false;
       im_.idr_feeds = 0;
-      im_.idr_forced_submits = 0;  // 闩已清，保持「闩为假 ⇒ 计数为零」不变式
     }
     ++im_.res.keepalive_feeds;
     im_.last_keepalive_feed_ms = now_ms;
@@ -1237,10 +1217,6 @@ class Loop {
     // stamp above. Conversion/encoder call cost must fit inside the frame
     // budget, not be serialized after it on every cadence.
     im_.last_submit_ms = submit_started_ms;
-    // 在途武装期间的活跃流提交计数（与 KeepaliveFeed 的 idr_feeds 同语义；
-    // take-idr 邮箱深度 1，一次武装只有一次 force 提交，仅计 force 次永远
-    // 到不了出界 —— 必须按提交数出界才能让活跃内容下的闩到期重试）。
-    if (im_.idr_in_flight) ++im_.idr_forced_submits;
     if (force)
       XNC_LOG_INFO("idr_submitted seq=%llu reason=%s",
                    static_cast<unsigned long long>(id.encode_seq), idr_reason);

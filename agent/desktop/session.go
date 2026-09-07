@@ -127,29 +127,19 @@ type streamQoS struct {
 	ctrl *QoSController
 
 	mu               sync.Mutex
-	sessions         map[string]*qosSession          // sessionID → 应用端点(pub 建联后注册)
-	keyframes        map[string]*KeyframeCoordinator // sessionID → 关键帧协调器(缺陷 B)
-	configSend       bool                            // host 未拒能力前持续下发
+	sessions         map[string]*qosSession // sessionID → 应用端点(pub 建联后注册)
+	configSend       bool                   // host 未拒能力前持续下发
 	unsupportedNoted bool
-
-	// lastEstSource(终审 Minor#3):上一次观测到的 controller 有效 est 来源
-	//(agent/browser;空 = 尚未见 decide 拍)—— 切换检测,DEBUG 观测线。
-	lastEstSource string
 }
 
 func newStreamQoS(cfg QoSControllerConfig, log *slog.Logger) *streamQoS {
-	return &streamQoS{log: log, ctrl: newQoSController(cfg),
-		sessions:   make(map[string]*qosSession),
-		keyframes:  make(map[string]*KeyframeCoordinator),
-		configSend: true}
+	return &streamQoS{log: log, ctrl: newQoSController(cfg), sessions: make(map[string]*qosSession), configSend: true}
 }
 
 // observe 消费一条反馈并返回决策(控制器互斥;动作应用在锁外)。grace
 // 挂起的拥塞剪码记一条 INFO(重置风暴诊断的核心观测线);节奏门抑制的
 // 假拥塞拍记 DEBUG(M4:静态会话下每秒一条,INFO 会刷屏 —— 计数器
-// CadenceHolds 提供聚合观测);controller 有效 est 来源切换(agent ↔
-// browser)记 DEBUG(终审 Minor#3:恢复/回落判定的可观测性,仅切换拍
-// 一条,1/s 反馈节奏下无刷屏风险)。
+// CadenceHolds 提供聚合观测)。
 func (q *streamQoS) observe(fb ViewerFeedback) []Action {
 	q.mu.Lock()
 	before := q.ctrl.HeldCuts()
@@ -157,17 +147,6 @@ func (q *streamQoS) observe(fb ViewerFeedback) []Action {
 	acts := q.ctrl.Observe(fb)
 	held := q.ctrl.HeldCuts() - before
 	holds := q.ctrl.CadenceHolds() - beforeHolds
-	// 终审 Minor#3:est 来源切换检测 —— estSource 只在 decide 拍推进,
-	// 检测必然落在 controller 自己的反馈拍上;首拍(空 → 有来源)不算
-	// 切换,不打日志。数值取当拍 controllerBps(切换后的有效 est)。
-	var srcFrom, srcTo string
-	var srcBps uint64
-	if src := q.ctrl.EstSource(); src != q.lastEstSource {
-		if q.lastEstSource != "" {
-			srcFrom, srcTo, srcBps = q.lastEstSource, src, q.ctrl.ControllerBps()
-		}
-		q.lastEstSource = src
-	}
 	q.mu.Unlock()
 	if held > 0 {
 		q.log.Info("desktop qos: congestion cut held (encoder reset in flight)", "held_total", held)
@@ -175,10 +154,6 @@ func (q *streamQoS) observe(fb ViewerFeedback) []Action {
 	if holds > 0 {
 		q.log.Debug("desktop qos: browser queue congestion suppressed (sparse cadence)",
 			"queue_ms", fb.QueueMs, "presented_fps", fb.PresentedFps, "holds_total", holds)
-	}
-	if srcTo != "" {
-		q.log.Debug("desktop qos: est source switched",
-			"session", fb.SessionID, "from", srcFrom, "to", srcTo, "est_bps", srcBps)
 	}
 	return acts
 }
@@ -209,62 +184,17 @@ func (q *streamQoS) attach(sessionID string, ctx context.Context, w *wsWriter, p
 	pub.SetPacingBudget(int(cur.Bitrate))
 }
 
-// AgentEstimate 会话的 agent 侧 GCC 估计回调入口(transport 层
-// OnTargetBitrateChange 直调;任意 goroutine 安全)。
-func (q *streamQoS) AgentEstimate(sessionID string, bps int) {
-	q.mu.Lock()
-	q.ctrl.AgentEstimate(sessionID, bps)
-	q.mu.Unlock()
-}
-
-// Current 返回共享流当前生效的编码参数(transport 层 per-会话 GCC 的
-// InitialBitrate 来源,缺陷 A;q.mu 即 ctrl 的串行锁)。
-func (q *streamQoS) Current() VideoConfig {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return q.ctrl.Current()
-}
-
-// detach 注销会话端点(幂等)。缺陷 C:同时从控制器 viewer 表删该表项
-//(会话收线即删,不等 2 分钟 lastSeen 修剪 —— reload 冷启动的新 viewer
-// 不再与陈旧 controller 表项比对而被误暂停;被删者是 controller 时触发
-// 接任解暂停,见 QoSController.DetachViewer)。
+// detach 注销会话端点(幂等)。
 func (q *streamQoS) detach(sessionID string) {
 	q.mu.Lock()
 	delete(q.sessions, sessionID)
-	delete(q.keyframes, sessionID)
-	q.ctrl.DetachViewer(sessionID)
 	q.mu.Unlock()
 }
-
-// attachKeyframes 注册本会话的关键帧协调器(缺陷 B):setupPublisher 建好
-// 协调器即注册,独立于 attach 的应用端点表 —— 后者要求 pub 已建成,而
-// QoS 的 actionRequestKeyframe 在端点就位前就可能需要打 host。协调器的
-// urgent 请求不经 Publisher 的 keyRequestIsUrgent seam(那里只认 connect,
-// 见 qos_min.go),epoch 变更类请求由 QoS 动作直走 coordinator API。
-func (q *streamQoS) attachKeyframes(sessionID string, coord *KeyframeCoordinator) {
-	q.mu.Lock()
-	q.keyframes[sessionID] = coord
-	q.mu.Unlock()
-}
-
-// keyRequestReasonQoSReset 是逃逸阀 urgent 关键帧请求的 reason(≤31B,
-// 与 pli/fir/connect/overflow/pacer/resume 同一 host 记账面)。
-const keyRequestReasonQoSReset = "qos-reset"
-
-// vocabStateSpectatorResumed(缺陷 C):接任/est 恢解暂停的稳定态
-//(spectator_network_paused 的对偶;经既有 state 帧形态,旧 viewer 按
-// 未知 code 忽略,向后兼容。词汇同伴都在 signaling.go,此条随缺陷 C 的
-// 分派落点留在 session.go,避免本任务扩散改动面)。
-const vocabStateSpectatorResumed = "spectator_network_resumed"
 
 // apply 应用一批动作:SetVideoConfig → 全体在场会话的 pacing 预算(裁决
 // 2:发送器预算来源 = controller 决策)+ 观察会话的 Source 下发(host 无
 // 能力 → 记一次 unsupported 即停发,决策仍留在 agent 侧);PauseSpectator
-// → 目标会话的 spectator_network_paused 稳定态 + ViewerSender.Pause();
-// ResumeSpectator(缺陷 C)→ 目标会话的 spectator_network_resumed 稳定
-// 态 + 发送器恢复(Pause 的对偶);RequestKeyframe → 各会话协调器的
-// urgent 请求(缺陷 B 逃逸阀)。
+// → 目标会话的 spectator_network_paused 稳定态 + ViewerSender.Pause()。
 func (q *streamQoS) apply(acts []Action, src Source) {
 	for _, a := range acts {
 		switch a.Kind {
@@ -310,32 +240,6 @@ func (q *streamQoS) apply(acts []Action, src Source) {
 			if s != nil {
 				s.apply(a)
 			}
-		case actionResumeSpectator:
-			// 缺陷 C:与 PauseSpectator 同型(单目标会话;锁内快照,
-			// 锁外应用)。目标已收线(如恢复动作在途时会话关闭)→ 无害
-			// 跳过:发送器随会话关闭,无需恢复。
-			q.mu.Lock()
-			s := q.sessions[a.ViewerID]
-			q.mu.Unlock()
-			if s != nil {
-				s.apply(a)
-			}
-		case actionRequestKeyframe:
-			// 逃逸阀(缺陷 B):流级 urgent 关键帧请求直达各会话的协调器
-			//(与 SetVideoConfig 分派同型:锁内快照,锁外触发)。多会话时
-			// 每协调器各一条 —— sink 是同一 host 编码器,native 侧
-			// kIdrMinIntervalMs 合并;阀本身 ≤1+2 次/3s,量级可忽略。
-			q.mu.Lock()
-			coords := make([]*KeyframeCoordinator, 0, len(q.keyframes))
-			for _, kf := range q.keyframes {
-				coords = append(coords, kf)
-			}
-			q.mu.Unlock()
-			q.log.Info("desktop qos: reset confirmation timed out; requesting urgent keyframe",
-				"retries_cap", qosResetConfirmRetries)
-			for _, kf := range coords {
-				kf.Request(keyRequestReasonQoSReset, true)
-			}
 		}
 	}
 }
@@ -355,14 +259,6 @@ func (s *qosSession) apply(a Action) {
 		s.w.write(s.ctx, stateFrame{
 			Type: vocabState, Code: vocabStateSpectatorPaused, Recoverable: true})
 		s.pub.Pause()
-	case actionResumeSpectator:
-		// 缺陷 C:暂停的对偶 —— 通知 viewer 恢复 + 发送器 Resume(进入
-		// waitIDR 重建参考链并恰一次合并关键帧请求,幂等)。直达
-		// pub.vs:Publisher 只有 Pause 转发(events.go 的 Stats 直达同款),
-		// 补一个 Resume 转发需动 transport.go —— 超出本任务的文件面。
-		s.w.write(s.ctx, stateFrame{
-			Type: vocabState, Code: vocabStateSpectatorResumed, Recoverable: true})
-		s.pub.vs.Resume()
 	}
 }
 
@@ -524,9 +420,7 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 	}
 }
 
-// setupPublisher 建 PeerConnection、接好回调和帧泵,并返回 answer。qos
-// 非空时本会话的 PC 走 per-会话 API(发送侧 GCC 估计器,缺陷 A;估计经
-// sessionID 路由回共享决策点)。
+// setupPublisher 建 PeerConnection、接好回调和帧泵,并返回 answer。
 // ictl 在 offer 应答前 attach 三条输入/光标 DataChannel(必须先于
 // HandleOffer 建立),frame-meta 遥测通道(M3 Task 4)随后同一约束建立,
 // 并在 answer 后启动 cursor 泵(0x0109 → cursor 通道)。
@@ -538,7 +432,7 @@ func (h *Handler) Handle(ctx context.Context, ws *websocket.Conn, sessionID stri
 // 帧观测——reset-recovery grace 由新代帧流解除(见 qos_controller.go)。
 func (h *Handler) setupPublisher(ctx context.Context, w *wsWriter, src Source,
 	p *proto.DesktopParams, offerSDP string, defDur time.Duration,
-	ictl *inputController, sessionID string, qos *streamQoS, log *slog.Logger) (*Publisher, error) {
+	ictl *inputController, qos *streamQoS, log *slog.Logger) (*Publisher, error) {
 	relay := p.IceTransportPolicy != proto.DesktopIceAll
 	var ice []webrtc.ICEServer
 	if p.Turn != nil {
@@ -555,8 +449,6 @@ func (h *Handler) setupPublisher(ctx context.Context, w *wsWriter, src Source,
 		ICEServers:      ice,
 		RelayOnly:       relay,
 		DefaultDuration: defDur,
-		QoS:             qos,       // 缺陷 A:非空 → per-会话 GCC 估计装配
-		SessionID:       sessionID, // 估计回调的路由键(OnTargetBitrateChange 闭包捕获)
 		Log:             log,
 	})
 	if err != nil {
@@ -616,10 +508,6 @@ func (h *Handler) setupPublisher(ctx context.Context, w *wsWriter, src Source,
 	if qos != nil {
 		pumpSrc = qosObservingSource{Source: pumpSrc,
 			onFrame: func(f Frame) { qos.frameObserved(f.CodecEpoch) }}
-		// 缺陷 B:共享 QoS 的逃逸阀 urgent 关键帧动作直达本会话的协调器
-		//(注册置于全部失败路径之后 —— setupPublisher 此后不再出错,端点
-		// 生命周期由 Handle 收线时的 detach 结清)。
-		qos.attachKeyframes(sessionID, coord)
 	}
 	go pumpFrames(ctx, log, pumpSrc, pub)
 	go pumpCursor(ctx, src, ictl)

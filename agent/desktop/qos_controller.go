@@ -40,19 +40,9 @@
 //     2026-08-29 本地环测:2.3Mbps 下 fps60 的 IDR 全被钳在 9.9KB,
 //     fps30 IDR 15.7-17.2KB)。fps 升不上去后,升档的富余自然流向
 //     bitrate(升档顺序首位)与 height —— 画质优先于帧率。
-//   - 旁观者暂停/恢复(缺陷 C):旁观者 est < 35%×controller est →
-//     PauseSpectator(恰一次,幂等)。恢复通道(设计 §2.3):① est 恢复
-//     —— 暂停中连续 5s est > 50%×controller est → ResumeSpectator(迟
-//     滞:抖动重启累计窗,恢复恰一次);② 接任 —— controller 离场
-//     (detach/修剪)→ 在场可见 viewer 暂停位一律解除(暂停是相对离场
-//     者 est 的裁决,参照失效),下一拍补发 Resume,接任者不可能是
-//     spectator。controller 自身与隐藏旁观者不受 35% 规则约束。
-//   - 有效 est(缺陷 A):每 viewer 的带宽估计 = agent 侧 GCC 目标码率
-//     (pion SendSideBWE,新鲜 ≤qosAgentEstTTL)优先,浏览器 est 兜底 ——
-//     浏览器对 pion 发送流不暴露 availableIncomingBitrate(2026-09-06
-//     生产实测),自指 goodput 会把控制器锁死在 500k 地板。全部 est 消费
-//     面(降档证据、升档目标、controllerBps、旁观者暂停比较)统一走
-//     有效 est;无 agent 注入时与浏览器 est 逐字节等价。
+//   - 旁观者暂停:旁观者 est < 35%×controller est → PauseSpectator(恰一
+//     次,幂等;无自动恢复——恢复通道是后续任务)。controller 自身与隐藏
+//     旁观者不受此规则约束。
 //   - 首个 controller 出现时恰一次下发初始配置(驱动 pacing 预算接线:
 //     「无反馈 → 保持 ViewerSender 缺省预算」的边界由 session 侧保证)。
 //
@@ -62,8 +52,7 @@
 //
 // 有界状态:viewer 表按 lastSeen 修剪(2 分钟未见即删,controller 亦不例
 // 外——离场的主导者让位),上限 64 条(超出的新 viewer 按字典序挤掉最旧
-// 表项);会话收线经 DetachViewer 即删(缺陷 C:不等修剪窗,reload 冷启
-// 动不撞陈旧表项)。时钟注入(Now)使全部时间规则可确定性单测。
+// 表项)。时钟注入(Now)使全部时间规则可确定性单测。
 //
 // reset-recovery grace(M4 修正):max_w 变更的决策走 host 的 resolution
 // 重置(编码器重建、codec epoch 前进、首个恢复 IDR 之前无帧产出)。
@@ -71,11 +60,7 @@
 // 码一律挂起(held,不累积——阶梯是状态机,恢复确认后自然续降)。修
 // 前:每条拥塞反馈都再剪一档 max_w → 密集重置风暴 → 恢复 IDR 反复作废
 // → 观众饿死而 host 徒劳产 IDR(M3-T6 合成矩阵的假编码器无重启延迟,
-// 从未暴露此链)。grace 不是无限期:确认超时逃逸阀(缺陷 B)先 urgent
-// 重钥 —— agent 侧至多 2 次,加上 native 编码器重建自身的一次恢复尝试
-//(隐式的首次机会),共 3 次恢复机会(终审 Minor#2b:措辞按机会来源
-// 精确化)—— 仍无确认则强制释放:编码器重置彻底失败时拥塞控制也必须
-// 恢复(见 decide 拥塞分支)。
+// 从未暴露此链)。
 package desktop
 
 import (
@@ -107,13 +92,6 @@ const (
 	qosUpStepAddBps = 1_000_000
 	// qosSpectatorPauseFraction:旁观者暂停线(35% of controller est)。
 	qosSpectatorPauseFraction = 0.35
-	// qosResumeFraction / qosResumeSustain(缺陷 C,设计 §2.3):est 恢复
-	// 解暂停的判据 —— 暂停中的旁观者有效 est 持续 qosResumeSustain 高于
-	// controller est 的 qosResumeFraction → 恢复发送。迟滞:est 掉回线下
-	// 即清零累计窗(抖动重启 5s,不累计断续的恢复);恢复恰一次(解除后
-	// 不再进恢复分支,幂等)。50% 线与 35% 暂停线之间的带 = 双向死区。
-	qosResumeFraction = 0.50
-	qosResumeSustain  = 5 * time.Second
 	// qosMinBitrateBps / qosMaxBitrateBps:码率工作区 500kbps–15Mbps。
 	qosMinBitrateBps = 500_000
 	qosMaxBitrateBps = 15_000_000
@@ -151,23 +129,9 @@ const (
 	// 2.3M 砍到 1.09M,4 拍到 500k 地板。真拥塞的证据在窗后仍然持续,
 	// 1/s 限速的阶梯照常响应 —— 代价只是约 8s 的决策延迟。
 	qosColdStartGuard = 8 * time.Second
-	// qosResetConfirmTimeout / qosResetConfirmRetries(缺陷 B,设计 §2.2):
-	// reset-grace 的确认超时逃逸阀 —— max_w 重置下发后 qosResetConfirmTimeout
-	// 内无新代帧确认,agent 侧至多 qosResetConfirmRetries(2)次 urgent 重钥
-	//(每 3s 一次),加上 native 编码器重建自身的一次恢复尝试(隐式的首次
-	// 机会),共 3 次恢复机会,随后强制释放 grace:单次 native 编码器失败
-	// 不得劫持整条流的拥塞控制(2026-09-06 生产:held 15+ 分钟,整流冻结)。
-	qosResetConfirmTimeout = 3 * time.Second
-	qosResetConfirmRetries = 2
 	// qosViewerTTL:viewer 表项的修剪窗;qosMaxViewers:表大小上限。
 	qosViewerTTL  = 2 * time.Minute
 	qosMaxViewers = 64
-	// qosAgentEstTTL(缺陷 A):agent 侧 GCC 估计(pion SendSideBWE 的
-	// OnTargetBitrateChange)的新鲜窗。浏览器对我们的 pion 发送流不暴露
-	// availableIncomingBitrate,web 上报的 est 是自指 goodput —— agent est
-	// 在窗内是 est 的主真相源;GCC 回调只在目标变化时触发,链路稳态下的
-	// 静默不应把旧值永锁,过期回落浏览器 est。
-	qosAgentEstTTL = 10 * time.Second
 )
 
 // bitrateForWidth 是 native diag.h BitrateForDims 的 Go 镜像(初始码率的
@@ -240,21 +204,13 @@ const (
 	// actionPauseSpectator:向 ViewerID 指定的 viewer 发稳定态
 	// spectator_network_paused 并暂停其 ViewerSender。
 	actionPauseSpectator
-	// actionRequestKeyframe:reset-grace 确认超时逃逸阀的 urgent 关键帧请求
-	//(流级,ViewerID 空;session 侧走 KeyframeCoordinator 的 urgent 路径,
-	// 绕过常规冷却 —— epoch 变更类,见 qos_min.go 的 keyRequestIsUrgent 注释)。
-	actionRequestKeyframe
-	// actionResumeSpectator(缺陷 C,设计 §2.3):恢复 ViewerID 指定 viewer
-	// 的发送(PauseSpectator 的对偶;触发面 = est 恢复解暂停或 controller
-	// 离场的接任解暂停;发送器进入 waitIDR 重建参考链,session 侧分派)。
-	actionResumeSpectator
 )
 
 // Action 是一次决策的产物(Observe 返回;session 侧应用)。
 type Action struct {
 	Kind     actionKind
 	Config   VideoConfig // actionSetVideoConfig
-	ViewerID string      // actionPauseSpectator / actionResumeSpectator
+	ViewerID string      // actionPauseSpectator
 }
 
 // QoSControllerConfig 组装控制器。
@@ -279,60 +235,6 @@ type qosViewer struct {
 	bps      uint64
 	paused   bool
 	lastSeen time.Time
-
-	// agentEst/agentEstAt(缺陷 A):该 viewer 会话的 agent 侧 GCC 目标
-	// 码率与最近到达时刻;effectiveEst 据此在新鲜窗内覆盖浏览器 est。
-	agentEst   uint64
-	agentEstAt time.Time
-
-	// resumeSince(缺陷 C):est 恢复的累计窗锚点 —— 暂停中的旁观者有效
-	// est 持续 > qosResumeFraction×controllerBps 达 qosResumeSustain 即解
-	// 除;est 掉回线下即清零(迟滞)。零值 = 未在累计。
-	resumeSince time.Time
-	// pendingResume(缺陷 C):接任解暂停的补发标记 —— 主导者离场时在
-	// DetachViewer/handoverUnpause 里解除暂停并置位,该 viewer 的下一个
-	// Observe 拍恰一次补发 actionResumeSpectator(收线/修剪路径上不便
-	// 直接返回动作;session 侧分派恢复发送器)。
-	pendingResume bool
-}
-
-// AgentEstimate 记录该 viewer 会话的 agent 侧 GCC 目标码率(pion
-// SendSideBWE OnTargetBitrateChange;设计 §2.1)。浏览器侧
-// availableIncomingBitrate 对 pion 发送流不暴露(2026-09-06 生产实测),
-// 此值是 est 的主真相源;TTL 内新鲜,过期回落浏览器 est。
-func (c *QoSController) AgentEstimate(sessionID string, bps int) {
-	if sessionID == "" || bps <= 0 {
-		return
-	}
-	if v := c.viewers[sessionID]; v != nil {
-		v.agentEst, v.agentEstAt = uint64(bps), c.now()
-	}
-}
-
-// effectiveEst 该 viewer 的有效带宽估计:agent est 新鲜(或 viewer 处于
-// 暂停态 —— 免 TTL,见下)则用之,否则浏览器 est 兜底(设计 §2.1)。
-func (v *qosViewer) effectiveEst(now time.Time) uint64 {
-	// 暂停期间免 TTL(终审 Important#1):暂停是发送侧自致的沉默(无帧→
-	// 无 TWCC→GCC 静默),最后一次 agent 估计仍是该路径的最佳带宽认知;若
-	// 按 10s 过期回落浏览器 goodput(暂停的接收端 ≈0),恢复判据
-	//(>50%×controllerBps)永不可达 —— 恢复通道被自己的暂停饿死。非暂停
-	// viewer 的 TTL 照常生效(TestAgentEstimatePrecedence 钉死)。
-	if v.agentEst > 0 && (v.paused || now.Sub(v.agentEstAt) <= qosAgentEstTTL) {
-		return v.agentEst
-	}
-	return v.bps
-}
-
-// 有效 est 来源的判别值(终审 Minor#3 的观测面,仅日志用;不参与决策)。
-const (
-	qosEstSourceAgent   = "agent"
-	qosEstSourceBrowser = "browser"
-)
-
-// estFromAgent 报告当前有效 est 是否取自 agent 估计(effectiveEst 的同款
-// 判据;终审 Minor#3:decide 据此记录 est 来源,session 侧打切换日志)。
-func (v *qosViewer) estFromAgent(now time.Time) bool {
-	return v.agentEst > 0 && (v.paused || now.Sub(v.agentEstAt) <= qosAgentEstTTL)
 }
 
 // QoSController 见文件头。零时钟缺省 time.Now;Observe 可从任意 goroutine
@@ -377,22 +279,10 @@ type QoSController struct {
 	graceCodecEpoch uint64
 	heldCuts        uint32
 
-	// 逃逸阀(缺陷 B,设计 §2.2):resetAt 是 grace 置位(或最近一次
-	// urgent 重发)的时刻,resetRetries 是已发出的 urgent 关键帧请求数 ——
-	// qosResetConfirmTimeout 内无新代帧确认 → 重发(≤qosResetConfirmRetries
-	// 次);再超时 → 强制释放 grace(见 decide 拥塞分支)。
-	resetAt      time.Time
-	resetRetries uint32
-
 	// cadenceHolds(M4 节奏门):queueMs 越线但因呈现节奏稀疏被抑制的
 	// 拥塞拍数(可观测性:streamQoS 观测并记日志;与 heldCuts 对偶——
 	// 那是「真拥塞但重置在途」,这是「假拥塞」)。
 	cadenceHolds uint32
-
-	// estSource(终审 Minor#3):最近一拍 decide 所用的有效 est 来源
-	//(qosEstSourceAgent/Browser;空 = 尚无 decide 拍)。只读观测点,
-	// 不参与任何决策;EstSource() 供 session 侧打切换日志。
-	estSource string
 
 	// C1 迟滞参考:上一拍 controller 观测的 (est, 该拍生效码率[动作前])。
 	// 以动作前码率为参考,我们自己降档后 goodput 的等比例回落(比率回
@@ -448,15 +338,6 @@ func (c *QoSController) Current() VideoConfig { return c.cur }
 // ControllerID 返回当前优先 viewer(空 = 无可见 viewer)。
 func (c *QoSController) ControllerID() string { return c.controllerID }
 
-// ControllerBps 返回最近一拍 decide 所用的有效带宽估计(agent est 新鲜
-// 时为其值,否则浏览器 est;缺陷 A 的观测点,单测与诊断用)。
-func (c *QoSController) ControllerBps() uint64 { return c.controllerBps }
-
-// EstSource 返回最近一拍 decide 所用的有效 est 来源(qosEstSourceAgent/
-// qosEstSourceBrowser;空 = 尚无 controller decide 拍)。终审 Minor#3 的
-// 观测点:session 侧据此打 est 源切换日志。
-func (c *QoSController) EstSource() string { return c.estSource }
-
 // Observe 消费一条 viewer 反馈,返回本次决策的 Action 列表(可为空:
 // 无反馈/无变化 → 无动作,default-safe)。
 func (c *QoSController) Observe(fb ViewerFeedback) []Action {
@@ -472,16 +353,6 @@ func (c *QoSController) Observe(fb ViewerFeedback) []Action {
 	v.bps = fb.EstimatedBps
 
 	c.prune(now)
-	// 接任解暂停(缺陷 C,设计 §2.3):controller 表项被 TTL 修剪 = 主导
-	// 者离场的另一形态,与 DetachViewer 同款处理(会话收线那条路在
-	// streamQoS.detach 直调;此处在反馈拍上兜底,防「controller 修剪 +
-	// 全部在场 viewer 暂停 → 永久空位」的死锁 —— 暂停 viewer 不得接任,
-	// 空位下其反馈又不进任何分支)。
-	if c.controllerID != "" {
-		if _, ok := c.viewers[c.controllerID]; !ok {
-			c.handoverUnpause()
-		}
-	}
 	prevController := c.controllerID
 	c.promote()
 	if c.controllerID != prevController && c.controllerID != "" {
@@ -497,45 +368,19 @@ func (c *QoSController) Observe(fb ViewerFeedback) []Action {
 		c.emitted = true
 		acts = append(acts, Action{Kind: actionSetVideoConfig, Config: c.cur})
 	}
-	// 接任解暂停的补发(缺陷 C):DetachViewer/handoverUnpause 在收线/修剪
-	// 路径上不便返回动作,恢复标记在此兑现 —— 恰一次(标记消费即清,
-	// 接任者自身的反馈同样走到这里:发送器恢复对新旧角色一律必要)。
-	if v.pendingResume {
-		v.pendingResume = false
-		acts = append(acts, Action{Kind: actionResumeSpectator, ViewerID: fb.SessionID})
-	}
 
 	isController := fb.SessionID == c.controllerID && fb.Visible
 	switch {
 	case isController:
-		if more := c.decide(fb, v, now); len(more) > 0 {
+		if more := c.decide(fb, now); len(more) > 0 {
 			acts = append(acts, more...)
 		}
 	case !fb.Visible || c.controllerID == "":
 		// 隐藏 viewer / 无 controller:全局决策与暂停都不做。
 	default:
-		// 旁观者:带宽不足暂停(恰一次,幂等)与 est 恢复解暂停(缺陷 C,
-		// 带迟滞)都在本分支;两个判据都用该 viewer 的有效 est(缺陷 A:
-		// agent est 新鲜则覆盖)。
-		if v.paused {
-			// est 恢复:有效 est 持续 > qosResumeFraction×controllerBps 达
-			// qosResumeSustain → 解除 + 恰一次 Resume(解除后不再进本分
-			// 支 = 幂等);est 掉回线下 → 累计窗清零(迟滞:抖动重启
-			// 5s 窗,不累计断续的恢复)。
-			if c.controllerBps > 0 &&
-				float64(v.effectiveEst(now)) > qosResumeFraction*float64(c.controllerBps) {
-				if v.resumeSince.IsZero() {
-					v.resumeSince = now
-				} else if now.Sub(v.resumeSince) >= qosResumeSustain {
-					v.paused = false
-					v.resumeSince = time.Time{}
-					acts = append(acts, Action{Kind: actionResumeSpectator, ViewerID: fb.SessionID})
-				}
-			} else {
-				v.resumeSince = time.Time{}
-			}
-		} else if c.controllerBps > 0 &&
-			float64(v.effectiveEst(now)) < qosSpectatorPauseFraction*float64(c.controllerBps) {
+		// 旁观者:唯一可能的动作是带宽不足暂停(见文件头;恰一次)。
+		if !v.paused && c.controllerBps > 0 &&
+			float64(fb.EstimatedBps) < qosSpectatorPauseFraction*float64(c.controllerBps) {
 			v.paused = true
 			acts = append(acts, Action{Kind: actionPauseSpectator, ViewerID: fb.SessionID})
 		}
@@ -544,35 +389,22 @@ func (c *QoSController) Observe(fb ViewerFeedback) []Action {
 }
 
 // decide 是 controller 反馈的全局决策(降/升档 + 限速;见文件头决策表)。
-// 调用前提:fb 来自当前可见的 controller;v 是其 viewer 表项(有效 est
-// 的选择需要 agent est 状态,缺陷 A)。
-func (c *QoSController) decide(fb ViewerFeedback, v *qosViewer, now time.Time) []Action {
-	// 有效 est(缺陷 A,设计 §2.1):agent est 新鲜则覆盖浏览器 est ——
-	// 本函数及其后的全部 est 消费面(headroom/decay/deep/target/
-	// lastEstBps/controllerBps)统一走 est,无 agent 注入时与浏览器值
-	// 逐字节等价。
-	est := v.effectiveEst(now)
-	c.controllerBps = est
-	// 终审 Minor#3:记录本拍有效 est 的来源(agent est / 浏览器 est)——
-	// 只读观测点;estFromAgent 与 effectiveEst 同款判据,行为零变化。
-	if v.estFromAgent(now) {
-		c.estSource = qosEstSourceAgent
-	} else {
-		c.estSource = qosEstSourceBrowser
-	}
+// 调用前提:fb 来自当前可见的 controller。
+func (c *QoSController) decide(fb ViewerFeedback, now time.Time) []Action {
+	c.controllerBps = fb.EstimatedBps
 
 	// C1 迟滞(final-fixwave):降档判据从恒真式改为「带证据的降」。
 	// goodput 形反馈(est ≈ 0.85×码率 —— pacing 令牌桶速率的直接投影)
 	// 令 0.85×est < 码率恒真;headroom 比率的衰减边沿 + 深亏线把「带宽
 	// 证据」与「发送速率的影子」区分开(常数文档见上)。
-	headroom := float64(est) / float64(c.cur.Bitrate)
+	headroom := float64(fb.EstimatedBps) / float64(c.cur.Bitrate)
 	decay := c.estRefKnown &&
 		headroom < qosDownRatioDecayGuard*(float64(c.lastEstBps)/float64(c.lastRefBps))
 	deep := headroom < qosDownDeepRatio
 	// 参考值记录当拍动作前的码率(decide 自此至动作只读 c.cur)。
-	c.lastEstBps, c.lastRefBps, c.estRefKnown = est, c.cur.Bitrate, true
+	c.lastEstBps, c.lastRefBps, c.estRefKnown = fb.EstimatedBps, c.cur.Bitrate, true
 
-	target := qosTargetBitrate(est)
+	target := qosTargetBitrate(fb.EstimatedBps)
 	// 冷启动保护(2026-08-30 XIAOXIN 事故):窗内不降档 —— est 低估与
 	// 首个 IDR 的桶欠债在头几秒都是噪声而非拥塞。窗后证据照常驱动
 	// 1/s 阶梯;保护窗内的拍继续累计稳定窗(est 低时升档本就无目标
@@ -601,30 +433,15 @@ func (c *QoSController) decide(fb ViewerFeedback, v *qosViewer, now time.Time) [
 		// 把上一代的恢复 IDR 作废)。挂起不累积:阶梯是状态机,确认后
 		// 的下一条拥塞反馈自然续降。
 		if c.resetPending {
-			// 逃逸阀(设计 §2.2):确认超时先重发 urgent 关键帧请求
-			//(≤qosResetConfirmRetries 次),再超时强制释放 grace——
-			// 单次 native 编码器失败不得劫持整条流的拥塞控制
-			//(2026-09-06 生产:held 15+ 分钟,整流冻结)。
-			if now.Sub(c.resetAt) >= qosResetConfirmTimeout {
-				if c.resetRetries < qosResetConfirmRetries {
-					c.resetRetries++
-					c.resetAt = now // 重臂:下一次超时再判
-					c.heldCuts++
-					return []Action{{Kind: actionRequestKeyframe}}
-				}
-				c.resetPending = false // force-release:拥塞控制恢复
-				// 落回本拍拥塞证据,继续常规剪码(不 return,直落下方剪码路径)。
-			} else {
-				c.heldCuts++
-				return nil
-			}
+			c.heldCuts++
+			return nil
 		}
 		if now.Sub(c.lastDownAt) < qosDownMinInterval {
 			return nil // 同一 1/s 限速(与常规降档通道共用 lastDownAt)
 		}
 		if next := c.stepDown(); next != c.cur {
 			c.stableSince = time.Time{}
-			c.noteMaxWChange(next, now)
+			c.noteMaxWChange(next)
 			c.cur = next
 			c.lastDownAt = now
 			return []Action{{Kind: actionSetVideoConfig, Config: c.cur}}
@@ -659,7 +476,7 @@ func (c *QoSController) decide(fb ViewerFeedback, v *qosViewer, now time.Time) [
 		// height 升档同样改变 max_w → 同样触发 host 重置:置 grace
 		//(升档本就要求 10s 稳定窗 + 3s 限速,任何降档之后 ≥10s,天然
 		// 满足降档限速,无需独立的 max_w 间隔记账 —— Fix 3 的净删除)。
-		c.noteMaxWChange(next, now)
+		c.noteMaxWChange(next)
 		c.cur = next
 		c.lastUpAt = now
 		return []Action{{Kind: actionSetVideoConfig, Config: c.cur}}
@@ -669,18 +486,15 @@ func (c *QoSController) decide(fb ViewerFeedback, v *qosViewer, now time.Time) [
 
 // noteMaxWChange 判定 next 是否为 reset-triggering 决策(max_w 变更):
 // 是则置 grace(resetPending)并快照当前已见 codec epoch(grace 的解除
-// 资格线:只认严格新于它的帧,见 FrameObserved),同时锚定逃逸阀的确认
-// 超时起点(缺陷 B:resetAt=now,重发计数清零)。非 max_w 决策
-//(bitrate/fps 热更新)不动 grace。决策节奏由调用方限速(降档 =
+// 资格线:只认严格新于它的帧,见 FrameObserved)。非 max_w 决策
+// (bitrate/fps 热更新)不动 grace。决策节奏由调用方限速(降档 =
 // lastDownAt 的 1/s;升档 = 10s 稳定窗 + 3s)。
-func (c *QoSController) noteMaxWChange(next VideoConfig, now time.Time) {
+func (c *QoSController) noteMaxWChange(next VideoConfig) {
 	if next.MaxW == c.cur.MaxW {
 		return
 	}
 	c.resetPending = true
 	c.graceCodecEpoch = c.lastCodecEpoch
-	c.resetAt = now
-	c.resetRetries = 0
 }
 
 // FrameObserved 通知决策器「流又产出了一帧(codecEpoch)」(session 帧泵
@@ -706,53 +520,6 @@ func (c *QoSController) ResetConfirmed() { c.resetPending = false }
 
 // HeldCuts 返回 grace 挂起的拥塞剪码累计数(可观测性)。
 func (c *QoSController) HeldCuts() uint32 { return c.heldCuts }
-
-// ResetPending 报告 reset-grace 是否在途(只读观测点,测试/诊断用)。
-func (c *QoSController) ResetPending() bool { return c.resetPending }
-
-// IsPaused 报告该 viewer 是否处于网络暂停态(缺陷 C 的只读观测点:接任
-// 解暂停的断言面;表项缺席 = 未暂停)。
-func (c *QoSController) IsPaused(sessionID string) bool {
-	v, ok := c.viewers[sessionID]
-	return ok && v.paused
-}
-
-// DetachViewer 会话收线即删 viewer 表项(设计 §2.3):修前只靠 lastSeen
-// 2 分钟修剪 —— reload 后新 viewer 冷启动 est 与陈旧 controller 表项
-// 比对,35% 暂停误触发率极高且无恢复。被删者是 controller 时触发接任
-//(handoverUnpause 解除在场可见 viewer 的暂停位,promote 重选接任者 ——
-// 接任者不可能仍是 spectator),冷启动窗重锚(新主导者 = 新 transport-cc
-// 爬坡)。幂等:表项缺席(如从未上报反馈的会话)无事可做。
-func (c *QoSController) DetachViewer(sessionID string) {
-	delete(c.viewers, sessionID)
-	if c.controllerID != sessionID {
-		return // 旁观者离场:不触发接任
-	}
-	c.controllerID = ""
-	c.handoverUnpause()
-	c.promote()
-	if c.controllerID != "" {
-		c.controllerSince = c.now()
-	}
-}
-
-// handoverUnpause 主导者离场(detach / TTL 修剪)的接任解暂停(设计
-// §2.3):暂停位是相对「离场 controller est」的裁决,参照一走即失效 ——
-// 在场可见 viewer 的暂停位一律解除并挂 pendingResume(其下一拍恰一次补
-// 发 Resume,发送器恢复);参照 controllerBps 同步清零,由接任者的首个
-// decide 拍重建(间隙内暂停/恢复判据一律不动作 —— 绝不拿陈旧参照误伤
-// reload 冷启动的新 est)。隐藏的暂停 viewer 不动:其对决策面本就不可见,
-// 恢复交由其重回可见后的 est 恢复通道。
-func (c *QoSController) handoverUnpause() {
-	for _, v := range c.viewers {
-		if v.visible && v.paused {
-			v.paused = false
-			v.resumeSince = time.Time{}
-			v.pendingResume = true
-		}
-	}
-	c.controllerBps = 0
-}
 
 // CadenceHolds 返回节奏门抑制的 queueMs 拥塞拍累计数(可观测性)。
 func (c *QoSController) CadenceHolds() uint32 { return c.cadenceHolds }
