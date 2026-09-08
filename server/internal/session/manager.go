@@ -473,6 +473,13 @@ func (m *Manager) AttachClientRTV(token string) (uuid.UUID, string, *proto.APIEr
 func (m *Manager) TouchActivity(sessionID string) {
 	m.mu.Lock()
 	s := m.sessions[sessionID]
+	if s != nil && !s.glued && s.Kind == proto.KindDesktop {
+		// relay-plane：viewer 不再经 AttachClientRTV 粘合（票据验签在
+		// relay 侧离线完成），首个 viewer 控制帧即视为粘合——否则 60s
+		// Opening TTL 会把正常在看的会话当"未粘合"收掉（真机验收踩坑：
+		// 首个 viewer 在 60s 内没问题，重连/晚到的 viewer 401）。
+		s.glued = true
+	}
 	m.mu.Unlock()
 	if s != nil {
 		s.lastActivity.Store(time.Now().UnixNano())
