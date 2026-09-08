@@ -157,6 +157,40 @@ host cargo check 本机受 VCPKG 环境阻塞（已知），钉扎 verifier 经�
 5. dev 双 relay compose 未加：单 relay 逻辑经 rtv 回环测试 + api 真 PG
    测试覆盖；双 relay 端到端并到真机验收（需 server 先部署）。
 
+## 真机验收结果（2026-09-08 22:00-22:05，server 0.10.14 + relay rl-3f7ed0d7）
+
+生产链路：XIAOXIN（老 agent，TLSInsecure 过渡路径）→ 中继机（杭州）→ dev 侧
+rtvload。六项全过：
+1. 分配/candidates：202 响应 candidates=[{wt 47.96.83.132:443, certSha256}]，
+   两会话同 relay（node-sticky）。
+2. 主站零媒体字节：SRV 40s tcpdump 仅 18 个探测包（30s QUIC probe）。
+3. 媒体经中继：rtvload 完整帧 1/丢失率 0%/RTT 24-27ms；dump 765KB 经
+   nalcheck OK（SPS+PPS+IDR 完整）。
+4. 同节点双 viewer 并发不换血：host registered 计数 = 1（无替换），
+   双 viewer 各自收到扇出。
+5. FEC 恢复实测生效（一次丢包窗口的入会 IDR 被校验码补回）。
+6. 撤销/墓碑：kill 后同票重连 401（修复前的现场即验证了拒绝面）；
+   修复后会话跨 Opening TTL 存活、同票重连成功。
+
+验收中抓出并修复的三个生产 bug（都有回归测试）：
+- desktop 会话 60s Opening TTL 误杀（viewer 不再经 AttachClientRTV 粘合）：
+  TouchActivity 即粘合 + 外部 relay 的活跃 sid 集经 RELAY_STATS 旁路上行
+  （外部 relay 的 TouchFn 为 nil，触碰原本死在中继进程内）。
+- 会话终局的墓碑误打节点键：host 张票按 node 铸造跨会话复用，一次会话
+  关闭把节点拉黑 25h（HOST_AUTH_FAILED 风暴）——Kill 语义改为会话级
+  只打会话键，节点级仅留给管理端。
+- 镜像构建缺 xnc/rtv 模块（Dockerfile COPY + go.mod require/replace +
+  GOWORK=off 补全 go.sum）。
+
+运维注意：
+- **生产 server 当前跑的是 feature 分支构建（0.10.14）**——尽快 PR/合回
+  main 使仓库与线上一致；compose 的 XNC_RTV_SIGNING_KEY 已入 SRV env
+  （deploy/.env 本地两份同步）。
+- 老 agent 走 TLSInsecure 过渡路径连接纯 IP relay；certSha256 钉扎要等
+  下一个安装器发版（agent/host 更新）后自动收紧。
+- relay rl-3f7ed0d7 已 active，容量声明 100 会话/500Mbps（1.6GiB 小机，
+  按 §6 保守值）。
+
 待办（P1 验收序，见 §5）：
 - PR → CI 六矩阵（host-rust 是关键门禁）→ 合入 main
 - server 部署（build-server-local.ps1，需配置 XNC_RTV_SIGNING_KEY——
