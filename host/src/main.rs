@@ -23,7 +23,7 @@ mod shared;
 mod stats;
 mod transport;
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -137,7 +137,13 @@ fn resolve_config(args: &Args) -> Result<RunConfig> {
         .clone()
         .or_else(|| args.server.clone())
         .context("server endpoint required (--server or stdin config)")?;
-    let endpoint: SocketAddr = endpoint_str.parse().context("server addr")?;
+    // endpoint 允许 host:port 域名形态（生产 = xnc.app:4433）——SocketAddr::
+    // parse 只认 IP 字面量，先经 getaddrinfo 解析（IP 字面量同样命中）。
+    let endpoint: SocketAddr = endpoint_str
+        .to_socket_addrs()
+        .context("server addr resolve")?
+        .next()
+        .context("server addr resolved empty")?;
     let server_name = stdin_cfg
         .server_name
         .clone()
