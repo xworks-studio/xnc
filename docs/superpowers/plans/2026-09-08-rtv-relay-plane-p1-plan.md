@@ -172,6 +172,14 @@ rtvload。六项全过：
 6. 撤销/墓碑：kill 后同票重连 401（修复前的现场即验证了拒绝面）；
    修复后会话跨 Opening TTL 存活、同票重连成功。
 
+补充（浏览器终验，22:10 后）：rtvload 验收绿但真实浏览器仍连不上——
+两个浏览器路径独有的关卡被工具绕过（无 Origin 头 / 跳过证书校验）：
+WT 腿同 host 校验拒绝 主站页面→relay IP 的跨 host 连接（--allow-origin
+显式放行）；钉扎自签证书 825 天超 WebTransport 规范的 14 天上限（改 7 天
+持久化 + 24h 重签余量）。真浏览器实测：WT 主路在线、RTT 25ms、e2e≈358ms、
+QSV config 到达、canvas 像素级确认画面渲染。**教训入档：合成 viewer 的
+验收矩阵必须包含"带 Origin + 证书钉扎"的真浏览器路径。**
+
 验收中抓出并修复的三个生产 bug（都有回归测试）：
 - desktop 会话 60s Opening TTL 误杀（viewer 不再经 AttachClientRTV 粘合）：
   TouchActivity 即粘合 + 外部 relay 的活跃 sid 集经 RELAY_STATS 旁路上行
