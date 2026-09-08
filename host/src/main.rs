@@ -301,7 +301,7 @@ fn run_pipeline(shared: &Arc<Shared>, cfg: &RunConfig) -> Result<()> {
         "startedUnixMs": now_ms(),
     })));
 
-    let mut frame_index: u32 = 0u32.wrapping_sub(1); // 下一帧从 0 开始
+    let mut frame_index: u32 = 0; // 帧号从 0 单调递增（起始值取 MAX 会在 wrap 后令按序定稿的接收端永久失效）
     let mut next_tick = Instant::now();
     let mut prev_viewers: usize = 0;
     loop {
