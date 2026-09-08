@@ -1,6 +1,8 @@
 # CI、版本号与发布部署 设计（2026-09-05）
 
-> 状态：设计稿（未实施）。四部分相互咬合：版本规则是地基，测试门禁是
+> 状态：已实施并投产（2026-09-08 随 RTV 重构更新运维现状：安装器发布走
+> 本地构建 + 管理员 API 直传、server 走本地镜像直推、watchtower 停用——
+> 详见 §3.5/§4.4）。四部分相互咬合：版本规则是地基，测试门禁是
 > 发布前置，发布流水线消费版本规则，手动部署是 server 侧的受控出口。
 > 实施落点：`.github/workflows/`；本文即实施规格。
 
@@ -41,9 +43,9 @@ MAJOR.MINOR.PATCH[-dev]
 
 ### 1.3 版本的载体与流转
 
-- **手动触发 release workflow（输入版本号）是唯一发版动作**（§3）：
-  CI 在当前 main HEAD 创建并推 tag `vX.Y.Z[-dev]` 锚定版本——tag 仍由
-  CI 产生且不可移动，但发版节奏由人经 Actions 触发决定。
+- **手动发版是唯一动作**（§3 CI publish.yml；CI 修复前为 §3.5 本地
+  直传）：CI 在当前 main HEAD 创建并推 tag `vX.Y.Z[-dev]` 锚定版本——tag
+  仍由 CI 产生且不可移动，但发版节奏由人经 Actions 触发决定。
 - server 版本与 agent 版本**独立但 MINOR 对齐**（同一批发布的 server
   版本号 = agent 正式版号；PATCH 允许各自独立）。
 - 回滚 = 发一个新的 PATCH 版本，**永不**删除/移动已发布 tag 或同版本
@@ -61,7 +63,7 @@ MAJOR.MINOR.PATCH[-dev]
 ```yaml
 jobs:
   go-linux:            # ubuntu-latest
-    # proto / cli / mockagent / shellhost / shellsmoke / tools/*
+    # proto / cli / shellhost / shellsmoke / tools/*（含 rtvload）
     # go build + go test + go vet；server 用 PG service container
     services: postgres:16（POSTGRES_USER/PASSWORD/DB 注入）
     steps: go test ./... （server 的 testcontainers 在 ubuntu docker 可用）
@@ -76,10 +78,17 @@ jobs:
 
   installer-dryrun:    # windows-latest，仅 main push（PR 可选）
     # 无证书构建：ISCC 装机 + build.ps1 走到 XNC-Installer-<ver>.exe 产出
-    # 保障 .iss/build.ps1 不烂；产物 sha256 上传 artifact 供人工核验
+    # 保障 .iss/build.ps1 不烂；native/host 产物按 hashFiles 缓存复用
+    # （bin/xnc-core.exe + bin/xnc-host.exe）
 
   native:              # windows-latest
-    # native/core + native/desktop 的 build.bat 编译门禁（selftest 编译即可）
+    # native/core 的 build.bat 编译门禁（desktop 已随 RTV 重构删除）
+
+  host-rust:           # windows-latest（2026-09-08 新增）
+    # xnc-host（Rust 采集/编码端）：cargo test（RS 黄金向量/组帧契约）
+    # + cargo build --release 编译门禁
+    # vcpkg 重依赖（ffmpeg[amf,nvcodec,qsv] + libyuv，x64-windows-static），
+    # VCPKG_DEFAULT_BINARY_CACHE + actions/cache 按 workflow 哈希复用
 ```
 
 ### 2.3 规则
@@ -92,7 +101,13 @@ jobs:
   CI 的 linux job 对该包 `//` 排除并在 job 内注释引用问题编号（不修
   不挡——避免 CI 一上线就红）。
 
-## 3. GitHub CI 发布规则（`.github/workflows/release.yml`）
+## 3. GitHub CI 发布规则（`.github/workflows/publish.yml`）
+
+> 2026-09-08：原 release.yml 因步骤名含未引号冒号损坏 workflow 注册表
+> （dispatch 422），重命名为 publish.yml 并修复；随后又暴露 vcpkg 陈旧
+> ffmpeg 基线问题（FF_PROFILE_* 枚举缺定义编译失败）——**CI 发布暂不可
+> 用，现行安装器发布走 §3.5 本地直传**。CI 恢复条件：锁 vcpkg baseline
+> 或 vendor 化 ffmpeg 头。
 
 ### 3.1 触发与前置校验
 
@@ -158,13 +173,45 @@ jobs:
   （默认 5m，下限 1m）、`XNC_GITHUB_TOKEN`。
 - `POST /api/admin/releases` 上传端点保留为人工应急通道（语义不变）。
 
-## 4. Server 镜像化交付（GHCR + Watchtower）
+### 3.5 本地构建直传（现行发布路径）
 
-**架构**：CI 构建版本镜像推 GHCR（GitHub 自带注册表）；服务器侧
+CI publish.yml 修复前的实际路径（与正规路径的节点升级语义完全一致，
+仅缺 tag 锚定——版本不可变改靠发布纪律）：
+
+```
+1. powershell installer/build.ps1 -Version <v> -Channel stable|dev
+   （本地签名：XNC_CODESIGN_PASSWORD 环境变量；产 bin/XNC-Installer-<v>.exe + .sha256）
+2. POST /api/admin/releases （multipart：file + sha256 边车 + channel/version
+   字段；生产 admin JWT）→ 直写生产 release store
+3. 在线 agent 经既有 WS 推送秒级升级；/installer.json 与下载页即时更新
+```
+
+注意：直传不产生 git tag 与 GitHub Release——发布记录以生产 release
+store 为准；同版本禁止重传不同内容（agent 侧版本比较感知不到同号变化）。
+
+## 4. Server 镜像化交付（本地直推为主，GHCR + Watchtower 备用）
+
+**架构（原设计）**：CI 构建版本镜像推 GHCR（GitHub 自带注册表）；服务器侧
 Watchtower（compose 内独立容器）轮询注册表自动拉取重建。与 server
 产品本身零耦合——不把基础设施交付嵌进产品 API。
 
-### 4.1 构建推送（`build-server.yml`，**手动触发 + 版本号输入**）
+### 4.4 现行路径：本地构建直推（2026-09-08 运维决策）
+
+远端构建/注册表中转耗时不做——`deploy/build-server-local.ps1`：
+
+```
+本地 docker build（web dist 先入上下文，XNC_VERSION 注入）
+→ docker save → SFTP 上 SRV → docker load + tag ghcr.io/...:latest
+→ docker compose up -d --no-pull
+```
+
+- 凭据读 `deploy/.env` 的 `SRV_HOST/SRV_SSH_USER/SRV_SSH_KEY`。
+- SRV 上 watchtower **已停用**（容器存在但不跑）——重启它等于恢复
+  §4.2 的自动换版，本地直推期间保持停用。
+- 验证/回滚姿势不变：`/api/health` version 比对；回滚 = load 旧 tar
+  或改 compose tag 为 `:vX.Y.Z` 后 `up -d`。
+
+### 4.1 构建推送（`build-server.yml`，**手动触发 + 版本号输入，现为备用**）
 
 - workflow_dispatch 输入 `version`（X.Y.Z[-dev]，段 ≤4 位；须先合入
   main——构建的是当前 main 代码）。server 发布节奏由人决定，不随
@@ -193,13 +240,12 @@ Watchtower（compose 内独立容器）轮询注册表自动拉取重建。与 s
 - **公开包**：首次推送后在包设置改 public，服务器匿名拉取
   （代价：server 二进制公开可下载）。
 
-## 5. 配套设置清单（实施时一次做完）
+## 5. 配套设置清单（已实施核对：2026-09-08）
 
-- [ ] 分支保护：main（CI 必需检查 + 禁 force push）
-- [ ] tag 保护：`v*`（禁删/移）
-- [ ] Secrets：`XNC_CODESIGN_PFX`、`XNC_CODESIGN_PASSWORD`、
+- [x] 分支保护：main（CI 必需检查 + 禁 force push）
+- [x] tag 保护：`v*`（禁删/移）
+- [x] Secrets：`XNC_CODESIGN_PFX`、`XNC_CODESIGN_PASSWORD`、
       `XNC_SERVER_URL`、`XNC_ADMIN_EMAIL`、`XNC_ADMIN_PASSWORD`、
       `SRV_HOST`、`SRV_SSH_USER`、`SRV_SSH_KEY`
-- [ ] 签名私钥 pfx 的 base64 导出命令记录在 AGENTS.md 签名节
-- [ ] AGENTS.md §3/§4/§5 增补：CI 门禁与发版/部署的触发方式
+- [x] AGENTS.md §3/§4/§5 增补：CI 门禁与发版/部署的触发方式
 ```
