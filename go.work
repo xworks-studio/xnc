@@ -9,7 +9,6 @@ use (
 	./shellhost
 	./shellsmoke
 	./tools/desktopreport
-	./tools/e2eviewer
 	./tools/nalcheck
 	./tools/rtvload
 )

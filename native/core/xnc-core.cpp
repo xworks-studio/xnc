@@ -114,7 +114,7 @@ bool ParseSecretHex(const wchar_t* hex, std::string& out) {
 // token (TokenManager, spec 4.2), spawn the whitelisted exe on
 // winsta0\default (SpawnInSession), wait, propagate the child's exit code.
 // Internal failures (no console session, token or spawn errors) exit 1;
-// the child's own exit code (0/1/2 per xnc-desktop contract) passes
+// the child's own exit code passes
 // through unchanged. No pipe server is started here - the point is one
 // remote exec command proving the whole capture spine end to end.
 int RunDiagSpawn(const wchar_t* child_exe, int argc, wchar_t** argv, int from) {
@@ -135,7 +135,7 @@ int RunDiagSpawn(const wchar_t* child_exe, int argc, wchar_t** argv, int from) {
   // --log-file: the child (xnc-host.exe) opens its own log - service
   // diag spawns have no console (2026-08-24 observability incident
   // follow-up). Appended after the verbatim child args; xnc-desktop's
-  // parser takes the last --log-file, overriding an explicit user one
+  // parser (xnc-host) takes the last --log-file, overriding an explicit user one
   // deterministically.
   std::vector<std::wstring> extra = {
       L"--log-file",

@@ -78,7 +78,7 @@ Name: "shell"; Description: "XNC Shell (ConPTY shell sessions)"; Types: full cus
 Source: "..\bin\xnc-agent.exe"; DestDir: "{app}"; Components: agent; Flags: ignoreversion
 Source: "..\bin\xnc.exe"; DestDir: "{app}"; Components: agent; Flags: ignoreversion restartreplace
 Source: "..\bin\xnc-core.exe"; DestDir: "{app}"; Components: desktop; Flags: ignoreversion
-Source: "..\bin\xnc-desktop.exe"; DestDir: "{app}"; Components: desktop; Flags: ignoreversion
+Source: "..\bin\xnc-host.exe"; DestDir: "{app}"; Components: desktop; Flags: ignoreversion
 Source: "..\bin\xnc-shell.exe"; DestDir: "{app}"; Components: shell; Flags: ignoreversion
 ; 签名公钥：安装时导入本机信任（自签过渡期的机群信任分发；正式 CA 后移除）
 Source: "codesign.cer"; DestDir: "{tmp}"; Flags: ignoreversion
@@ -204,7 +204,7 @@ begin
     '# install dir (mirror-path match; dev machines may run same-named exes' + #13#10 +
     '# from elsewhere).' + #13#10 +
     '$prefix = $InstallDir.TrimEnd(''\'') + ''\''' + #13#10 +
-    '$procs = @(Get-CimInstance Win32_Process -Filter ''Name="xnc-desktop.exe" OR Name="xnc-shell.exe"'' -ErrorAction SilentlyContinue)' + #13#10 +
+    '$procs = @(Get-CimInstance Win32_Process -Filter ''Name="xnc-host.exe" OR Name="xnc-shell.exe"'' -ErrorAction SilentlyContinue)' + #13#10 +
     'foreach ($p in $procs) {' + #13#10 +
     '    if ($p.ExecutablePath -and $p.ExecutablePath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {' + #13#10 +
     '        Log "prep: killing residual $($p.Name) pid=$($p.ProcessId)"' + #13#10 +

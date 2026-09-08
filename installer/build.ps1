@@ -58,12 +58,24 @@ if (-not ($ReuseNative -and (Test-Path (Join-Path $bin "xnc-core.exe")))) {
         $global:LASTEXITCODE = $p.ExitCode
     }
 } else { Write-Output "build.ps1: reuse cached xnc-core.exe" }
-if (-not ($ReuseNative -and (Test-Path (Join-Path $bin "xnc-desktop.exe")))) {
-    Invoke-Step "build xnc-desktop.exe" {
-        $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c build.bat" -WorkingDirectory (Join-Path $root "native\desktop") -NoNewWindow -Wait -PassThru
-        $global:LASTEXITCODE = $p.ExitCode
+# RTV host（Rust，2026-09-08 重构替代 C++ xnc-desktop）：cargo release；
+# 需 VCPKG_ROOT（x64-windows-static：ffmpeg[amf,nvcodec,qsv] + libyuv）与
+# LIBCLANG_PATH（bindgen）。产物 crt-static 单文件，复制进 bin。
+# -ReuseNative：bin 里已有产物时跳过 cargo（CI 缓存命中路径；缓存键 =
+# host/** + third_party/scrap/** 哈希）。release 构建不传此开关——发版
+# 永远全量重建。
+if (-not ($ReuseNative -and (Test-Path (Join-Path $bin "xnc-host.exe")))) {
+    if (-not $env:VCPKG_ROOT) { throw "xnc-host build needs VCPKG_ROOT (x64-windows-static with ffmpeg[amf,nvcodec,qsv] + libyuv)" }
+    if (-not $env:LIBCLANG_PATH) { throw "xnc-host build needs LIBCLANG_PATH (bindgen)" }
+    Invoke-Step "build xnc-host.exe (cargo release)" {
+        Push-Location (Join-Path $root "host")
+        try {
+            cargo build --release
+            if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+            Copy-Item (Join-Path $PWD "target\release\xnc-host.exe") (Join-Path $bin "xnc-host.exe") -Force
+        } finally { Pop-Location }
     }
-} else { Write-Output "build.ps1: reuse cached xnc-desktop.exe" }
+} else { Write-Output "build.ps1: reuse cached xnc-host.exe" }
 
 # Version single-source check: the agent's self-reported version must equal
 # the version being packaged.
@@ -128,7 +140,7 @@ function Sign-Artifact([string]$file) {
         Write-Output "build.ps1: signed $(Split-Path -Leaf $file)"
     }
 }
-foreach ($exe in @("xnc-agent.exe", "xnc.exe", "xnc-shell.exe", "xnc-core.exe", "xnc-desktop.exe")) {
+foreach ($exe in @("xnc-agent.exe", "xnc.exe", "xnc-shell.exe", "xnc-core.exe", "xnc-host.exe")) {
     Sign-Artifact (Join-Path $bin $exe)
 }
 

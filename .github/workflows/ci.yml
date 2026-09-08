@@ -25,11 +25,10 @@ jobs:
       # agent 模块在 linux 存在预存在构建失败（agent/session，与新增
       # 变更无关，见设计 §2.3）——linux 仅测试跨平台模块，agent 由
       # go-windows 覆盖。mockagent 依赖 agent/session 且仅用于 Windows
-      # 负载测试，一并排除。e2eviewer 依赖 Windows-only 的
-      # agent/desktoppipe（linux 无该包）。
+      # 负载测试，一并排除。rtvload 依赖 quic-go（跨平台，linux 覆盖）。
       - name: test (proto server cli shellsmoke tools)
         run: |
-          for m in proto server cli shellsmoke tools/desktopreport tools/nalcheck; do
+          for m in proto server cli shellsmoke tools/desktopreport tools/nalcheck tools/rtvload; do
             echo "=== $m ==="
             (cd "$m" && go vet ./... && go test ./... )
           done
@@ -91,14 +90,50 @@ jobs:
         with:
           path: |
             bin/xnc-core.exe
-            bin/xnc-desktop.exe
           key: native-${{ runner.os }}-${{ hashFiles('native/**') }}
-      - name: build core + desktop (compile gate, cache miss only)
+      - name: build core (compile gate, cache miss only)
         if: steps.nativecache.outputs.cache-hit != 'true'
         shell: cmd
+        run: cd native\core && call build.bat
+
+  # RTV host（Rust 采集端）：cargo test（RS 黄金向量/组帧契约）+ release
+  # 编译门禁。vcpkg 重依赖（ffmpeg[amf,nvcodec,qsv]+libyuv，x64-windows-
+  # static）用 GitHub Actions 二进制缓存复用——首跑 ~40min，命中后 ~分钟级。
+  host-rust:
+    runs-on: windows-latest
+    env:
+      VCPKG_ROOT: C:\vcpkg
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-bincache
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: restore caches
+        id: hostcache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo
+            host/target
+          key: host-${{ runner.os }}-${{ hashFiles('host/Cargo.lock') }}-${{ hashFiles('third_party/scrap/**') }}
+      - name: restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: vcpkg-bincache
+          key: vcpkg-bin-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml') }}
+      - name: vcpkg install (binary-cached)
+        shell: pwsh
         run: |
-          cd native\core && call build.bat
-          cd ..\desktop && call build.bat
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          & C:\vcpkg\vcpkg.exe install --triplet x64-windows-static ffmpeg[amf,nvcodec,qsv] libyuv
+      - name: cargo test (RS golden vectors + framing)
+        working-directory: host
+        run: cargo test
+      - name: cargo build --release (compile gate)
+        working-directory: host
+        run: cargo build --release
+
+  # web RS 黄金向量已并入 web job（vitest src/lib/rtv/rs.test.js）。
 
   installer-dryrun:
     # 仅 main：验证 .iss/build.ps1 可产出安装器（无签名，无 pfx 依赖）。
@@ -111,13 +146,13 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.work
-      - name: restore native cache
+      - name: restore native + host cache
         uses: actions/cache@v4
         with:
           path: |
             bin/xnc-core.exe
-            bin/xnc-desktop.exe
-          key: native-${{ runner.os }}-${{ hashFiles('native/**') }}
+            bin/xnc-host.exe
+          key: bins-${{ runner.os }}-${{ hashFiles('native/**', 'host/**', 'third_party/scrap/**') }}
       - name: install Inno Setup
         shell: pwsh
         run: choco install innosetup -y --no-progress
