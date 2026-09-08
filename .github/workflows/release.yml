@@ -129,3 +129,5 @@ jobs:
           Write-Host "released $env:VERSION ($env:CHANNEL) sha256=$sha"
           Write-Host "发布终点为 GitHub Release；生产 server 由 installersync 在一个同步间隔内自动拉取"
           Write-Host "验证：curl https://xnc.app/installer.json?channel=$env:CHANNEL （约 5 分钟内生效）"
+
+# registry re-index marker (2026-09-08): no functional change
