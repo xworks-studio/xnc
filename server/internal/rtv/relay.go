@@ -183,6 +183,12 @@ type Hub struct {
 
 	// gateInput 由 api 层注入：该 (node, session) 是否持节点输入活约。
 	gateInput func(node, session string) bool
+
+	// hostTokenOf 由 api 层注入：节点当前活跃 desktop 会话 params 里的
+	// HostToken（无活约/解析失败 = ""）。server 重启后 minted 表清空，而
+	// 运行中的 host 重连时重放的是 spawn 时的 token——经活跃会话回查即可
+	// 无持久化地恢复注册（会话仍在 = 凭据仍有效）。
+	hostTokenOf func(node string) string
 }
 
 func NewHub() *Hub {
@@ -192,6 +198,9 @@ func NewHub() *Hub {
 
 // SetInputGate 注入 input 门控（须在 Start 前完成）。
 func (g *Hub) SetInputGate(fn func(node, session string) bool) { g.gateInput = fn }
+
+// SetHostTokenOf 注入活跃会话 token 回查（server 重启后的 host 重注册路径）。
+func (g *Hub) SetHostTokenOf(fn func(node string) string) { g.hostTokenOf = fn }
 
 func (g *Hub) NextViewerID() uint64 { return g.nextID.Add(1) }
 
@@ -213,7 +222,8 @@ func (g *Hub) HostTokenFor(nodeID string) string {
 	return t
 }
 
-// validateHost 校验 host 注册凭据（hello{nodeId, token}）。
+// validateHost 校验 host 注册凭据（hello{nodeId, token}）：命中 minted 表，
+// 或回查该节点任一活跃 desktop 会话的 params token（server 重启恢复路径）。
 func (g *Hub) validateHost(nodeID, token string) bool {
 	if nodeID == "" || token == "" {
 		return false
@@ -221,7 +231,13 @@ func (g *Hub) validateHost(nodeID, token string) bool {
 	g.mu.Lock()
 	want := g.tokens[nodeID]
 	g.mu.Unlock()
-	return token == want
+	if token == want && want != "" {
+		return true
+	}
+	if g.hostTokenOf != nil {
+		return token == g.hostTokenOf(nodeID) && token != ""
+	}
+	return false
 }
 
 // RegisterHost 注册/替换 host 连接（同节点旧连接被关闭——重启场景）。
