@@ -59,6 +59,7 @@ func (h *handlers) desktopStart(w http.ResponseWriter, r *http.Request) {
 		StreamEndpoint: h.cfg.RTVStreamEndpoint, // server config 独占
 		HostToken:      hostToken,               // relay Hub 签发；绝不回显给客户端
 		WTSSession:     req.WTSSession,
+		TLSInsecure:    h.cfg.RTVInsecureTLS, // dev 自签栈专用（server config 独占）
 	})
 	if err != nil {
 		respondError(w, proto.Err(500, proto.CodeInternal, "encode params"))

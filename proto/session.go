@@ -41,6 +41,10 @@ type DesktopParams struct {
 	HostToken string `json:"hostToken,omitempty"`
 	// WTSSession 目标 WTS 会话 id；0 = 活动控制台会话（dev 默认）。
 	WTSSession uint32 `json:"wtsSession,omitempty"`
+	// TLSInsecure（dev-only）：dev 栈自签证书时 host 跳过服务端证书校验。
+	// 只来自 server config XNC_RTV_INSECURE_TLS；客户端提交值被白名单
+	// 剥离；生产绝不开（server 侧高声告警）。
+	TLSInsecure bool `json:"tlsInsecure,omitempty"`
 }
 
 // Desktop capability 词汇（RTV 后由 server 中继侧强制：input 门控按

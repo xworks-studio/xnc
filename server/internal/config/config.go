@@ -40,6 +40,9 @@ type Config struct {
 	AlidnsSecret   string // ALIDNS_SECRET_KEY
 	RTVCertFile    string // XNC_RTV_CERT_FILE（ACME 关闭时的文件形态）
 	RTVKeyFile     string // XNC_RTV_KEY_FILE
+	// RTVInsecureTLS（dev-only）：host 腿跳过证书校验（自签 dev 栈）。
+	// 生产绝不开（配置即高声告警）。
+	RTVInsecureTLS bool // XNC_RTV_INSECURE_TLS
 	// RTVWSOrigins WS 兜底腿的 Origin 白名单（空 = coder/websocket 同源
 	// 校验；生产经 caddy 同源反代即正确语义，dev 跨源联调时配置）。
 	RTVWSOrigins []string // XNC_RTV_WS_ORIGINS，逗号分隔
@@ -71,6 +74,7 @@ func Load() (Config, error) {
 		RTVWTAddr:             env("XNC_RTV_WT_ADDR", ":443"),
 		RTVCertFile:           os.Getenv("XNC_RTV_CERT_FILE"),
 		RTVKeyFile:            os.Getenv("XNC_RTV_KEY_FILE"),
+		RTVInsecureTLS:        envBool("XNC_RTV_INSECURE_TLS", false),
 		RTVWSOrigins:          envList("XNC_RTV_WS_ORIGINS"),
 		DesktopPerNode:        envInt("XNC_DESKTOP_PER_NODE", 4),
 		DesktopIdleTimeout:    envDur("XNC_DESKTOP_IDLE", 5*time.Minute),

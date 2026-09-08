@@ -34,6 +34,8 @@ type hostCfg struct {
 	Endpoint string `json:"endpoint"`
 	NodeID   string `json:"nodeId"`
 	Token    string `json:"token"`
+	// TLSInsecure 透传 proto.DesktopParams 同名 dev 开关（自签 dev 栈）。
+	TLSInsecure bool `json:"tlsInsecure,omitempty"`
 }
 
 // Handler 实现 session.WslessHandler：一个 desktop 会话 = 一次引用计数
@@ -95,7 +97,7 @@ func (h *Handler) SessionStart(ctx context.Context, sessionID string, params jso
 		h.log().Warn("desktop: bad session params, ignoring session", "session", sessionID, "err", err)
 		return
 	}
-	cfg, err := json.Marshal(hostCfg{Endpoint: p.StreamEndpoint, NodeID: h.nodeID, Token: p.HostToken})
+	cfg, err := json.Marshal(hostCfg{Endpoint: p.StreamEndpoint, NodeID: h.nodeID, Token: p.HostToken, TLSInsecure: p.TLSInsecure})
 	if err != nil {
 		h.log().Warn("desktop: cfg marshal", "session", sessionID, "err", err)
 		return

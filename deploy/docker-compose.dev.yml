@@ -1,15 +1,29 @@
 services:
   xnc-server:
-    # Loopback-only: the dev stack's plaintext JWT channel must not be
-    # reachable from other hosts.
-    ports: ["127.0.0.1:8080:8080", "127.0.0.1:8443:443/udp", "127.0.0.1:14433:4433/udp"]
+    # Dev stack: locally built image (deploy/Dockerfile, repo-root context)
+    # instead of the production GHCR tag — dev carries unreleased code.
+    # XNC_DEV_BIND=0.0.0.0 exposes the legs on the LAN for remote dev nodes
+    # (XIAOXIN); the default 127.0.0.1 keeps the plaintext JWT channel
+    # loopback-only.
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: xnc-server:dev-rtv
+    ports:
+      - "${XNC_DEV_BIND:-127.0.0.1}:8080:8080"
+      # RTV 腿（LAN 部署时 XNC_DEV_BIND=0.0.0.0）：18080 兼容旧 dev 拓扑的
+      # agent 控制连接端口；8443/14433 = WT/host QUIC。
+      - "${XNC_DEV_BIND:-127.0.0.1}:18080:8080"
+      - "${XNC_DEV_BIND:-127.0.0.1}:8443:443/udp"
+      - "${XNC_DEV_BIND:-127.0.0.1}:14433:4433/udp"
     environment:
-      # E2E wants a short offline window; load runs (Gate A) override to the
-      # production 90s via the shell: XNC_HEARTBEAT_TIMEOUT=90s docker compose ...
+      # E2E wants a short offline window; load runs override via the shell.
       XNC_HEARTBEAT_TIMEOUT: ${XNC_HEARTBEAT_TIMEOUT:-10s}
-      # RTV（dev）：endpoint 指向本机映射端口；dev 无 ACME（自签证书，
-      # host --tls-insecure / 浏览器走 WS 兜底）。
+      # RTV（dev）：endpoint = 本机 LAN IP 的 host 腿映射端口；dev 无 ACME
+      # （进程内自签证书 → XNC_RTV_INSECURE_TLS 让 host 跳过校验；浏览器
+      # WT 不可用，走 WS 兜底——8443 的自签只服务 rtvload -insecure）。
       XNC_RTV_ENDPOINT: ${XNC_RTV_ENDPOINT:-127.0.0.1:14433}
+      XNC_RTV_INSECURE_TLS: "true"
       XNC_ACME_DOMAIN: ""
   caddy:
     profiles: ["never"]
