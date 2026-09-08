@@ -10,7 +10,10 @@ import { rsRecover } from './rs.js';
 
 // 帧定稿等待（新帧到达或超时）。WT=不可靠 datagram，超时≈丢包需上报；
 // WS=可靠有序流，超时只是排队晚到，放宽且不上报（否则 IDR 风暴）。
-const FRAME_GC_MS = 25;
+// 25ms 是 MVP 的 LAN 参数；公网 Chrome WT 投递存在跨帧抖动（实测 shard
+// 迟到数十 ms 常态），超时过紧会把可恢复帧提前判死（FEC 失败暴增）。
+// 120ms 为超时兜底上限（确定性丢帧检测=新帧首包到达，不受此影响）。
+const FRAME_GC_MS = 120;
 const FRAME_GC_MS_RELIABLE = 500;
 let transportReliable = false; // WS 兜底路径
 const MAX_PENDING = 16;

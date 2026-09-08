@@ -91,7 +91,10 @@ impl QosController {
         } else {
             self.fec_bad_windows = 0;
             self.fec_good_windows += 1;
-            if self.fec_good_windows >= 6 && fec > 10 {
+            // FEC 下限 20：公网 viewer 侧丢弃（中转/浏览器投递）对 host 的
+            // fecStats 视角不可见，10% 覆盖不了实际 shard 损耗（生产实测
+            // ~15%）；宁多带冗余，靠 qosAdjust 阶梯在真健康时回收到 20。
+            if self.fec_good_windows >= 6 && fec > 20 {
                 nfec = fec - 5;
                 reason = format!("{reason} fecDown");
                 self.fec_good_windows = 0;
