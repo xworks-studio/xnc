@@ -39,3 +39,6 @@ installer/codesign.pfx
 # Rust（xnc-host / vendored scrap）
 host/target/
 third_party/scrap/src/generated/
+
+# RTV 研究期 MVP 源（已迁移进 host/server/web；原品保留于 desktop-reserch）
+mvp/

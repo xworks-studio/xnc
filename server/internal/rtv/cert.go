@@ -12,6 +12,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"fmt"
 	"log/slog"
 	"math/big"
 	"os"
@@ -25,27 +26,32 @@ func CertFiles(certFile, keyFile string) func([]string) *tls.Config {
 	var cached *tls.Certificate
 	var lastMod time.Time
 	return func(alpn []string) *tls.Config {
-		mu.Lock()
-		defer mu.Unlock()
-		if st, err := os.Stat(certFile); err == nil {
-			if cached == nil || !st.ModTime().Equal(lastMod) {
-				if c, err := tls.LoadX509KeyPair(certFile, keyFile); err == nil {
-					cached = &c
-					lastMod = st.ModTime()
-					slog.Info("rtv: tls cert (re)loaded", "cert", certFile)
-				} else {
-					slog.Error("rtv: tls cert load failed, keeping previous", "err", err)
+		// GetCertificate 按连接解析：caddy 续期换文件（cert-sync 同步）后，
+		// 新握手即用新证书，QUIC 监听器无需重启（Certificates 字段只在
+		// Listen 时快照，不能承载热加载）。
+		getCert := func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if st, err := os.Stat(certFile); err == nil {
+				if cached == nil || !st.ModTime().Equal(lastMod) {
+					if c, err := tls.LoadX509KeyPair(certFile, keyFile); err == nil {
+						cached = &c
+						lastMod = st.ModTime()
+						slog.Info("rtv: tls cert (re)loaded", "cert", certFile)
+					} else {
+						slog.Error("rtv: tls cert load failed, keeping previous", "err", err)
+					}
 				}
 			}
-		}
-		if cached == nil {
-			slog.Error("rtv: no tls cert available, leg will fail handshakes", "cert", certFile)
-			return &tls.Config{NextProtos: alpn, MinVersion: tls.VersionTLS13}
+			if cached == nil {
+				return nil, fmt.Errorf("rtv: no tls cert available at %s", certFile)
+			}
+			return cached, nil
 		}
 		return &tls.Config{
-			Certificates: []tls.Certificate{*cached},
-			NextProtos:   alpn,
-			MinVersion:   tls.VersionTLS13,
+			GetCertificate: getCert,
+			NextProtos:     alpn,
+			MinVersion:     tls.VersionTLS13,
 		}
 	}
 }
