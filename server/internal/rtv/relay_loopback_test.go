@@ -296,3 +296,127 @@ func waitFor(t *testing.T, what string, fn func() bool) {
 	}
 	t.Fatalf("timeout waiting for %s", what)
 }
+
+// recViewer 记录控制下行的 stub（控制权流转测试用）。
+type recViewer struct {
+	stubViewer
+	id2  uint64
+	mu   sync.Mutex
+	sent []map[string]any
+}
+
+func (v *recViewer) ID() uint64 { return v.id2 }
+func (v *recViewer) SendControlJSON(b json.RawMessage) error {
+	var m map[string]any
+	_ = json.Unmarshal(b, &m)
+	v.mu.Lock()
+	v.sent = append(v.sent, m)
+	v.mu.Unlock()
+	return nil
+}
+func (v *recViewer) last() map[string]any {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if len(v.sent) == 0 {
+		return nil
+	}
+	return v.sent[len(v.sent)-1]
+}
+
+// TestControlFlow — 控制权流转消息在服务器终结：takeControl/releaseControl
+// 不进 host；成功广播 controlState、冷却拒绝回 controlResult；新 viewer
+// AddViewer 时单发当前归属。
+func TestControlFlow(t *testing.T) {
+	var mu sync.Mutex
+	holder := ""
+	var cooldownUntil time.Time
+	take := func(node, sess string) (bool, string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if holder != "" && holder != sess {
+			if time.Now().Before(cooldownUntil) {
+				return false, "cooldown"
+			}
+			cooldownUntil = time.Now().Add(time.Second)
+		}
+		holder = sess
+		return true, "granted"
+	}
+	release := func(node, sess string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if holder == sess {
+			holder = ""
+		}
+	}
+	state := func(node string) (string, string) {
+		mu.Lock()
+		defer mu.Unlock()
+		return holder, "user-" + holder
+	}
+
+	h := &HostSession{NodeID: "n1", viewers: map[uint64]Viewer{}}
+	var hostCtrl []map[string]any
+	h.sendControl = func(v json.RawMessage) error {
+		var m map[string]any
+		_ = json.Unmarshal(v, &m)
+		hostCtrl = append(hostCtrl, m)
+		return nil
+	}
+	a := &recViewer{stubViewer: stubViewer{node: "n1", sess: "sess-A"}, id2: 1}
+	b := &recViewer{stubViewer: stubViewer{node: "n1", sess: "sess-B"}, id2: 2}
+	hub := &Hub{hosts: map[string]*HostSession{"n1": h},
+		control: ControlHooks{Take: take, Release: release, State: state}}
+	h.hub = hub
+	h.mu.Lock()
+	h.viewers[1] = a
+	h.viewers[2] = b
+	h.mu.Unlock()
+
+	takeMsg := mustJSON(map[string]any{"type": "takeControl"})
+	// A 接管 → A/B 均收 controlState(holder=sess-A)，host 不收 takeControl。
+	h.forwardToHost(takeMsg, a)
+	for _, v := range []*recViewer{a, b} {
+		m := v.last()
+		if m == nil || m["type"] != "controlState" || m["holderSession"] != "sess-A" {
+			t.Fatalf("A take: viewer must get controlState holder=sess-A, got %v", m)
+		}
+	}
+	// B 接管（首个抢占，无冷却）→ holder=sess-B。
+	h.forwardToHost(takeMsg, b)
+	if m := a.last(); m["holderSession"] != "sess-B" {
+		t.Fatalf("B take: A must see holder=sess-B, got %v", m)
+	}
+	// A 立即抢回 → 冷却拒绝：controlResult + 状态同步，holder 不变。
+	h.forwardToHost(takeMsg, a)
+	if m := a.last(); m == nil || m["type"] != "controlState" || m["holderSession"] != "sess-B" {
+		t.Fatalf("cooldown: A last msg must be controlState holder=sess-B, got %v", m)
+	}
+	var denied bool
+	a.mu.Lock()
+	for _, m := range a.sent {
+		if m["type"] == "controlResult" && m["ok"] == false && m["reason"] == "cooldown" {
+			denied = true
+		}
+	}
+	a.mu.Unlock()
+	if !denied {
+		t.Fatal("cooldown denial must send controlResult{ok:false,reason:cooldown}")
+	}
+	// B 释放 → 广播空闲。
+	h.forwardToHost(mustJSON(map[string]any{"type": "releaseControl"}), b)
+	if m := a.last(); m["holderSession"] != "" {
+		t.Fatalf("release: holder must be empty, got %v", m)
+	}
+	// takeControl/releaseControl 绝不进 host。
+	for _, m := range hostCtrl {
+		if m["type"] == "takeControl" || m["type"] == "releaseControl" {
+			t.Fatalf("control messages must not reach host, got %v", m)
+		}
+	}
+	// AddViewer 单发当前归属（新加入者立即知道 view-only/谁在控）。
+	hub.AddViewer("n1", a)
+	if m := a.last(); m == nil || m["type"] != "controlState" {
+		t.Fatalf("AddViewer must unicast controlState, got %v", m)
+	}
+}
