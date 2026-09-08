@@ -51,4 +51,6 @@ export interface DesktopCandidate {
   port: number;
   path: string;
   certSha256?: string;
+  relayId?: string; // 归属中继（"rl-0" = 主站内嵌）
+  region?: string; // 区域标签（embedded = 主站内嵌）
 }

@@ -74,9 +74,12 @@ const REPOST_THROTTLE_MS = 10_000;
 // 逐样本显示会双峰抖动 + 顶栏回流；中值滤波兼顾展示与 QoS 反馈。
 const SMOOTH_WIN = 9;
 
-function median(nums: number[]): number {
-  const s = [...nums].sort((a, b) => a - b);
-  return s[Math.floor(s.length / 2)];
+// 窗口最低基线 + 最优样本：控制期媒体突发会让心跳回显在 host→viewer
+// 发送队列里排队（与媒体同拥塞域），RTT 采样呈"真值 / 真值+排队延迟"
+// 双峰——中值随多数派翻转来回跳（真机踩坑）。下包络才是网络往返的
+// 诚实度量；拥塞感知由 arrivalGapP95 / 解码队列承担，不靠 RTT。
+function minOf(nums: number[]): number {
+  return nums.reduce((m, v) => Math.min(m, v), Infinity);
 }
 
 /** 64 位 hex → 32 字节（certSha256 → WebTransport 钉扎指纹）；非法输入
@@ -97,6 +100,8 @@ export default function DesktopLive() {
   const [phase, setPhase] = useState<Phase>("connecting");
   const [fatalMsg, setFatalMsg] = useState("");
   const [transport, setTransport] = useState<"wt" | "ws" | "-">("-");
+  // 当前使用的中继（连接成功时按候选/URL 记录；统计面板展示）
+  const [relayInfo, setRelayInfo] = useState<string | null>(null);
   const [codecInfo, setCodecInfo] = useState("");
   // 控制权归属（服务器 controlState 广播；null = 尚未收到）
   const [control, setControl] = useState<{
@@ -125,9 +130,10 @@ export default function DesktopLive() {
   const repostRef = useRef(0);
   const prevStatsRef = useRef<WorkerStats | null>(null);
   const rttRef = useRef(0);
-  // RTT/时钟偏差平滑（含 QoS 反馈与 e2e 校正，见 SMOOTH_WIN 注释）
-  const rttWinRef = useRef<number[]>([]);
-  const offsetWinRef = useRef<number[]>([]);
+  // RTT/时钟偏差平滑（含 QoS 反馈与 e2e 校正，见 SMOOTH_WIN 注释）。
+  // 窗口存 {rtt, off} 成对样本：偏差取最低延迟样本（NTP 惯例——最优
+  // 样本的偏差估计最准，见 minOf 注释）。
+  const rttWinRef = useRef<{ rtt: number; off: number | null }[]>([]);
   const clockOffsetRef = useRef<number | null>(null);
   // e2e 高频原始值（renderLoop 每帧算，1s 才同步到 state 免整页重渲染）
   const e2eRawRef = useRef<number | null>(null);
@@ -307,19 +313,22 @@ export default function DesktopLive() {
           const rtt = Date.now() - v.tMs;
           // 负值/离谱大值 = 本机时钟被 NTP 回拨或样本损坏，丢弃
           if (rtt < 0 || rtt > 10_000) break;
-          const win = rttWinRef.current;
-          win.push(rtt);
-          if (win.length > SMOOTH_WIN) win.shift();
-          rttRef.current = median(win); // QoS 反馈用平滑值（尖峰会误伤码率/FEC）
-          setRttMs(median(win));
           // 时钟偏差（NTP 中点法）：hostNow - (send+recv)/2，e2e 校正用
-          if (typeof v.hostNowMs === "number") {
-            const off = v.hostNowMs - (v.tMs + rtt / 2);
-            const ow = offsetWinRef.current;
-            ow.push(off);
-            if (ow.length > SMOOTH_WIN) ow.shift();
-            clockOffsetRef.current = median(ow);
-          }
+          const off =
+            typeof v.hostNowMs === "number"
+              ? v.hostNowMs - (v.tMs + rtt / 2)
+              : null;
+          const win = rttWinRef.current;
+          win.push({ rtt, off });
+          if (win.length > SMOOTH_WIN) win.shift();
+          // 显示/QoS 反馈 = 窗口最低基线（双峰时中值会来回跳，见 minOf
+          // 注释；基线也防尖峰误伤码率/FEC 调整）。
+          rttRef.current = minOf(win.map((s) => s.rtt));
+          setRttMs(rttRef.current);
+          // 偏差取最低延迟样本（排队污染的样本其中点假设不成立）。
+          let best: { rtt: number; off: number | null } | null = null;
+          for (const s of win) if (!best || s.rtt < best.rtt) best = s;
+          if (best && best.off !== null) clockOffsetRef.current = best.off;
           break;
         }
         default:
@@ -586,6 +595,11 @@ export default function DesktopLive() {
               await connectWS(withToken(base));
               startWorker(true);
             }
+            setRelayInfo(
+              c.relayId === "rl-0"
+                ? `主站内嵌（${curTransport.toUpperCase()}）`
+                : `${c.host}:${c.port}${c.region ? ` · ${c.region}` : ""}（${curTransport.toUpperCase()}）`,
+            );
             finish();
             return;
           } catch (e) {
@@ -600,19 +614,30 @@ export default function DesktopLive() {
 
       const wtUrl = withToken(resp.wtUrl);
       const wsUrl = withToken(resp.wsUrl);
+      // 旧响应形态（无 candidates）：从 URL 提取 host 展示
+      const legacyHost = (u: string) => {
+        try {
+          return new URL(u).host;
+        } catch {
+          return "";
+        }
+      };
       if (wanted === "ws") {
         curTransport = "ws";
         await connectWS(wsUrl);
         startWorker(true);
+        setRelayInfo(`${legacyHost(wsUrl) || "主站内嵌"}（WS）`);
       } else {
         curTransport = "wt";
         try {
           await connectWT(wtUrl);
+          setRelayInfo(`${legacyHost(wtUrl) || "主站内嵌"}（WT）`);
         } catch (e) {
           log(`WebTransport 失败（${e}），回退 WebSocket`);
           curTransport = "ws";
           await connectWS(wsUrl);
           startWorker(true);
+          setRelayInfo(`${legacyHost(wsUrl) || "主站内嵌"}（WS）`);
         }
       }
       finish();
@@ -716,6 +741,7 @@ export default function DesktopLive() {
     repostRef.current = 0; // 手动重试从零开始完整重试预算
     setFatalMsg("");
     setPhase("connecting");
+    setRelayInfo(null);
     setEpoch((e) => e + 1);
   };
 
@@ -747,7 +773,7 @@ export default function DesktopLive() {
           )}
           <span
             className="dt-chip dt-chip-num"
-            title="控制环往返（心跳测得，中值滤波）"
+            title="控制环往返（心跳测得，窗口最低基线——突发排队不抬高显示）"
           >
             rtt {rttMs === null ? "–" : `${Math.round(rttMs)}ms`}
           </span>
@@ -842,6 +868,12 @@ export default function DesktopLive() {
         <aside className={`dt-stats${statsOpen ? " open" : ""}`}>
           <div className="dt-stats-inner">
             <div className="dt-stats-title">实时统计</div>
+            <div className="dt-m">
+              <div className="k">中继</div>
+              <div className="v" title={relayInfo ?? undefined}>
+                {relayInfo ?? "–"}
+              </div>
+            </div>
             <div className="dt-mgrid">
               <div className="dt-m">
                 <div className="k">码率</div>

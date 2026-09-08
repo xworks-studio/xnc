@@ -69,10 +69,14 @@ func (h *handlers) desktopStart(w http.ResponseWriter, r *http.Request) {
 	// relay-plane 分配：node-sticky + 负载打分选外部中继；池空/全不合格
 	// 回落 relay-0（内嵌，现行为）。rid 决定两张票的归属与 StreamEndpoint。
 	rid := rtv.EmbeddedRelayID
+	assignRelayID := rtv.EmbeddedRelayID
+	assignRegion := "embedded"
 	var candidates []proto.EndpointDesc
 	if h.pool != nil {
 		if a, ok := h.pool.Assign(nodeID); ok {
 			rid = a.RelayID
+			assignRelayID = a.RelayID
+			assignRegion = a.Region
 			candidates = a.Endpoints
 		}
 	}
@@ -113,6 +117,11 @@ func (h *handlers) desktopStart(w http.ResponseWriter, r *http.Request) {
 	var wtURL, wsURL string
 	if rid != rtv.EmbeddedRelayID {
 		ordered := orderCandidates(candidates)
+		// 标注归属中继（观测信息；web 统计面板展示当前中继）。
+		for i := range ordered {
+			ordered[i].RelayID = assignRelayID
+			ordered[i].Region = assignRegion
+		}
 		candidates = ordered
 		wtHostPort := candidateHostPort(ordered, "wt")
 		if wtHostPort != "" {
@@ -135,8 +144,10 @@ func (h *handlers) desktopStart(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		candidates = []proto.EndpointDesc{
-			{Transport: "wt", Host: host, Port: wtPort, Path: "/wt"},
-			{Transport: "ws", Host: host, Port: 443, Path: "/ws"},
+			{Transport: "wt", Host: host, Port: wtPort, Path: "/wt",
+				RelayID: rtv.EmbeddedRelayID, Region: "embedded"},
+			{Transport: "ws", Host: host, Port: 443, Path: "/ws",
+				RelayID: rtv.EmbeddedRelayID, Region: "embedded"},
 		}
 	}
 

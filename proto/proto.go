@@ -153,6 +153,11 @@ type EndpointDesc struct {
 	ALPN       string `json:"alpn,omitempty"`
 	Path       string `json:"path,omitempty"`
 	CertSHA256 string `json:"certSha256,omitempty"`
+	// RelayID/Region 由 server 在会话响应的 candidates 里标注（归属中继
+	// 的观测信息，relay 自注册时不填）。region "embedded" = 主站内嵌
+	// relay-0。web 统计面板展示"当前使用的中继"用。
+	RelayID string `json:"relayId,omitempty"`
+	Region  string `json:"region,omitempty"`
 }
 
 // RelayChallengeResponse 挑战应答（relay 侧；复用 Challenge 的 nonce）。

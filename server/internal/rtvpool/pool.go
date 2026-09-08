@@ -64,9 +64,11 @@ type relayConn struct {
 	drift      time.Duration
 }
 
-// Assignment 一次分配的产物（desktopStart 消费）。
+// Assignment 一次分配的产物（desktopStart 消费）。Region 随中继注册
+// 画像（观测信息，会话响应 candidates 会带）。
 type Assignment struct {
 	RelayID   string
+	Region    string
 	Endpoints []proto.EndpointDesc
 }
 
@@ -437,7 +439,10 @@ func (m *Manager) Assign(nodeID string) (Assignment, bool) {
 func (c *relayConn) assignmentLocked() Assignment {
 	eps := make([]proto.EndpointDesc, len(c.endpoints))
 	copy(eps, c.endpoints)
-	return Assignment{RelayID: c.id, Endpoints: eps}
+	c.sendMu.Lock()
+	region := c.region
+	c.sendMu.Unlock()
+	return Assignment{RelayID: c.id, Region: region, Endpoints: eps}
 }
 
 // eligibleLocked 合格 = active + 判活窗口内有心跳 + 探测连败 <2 + 时钟
