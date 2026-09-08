@@ -124,7 +124,7 @@ func New(reg *registry.Registry, log *slog.Logger) *Manager {
 		reg: reg, log: log, sessions: map[string]*session{},
 		desktopLeases: map[uuid.UUID]*desktopLease{},
 		ShellPerNode:  10, ShellIdleTimeout: 30 * time.Minute, ShellMaxLifetime: 8 * time.Hour,
-		DesktopPerNode: 4, DesktopIdleTimeout: 5 * time.Minute, DesktopLeaseTTL: 60 * time.Second,
+		DesktopPerNode: 8, DesktopIdleTimeout: 5 * time.Minute, DesktopLeaseTTL: 60 * time.Second,
 		janitorInterval: janitorDefaultInterval,
 		stopJanitor:     make(chan struct{}),
 		kickJanitor:     make(chan struct{}, 1),

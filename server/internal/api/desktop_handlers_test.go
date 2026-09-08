@@ -166,8 +166,8 @@ func TestDesktopPerNodeLimit(t *testing.T) {
 	nodeID := env.EnrollNode(t, "WEB-DT3", "mid-dt3")
 	_ = dialControl(t, env, nodeID)
 
-	// 默认 4（含 manager.New 零值兜底）：前 4 发均 202
-	for i := 0; i < 4; i++ {
+	// 默认 8（含 manager.New 零值兜底）：前 8 发均 202
+	for i := 0; i < 8; i++ {
 		resp := desktopPost(t, env, nodeID, `{}`)
 		_ = resp.Body.Close()
 		require.Equal(t, 202, resp.StatusCode, "viewer %d", i+1)
