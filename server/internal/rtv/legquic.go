@@ -35,6 +35,9 @@ func (s *Server) serveHostLeg(addr string) error {
 	if err != nil {
 		return fmt.Errorf("host leg quic listen: %w", err)
 	}
+	s.addrMu.Lock()
+	s.hostAddrInfo = udp.LocalAddr().String()
+	s.addrMu.Unlock()
 	slog.Info("rtv: host leg (raw QUIC) listening", "addr", addr, "alpn", HostALPN)
 	go func() {
 		for {

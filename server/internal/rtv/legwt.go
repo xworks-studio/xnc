@@ -48,6 +48,9 @@ func (s *Server) serveWTLeg(addr string) error {
 		// 胶囊（MAX_DATA）不再被处理 → 流写入永久阻塞。
 		s.handleWTSession(binding, sess)
 	})
+	s.addrMu.Lock()
+	s.wtAddrInfo = udp.LocalAddr().String()
+	s.addrMu.Unlock()
 	slog.Info("rtv: webtransport leg listening", "addr", addr)
 	go func() {
 		if err := wt.Serve(udp); err != nil {

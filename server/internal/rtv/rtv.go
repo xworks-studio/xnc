@@ -5,6 +5,7 @@ package rtv
 
 import (
 	"crypto/tls"
+	"sync"
 )
 
 // ViewerBinding 连接期鉴权产物：会话 token → 节点/会话绑定。
@@ -38,9 +39,20 @@ type Server struct {
 	// TTL 判据）；可为 nil（无治理）。
 	Touch func(session string)
 
-	wtAddr  string // UDP（如 ":443"）
+	wtAddr   string // UDP（如 ":443"）
 	hostAddr string // host 腿 QUIC（如 ":4433"）
-	wsReady bool
+
+	// 实际监听地址（":0" → ephemeral 后回填；测试读取）。
+	addrMu      sync.Mutex
+	hostAddrInfo string
+	wtAddrInfo   string
+}
+
+// ActualAddrs 返回两腿的实际监听地址（Start 后可用；测试与观测用）。
+func (s *Server) ActualAddrs() (host, wt string) {
+	s.addrMu.Lock()
+	defer s.addrMu.Unlock()
+	return s.hostAddrInfo, s.wtAddrInfo
 }
 
 // Options 构造参数（源自 server config；地址空 = 不启对应腿）。
@@ -70,6 +82,5 @@ func (s *Server) Start() error {
 			return err
 		}
 	}
-	s.wsReady = true
 	return nil
 }
