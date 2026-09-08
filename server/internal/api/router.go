@@ -2,12 +2,14 @@ package api
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"xnc/proto"
 	"xnc/server"
 	"xnc/server/internal/auth"
 	"xnc/server/internal/config"
@@ -115,6 +117,21 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		},
 		cfg.RTVWSOrigins)
 	h.rtv.Touch = sess.TouchActivity
+	// HostToken 活跃会话回查：server 重启后 minted 表清空，运行中 host 的
+	// 重连注册经此恢复（凭据随会话存续）。
+	h.rtv.Hub.SetHostTokenOf(func(node string) string {
+		n, err := uuid.Parse(node)
+		if err != nil {
+			return ""
+		}
+		for _, s := range sess.SessionsOf(n, proto.KindDesktop) {
+			var p proto.DesktopParams
+			if json.Unmarshal(s.Params, &p) == nil && p.HostToken != "" {
+				return p.HostToken
+			}
+		}
+		return ""
+	})
 	h.rtv.Hub.SetInputGate(func(node, sessionID string) bool {
 		n, err := uuid.Parse(node)
 		if err != nil {
