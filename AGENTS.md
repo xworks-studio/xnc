@@ -15,11 +15,15 @@ XNC = Windows 节点远程管理平台：Go server（xnc.app）+ Windows agent
 ```
                  ┌─ SRV（阿里云，xnc.app）docker：caddy(TLS) ─ xnc-server ─ postgres
                  │                                    coturn(TURN)   watchtower(自动更新)
-   浏览器 ───────┤  HTTPS/WS：Web UI / REST / WS 信令 / 桌面会话中继（SRTP 经 TURN）
+   浏览器 ───────┤  TCP443(caddy)：Web UI / REST / RTV WS 兜底腿（/ws）
+                 │  UDP443：RTV WebTransport 主路（H3，ACME 真实 CA 证书）
                  │  分发：/installer + /installer.json + /download 页（无认证）
                  │
-   Windows 节点 ─┘  纯出站 wss 连接（agent 自报版本，server 推送更新）
-     XNCAgent(SYSTEM) + XNCCore(桌面采集/会话桥) + agentctl 管道(本地控制面)
+   Windows 节点 ─┘  纯出站 wss 控制连接（agent 自报版本，server 推送更新）
+     XNCAgent(SYSTEM) + XNCCore(spawn 桥) + xnc-host.exe(Rust 采集/编码/
+       RS FEC/QUIC 直连 UDP4433，HostToken 经 stdin 下发) + agentctl 管道
+     媒体面（RTV，2026-09-08 重构）：host→server 字节扇出→浏览器 WebCodecs
+       硬解；TURN/WebRTC/rt-pipe/C++ desktop 栈已退役
      状态：ProgramData\XNC（binding/identity/回滚缓存）；用户会话：~/.xnc
      用户流：装安装器（零凭据）→ xnc register（登录→选 cluster→秒级上线）
 ```
