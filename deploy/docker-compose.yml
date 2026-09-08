@@ -38,6 +38,7 @@ services:
       # 容器内监听（host 腿 UDP4433 / WT 腿 UDP443；均需 compose 端口映射）。
       XNC_RTV_HOST_ADDR: ":4433"
       XNC_RTV_WT_ADDR: ":443"
+      XNC_RTV_WT_PORT: ${XNC_RTV_WT_PORT:-}
       # ACME DNS-01（lego + Aliyun DNS）：浏览器 WT 走标准 Web PKI。凭据在
       # deploy/.env（ALIDNS_*），证书/账号密钥持久化于 rtv-certs 卷。
       XNC_ACME_DOMAIN: ${XNC_ACME_DOMAIN:-xnc.app}
@@ -56,6 +57,9 @@ services:
       # 网络不必要）。
       - "443:443/udp"
       - "4433:4433/udp"
+      # 过渡期 WT 非规范端口（UDP443 被安全组拦截时浏览器走这里；放行
+      # 443/udp 后置空 XNC_RTV_WT_PORT 即回规范 URL）。
+      - "14433:443/udp"
     volumes:
       - rtv-certs:/data/rtv-certs
 

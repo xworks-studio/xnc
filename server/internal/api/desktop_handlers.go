@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -69,7 +70,14 @@ func (h *handlers) desktopStart(w http.ResponseWriter, r *http.Request) {
 	// viewer 腿地址按请求同源推导（生产 = xnc.app 经 caddy/UDP443；dev =
 	// 本机直连）。HostToken/StreamEndpoint 的 endpoint 形态可不同（endpoint
 	// 是 host 腿 QUIC 地址，可能经独立端口映射）。
-	wtURL := "https://" + r.Host + "/wt"
+	wtHost := r.Host
+	if p := h.cfg.RTVWTPublicPort; p != "" {
+		// 过渡期非规范 WT 端口（UDP443 受限时）：替换 URL 的端口部分。
+		if h := hostOnly(r.Host); h != "" {
+			wtHost = h + ":" + p
+		}
+	}
+	wtURL := "https://" + wtHost + "/wt"
 	wsURL := "wss://" + r.Host + "/ws"
 
 	h.startSession(w, r, proto.KindDesktop, params, "desktop.open", "desktop.close",
@@ -82,6 +90,14 @@ func (h *handlers) desktopStart(w http.ResponseWriter, r *http.Request) {
 				"granted": res.LeaseGranted, "leaseId": res.LeaseID,
 			}}
 		})
+}
+
+// hostOnly 剥离 Host 头的 :port 部分（空 = 形态异常，调用方保底原样）。
+func hostOnly(host string) string {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	return host
 }
 
 // rtvStats 管理端观测面（原 MVP /statsz 收权版本：JWT admin 组内挂载）。
