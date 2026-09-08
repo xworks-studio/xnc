@@ -1,0 +1,283 @@
+//! MVP-RTV 采集端入口。
+//!
+//! 线程模型（对应研究报告中的 Sunshine video.cpp 结构）：
+//! - 主线程 = 采集+编码循环（frame pacing，`critical` 越权不设，保持系统友好）
+//! - tokio 运行时：QUIC 传输 / 控制分发 / QoS(3s) / 统计日志(1s)
+//!
+//! 采集→编码→组帧→FEC→pacing 发送的数据流：
+//!   ScreenCapturer(BGRA+光标) → VideoEncoder(NV12→H.264) → framing::build_packets
+//!   → Shared::media_send → 令牌桶 → QUIC datagram → server 扇出
+
+mod capture;
+mod encoder;
+mod framing;
+mod input;
+mod qos;
+mod rs;
+mod shared;
+mod stats;
+mod transport;
+
+use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use clap::Parser;
+
+use capture::{CaptureOutcome, ScreenCapturer};
+use encoder::VideoEncoder;
+use shared::{ControlMsg, EncoderMeta, Shared};
+
+#[derive(Parser, Debug)]
+#[command(about = "MVP-RTV host: capture + encode + FEC + QUIC")]
+struct Args {
+    /// 中转服务器 QUIC 地址（host leg，UDP）
+    #[arg(long, default_value = "47.96.83.132:4433")]
+    server: String,
+    #[arg(long, default_value = "default")]
+    session: String,
+    #[arg(long, default_value_t = 30)]
+    fps: i32,
+    #[arg(long, default_value_t = 15000)]
+    bitrate_kbps: i32,
+    /// FEC 百分比（初始值，QoS 可动态调节）
+    #[arg(long, default_value_t = 20)]
+    fec: u8,
+    /// 显示器序号（0 = 主屏）
+    #[arg(long, default_value_t = 0)]
+    display: usize,
+    /// 发送端整流速率上限（kbps）
+    #[arg(long, default_value_t = 50000)]
+    send_kbps: u32,
+    /// 不叠加光标（调试用）
+    #[arg(long, default_value_t = false)]
+    no_cursor: bool,
+    /// 强制指定编码器名（如 h264_qsv / libx264），跳过自动探测
+    #[arg(long)]
+    encoder: Option<String>,
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    init_tracing()?;
+
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        server = %args.server,
+        fps = args.fps,
+        bitrate_kbps = args.bitrate_kbps,
+        fec = args.fec,
+        "mvp-host starting"
+    );
+
+    let shared = Arc::new(Shared::new(
+        args.session.clone(),
+        args.fps,
+        args.bitrate_kbps,
+        args.fec,
+    ));
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("tokio runtime")?;
+    let server: SocketAddr = args.server.parse().context("server addr")?;
+
+    // 传输任务
+    {
+        let shared = shared.clone();
+        rt.spawn(async move {
+            if let Err(e) = transport::run(shared, server, args.send_kbps).await {
+                tracing::error!(?e, "transport task exited");
+                std::process::exit(2);
+            }
+        });
+    }
+    // QoS 任务（3s 窗口）
+    {
+        let shared = shared.clone();
+        rt.spawn(async move {
+            let mut qos = qos::QosController::new();
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                qos.evaluate(&shared);
+            }
+        });
+    }
+    // 统计任务（1s 日志）
+    {
+        let shared = shared.clone();
+        rt.spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let enc = shared
+                    .encoder_meta()
+                    .map(|m| m.name)
+                    .unwrap_or_else(|| "pending".into());
+                shared.stats.log_periodic(
+                    &enc,
+                    shared.is_connected(),
+                    shared.viewers.load(Ordering::SeqCst),
+                    shared.fps.load(Ordering::SeqCst),
+                    shared.bitrate_kbs.load(Ordering::SeqCst),
+                    shared.fec_percentage.load(Ordering::SeqCst),
+                );
+            }
+        });
+    }
+
+    // 采集 + 编码主循环（带重建：显示器/编码器异常恢复）
+    let _rt = rt;
+    let mut backoff = Duration::from_millis(200);
+    loop {
+        match run_pipeline(&shared, &args) {
+            Ok(()) => unreachable!("pipeline only returns on error"),
+            Err(e) => {
+                tracing::warn!(?e, retry_in_ms = backoff.as_millis() as u64, "pipeline restart");
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_secs(3));
+            }
+        }
+    }
+}
+
+/// 一轮完整采集→编码管线；返回 Err 时上层带退避重启（rustdesk SWITCH 模式）。
+fn run_pipeline(shared: &Arc<Shared>, args: &Args) -> Result<()> {
+    let mut capturer = ScreenCapturer::new(args.display, !args.no_cursor)
+        .context("create capturer")?;
+    let (w, h) = (capturer.width, capturer.height);
+    if capturer.is_gdi() {
+        tracing::warn!("running on GDI capture (DXGI unavailable)");
+    }
+
+    let fps0 = shared.fps.load(Ordering::SeqCst);
+    let bitrate = shared.bitrate_kbs.load(Ordering::SeqCst);
+    let mut enc = match &args.encoder {
+        Some(name) => VideoEncoder::with_name(name, w, h, fps0, bitrate)?,
+        None => VideoEncoder::new(w, h, fps0, bitrate)?,
+    };
+    shared.set_encoder_meta(EncoderMeta {
+        name: enc.name.clone(),
+        hw: enc.hw,
+        width: w,
+        height: h,
+    });
+    // config 在 transport 连接时/已连接时都会发送；已连接则补发一次
+    shared.ctrl_send(ControlMsg(serde_json::json!({
+        "type": "config", "codec": "h264", "width": w, "height": h,
+        "fps": fps0, "fecPercentage": shared.fec_percentage.load(Ordering::SeqCst),
+        "shardPayload": framing::SHARD_PAYLOAD_TARGET,
+        "encoder": enc.name, "encoderHw": enc.hw,
+        "startedUnixMs": now_ms(),
+    })));
+
+    let mut frame_index: u32 = 0u32.wrapping_sub(1); // 下一帧从 0 开始
+    let mut next_tick = Instant::now();
+    let mut prev_viewers: usize = 0;
+    loop {
+        // ---- frame pacing（fps 可被 QoS/setParams 动态调整）----
+        let fps = shared.fps.load(Ordering::SeqCst).max(1);
+        let interval = Duration::from_secs_f64(1.0 / fps as f64);
+        let now = Instant::now();
+        if next_tick > now {
+            std::thread::sleep(next_tick - now);
+        }
+        next_tick += interval;
+        if next_tick <= now {
+            next_tick = now + interval; // 掉队重锚定（Sunshine/Linux handle_pacing 同款）
+        }
+
+        // ---- viewer 增加时强制产帧（静止桌面下新 viewer 否则等不到 IDR）----
+        let viewers = shared.viewers.load(Ordering::SeqCst);
+        if viewers > prev_viewers && viewers > 0 {
+            tracing::info!(prev = prev_viewers, now = viewers, "viewer joined, force frame");
+            capturer.force_frame();
+        }
+        prev_viewers = viewers;
+
+        // ---- 采集 ----
+        let t_cap = Instant::now();
+        let outcome = capturer.next(Duration::from_millis(1))?;
+        match outcome {
+            CaptureOutcome::Reinit => {
+                anyhow::bail!("display changed -> pipeline restart")
+            }
+            CaptureOutcome::NoChange => continue,
+            CaptureOutcome::Frame(bgra) => {
+                // 未连接不编码（省 CPU；rustdesk 无订阅者时不采）
+                if !shared.is_connected() || shared.viewers.load(Ordering::SeqCst) == 0 {
+                    continue;
+                }
+                let cap_ms = t_cap.elapsed().as_secs_f64() * 1000.0;
+                shared.stats.capture_time(cap_ms);
+
+                // ---- 按需 IDR（viewer frameLoss / 显式请求）----
+                if shared.idr_requested.swap(false, Ordering::SeqCst) {
+                    if let Err(e) = enc.force_idr() {
+                        tracing::warn!(?e, "force_idr failed");
+                    } else {
+                        shared.stats.idr_forced();
+                    }
+                }
+                // 码率热调
+                enc.set_bitrate(shared.bitrate_kbs.load(Ordering::SeqCst));
+
+                // ---- 编码 ----
+                let t_enc = Instant::now();
+                let packets = enc
+                    .encode_bgra(bgra, frame_index as i64)
+                    .with_context(|| format!("encode frame {frame_index}"))?;
+                let enc_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
+                shared.stats.encode_time(enc_ms);
+                if packets.iter().any(|p| p.key) {
+                    tracing::debug!(frame = frame_index, "keyframe emitted");
+                }
+                // 单帧可能产出多个包（编码器内部缓存/重排，理论上 CBR 无 B 帧为 1 个）
+                for (i, p) in packets.iter().enumerate() {
+                    let pkt_frame = frame_index.wrapping_add(i as u32);
+                    let fec = shared.fec_percentage.load(Ordering::SeqCst);
+                    let capture_us = Shared::unix_us();
+                    let media = framing::build_packets(
+                        &p.data, pkt_frame, framing::CODEC_H264, p.key, capture_us, fec,
+                    );
+                    let bytes: u64 = media.iter().map(|x| x.len() as u64).sum();
+                    let shard_count = media.len();
+                    shared.stats.frame_sent(p.key, bytes);
+                    shared.media_send(media);
+                    shared.ctrl_send(ControlMsg(serde_json::json!({
+                        "type": "frameStats",
+                        "frameIndex": pkt_frame,
+                        "captureMs": (cap_ms * 100.0).round() / 100.0,
+                        "encodeMs": (enc_ms * 100.0).round() / 100.0,
+                        "bytes": bytes,
+                        "keyframe": p.key,
+                        "shards": shard_count,
+                        "sentUnixUs": Shared::unix_us(),
+                    })));
+                }
+                frame_index = frame_index.wrapping_add(packets.len() as u32);
+            }
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+fn init_tracing() -> Result<()> {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,mvp=debug"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_thread_names(false)
+        .with_ansi(false)
+        .init();
+    Ok(())
+}

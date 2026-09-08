@@ -1,0 +1,29 @@
+[package]
+name = "xnc-host"
+version = "0.1.0"
+edition = "2021"
+description = "XNC 桌面采集端：scrap 采集 + hwcodec 编码 + RS FEC + QUIC 发送（线协议见 docs/superpowers/specs/2026-09-08-desktop-rtv-rewrite-design.md 与原 mvp/docs/proto.md）"
+
+[dependencies]
+# 采集复用 third_party/scrap（rustdesk fork 的 XNC 裁剪版：Windows DXGI/GDI + libyuv）
+scrap = { path = "../third_party/scrap" }
+hwcodec = { git = "https://github.com/rustdesk-org/hwcodec" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+bytes = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+winapi = { version = "0.3", features = [
+    "winuser", "wingdi", "errhandlingapi", "winerror", "libloaderapi", "handleapi",
+] }
+
+[profile.release]
+opt-level = 2
+debug = false

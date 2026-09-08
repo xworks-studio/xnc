@@ -35,3 +35,7 @@ artifacts/
 
 # 代码签名私钥（仅本地，勿入库）
 installer/codesign.pfx
+
+# Rust（xnc-host / vendored scrap）
+host/target/
+third_party/scrap/src/generated/

@@ -1,0 +1,4 @@
+# 与 rustdesk/.cargo/config.toml 同款：hwcodec 强制 static_crt(true)（/MT），
+# 全链路 crt-static 保持 CRT 一致，产物单文件无需 VCRedist（便于部署）。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-Ctarget-feature=+crt-static"]

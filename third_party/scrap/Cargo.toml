@@ -1,0 +1,35 @@
+[package]
+name = "scrap"
+description = "Screen capture made easy. (XNC vendored trim of rustdesk/libs/scrap: Windows DXGI/GDI + libyuv only)"
+version = "0.5.0-xnc"
+repository = "https://github.com/rustdesk/rustdesk"
+keywords = ["screen", "capture", "record"]
+license = "MIT"
+edition = "2018"
+
+# XNC 裁剪说明（源自 rustdesk rev 92d787b88，2026-09-07 检出）：
+# - 仅保留 Windows DXGI/GDI 采集、common/{mod,convert,dxgi}、libyuv 绑定；
+# - 删除 codec/vpxcodec/vpx/aom/camera/record/vram/wayland/x11/quartz/android
+#   与 hbb_common 依赖（bail/log/ResultType 以 anyhow+tracing 垫片替代）；
+# - 删除 hwcodec feature（宿主 crate 直接依赖 hwcodec，不经 scrap）；
+# - build.rs 仅生成 libyuv 绑定（vpx/aom 绑定随模块一并移除）。
+# 上游升级：以 rustdesk/libs/scrap 对应文件 diff 后手工回移，勿整目录覆盖。
+
+[dependencies]
+lazy_static = "1.4"
+anyhow = "1"
+tracing = "0.1"
+
+[features]
+# vram（D3D11 零拷贝）路径未随迁移启用；保留空特性声明使 cfg(feature="vram")
+# 为已知（恒假）配置，避免 unexpected_cfgs 告警。
+vram = []
+
+[dependencies.winapi]
+version = "0.3"
+default-features = true
+features = ["dxgi", "dxgi1_2", "dxgi1_5", "d3d11", "winuser", "winerror", "errhandlingapi", "libloaderapi", "wingdi", "impl-default"]
+
+[build-dependencies]
+target_build_utils = "0.3"
+bindgen = "0.72.1"
