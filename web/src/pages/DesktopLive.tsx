@@ -57,6 +57,14 @@ type Phase = "connecting" | "waiting" | "live" | "hostOffline" | "fatal";
 
 const MAX_QUEUE = 3;
 const MAX_RETRIES = 8;
+// RTT/时钟偏差平滑窗口（中值）：媒体突发会短暂阻塞控制流（真实排队），
+// 逐样本显示会双峰抖动 + 顶栏回流；中值滤波兼顾展示与 QoS 反馈。
+const SMOOTH_WIN = 9;
+
+function median(nums: number[]): number {
+  const s = [...nums].sort((a, b) => a - b);
+  return s[Math.floor(s.length / 2)];
+}
 
 export default function DesktopLive() {
   const { nodeId = "" } = useParams();
@@ -77,7 +85,7 @@ export default function DesktopLive() {
   const [hud, setHud] = useState<WorkerStats | null>(null);
   // 每秒差分速率（worker 计数器为累计值）
   const [rates, setRates] = useState({ mbps: 0, pktRate: 0, fps: 0 });
-  const [rttMs, setRttMs] = useState(0);
+  const [rttMs, setRttMs] = useState<number | null>(null);
   const [e2eMs, setE2eMs] = useState<number | null>(null);
   const [logLines, setLogLines] = useState<string[]>([]);
 
@@ -90,6 +98,12 @@ export default function DesktopLive() {
   const retryRef = useRef(0);
   const prevStatsRef = useRef<WorkerStats | null>(null);
   const rttRef = useRef(0);
+  // RTT/时钟偏差平滑（含 QoS 反馈与 e2e 校正，见 SMOOTH_WIN 注释）
+  const rttWinRef = useRef<number[]>([]);
+  const offsetWinRef = useRef<number[]>([]);
+  const clockOffsetRef = useRef<number | null>(null);
+  // e2e 高频原始值（renderLoop 每帧算，1s 才同步到 state 免整页重渲染）
+  const e2eRawRef = useRef<number | null>(null);
 
   useEffect(() => {
     inputOnRef.current = inputOn;
@@ -247,13 +261,26 @@ export default function DesktopLive() {
           config = null;
           setPhase("hostOffline");
           break;
-        case "heartbeat":
-          if (typeof v.tMs === "number") {
-            const rtt = Date.now() - v.tMs;
-            rttRef.current = rtt;
-            setRttMs(rtt);
+        case "heartbeat": {
+          if (typeof v.tMs !== "number") break;
+          const rtt = Date.now() - v.tMs;
+          // 负值/离谱大值 = 本机时钟被 NTP 回拨或样本损坏，丢弃
+          if (rtt < 0 || rtt > 10_000) break;
+          const win = rttWinRef.current;
+          win.push(rtt);
+          if (win.length > SMOOTH_WIN) win.shift();
+          rttRef.current = median(win); // QoS 反馈用平滑值（尖峰会误伤码率/FEC）
+          setRttMs(median(win));
+          // 时钟偏差（NTP 中点法）：hostNow - (send+recv)/2，e2e 校正用
+          if (typeof v.hostNowMs === "number") {
+            const off = v.hostNowMs - (v.tMs + rtt / 2);
+            const ow = offsetWinRef.current;
+            ow.push(off);
+            if (ow.length > SMOOTH_WIN) ow.shift();
+            clockOffsetRef.current = median(ow);
           }
           break;
+        }
         default:
           break;
       }
@@ -287,6 +314,7 @@ export default function DesktopLive() {
           decodeQueueDepth: s?.decodeQueue || 0,
           decodedFps: s?.decoded || 0,
         });
+        setE2eMs(e2eRawRef.current); // 1s 同步，避免逐帧 setState 重渲染整页
       }, 1000);
     };
 
@@ -355,7 +383,12 @@ export default function DesktopLive() {
       const m = queue.shift()!;
       ctx.drawImage(m.frame, 0, 0, canvas.width, canvas.height);
       if (m.captureUnixUs) {
-        setE2eMs(Math.round((Date.now() * 1000 - m.captureUnixUs) / 1000));
+        // e2e = 本地时刻 + 时钟偏差 - 采集时刻；偏差未收敛前不显示
+        const off = clockOffsetRef.current;
+        e2eRawRef.current =
+          off === null
+            ? null
+            : Math.max(0, Math.round(Date.now() + off - m.captureUnixUs / 1000));
       }
       if (lastDrawn) lastDrawn.close(); // 延迟一帧释放（防 GPU 竞争）
       lastDrawn = m.frame;
@@ -609,19 +642,22 @@ export default function DesktopLive() {
               控制权：{control?.name || "其他用户"}
             </span>
           )}
-          <span className="dt-chip" title="控制环往返（心跳测得）">
-            rtt {Math.round(rttMs)}ms
+          <span
+            className="dt-chip dt-chip-num"
+            title="控制环往返（心跳测得，中值滤波）"
+          >
+            rtt {rttMs === null ? "–" : `${Math.round(rttMs)}ms`}
           </span>
           {phase === "live" && (
-            <span className="dt-chip" title="解码帧率（每秒差分）">
+            <span className="dt-chip dt-chip-num" title="解码帧率（每秒差分）">
               {rates.fps} fps
             </span>
           )}
           <span
-            className="dt-chip"
-            title="采集→渲染端到端（含双端时钟偏差，参考值）"
+            className="dt-chip dt-chip-num"
+            title="采集→渲染端到端（已按心跳估出的双端时钟偏差校正）"
           >
-            e2e≈{e2eMs ?? "–"}ms
+            e2e≈{e2eMs === null ? "–" : `${e2eMs}ms`}
           </span>
           {codecInfo && (
             <span className="dt-chip" title={codecInfo}>

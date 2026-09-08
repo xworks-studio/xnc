@@ -600,6 +600,12 @@ h2 {
   text-overflow: ellipsis;
   max-width: 340px;
 }
+/* 数值芯片：定宽 + 表格数字，数值变化不回流顶栏（防闪烁） */
+.dt-chip.dt-chip-num {
+  min-width: 10ch;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
 .dt-chip.ok {
   color: var(--ok);
   border-color: rgba(53, 201, 138, 0.45);
