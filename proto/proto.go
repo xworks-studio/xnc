@@ -36,12 +36,13 @@ const (
 	// ── relay 控制连接（relay ↔ server，relay-plane spec §3.4）──
 	// 与 agent 控制连接同构：持久 WS + ed25519 挑战-应答 + 公钥准入。
 	// P1 子集；P2 的 RESOLVE/DRAIN/TICKET_REFRESH 不在本次定义。
-	TypeRelayRegister     = "RELAY_REGISTER"
-	TypeRelayHeartbeat    = "RELAY_HEARTBEAT"
-	TypeRelayHeartbeatAck = "RELAY_HEARTBEAT_ACK"
-	TypeRelayStats        = "RELAY_STATS"
-	TypeRelayReconcile    = "RELAY_RECONCILE"
-	TypeRelaySessionKill  = "RELAY_SESSION_KILL"
+	TypeRelayChallengeResponse = "RELAY_CHALLENGE_RESPONSE"
+	TypeRelayRegister          = "RELAY_REGISTER"
+	TypeRelayHeartbeat         = "RELAY_HEARTBEAT"
+	TypeRelayHeartbeatAck      = "RELAY_HEARTBEAT_ACK"
+	TypeRelayStats             = "RELAY_STATS"
+	TypeRelayReconcile         = "RELAY_RECONCILE"
+	TypeRelaySessionKill       = "RELAY_SESSION_KILL"
 )
 
 func NewMsg(typ string, payload any) (Message, error) {

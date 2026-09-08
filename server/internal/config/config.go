@@ -55,6 +55,9 @@ type Config struct {
 	// 可接受；部署外部 relay 前必须显式配置，否则 server 重启后外部 relay
 	// 需重连控制连接同步新公钥）。
 	RTVSigningKey string // XNC_RTV_SIGNING_KEY
+	// RTVRelayAllowlist（relay-plane 准入）：ed25519 公钥 hex 清单（逗号
+	// 分隔）。命中 → 注册即 active；未命中 → pending 待管理端审批。
+	RTVRelayAllowlist []string // XNC_RTV_RELAY_ALLOWLIST
 
 	DesktopPerNode     int           // XNC_DESKTOP_PER_NODE，默认 8（多 viewer 各自独立会话），0 = 不限
 	DesktopIdleTimeout time.Duration // XNC_DESKTOP_IDLE，默认 5m（无信令活动即关），0 = 不限
@@ -87,6 +90,7 @@ func Load() (Config, error) {
 		RTVInsecureTLS:        envBool("XNC_RTV_INSECURE_TLS", false),
 		RTVWSOrigins:          envList("XNC_RTV_WS_ORIGINS"),
 		RTVSigningKey:         os.Getenv("XNC_RTV_SIGNING_KEY"),
+		RTVRelayAllowlist:     envList("XNC_RTV_RELAY_ALLOWLIST"),
 		DesktopPerNode:        envInt("XNC_DESKTOP_PER_NODE", 8),
 		DesktopIdleTimeout:    envDur("XNC_DESKTOP_IDLE", 5*time.Minute),
 		InstallerSyncRepo:     env("XNC_INSTALLER_SYNC_REPO", "xworks-studio/xnc"),

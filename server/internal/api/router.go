@@ -26,6 +26,8 @@ type handlers struct {
 	// rtvSign RelayTicket 签发器（relay-plane spec §3.1：host 张按
 	// (node,relay) 等值复用、viewer 张按会话铸造；私钥绝不外流）。
 	rtvSign *rtv.Signer
+	// pool relay 池管理器（T5 注入；nil = 未接线，状态变更无在线通知）。
+	pool relayPool
 }
 
 // Close 停止 handler 的后台 worker（RTV 中继随进程生命周期，无独立停止面）。
@@ -211,6 +213,10 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		ar.Get("/releases", h.adminListReleases)
 		ar.Delete("/releases/{id}", h.adminDeleteRelease)
 		ar.Post("/rollout", h.adminRollout)
+		// relay 池管理（relay-plane）：列出/状态流转（审批 pending → active
+		// 等；admin = cluster owner，与 releases 同判定）。
+		ar.Get("/relays", h.adminListRelays)
+		ar.Patch("/relays/{id}", h.adminSetRelayStatus)
 	})
 	// CLI 自更新（用户 JWT）：元信息 + 二进制
 	r.Route("/api/cli", func(cr chi.Router) {

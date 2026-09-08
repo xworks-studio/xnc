@@ -64,6 +64,19 @@ type Node struct {
 	Channel       string             `json:"channel"`
 }
 
+type Relay struct {
+	ID          string    `json:"id"`
+	Pubkey      string    `json:"pubkey"`
+	Region      string    `json:"region"`
+	Endpoints   []byte    `json:"endpoints"`
+	MaxSessions int32     `json:"max_sessions"`
+	MaxMbpsOut  int32     `json:"max_mbps_out"`
+	Version     string    `json:"version"`
+	Status      string    `json:"status"`
+	CreatedAt   time.Time `json:"created_at"`
+	LastSeenAt  time.Time `json:"last_seen_at"`
+}
+
 type Release struct {
 	ID        uuid.UUID `json:"id"`
 	Version   string    `json:"version"`
