@@ -11,4 +11,5 @@ use (
 	./tools/desktopreport
 	./tools/e2eviewer
 	./tools/nalcheck
+	./tools/rtvload
 )
