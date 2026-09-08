@@ -15,6 +15,8 @@ import { rsRecover } from './rs.js';
 // 120ms 为超时兜底上限（确定性丢帧检测=新帧首包到达，不受此影响）。
 const FRAME_GC_MS = 120;
 const FRAME_GC_MS_RELIABLE = 500;
+// 新帧触发的确定性定稿所需的静默时长（收包会刷新；低于此值的在途帧豁免）。
+const FRAME_STALE_MS = 60;
 let transportReliable = false; // WS 兜底路径
 const MAX_PENDING = 16;
 
@@ -44,6 +46,7 @@ class Frame {
     this.captureUnixUs = 0;
     this.firstArrivalMs = performance.now();
     this.createdAt = Date.now();
+    this.lastAtMs = Date.now(); // 最近一包到达时刻（in-flight 判据）
   }
 }
 
@@ -87,11 +90,15 @@ function onDatagram(buf) {
     if (pending.size > MAX_PENDING) pending.clear(); // 防积压（异常场景）
     const f = new Frame(h.frameIndex);
     pending.set(h.frameIndex, f);
+    const nowMs = Date.now();
     for (const [idx, pf] of pending) {
-      if (idx < h.frameIndex) finalize(pf);
+      // 确定性丢帧检测只对"已静默"的更早帧生效：仍在收包的帧（大 IDR
+      // 跨秒投递）绝不提前判死。
+      if (idx < h.frameIndex && nowMs - pf.lastAtMs >= FRAME_STALE_MS) finalize(pf);
     }
   }
   const f = pending.get(h.frameIndex);
+  f.lastAtMs = Date.now();
   f.blockTotal = Math.max(f.blockTotal, h.blockTotal);
   f.keyframe = f.keyframe || h.keyframe;
   if (!f.captureUnixUs) f.captureUnixUs = h.captureUnixUs;
@@ -121,7 +128,7 @@ setInterval(() => {
   const now = Date.now();
   const gc = transportReliable ? FRAME_GC_MS_RELIABLE : FRAME_GC_MS;
   for (const f of pending.values()) {
-    if (now - f.createdAt >= gc) finalize(f);
+    if (now - f.lastAtMs >= gc) finalize(f);
   }
 }, 5);
 
