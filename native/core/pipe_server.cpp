@@ -952,9 +952,20 @@ Frame HandleStartCapture(const Frame& req, Watchdog* wd) {
   switch (DecideCaptureReuse(g_capture.valid, alive, g_capture.session,
                              active)) {
     case CaptureReuse::kReuse:
-      XNC_LOG_INFO("start_capture: reuse pid=%lu gen=%u session=%u",
-                   g_capture.pid, g_capture.gen, g_capture.session);
-      return EncodeStartCaptureOk(req, g_capture.pid, g_capture.gen);
+      if (g_capture.cfg == cfg) {
+        XNC_LOG_INFO("start_capture: reuse pid=%lu gen=%u session=%u",
+                     g_capture.pid, g_capture.gen, g_capture.session);
+        return EncodeStartCaptureOk(req, g_capture.pid, g_capture.gen);
+      }
+      // cfg 变更（token 轮换/endpoint 调整）：运行中的 host 持旧凭据，对其
+      // 而言新值永不可见（stdin 只在 spawn 时投递）——终止换血，按新 cfg
+      // 重拉（gen++；退避/降级监督不变）。
+      XNC_LOG_INFO(
+          "start_capture: cfg changed, restarting host pid=%lu gen=%u",
+          g_capture.pid, g_capture.gen);
+      TerminateCaptureChildLocked(g_capture.pid, g_capture.child);
+      g_capture.valid = false;
+      break;
     case CaptureReuse::kRespawnStaleSession:
       // Console moved (fast user switch / logoff->logon) under a live
       // child: it belongs to the OLD session. Terminate by stored handle
