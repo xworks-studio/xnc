@@ -17,7 +17,7 @@ import (
 	"xnc/server/internal/config"
 	"xnc/server/internal/db"
 	"xnc/server/internal/registry"
-	"xnc/server/internal/rtv"
+	"xnc/rtv"
 	"xnc/server/internal/session"
 	"xnc/server/internal/version"
 )

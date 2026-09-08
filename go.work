@@ -5,6 +5,7 @@ use (
 	./cli
 	./mockagent
 	./proto
+	./rtv
 	./server
 	./shellhost
 	./shellsmoke
