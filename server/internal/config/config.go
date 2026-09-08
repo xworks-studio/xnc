@@ -51,7 +51,7 @@ type Config struct {
 	// 校验；生产经 caddy 同源反代即正确语义，dev 跨源联调时配置）。
 	RTVWSOrigins []string // XNC_RTV_WS_ORIGINS，逗号分隔
 
-	DesktopPerNode     int           // XNC_DESKTOP_PER_NODE，默认 4（多 viewer 各自独立会话），0 = 不限
+	DesktopPerNode     int           // XNC_DESKTOP_PER_NODE，默认 8（多 viewer 各自独立会话），0 = 不限
 	DesktopIdleTimeout time.Duration // XNC_DESKTOP_IDLE，默认 5m（无信令活动即关），0 = 不限
 
 	// —— installer 分发同步（installersync）：GitHub Releases 是唯一事实
@@ -80,7 +80,7 @@ func Load() (Config, error) {
 		RTVKeyFile:            os.Getenv("XNC_RTV_KEY_FILE"),
 		RTVInsecureTLS:        envBool("XNC_RTV_INSECURE_TLS", false),
 		RTVWSOrigins:          envList("XNC_RTV_WS_ORIGINS"),
-		DesktopPerNode:        envInt("XNC_DESKTOP_PER_NODE", 4),
+		DesktopPerNode:        envInt("XNC_DESKTOP_PER_NODE", 8),
 		DesktopIdleTimeout:    envDur("XNC_DESKTOP_IDLE", 5*time.Minute),
 		InstallerSyncRepo:     env("XNC_INSTALLER_SYNC_REPO", "xworks-studio/xnc"),
 		InstallerSyncInterval: envDur("XNC_INSTALLER_SYNC_INTERVAL", 5*time.Minute),
