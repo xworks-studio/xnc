@@ -306,6 +306,7 @@ export default function DesktopLive() {
         }
       };
       sock.onclose = () => {
+        if (ws !== sock) return; // 已被新一轮会话替换
         log("WS 断开");
         bumpEpoch();
       };
@@ -313,14 +314,20 @@ export default function DesktopLive() {
 
     const connectWT = async (url: string) => {
       const t = new WebTransport(url);
+      // closed 只在 WT 仍是当前活跃传输时才触发重建：握手失败回退 WS 后，
+      // 迟到的 closed 回调不得把已建立的 WS 会话杀掉（曾致无限重连循环）。
       void t.closed.then(
         () => {
-          log("WT 关闭");
-          bumpEpoch();
+          if (wt === t) {
+            log("WT 关闭");
+            bumpEpoch();
+          }
         },
         () => {
-          log("WT 异常关闭");
-          bumpEpoch();
+          if (wt === t) {
+            log("WT 异常关闭");
+            bumpEpoch();
+          }
         },
       );
       await t.ready;
