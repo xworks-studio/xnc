@@ -302,6 +302,8 @@ fn run_pipeline(shared: &Arc<Shared>, cfg: &RunConfig) -> Result<()> {
     if (ew, eh) != (w, h) {
         tracing::info!(from = format!("{w}x{h}"), to = format!("{ew}x{eh}"), "downscale enabled");
     }
+    // 输入注入坐标换算基准：web 端在编码空间，桌面在原生空间
+    input::set_viewport((w, h), (ew, eh));
     let mut scale_buf: Vec<u8> = Vec::new();
     let mut enc = match &cfg.encoder {
         Some(name) => VideoEncoder::with_name(name, ew, eh, fps0, bitrate)?,
