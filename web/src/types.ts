@@ -36,3 +36,19 @@ export interface LoginResponse {
   token: string;
   user: UserDTO;
 }
+
+/**
+ * POST /api/nodes/{id}/desktop 202 响应的 relay 候选（relay-plane 新增；
+ * 字段 camelCase 与会话响应其余字段一致）。同一 relay 的传输变体，有序
+ * （wt 主路在前，ws 兜底在后）；certSha256 仅纯 IP 自签模式的 relay 携带
+ * ——64 位 hex = relay 自签证书 DER 的 SHA-256，浏览器 WebTransport
+ * serverCertificateHashes 钉扎用；缺失 = 标准 Web PKI（不传该选项）。
+ * 旧形态服务器不带 candidates 字段，客户端回退 wtUrl/wsUrl 既有逻辑。
+ */
+export interface DesktopCandidate {
+  transport: "wt" | "ws";
+  host: string;
+  port: number;
+  path: string;
+  certSha256?: string;
+}

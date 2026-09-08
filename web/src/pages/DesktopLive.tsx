@@ -2,13 +2,17 @@ import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import type { MouseEvent as ReactMouseEvent } from "react";
 import { api } from "../api";
+import type { DesktopCandidate } from "../types";
 
 /**
  * RTV desktop viewer (2026-09-08 rebuild): WebTransport 主路 + WebSocket
  * 兜底，Worker 内组帧/FEC/WebCodecs 硬解，主线程 rAF Pacer 渲染。
  * 沉浸式独立路由（无侧栏，占满视口）——直达 /desktop/<nodeId>。
  *
- * 1. POST /api/nodes/{id}/desktop {} → 202 {token, wtUrl, wsUrl, lease}。
+ * 1. POST /api/nodes/{id}/desktop {} → 202 {token, wtUrl, wsUrl, lease,
+ *    candidates?}。带 candidates（relay-plane）时按候选序顺序 fallback
+ *    （wt→ws）；certSha256 候选用 serverCertificateHashes 钉扎。无该字段
+ *    走 wtUrl/wsUrl 既有逻辑。
  * 2. WT 主路（真实 CA 证书，标准 Web PKI——无 serverCertificateHashes 层）；
  *    失败自动回退 WS 兜底（?transport=ws 强制）。
  * 3. 控制词汇：hello/heartbeat/feedback/frameLoss（viewer→host 方向），
@@ -19,7 +23,9 @@ import { api } from "../api";
  *    letterbox 映射，move 16ms 合并。canvas 坐标即编码分辨率空间，host
  *    侧换算回原生桌面像素（降采样场景）。
  * 6. 恢复：hostOffline → hello 周期重发（host 回来 config 重下发，无感）；
- *    传输层断开 → 重建会话（epoch 递增 + 退避，最多 8 次）。
+ *    传输层断开 → 重建会话（epoch 递增 + 退避，最多 8 次）；8 次烧尽后
+ *    不直接 fatal——≥10s 节流 re-POST 重建会话再试，最多 3 轮后才维持
+ *    失败 UI。
  */
 
 interface DesktopOpenResp {
@@ -29,6 +35,9 @@ interface DesktopOpenResp {
   wtUrl: string;
   wsUrl: string;
   lease: { granted: boolean; leaseId: string };
+  // relay 候选（relay-plane）：同一 relay 的传输变体，wt 在前。旧形态
+  // 服务器不带此字段 → 走 wtUrl/wsUrl 既有逻辑（零行为变化）。
+  candidates?: DesktopCandidate[];
 }
 
 interface WorkerStats {
@@ -57,6 +66,10 @@ type Phase = "connecting" | "waiting" | "live" | "hostOffline" | "fatal";
 
 const MAX_QUEUE = 3;
 const MAX_RETRIES = 8;
+// 重试烧尽后的会话重建（re-POST /desktop 拿新 token/端点）：最多轮数与
+// 轮间节流（≥10s，避免高频打服务器）。
+const REPOST_ROUNDS = 3;
+const REPOST_THROTTLE_MS = 10_000;
 // RTT/时钟偏差平滑窗口（中值）：媒体突发会短暂阻塞控制流（真实排队），
 // 逐样本显示会双峰抖动 + 顶栏回流；中值滤波兼顾展示与 QoS 反馈。
 const SMOOTH_WIN = 9;
@@ -64,6 +77,18 @@ const SMOOTH_WIN = 9;
 function median(nums: number[]): number {
   const s = [...nums].sort((a, b) => a - b);
   return s[Math.floor(s.length / 2)];
+}
+
+/** 64 位 hex → 32 字节（certSha256 → WebTransport 钉扎指纹）；非法输入
+ * 返回 null（调用方跳过该候选，绝不静默降级为无钉扎连接）。
+ * 注：显式 ArrayBuffer 参数化满足 WebTransportHash 的 BufferSource 约束。 */
+function hexTo32Bytes(hex: string): Uint8Array<ArrayBuffer> | null {
+  if (!/^[0-9a-fA-F]{64}$/.test(hex)) return null;
+  const out = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) {
+    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
 }
 
 export default function DesktopLive() {
@@ -96,6 +121,8 @@ export default function DesktopLive() {
   const inputOnRef = useRef(false);
   const pendingMoveRef = useRef<{ x: number; y: number } | null>(null);
   const retryRef = useRef(0);
+  // 烧尽 re-POST 已用轮数（跨 epoch 存活；手动“重新连接”清零）
+  const repostRef = useRef(0);
   const prevStatsRef = useRef<WorkerStats | null>(null);
   const rttRef = useRef(0);
   // RTT/时钟偏差平滑（含 QoS 反馈与 e2e 校正，见 SMOOTH_WIN 注释）
@@ -186,8 +213,22 @@ export default function DesktopLive() {
       if (cancelled) return;
       retryRef.current += 1;
       if (retryRef.current > MAX_RETRIES) {
-        setFatalMsg("连接重试次数用尽；请检查网络后重试。");
-        setPhase("fatal");
+        // 烧尽 re-POST：不直接 fatal——节流重建会话（re-POST /desktop 拿
+        // 新 token/端点）再跑一轮完整重试循环；REPOST_ROUNDS 轮烧尽后
+        // 才维持现有失败 UI。epoch 递增本身即触发 effect 重跑（re-POST）。
+        if (repostRef.current >= REPOST_ROUNDS) {
+          setFatalMsg("连接重试次数用尽；请检查网络后重试。");
+          setPhase("fatal");
+          return;
+        }
+        repostRef.current += 1;
+        retryRef.current = 0;
+        log(
+          `重试烧尽，${REPOST_THROTTLE_MS / 1000}s 后重建会话（第 ${repostRef.current}/${REPOST_ROUNDS} 轮）`,
+        );
+        window.setTimeout(() => {
+          if (!cancelled) setEpoch((e) => e + 1);
+        }, REPOST_THROTTLE_MS);
         return;
       }
       window.setTimeout(() => {
@@ -421,8 +462,23 @@ export default function DesktopLive() {
       };
     };
 
-    const connectWT = async (url: string) => {
-      const t = new WebTransport(url);
+    const connectWT = async (
+      url: string,
+      certHash?: Uint8Array<ArrayBuffer>,
+    ) => {
+      // certHash 仅纯 IP 自签 relay 候选携带（serverCertificateHashes 钉
+      // 扎）；缺省不带该选项 = 标准 Web PKI，与既有行为一致。url 的
+      // https 前提由调用方（服务器 URL 形态）保证。
+      const t = new WebTransport(
+        url,
+        certHash
+          ? {
+              serverCertificateHashes: [
+                { algorithm: "sha-256", value: certHash },
+              ],
+            }
+          : undefined,
+      );
       // closed 只在 WT 仍是当前活跃传输时才触发重建：握手失败回退 WS 后，
       // 迟到的 closed 回调不得把已建立的 WS 会话杀掉（曾致无限重连循环）。
       void t.closed.then(
@@ -494,8 +550,56 @@ export default function DesktopLive() {
       selfSessionRef.current = resp.sessionId;
       const wanted = new URLSearchParams(location.search).get("transport");
       const sep = (u: string) => (u.includes("?") ? "&" : "?");
-      const wtUrl = `${resp.wtUrl}${sep(resp.wtUrl)}token=${encodeURIComponent(resp.token)}`;
-      const wsUrl = `${resp.wsUrl}${sep(resp.wsUrl)}token=${encodeURIComponent(resp.token)}`;
+      const withToken = (u: string) =>
+        `${u}${sep(u)}token=${encodeURIComponent(resp.token)}`;
+      const finish = () => {
+        setTransport(curTransport);
+        startLoops();
+        setPhase("waiting");
+      };
+
+      // relay 候选（relay-plane）：按候选序顺序 fallback（服务器保证 wt
+      // 在前、ws 兜底在后），单候选失败即试下一个。?transport=ws 仍强制
+      // 只取 ws 候选。字段缺失/无可用候选 → 回退下方 wtUrl/wsUrl 既有
+      // 逻辑（零行为变化）。
+      const cands = Array.isArray(resp.candidates) ? resp.candidates : [];
+      const usable =
+        wanted === "ws" ? cands.filter((c) => c.transport === "ws") : cands;
+      if (usable.length > 0) {
+        let lastErr: unknown = new Error("无可用候选");
+        for (const c of usable) {
+          // 候选为 host/port/path 形态（无 scheme）：wt→https / ws→wss
+          const base = `${c.transport === "wt" ? "https" : "wss"}://${c.host}:${c.port}${c.path.startsWith("/") ? c.path : `/${c.path}`}`;
+          // certSha256 存在但非法 → 候选不可信，跳过（不静默降级为无钉扎）
+          const pin = c.certSha256 ? hexTo32Bytes(c.certSha256) : null;
+          if (c.certSha256 && !pin) {
+            log(`候选 ${c.host}:${c.port} 的 certSha256 非法，跳过`);
+            lastErr = new Error("bad certSha256");
+            continue;
+          }
+          try {
+            if (c.transport === "wt") {
+              curTransport = "wt";
+              await connectWT(withToken(base), pin ?? undefined);
+            } else {
+              curTransport = "ws";
+              await connectWS(withToken(base));
+              startWorker(true);
+            }
+            finish();
+            return;
+          } catch (e) {
+            lastErr = e;
+            log(
+              `${c.transport.toUpperCase()} 候选 ${c.host}:${c.port} 失败（${e}），尝试下一候选`,
+            );
+          }
+        }
+        throw lastErr;
+      }
+
+      const wtUrl = withToken(resp.wtUrl);
+      const wsUrl = withToken(resp.wsUrl);
       if (wanted === "ws") {
         curTransport = "ws";
         await connectWS(wsUrl);
@@ -511,9 +615,7 @@ export default function DesktopLive() {
           startWorker(true);
         }
       }
-      setTransport(curTransport);
-      startLoops();
-      setPhase("waiting");
+      finish();
     };
 
     run().catch((e) => {
@@ -611,6 +713,7 @@ export default function DesktopLive() {
 
   const retryNow = () => {
     retryRef.current = 0;
+    repostRef.current = 0; // 手动重试从零开始完整重试预算
     setFatalMsg("");
     setPhase("connecting");
     setEpoch((e) => e + 1);
