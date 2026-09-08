@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::shared::{ControlMsg, Shared};
 
-pub const ALPN: &[&str] = &["mvp-host/1"];
+pub const ALPN: &[&str] = &["xnc-host/1"];
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 const CONTROL_BUF: usize = 256 * 1024;
 
