@@ -32,29 +32,32 @@ services:
       XNC_INSTALLER_SYNC_REPO: ${XNC_INSTALLER_SYNC_REPO:-xworks-studio/xnc}
       XNC_INSTALLER_SYNC_INTERVAL: ${XNC_INSTALLER_SYNC_INTERVAL:-5m}
       XNC_GITHUB_TOKEN: ${XNC_GITHUB_TOKEN:-}
-      # M4 金丝雀开关(§14): compose 此前未接线,M4-T4 部署缺口,生产 2026-08-28 补
-      XNC_DESKTOP_MEDIA_V2_PERCENT: ${XNC_DESKTOP_MEDIA_V2_PERCENT:-0}
-      XNC_DESKTOP_MEDIA_V2_ALLOWLIST: ${XNC_DESKTOP_MEDIA_V2_ALLOWLIST:-}
-      XNC_DESKTOP_MEDIA_V2_ROLLBACK: ${XNC_DESKTOP_MEDIA_V2_ROLLBACK:-false}
-      # Desktop ICE policy (M4 Task 7): "relay" (default, spec-mandated) keeps
-      # all media through TURN; "all" allows LAN direct connect when browser
-      # and node share a LAN (bypasses the public TURN relay round-trip).
-      XNC_DESKTOP_ICE_POLICY: ${XNC_DESKTOP_ICE_POLICY:-relay}
-      # TURN relay config handed to desktop sessions (mirrors coturn below).
-      # server 只读 XNC_TURN_CREDENTIAL(单一来源,config.go);XNC_TURN_PASSWORD
-      # 仅供 coturn 自身用户配置(turnserver.conf 模板,见下),与 server env 无关。
-      XNC_TURN_URLS: ${XNC_TURN_URLS:-turn:xnc.app:3478?transport=tcp}
-      XNC_TURN_USERNAME: ${XNC_TURN_USERNAME:-xncdev}
-      XNC_TURN_CREDENTIAL: ${XNC_TURN_CREDENTIAL:-xncdev-secret}
-      # TURN 池（境内媒体中转）：逗号分隔 ip[:port]（缺省端口 3478），空 =
-      # 未配置 → 沿用 XNC_TURN_URLS（现状）。池配置后 desktop 会话从池中
-      # round-robin 分配单台，凭据与上面 XNC_TURN_USERNAME/CREDENTIAL 共用
-      # （CREDENTIAL 即唯一凭据来源）。
-      XNC_TURN_POOL: ${XNC_TURN_POOL:-}
+      # —— RTV 桌面中继（2026-09-08 重构，替代 TURN/WebRTC 面）——
+      # host 腿 QUIC 地址（agent 经 SESSION_OPEN 收到；生产 = 域名:4433）。
+      XNC_RTV_ENDPOINT: ${XNC_RTV_ENDPOINT:-xnc.app:4433}
+      # 容器内监听（host 腿 UDP4433 / WT 腿 UDP443；均需 compose 端口映射）。
+      XNC_RTV_HOST_ADDR: ":4433"
+      XNC_RTV_WT_ADDR: ":443"
+      # ACME DNS-01（lego + Aliyun DNS）：浏览器 WT 走标准 Web PKI。凭据在
+      # deploy/.env（ALIDNS_*），证书/账号密钥持久化于 rtv-certs 卷。
+      XNC_ACME_DOMAIN: ${XNC_ACME_DOMAIN:-xnc.app}
+      XNC_ACME_EMAIL: ${XNC_ACME_EMAIL:-}
+      XNC_ACME_CERT_DIR: /data/rtv-certs
+      XNC_ACME_STAGING: ${XNC_ACME_STAGING:-false}
+      ALIDNS_ACCESS_KEY: ${ALIDNS_ACCESS_KEY:-}
+      ALIDNS_SECRET_KEY: ${ALIDNS_SECRET_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy
     expose: ["8080"]
+    ports:
+      # RTV 腿：host QUIC（agent→server）与 WT（浏览器 H3）。容器 NAT 对纯
+      # 客户端→服务端 QUIC 足够（无连接迁移/反射地址协商，coturn 式 host
+      # 网络不必要）。
+      - "443:443/udp"
+      - "4433:4433/udp"
+    volumes:
+      - rtv-certs:/data/rtv-certs
 
   # Watchtower：轮询 GHCR 自动更新 xnc-server（label 圈定范围，仅此一个
   # 服务被管理；5 分钟一轮；--cleanup 清旧镜像；不做滚动重启——单实例）。
@@ -83,29 +86,12 @@ services:
       - caddy_config:/config
     depends_on: [xnc-server]
 
-  coturn:
-    image: coturn/coturn:alpine
-    # TURN/STUN config lives in ./turnserver.conf (mounted read-only), not
-    # as CLI flags: the image entrypoint evals each arg through `echo`, so a
-    # bare `-n` or `$`-containing flag gets mangled (2026-08-24 retro P0#5);
-    # `-c` + a plain path is the only safe form. The checked-in file is a
-    # template: deploy_srv.py `up` renders ${VAR}/…:-default from deploy/.env
-    # first (coturn config files have no native env expansion). Prod TURN:
-    # static lt-cred user, plain turn: TCP/UDP — no TLS this round.
-    # coturn user 密码须与 XNC_TURN_CREDENTIAL 同值:deploy_srv.py 渲染
-    # turnserver.conf 时 XNC_TURN_PASSWORD 缺省取 CREDENTIAL 值(自动同步,
-    # 只改 CREDENTIAL 不错配)。
-    command: ["-c", "/etc/coturn/turnserver.conf"]
-    volumes:
-      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
-    # host 网络（无 docker NAT）：NAT + external-ip 映射形态下 coturn 拒绝
-    # "对端=自身公网映射地址"的中继（浏览器回环探测 403/disconnected，
-    # 2026-09-06 生产实测）——两端都经同一台 TURN 的会话同样命中。host
-    # 直挂（对齐池机形态）后正常；3478 与 49160-49200 直接监听宿主端口。
-    network_mode: host
-    restart: unless-stopped
+  # coturn 已随 RTV 重构退役（2026-09-08）：desktop 是 TURN 的唯一用户，
+  # 媒体面改经 xnc-server 的 QUIC/WT/WS 三腿中继。回滚旧版 = git checkout
+  # 上一版 compose（turnserver.conf 模板仍保留在仓库供回滚窗口使用）。
 
 volumes:
   pgdata:
   caddy_data:
   caddy_config:
+  rtv-certs:

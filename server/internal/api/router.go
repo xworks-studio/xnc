@@ -82,10 +82,26 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 	// RTV 中继（desktop 媒体面）：host QUIC + WT 两腿绑 UDP；WS 兜底腿挂主
 	// mux（/ws，经 caddy TCP443 反代）。viewer 鉴权 = 会话 client token；
 	// input 门控 = per-node 输入活约（janitor TTL 撤约语义不变）。
+	// TLS 证书链：ACME DNS-01（生产，真实 CA）→ 文件对 → dev 自签（高声
+	// 告警；WT 腿浏览器不可用，WS 兜底腿经 caddy 自有证书仍可用——ACME
+	// 瞬时失败不 bricks 整个 server）。
 	var tlsProv func([]string) *tls.Config
-	if cfg.RTVCertFile != "" && cfg.RTVKeyFile != "" {
+	switch {
+	case cfg.RTVACMEDomain != "":
+		certFile, keyFile, err := rtv.StartACME(rtv.ACMEConfig{
+			Dir: cfg.RTVACMEDir, Domain: cfg.RTVACMEDomain, Email: cfg.RTVACMEEmail,
+			AlidnsKey: cfg.AlidnsKey, AlidnsSecret: cfg.AlidnsSecret,
+			Staging: cfg.RTVACMEStaging,
+		})
+		if err != nil {
+			slog.Error("rtv: acme failed, falling back to dev self-signed (WT legs will be browser-unusable; WS fallback rides caddy)", "err", err)
+			tlsProv = rtv.DevSelfSigned()
+		} else {
+			tlsProv = rtv.CertFiles(certFile, keyFile)
+		}
+	case cfg.RTVCertFile != "" && cfg.RTVKeyFile != "":
 		tlsProv = rtv.CertFiles(cfg.RTVCertFile, cfg.RTVKeyFile)
-	} else {
+	default:
 		tlsProv = rtv.DevSelfSigned()
 	}
 	h.rtv = rtv.New(rtv.Options{HostAddr: cfg.RTVHostAddr, WTAddr: cfg.RTVWTAddr},

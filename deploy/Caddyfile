@@ -1,4 +1,13 @@
 # xnc.app — 唯一域名（原 control.xnc.app 已弃用；短域块随主域统一而移除）。
+# H3 显式关闭（RTV 重构，2026-09-08）：UDP443 让给 xnc-server 的
+# WebTransport 腿（浏览器 WT 主路经该端口直连容器）；caddy 只管 TCP443
+# （HTTPS/WS 反代）。caddy 缺省会自启 H3，不关会端口冲突。
+{
+	servers {
+		protocols h1 h2
+	}
+}
+
 {$XNC_DOMAIN} {
 	reverse_proxy xnc-server:8080 {
 		flush_interval -1

@@ -2,10 +2,14 @@ services:
   xnc-server:
     # Loopback-only: the dev stack's plaintext JWT channel must not be
     # reachable from other hosts.
-    ports: ["127.0.0.1:8080:8080"]
+    ports: ["127.0.0.1:8080:8080", "127.0.0.1:8443:443/udp", "127.0.0.1:14433:4433/udp"]
     environment:
       # E2E wants a short offline window; load runs (Gate A) override to the
       # production 90s via the shell: XNC_HEARTBEAT_TIMEOUT=90s docker compose ...
       XNC_HEARTBEAT_TIMEOUT: ${XNC_HEARTBEAT_TIMEOUT:-10s}
+      # RTV（dev）：endpoint 指向本机映射端口；dev 无 ACME（自签证书，
+      # host --tls-insecure / 浏览器走 WS 兜底）。
+      XNC_RTV_ENDPOINT: ${XNC_RTV_ENDPOINT:-127.0.0.1:14433}
+      XNC_ACME_DOMAIN: ""
   caddy:
     profiles: ["never"]

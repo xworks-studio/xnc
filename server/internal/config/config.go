@@ -28,10 +28,18 @@ type Config struct {
 	// 腿；compose 映射 4433/udp 与 443/udp）。
 	RTVHostAddr string // XNC_RTV_HOST_ADDR，默认 ":4433"
 	RTVWTAddr   string // XNC_RTV_WT_ADDR，默认 ":443"
-	// RTV 证书（ACME 就绪前的文件形态；两者全缺 = 进程内自签 dev 证书，
-	// 高声告警——生产必须配置，浏览器 WT 走标准 Web PKI 校验）。
-	RTVCertFile string // XNC_RTV_CERT_FILE
-	RTVKeyFile  string // XNC_RTV_KEY_FILE
+	// RTV 证书：ACME DNS-01（lego + Aliyun DNS）为主——浏览器 WT 走标准
+	// Web PKI（真实 CA 证书，无 serverCertificateHashes 层）。ACME 未配置时
+	// 回落 XNC_RTV_CERT_FILE/KEY_FILE 文件对；再缺 = 进程内自签 dev 证书
+	// （高声告警，WT 腿浏览器不可用，WS 兜底腿经 caddy 仍可用）。
+	RTVACMEDomain  string // XNC_ACME_DOMAIN（如 xnc.app；空 = ACME 关闭）
+	RTVACMEEmail   string // XNC_ACME_EMAIL
+	RTVACMEDir     string // XNC_ACME_CERT_DIR，证书+账号密钥的卷持久化目录
+	RTVACMEStaging bool   // XNC_ACME_STAGING，LE staging 目录（联调防配额烧穿）
+	AlidnsKey      string // ALIDNS_ACCESS_KEY（deploy/.env 唯一源）
+	AlidnsSecret   string // ALIDNS_SECRET_KEY
+	RTVCertFile    string // XNC_RTV_CERT_FILE（ACME 关闭时的文件形态）
+	RTVKeyFile     string // XNC_RTV_KEY_FILE
 	// RTVWSOrigins WS 兜底腿的 Origin 白名单（空 = coder/websocket 同源
 	// 校验；生产经 caddy 同源反代即正确语义，dev 跨源联调时配置）。
 	RTVWSOrigins []string // XNC_RTV_WS_ORIGINS，逗号分隔
