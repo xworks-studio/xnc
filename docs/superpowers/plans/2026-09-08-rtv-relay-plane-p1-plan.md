@@ -134,6 +134,34 @@ P2 项（redirect/resolve/drain/SESSION_REFRESH/host 张续期/Monitor 页）不
 - host 张票 24h 无续期（P2 才有）：P1 期长会话 24h 后经"注册失败→SESSION_REFRESH 缺位
   →viewer re-POST"路径重建——真机验收观察此路径的实际体验，异常再提前 P2 的续期任务。
 
-## Results
+## Results（2026-09-08，P1 代码全部落地，分支 feature/rtv-relay-plane）
 
-（实施后填写）
+提交序列（efb7b71 文档 → b4f08ff T1 → fccc381 T2a → dd031c2 T2b+T3 →
+3dd7da9 T4 → 11559cf T5+T6 → ba90601 T7 → d896fb2 T8+T9 → f43c9b1 T10）。
+
+门禁：proto/rtv/relay/server/agent Go 全绿（server 真 PG 集成 0 失败；
+desktop API 测试随票据模型更新）；web npm build + vitest 13/13；
+host cargo check 本机受 VCPKG 环境阻塞（已知），钉扎 verifier 经同版本
+依赖组合的 scratch crate 测试验证，PR 后由 CI host-rust job 承担正式门禁。
+
+与计划的偏差（有意为之）：
+1. **XNC_RTV_RELAYS bootstrap 种子取消**——注册全动态，准入即 allowlist
+   （或 pending 审批），少一条配置面。
+2. **RELAY_CONFIG 提前进 P1**（原排 P2）：relay 离线验票必须有 server
+   签名公钥，认证通过即下发；轮换推送仍留 P2。Challenge 顺带回传
+   relayId（首注册时 relay 才知道自己被分配的 id）。
+3. **被动首约（Grant）仅 relay-0**：外部 relay 的仲裁机在远端，P1 无
+   下发通道，外部会话以显式 takeControl 为准（P2 经控制连接补）。
+4. host 张票 24h 无续期（P2 的 ticketRefresh）；relay-0 会话本就随进程
+   存亡，外部 relay 场景经"注册失败→viewer re-POST"路径重生。
+5. dev 双 relay compose 未加：单 relay 逻辑经 rtv 回环测试 + api 真 PG
+   测试覆盖；双 relay 端到端并到真机验收（需 server 先部署）。
+
+待办（P1 验收序，见 §5）：
+- PR → CI 六矩阵（host-rust 是关键门禁）→ 合入 main
+- server 部署（build-server-local.ps1，需配置 XNC_RTV_SIGNING_KEY——
+  一次性生成入 deploy/.env 与 compose env）
+- `powershell deploy/build-relay.ps1 -PublicHost 47.96.83.132` 部署中继机
+- relay 注册（pending）→ `PATCH /api/admin/relays/{id}` 审批 active
+- LABS-XIAOXIN 真机走 §5 六项验收（tcpdump 主站无媒体 UDP 字节、双
+  viewer 不换血、墓碑拒绝矩阵、kill -9 自愈、rtvload canary）
