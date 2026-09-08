@@ -1,15 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { useParams } from "react-router-dom";
-import type {
-  MouseEvent as ReactMouseEvent,
-  WheelEvent as ReactWheelEvent,
-} from "react";
+import { Link, useParams } from "react-router-dom";
+import type { MouseEvent as ReactMouseEvent } from "react";
 import { api } from "../api";
 
 /**
- * RTV desktop viewer (2026-09-08 rewrite): WebTransport 主路 + WebSocket
+ * RTV desktop viewer (2026-09-08 rebuild): WebTransport 主路 + WebSocket
  * 兜底，Worker 内组帧/FEC/WebCodecs 硬解，主线程 rAF Pacer 渲染。
- * Not in the sidebar — reach it directly at /desktop/<nodeId>.
+ * 沉浸式独立路由（无侧栏，占满视口）——直达 /desktop/<nodeId>。
  *
  * 1. POST /api/nodes/{id}/desktop {} → 202 {token, wtUrl, wsUrl, lease}。
  * 2. WT 主路（真实 CA 证书，标准 Web PKI——无 serverCertificateHashes 层）；
@@ -19,7 +16,8 @@ import { api } from "../api";
  * 4. 渲染：Worker 解码出 VideoFrame 转移主线程，队列≤3 迟到丢帧不追、
  *    延迟一帧释放、空转重绘（moonlight-qt Pacer 语义，worker.js 配套）。
  * 5. 输入：仅鼠标（键盘为后续 PATCH）；lease 授予方可开启；绝对坐标
- *    letterbox 映射，move 16ms 合并。
+ *    letterbox 映射，move 16ms 合并。canvas 坐标即编码分辨率空间，host
+ *    侧换算回原生桌面像素（降采样场景）。
  * 6. 恢复：hostOffline → hello 周期重发（host 回来 config 重下发，无感）；
  *    传输层断开 → 重建会话（epoch 递增 + 退避，最多 8 次）。
  */
@@ -55,34 +53,64 @@ interface HostConfig {
   fecPercentage: number;
 }
 
+type Phase = "connecting" | "waiting" | "live" | "hostOffline" | "fatal";
+
 const MAX_QUEUE = 3;
 const MAX_RETRIES = 8;
 
 export default function DesktopLive() {
   const { nodeId = "" } = useParams();
   const [epoch, setEpoch] = useState(0);
-  const [status, setStatus] = useState("连接中…");
-  const [fatal, setFatal] = useState("");
+  const [phase, setPhase] = useState<Phase>("connecting");
+  const [fatalMsg, setFatalMsg] = useState("");
   const [transport, setTransport] = useState<"wt" | "ws" | "-">("-");
   const [codecInfo, setCodecInfo] = useState("");
-  const [hostOnline, setHostOnline] = useState(false);
   const [leaseGranted, setLeaseGranted] = useState(false);
   const [inputOn, setInputOn] = useState(false);
+  const [statsOpen, setStatsOpen] = useState(false);
+  const [isFs, setIsFs] = useState(false);
   const [hud, setHud] = useState<WorkerStats | null>(null);
+  // 每秒差分速率（worker 计数器为累计值）
+  const [rates, setRates] = useState({ mbps: 0, pktRate: 0, fps: 0 });
   const [rttMs, setRttMs] = useState(0);
   const [e2eMs, setE2eMs] = useState<number | null>(null);
   const [logLines, setLogLines] = useState<string[]>([]);
 
+  const rootRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   // effect 内部状态（不经 React 渲染路径的高频对象）
   const sendCtrlRef = useRef<((obj: unknown) => void) | null>(null);
   const inputOnRef = useRef(false);
   const pendingMoveRef = useRef<{ x: number; y: number } | null>(null);
   const retryRef = useRef(0);
+  const prevStatsRef = useRef<WorkerStats | null>(null);
+  const rttRef = useRef(0);
 
   useEffect(() => {
     inputOnRef.current = inputOn;
   }, [inputOn]);
+
+  // 全屏切换（F 键 / 按钮）
+  const toggleFullscreen = () => {
+    const el = rootRef.current;
+    if (!el) return;
+    if (document.fullscreenElement) void document.exitFullscreen();
+    else void el.requestFullscreen().catch(() => {});
+  };
+  useEffect(() => {
+    const onFs = () => setIsFs(Boolean(document.fullscreenElement));
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+      if (e.key === "f" || e.key === "F") toggleFullscreen();
+    };
+    document.addEventListener("fullscreenchange", onFs);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("fullscreenchange", onFs);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, []);
 
   useEffect(() => {
     const log = (s: string) =>
@@ -101,6 +129,7 @@ export default function DesktopLive() {
     let fbTimer: number | undefined;
     let raf = 0;
     let moveTimer: number | undefined;
+    let gotFrame = false;
     // Pacer 状态
     const queue: { frame: VideoFrame; captureUnixUs: number }[] = [];
     let lastDrawn: VideoFrame | null = null;
@@ -138,7 +167,8 @@ export default function DesktopLive() {
       if (cancelled) return;
       retryRef.current += 1;
       if (retryRef.current > MAX_RETRIES) {
-        setFatal("连接重试次数用尽；请检查网络后刷新。");
+        setFatalMsg("连接重试次数用尽；请检查网络后重试。");
+        setPhase("fatal");
         return;
       }
       window.setTimeout(() => {
@@ -167,15 +197,16 @@ export default function DesktopLive() {
       switch (v.type) {
         case "config":
           config = v as unknown as HostConfig;
-          setHostOnline(true);
           setCodecInfo(
-            `H.264 ${config.width}×${config.height}@${config.fps} · ${config.encoder}${config.encoderHw ? " (硬编)" : ""} · FEC ${config.fecPercentage}%`,
+            `H.264 ${config.width}×${config.height}@${config.fps} · ${config.encoder}${config.encoderHw ? " 硬编" : ""} · FEC ${config.fecPercentage}%`,
           );
           worker?.postMessage({ type: "config", ...v });
           if (canvasRef.current) {
             canvasRef.current.width = config.width;
             canvasRef.current.height = config.height;
           }
+          // hostOffline 恢复：回到等画面（下一帧到达即 live）
+          setPhase((p) => (p === "hostOffline" ? "waiting" : p));
           break;
         case "qosAdjust":
           log(
@@ -185,11 +216,14 @@ export default function DesktopLive() {
         case "hostOffline":
           // 置空 config 恢复 hello 周期重发；host 回来后 config 重新下发。
           config = null;
-          setHostOnline(false);
-          setStatus("主机离线，等待重连…");
+          setPhase("hostOffline");
           break;
         case "heartbeat":
-          if (typeof v.tMs === "number") setRttMs(Date.now() - v.tMs);
+          if (typeof v.tMs === "number") {
+            const rtt = Date.now() - v.tMs;
+            rttRef.current = rtt;
+            setRttMs(rtt);
+          }
           break;
         default:
           break;
@@ -219,7 +253,7 @@ export default function DesktopLive() {
         const s = workerStats;
         sendCtrl({
           type: "feedback",
-          rttMs: Math.round(rttMs),
+          rttMs: Math.round(rttRef.current),
           arrivalGapP95Ms: s?.arrivalGapP95Ms || 0,
           decodeQueueDepth: s?.decodeQueue || 0,
           decodedFps: s?.decoded || 0,
@@ -240,6 +274,10 @@ export default function DesktopLive() {
             while (queue.length > MAX_QUEUE) {
               queue.shift()?.frame.close();
             }
+            if (!gotFrame) {
+              gotFrame = true;
+              setPhase("live");
+            }
             break;
           case "frameLoss":
             sendCtrl({
@@ -251,9 +289,18 @@ export default function DesktopLive() {
           case "stats":
             workerStats = m;
             setHud(m);
-            break;
-          case "status":
-            setStatus(String(m.msg));
+            // 每秒差分（计数器均为累计值）
+            {
+              const prev = prevStatsRef.current;
+              if (prev) {
+                setRates({
+                  mbps: ((m.bytes - prev.bytes) * 8) / 1e6,
+                  pktRate: m.pkts - prev.pkts,
+                  fps: m.decoded - prev.decoded,
+                });
+              }
+              prevStatsRef.current = m;
+            }
             break;
           case "decoderError":
             log(`解码器错误: ${m.error}（已请求 IDR）`);
@@ -403,13 +450,14 @@ export default function DesktopLive() {
       }
       setTransport(curTransport);
       startLoops();
-      setStatus("已连接，等待主机画面…");
+      setPhase("waiting");
     };
 
     run().catch((e) => {
       if (cancelled) return;
       const msg = e instanceof Error ? e.message : String(e);
-      setFatal(`会话建立失败：${msg}`);
+      setFatalMsg(`会话建立失败：${msg}`);
+      setPhase("fatal");
     });
 
     // ---- 输入（鼠标；lease 授予 + 用户开启才注入）----
@@ -427,6 +475,25 @@ export default function DesktopLive() {
 
     return cleanup;
   }, [nodeId, epoch]);
+
+  // 滚轮要走原生非被动监听：React 合成 wheel 在根节点按 passive 注册，
+  // preventDefault 无效（输入态下页面会被滚出去）。
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !inputOn) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      sendCtrlRef.current?.({
+        type: "input",
+        event: "mouse",
+        kind: "wheel",
+        dy: Math.sign(e.deltaY) * Math.min(3, Math.abs(e.deltaY) / 100),
+        dx: Math.sign(e.deltaX),
+      });
+    };
+    canvas.addEventListener("wheel", onWheel, { passive: false });
+    return () => canvas.removeEventListener("wheel", onWheel);
+  }, [inputOn, phase]);
 
   const mapToVideo = (clientX: number, clientY: number) => {
     const canvas = canvasRef.current;
@@ -457,70 +524,181 @@ export default function DesktopLive() {
     if (p) pendingMoveRef.current = p;
   };
 
+  const retryNow = () => {
+    retryRef.current = 0;
+    setFatalMsg("");
+    setPhase("connecting");
+    setEpoch((e) => e + 1);
+  };
+
   return (
-    <div className="page">
-      <h1>
-        桌面 — {nodeId.slice(0, 8)}
-        <span style={{ fontSize: "0.6em", opacity: 0.6 }}>
-          {" "}
-          RTV/{transport.toUpperCase()}
-          {hostOnline ? "" : " · 主机离线"}
-        </span>
-      </h1>
-      {fatal ? (
-        <p className="error">{fatal}</p>
-      ) : (
-        <>
-          <div className="desktop-toolbar">
-            <span className="status-badge">{status}</span>
-            <span style={{ opacity: 0.7 }}>{codecInfo}</span>
-            <button disabled={!leaseGranted} onClick={() => setInputOn((v) => !v)}>
-              鼠标控制：{inputOn ? "开" : "关"}
-              {!leaseGranted && "（无输入权）"}
-            </button>
-            <span style={{ opacity: 0.7 }}>
-              e2e≈{e2eMs ?? "–"}ms rtt={Math.round(rttMs)}ms
+    <div className="dt-root" ref={rootRef}>
+      <header className="dt-topbar">
+        <Link className="dt-back" to={`/nodes/${nodeId}`} title="返回节点详情">
+          ←
+        </Link>
+        <span className="dt-title">桌面 · {nodeId.slice(0, 8)}</span>
+        <div className="dt-chips">
+          <span
+            className={`dt-chip ${transport === "wt" ? "ok" : transport === "ws" ? "warn" : ""}`}
+          >
+            {transport === "-"
+              ? "连接中"
+              : transport === "wt"
+                ? "WebTransport"
+                : "WS 兜底"}
+          </span>
+          {phase === "live" && <span className="dt-chip ok">● 在线</span>}
+          {phase === "hostOffline" && (
+            <span className="dt-chip bad">○ 主机离线</span>
+          )}
+          <span className="dt-chip" title="控制环往返（心跳测得）">
+            rtt {Math.round(rttMs)}ms
+          </span>
+          {phase === "live" && (
+            <span className="dt-chip" title="解码帧率（每秒差分）">
+              {rates.fps} fps
             </span>
-          </div>
-          <div className="desktop-video-wrap">
-            <canvas
-              ref={canvasRef}
-              style={{ maxWidth: "100%", maxHeight: "72vh" }}
-              onMouseMove={onMouseMove}
-              onMouseDown={(e) => {
-                if (!inputAllowed) return;
-                e.preventDefault();
-                sendMouse("down", { button: e.button });
-              }}
-              onMouseUp={(e) => sendMouse("up", { button: e.button })}
-              onWheel={(e: ReactWheelEvent<HTMLCanvasElement>) => {
-                if (!inputAllowed) return;
-                e.preventDefault();
-                sendMouse("wheel", {
-                  dy: Math.sign(e.deltaY) * Math.min(3, Math.abs(e.deltaY) / 100),
-                  dx: Math.sign(e.deltaX),
-                });
-              }}
-              onContextMenu={(e) => {
-                if (inputAllowed) e.preventDefault();
-              }}
-            />
-          </div>
-          {hud && (
-            <div className="desktop-hud">
-              码率≈{(hud.bytes ? (hud.bytes * 8) / 1e6 : 0).toFixed(2)}Mbps ·
-              收包{hud.pkts}/s · 完整帧{hud.framesComplete} · 解码{hud.decoded}
-              · FEC 恢复{hud.fecRecovered}/失败{hud.fecFailed} · 丢帧上报
-              {hud.lossSent} · 解码队列{hud.decodeQueue} · 到帧间隔p95
-              {hud.arrivalGapP95Ms}ms
+          )}
+          <span
+            className="dt-chip"
+            title="采集→渲染端到端（含双端时钟偏差，参考值）"
+          >
+            e2e≈{e2eMs ?? "–"}ms
+          </span>
+          {codecInfo && (
+            <span className="dt-chip" title={codecInfo}>
+              {codecInfo}
+            </span>
+          )}
+        </div>
+        <div className="dt-actions">
+          <button
+            className={`btn${inputOn ? " dt-btn-on" : ""}`}
+            disabled={!leaseGranted}
+            title={
+              leaseGranted
+                ? inputOn
+                  ? "关闭鼠标控制"
+                  : "开启鼠标控制（注入远程桌面）"
+                : "当前用户无输入权（需 desktop lease）"
+            }
+            onClick={() => setInputOn((v) => !v)}
+          >
+            鼠标控制{inputOn ? "：开" : ""}
+          </button>
+          <button
+            className="btn"
+            onClick={() => setStatsOpen((v) => !v)}
+            title="统计面板"
+          >
+            统计
+          </button>
+          <button className="btn" onClick={toggleFullscreen} title="全屏（F）">
+            {isFs ? "退出全屏" : "全屏"}
+          </button>
+        </div>
+      </header>
+
+      <div className="dt-body">
+        <div className="dt-stage">
+          <canvas
+            ref={canvasRef}
+            className={inputAllowed ? "dt-canvas dt-capture" : "dt-canvas"}
+            onMouseMove={onMouseMove}
+            onMouseDown={(e) => {
+              if (!inputAllowed) return;
+              e.preventDefault();
+              sendMouse("down", { button: e.button });
+            }}
+            onMouseUp={(e) => sendMouse("up", { button: e.button })}
+            onContextMenu={(e) => {
+              if (inputAllowed) e.preventDefault();
+            }}
+          />
+          {phase === "connecting" && (
+            <div className="dt-overlay">
+              <div className="dt-spin" />
+              <div>正在建立会话…</div>
             </div>
           )}
-          <div className="desktop-log">
-            {logLines.map((l, i) => (
-              <div key={i}>{l}</div>
-            ))}
+          {phase === "waiting" && (
+            <div className="dt-overlay dim">
+              <div className="dt-spin" />
+              <div>已连接，等待主机画面…</div>
+            </div>
+          )}
+          {phase === "hostOffline" && (
+            <div className="dt-overlay dim">
+              <div className="dt-pulse" />
+              <div>主机离线，等待重连…</div>
+            </div>
+          )}
+          {phase === "fatal" && (
+            <div className="dt-overlay">
+              <div className="dt-err">{fatalMsg}</div>
+              <button className="btn" onClick={retryNow}>
+                重新连接
+              </button>
+            </div>
+          )}
+        </div>
+
+        <aside className={`dt-stats${statsOpen ? " open" : ""}`}>
+          <div className="dt-stats-inner">
+            <div className="dt-stats-title">实时统计</div>
+            <div className="dt-mgrid">
+              <div className="dt-m">
+                <div className="k">码率</div>
+                <div className="v">{rates.mbps.toFixed(2)} Mbps</div>
+              </div>
+              <div className="dt-m">
+                <div className="k">收包</div>
+                <div className="v">{rates.pktRate} /s</div>
+              </div>
+              <div className="dt-m">
+                <div className="k">解码帧率</div>
+                <div className="v">{rates.fps} fps</div>
+              </div>
+              <div className="dt-m">
+                <div className="k">解码队列</div>
+                <div className="v">{hud?.decodeQueue ?? 0}</div>
+              </div>
+              <div className="dt-m">
+                <div className="k">FEC 恢复 / 失败</div>
+                <div className="v">
+                  {hud?.fecRecovered ?? 0} / {hud?.fecFailed ?? 0}
+                </div>
+              </div>
+              <div className="dt-m">
+                <div className="k">完整帧</div>
+                <div className="v">{hud?.framesComplete ?? 0}</div>
+              </div>
+              <div className="dt-m">
+                <div className="k">丢帧上报</div>
+                <div className="v">{hud?.lossSent ?? 0}</div>
+              </div>
+              <div className="dt-m">
+                <div className="k">到帧间隔 p95</div>
+                <div className="v">{hud?.arrivalGapP95Ms ?? 0} ms</div>
+              </div>
+            </div>
+            <div className="dt-stats-title">事件</div>
+            <div className="dt-log">
+              {logLines.length === 0 ? (
+                <div style={{ opacity: 0.5 }}>（暂无）</div>
+              ) : (
+                logLines.map((l, i) => <div key={i}>{l}</div>)
+              )}
+            </div>
           </div>
-        </>
+        </aside>
+      </div>
+
+      {inputOn && (
+        <footer className="dt-hint">
+          鼠标控制已开启，移动/点击/滚轮将注入远程桌面（键盘输入为后续版本）
+        </footer>
       )}
     </div>
   );
