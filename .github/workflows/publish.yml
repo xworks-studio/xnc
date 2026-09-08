@@ -67,7 +67,7 @@ jobs:
           path: vcpkg-bincache
           key: vcpkg-bin-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml') }}
 
-      - name: vcpkg install (host deps: ffmpeg hw encoders + libyuv)
+      - name: vcpkg install (host deps - ffmpeg hw encoders + libyuv)
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
