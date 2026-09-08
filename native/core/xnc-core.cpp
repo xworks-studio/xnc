@@ -3,9 +3,9 @@
 //   --console --smoke-secret <hex>   foreground pipe server (diagnostic)
 //       [--pipe-name \.\pipe\<name>] default \\.\pipe\xnc-core; secret is
 //       hex (nominal 32B = 64 chars; the smoke vector is 16B/32 chars)
-//   --console --diag-spawn [xnc-desktop.exe] <args...>   session bridge
+//   --console --diag-spawn [xnc-host.exe] <args...>   session bridge
 //       (Task 6): mint the console-session SYSTEM token, spawn the
-//       whitelisted exe (xnc-desktop.exe next to xnc-core.exe) on
+//       whitelisted exe (xnc-host.exe next to xnc-core.exe) on
 //       winsta0\default, wait, propagate its exit code. Everything after
 //       --diag-spawn goes to the child verbatim (an explicit whitelisted
 //       exe name as the first token is consumed as the exe); the pipe
@@ -78,9 +78,9 @@ void Usage(FILE* out) {
       L"                  [reason] (default \"diag\") and print the response\n"
       L"                  HRESULT / error code; no server is started. Needs\n"
       L"                  --smoke-secret (the TARGET core's secret)\n"
-      L"  --diag-spawn    session bridge: spawn xnc-desktop.exe (whitelist;\n"
+      L"  --diag-spawn    session bridge: spawn xnc-host.exe (whitelist;\n"
       L"                  resolved next to xnc-core.exe; an explicit\n"
-      L"                  'xnc-desktop.exe' first arg is also accepted) in\n"
+      L"                  'xnc-host.exe' first arg is also accepted) in\n"
       L"                  the active console session via TokenManager, wait\n"
       L"                  for it and propagate its exit code; remaining args\n"
       L"                  go to the child verbatim; no pipe server here\n"
@@ -132,7 +132,7 @@ int RunDiagSpawn(const wchar_t* child_exe, int argc, wchar_t** argv, int from) {
     return 1;
   }
 
-  // --log-file: the child (xnc-desktop.exe) opens its own log - service
+  // --log-file: the child (xnc-host.exe) opens its own log - service
   // diag spawns have no console (2026-08-24 observability incident
   // follow-up). Appended after the verbatim child args; xnc-desktop's
   // parser takes the last --log-file, overriding an explicit user one
@@ -308,12 +308,12 @@ int wmain(int argc, wchar_t** argv) {
       }
       diag_spawn = true;
       // Two accepted forms (both whitelist-enforced at spawn time):
-      //   --diag-spawn xnc-desktop.exe <args...>   explicit (plan form)
+      //   --diag-spawn xnc-host.exe <args...>   explicit (plan form)
       //   --diag-spawn <args...>                   exe implied
       if (xnc::SpawnExeArgAllowed(argv[i + 1])) {
         child_exe = argv[++i];
       } else {
-        child_exe = L"xnc-desktop.exe";
+        child_exe = L"xnc-host.exe";
       }
       child_args_from = i + 1;
       break;  // rest of argv belongs to the child, verbatim

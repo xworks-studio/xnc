@@ -1,7 +1,7 @@
 // pipe_server.cpp - console-mode XNIP pipe server (spec 9 server half):
 // DACL'd single-instance pipe, accept loop, server-side mutual-proof
 // handshake (9.3), PING/PONG frame loop, START/STOP_CAPTURE RPC
-// (M1-Slice2 Task 3: spawn xnc-desktop into the console session, report
+// (RTV: spawn xnc-host into the console session, report
 // its rt pipe name/secret/generation). All blocking waits (accept, reads,
 // writes) are sliced into 5s chunks that heartbeat the watchdog, so a quiet
 // but healthy server stays alive while a stuck loop is killed after 30s
@@ -169,8 +169,9 @@ struct CaptureHost {
   HANDLE child = nullptr;    // owned by the watcher thread of that spawn
   uint32_t session = 0;      // session the child was spawned into (Task 4)
   uint32_t gen = 0;          // increments per spawn (agent-side accounting)
-  uint8_t secret[kDesktopSecretLen] = {0};
-  std::wstring pipe_name;
+  // RTV：不透明的 xnc-host stdin 配置 JSON（含 HostToken，绝不入日志）；
+  // 崩溃退避重启时原样重放（server 侧 token 按节点绑定，重放=合法再注册）。
+  std::string cfg;
 };
 CaptureHost g_capture;
 
@@ -224,13 +225,6 @@ DesktopSupervisor g_desktop;
 // Seams (selftest injection; null = production default below).
 ShellTokenFn g_shell_token_fn = nullptr;
 ShellSpawnFn g_shell_spawn_fn = nullptr;
-SnapshotSpawnFn g_snapshot_spawn_fn = nullptr;
-
-SnapshotSpawnResult RealSnapshotSpawn(uint32_t session, uint32_t max_w);
-SnapshotSpawnFn CurrentSnapshotSpawnFn() {
-  return g_snapshot_spawn_fn != nullptr ? g_snapshot_spawn_fn
-                                        : &RealSnapshotSpawn;
-}
 
 
 bool RealShellToken(uint32_t session, uint8_t token_kind, HANDLE* out);
@@ -245,9 +239,8 @@ ShellSpawnFn CurrentShellSpawnFn() {
   return g_shell_spawn_fn != nullptr ? g_shell_spawn_fn : &RealShellSpawn;
 }
 
-CaptureSpawnResult RealCaptureSpawn(uint32_t session, const wchar_t* pipe_name,
-                                    const uint8_t* secret, Watchdog* wd,
-                                    bool degraded);
+CaptureSpawnResult RealCaptureSpawn(uint32_t session, const std::string& cfg,
+                                    Watchdog* wd, bool degraded);
 ShellSpawnResult RealShellSpawn(const ShellCreateReq& req, uint32_t session,
                                 const wchar_t* pipe_name, const uint8_t* secret,
                                 HANDLE token, Watchdog* wd);
@@ -336,7 +329,7 @@ SasSendFn RealResolveSendSas() {
 // Supervised desktop restart loop (detached thread): sleep the backoff,
 // re-spawn (degraded args once crash-loop locked), retry on spawn failure.
 void DesktopRestartLoop(uint32_t spawn_epoch, uint32_t session,
-                        std::wstring pipe_name, std::vector<uint8_t> secret);
+                        std::string cfg);
 void WatchCaptureChild(HANDLE child, DWORD pid, uint32_t spawn_epoch) {
   WaitForSingleObject(child, INFINITE);
   DWORD code = 0;
@@ -344,15 +337,13 @@ void WatchCaptureChild(HANDLE child, DWORD pid, uint32_t spawn_epoch) {
   XNC_LOG_INFO("worker_exited kind=desktop pid=%lu exit=%lu", pid, code);
 
   uint32_t session = 0;
-  std::wstring pipe_name;
-  uint8_t secret[kDesktopSecretLen] = {0};
+  std::string cfg;
   bool arm_restart = false;
   const uint64_t now = GetTickCount64();
   {
     std::lock_guard<std::mutex> lk(g_capture.mu);
     session = g_capture.session;
-    pipe_name = g_capture.pipe_name;
-    std::memcpy(secret, g_capture.secret, kDesktopSecretLen);
+    cfg = g_capture.cfg;
     if (g_capture.child == child) {
       g_capture.valid = false;
       g_capture.child = nullptr;
@@ -372,7 +363,7 @@ void WatchCaptureChild(HANDLE child, DWORD pid, uint32_t spawn_epoch) {
         g_desktop.degraded = true;
         XNC_LOG_INFO(
             "crash_loop_degraded kind=desktop exits=%zu window_ms=%zu "
-            "(desktop locked to --backend gdi --encoder software)",
+            "(desktop locked to --encoder libx264)",
             g_desktop.exit_ms.size(), (size_t)kCrashLoopWindowMs);
       }
       // A child that survived longer than the crash-loop window resets the
@@ -388,9 +379,8 @@ void WatchCaptureChild(HANDLE child, DWORD pid, uint32_t spawn_epoch) {
     }
   }
   CloseHandle(child);
-  if (arm_restart && session != 0xFFFFFFFF && !pipe_name.empty()) {
-    std::thread(DesktopRestartLoop, spawn_epoch, session, pipe_name,
-                std::vector<uint8_t>(secret, secret + kDesktopSecretLen))
+  if (arm_restart && session != 0xFFFFFFFF && !cfg.empty()) {
+    std::thread(DesktopRestartLoop, spawn_epoch, session, std::move(cfg))
         .detach();
   }
 }
@@ -401,150 +391,12 @@ Frame ErrorFrame(uint16_t type, uint32_t request_id, const char* code) {
                std::vector<uint8_t>(code, code + std::strlen(code))};
 }
 
-// M2-Slice3 Task 3 production snapshot spawn: SessionSystemToken ->
-// SpawnInSession("xnc-desktop.exe --jpeg-single <tmp> --max-w <w>") ->
-// wait exit (15s) -> read file (<= 8 MiB) -> delete temp. The temp path is
-// program-constructed under core's %TEMP% (SYSTEM context; the child runs
-// under the same SYSTEM token, so both sides can write it).
-SnapshotSpawnResult RealSnapshotSpawn(uint32_t session, uint32_t max_w) {
-  SnapshotSpawnResult r{};
-  auto fail = [&r](const char* code) {
-    snprintf(r.err, sizeof(r.err), "%s", code);
-    return r;
-  };
-
-  wchar_t tmp_dir[MAX_PATH] = {0};
-  const DWORD tl = GetTempPathW(MAX_PATH, tmp_dir);
-  if (tl == 0 || tl >= MAX_PATH) return fail("INTERNAL");
-  // Temp name carries pid + per-process monotonic seq: concurrent snapshot
-  // spawns (multiple sessions / rapid retries) never collide on one path
-  // (T3 review fix carried into T4).
-  static std::atomic<unsigned> snap_seq{0};
-  wchar_t path[MAX_PATH + 64] = {0};
-  swprintf(path, MAX_PATH + 64, L"%lsxnc-snap-%lu-%u.jpg", tmp_dir,
-           GetCurrentProcessId(), snap_seq.fetch_add(1) + 1);
-
-  HANDLE token = nullptr;
-  std::string err;
-  if (!TokenManager::SessionSystemToken(session, &token, &err)) {
-    XNC_LOG_ERROR("snapshot: session token failed err=\"%s\"", err.c_str());
-    return fail("TOKEN_FAILED");
-  }
-
-  wchar_t maxw[16] = {0};
-  swprintf(maxw, 16, L"%u", max_w);
-  std::vector<std::wstring> args = {L"--jpeg-single", path};
-  if (max_w > 0) {
-    args.push_back(L"--max-w");
-    args.push_back(maxw);
-  }
-  // --log-file: same single log channel as the RT desktop spawn - service
-  // spawns have no console (2026-08-24 observability incident follow-up).
-  // Snapshot child shares xnc-desktop.log with the RT child (append mode).
-  args.push_back(L"--log-file");
-  args.push_back(JoinSiblingPath(OwnModuleDir(), L"xnc-desktop.log"));
-  std::vector<wchar_t*> av;
-  for (auto& a : args) av.push_back(&a[0]);
-  std::wstring cmd;
-  std::string cmd_err;
-  if (!BuildChildCommandLine(L"xnc-desktop.exe", static_cast<int>(av.size()),
-                             av.data(), 0, &cmd, &cmd_err)) {
-    CloseHandle(token);
-    XNC_LOG_ERROR("snapshot: cmdline rejected err=\"%s\"", cmd_err.c_str());
-    return fail("INTERNAL");
-  }
-
-  DWORD pid = 0;
-  HANDLE child = nullptr;
-  if (!SpawnInSession(token, L"xnc-desktop.exe", cmd.c_str(), &pid, &child,
-                      &err)) {
-    CloseHandle(token);
-    XNC_LOG_ERROR("snapshot: spawn failed err=\"%s\"", err.c_str());
-    return fail("SPAWN_FAILED");
-  }
-  CloseHandle(token);
-
-  // 15s wait budget, sliced for watchdog heartbeats (spec 15 pattern).
-  const ULONGLONG deadline = GetTickCount64() + 15000;
-  bool exited = false;
-  DWORD exit_code = 1;
-  for (;;) {
-    const DWORD w = WaitForSingleObject(child, 1000);
-    if (w == WAIT_OBJECT_0) {
-      exited = true;
-      GetExitCodeProcess(child, &exit_code);
-      break;
-    }
-    if (w != WAIT_TIMEOUT) break;
-    if (g_wd != nullptr) g_wd->Heartbeat();
-    if (GetTickCount64() >= deadline) break;
-  }
-  if (!exited) {
-    TerminateProcess(child, 1);
-    // reap the deliberate kill
-    WaitForSingleObject(child, 3000);
-    CloseHandle(child);
-    DeleteFileW(path);
-    XNC_LOG_ERROR("snapshot: child pid=%lu timed out", pid);
-    return fail("SNAPSHOT_TIMEOUT");
-  }
-  CloseHandle(child);
-  if (exit_code != 0) {
-    DeleteFileW(path);
-    XNC_LOG_ERROR("snapshot: child pid=%lu exit=%lu", pid, exit_code);
-    return fail("SNAPSHOT_FAILED");
-  }
-
-  // Read the JPEG (cap: 8 MiB payload budget inside the 9 MiB frame cap).
-  HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
-                         OPEN_EXISTING, 0, nullptr);
-  if (f == INVALID_HANDLE_VALUE) {
-    XNC_LOG_ERROR("snapshot: open temp failed err=%lu", GetLastError());
-    DeleteFileW(path);
-    return fail("SNAPSHOT_FAILED");
-  }
-  LARGE_INTEGER sz{};
-  bool too_large = false;
-  if (GetFileSizeEx(f, &sz) && sz.QuadPart > 0 &&
-      sz.QuadPart <= (LONGLONG)8 * 1024 * 1024) {
-    r.jpeg.resize(static_cast<size_t>(sz.QuadPart));
-    DWORD got = 0;
-    if (ReadFile(f, r.jpeg.data(), static_cast<DWORD>(r.jpeg.size()), &got,
-                 nullptr) &&
-        got == r.jpeg.size()) {
-      r.ok = true;
-    }
-  } else {
-    too_large = true;
-  }
-  CloseHandle(f);
-  DeleteFileW(path);
-  if (!r.ok) {
-    r.jpeg.clear();
-    return fail(too_large ? "SNAPSHOT_TOO_LARGE" : "SNAPSHOT_FAILED");
-  }
-  XNC_LOG_INFO("snapshot ok session=%u max_w=%u bytes=%zu", session, max_w,
-               r.jpeg.size());
-  return r;
-}
-
-// 0x0111: decode + session validate + the (injectable) one-shot spawn.
+// 0x0111 已退役（RTV 重构）：JPEG 快照通道随 xnc-desktop C++ 栈删除
+// （spec 2026-09-08 §8.4，快照恢复为后续 PATCH）。稳定回 SNAPSHOT_RETIRED，
+// 让旧调用方得到明确错误而非 unknown-type。
 Frame HandleSnapshot(const Frame& req, Watchdog* wd) {
-  SnapshotReq sr;
-  if (!DecodeSnapshotPayload(req.payload.data(), req.payload.size(), &sr) ||
-      sr.max_w > kSnapshotMaxWCap)
-    return ErrorFrame(kMsgSnapshot, req.request_id, "BAD_PAYLOAD");
-  const uint32_t wts = sr.wts == 0xFFFFFFFFu ? CoreWts().console_session()
-                                             : sr.wts;
-  if (!SessionTargetAllowed(wts, CoreWts().console_session()))
-    return ErrorFrame(kMsgSnapshot, req.request_id, "SESSION_MISMATCH");
-  wd->Heartbeat();
-  const SnapshotSpawnResult r = CurrentSnapshotSpawnFn()(wts, sr.max_w);
-  if (!r.ok) {
-    XNC_LOG_ERROR("snapshot failed code=%s", r.err);
-    return ErrorFrame(kMsgSnapshot, req.request_id, r.err);
-  }
-  return EncodeSnapshotResp(req, r.jpeg.data(), r.jpeg.size());
+  (void)wd;
+  return ErrorFrame(kMsgSnapshot, req.request_id, "SNAPSHOT_RETIRED");
 }
 
 // Wait until the child's rt pipe has a listenable instance. FILE_NOT_FOUND
@@ -568,13 +420,15 @@ bool WaitPipeReady(const wchar_t* name, Watchdog* wd) {
   }
 }
 
-// Production capture spawn: session SYSTEM token -> whitelisted
-// xnc-desktop.exe via SpawnInSession with the secret on inherited stdin
-// (never argv, spec 1.5) -> wait for the child's rt pipe. Every failure
-// path closes what it opened; err carries the stable ASCII code.
-CaptureSpawnResult RealCaptureSpawn(uint32_t session, const wchar_t* pipe_name,
-                                    const uint8_t* secret, Watchdog* wd,
-                                    bool degraded) {
+// Production capture spawn (RTV): session SYSTEM token -> whitelisted
+// xnc-host.exe via SpawnInSession with the endpoint/token config JSON on
+// inherited stdin (never argv, spec 1.5). The host dials the relay itself
+// (QUIC UDP 4433) and registers with its HostToken; core has no pipe
+// back-channel and no WaitPipeReady step - the watcher thread owns crash
+// supervision from here. Every failure path closes what it opened; err
+// carries the stable ASCII code.
+CaptureSpawnResult RealCaptureSpawn(uint32_t session, const std::string& cfg,
+                                    Watchdog* wd, bool degraded) {
   CaptureSpawnResult r{};
 
   HANDLE token = nullptr;
@@ -586,71 +440,51 @@ CaptureSpawnResult RealCaptureSpawn(uint32_t session, const wchar_t* pipe_name,
     return r;
   }
 
-  // Secret handoff (spec 1.5 red line): the secret NEVER enters argv - the
-  // process list would expose it. It travels over an anonymous pipe the
-  // child consumes as its stdin under xnc-desktop --secret-stdin: the read
-  // end becomes the child's inherited hStdInput (STARTF_USESTDHANDLES),
-  // then the parent writes the 64-hex-char line and closes the write end.
-  // The write end is stripped of the inherit flag so ONLY the read end
-  // crosses the process boundary.
-  HANDLE sec_rd = nullptr, sec_wr = nullptr;
+  // Config handoff (spec 1.5 red line): the JSON blob (含 HostToken) NEVER
+  // enters argv - the process list would expose it. It travels over an
+  // anonymous pipe the child consumes as its stdin under xnc-host
+  // --stdin-config: the read end becomes the child's inherited hStdInput
+  // (STARTF_USESTDHANDLES), then the parent writes the blob and closes the
+  // write end. The write end is stripped of the inherit flag so ONLY the
+  // read end crosses the process boundary.
+  HANDLE cfg_rd = nullptr, cfg_wr = nullptr;
   SECURITY_ATTRIBUTES inherit_sa{sizeof(inherit_sa), nullptr, TRUE};
-  if (!CreatePipe(&sec_rd, &sec_wr, &inherit_sa, 0) ||
-      !SetHandleInformation(sec_wr, HANDLE_FLAG_INHERIT, 0)) {
+  if (!CreatePipe(&cfg_rd, &cfg_wr, &inherit_sa, 0) ||
+      !SetHandleInformation(cfg_wr, HANDLE_FLAG_INHERIT, 0)) {
     const DWORD pipe_err = GetLastError();
-    if (sec_rd) CloseHandle(sec_rd);
-    if (sec_wr) CloseHandle(sec_wr);
+    if (cfg_rd) CloseHandle(cfg_rd);
+    if (cfg_wr) CloseHandle(cfg_wr);
     CloseHandle(token);
-    XNC_LOG_ERROR("start_capture: secret stdin pipe failed err=%lu", pipe_err);
+    XNC_LOG_ERROR("start_capture: config stdin pipe failed err=%lu", pipe_err);
     snprintf(r.err, sizeof(r.err), "%s", "INTERNAL");
     return r;
   }
 
   // Program-constructed argv only - no user input and no secret reach the
   // command line, and BuildChildCommandLine additionally rejects unsafe
-  // quoting shapes (embedded quotes / trailing backslash; the slice3
-  // must-fix is resolved) as defense in depth - the cmdline carries
-  // nothing sensitive either way.
-  std::vector<std::wstring> args = {L"--console-rt", L"--pipe", pipe_name,
-                                    L"--secret-stdin"};
-  // feat/rt-scale (hw-encode task 2 Part B): downscale wide sources to
-  // 1920 before encode - the software MFT ceiling at 3440x1440 is ~20 fps,
-  // at 1920 it clears 30 fps; the hardware ladder stays in front either way.
-  // XNC_DESKTOP_MAXW / XNC_DESKTOP_FPS: node-level override (service env or
-  // registry) - e.g. 1280+60 for a 720p60 stream (smooth video content,
-  // jelly-effect mitigation). 0/unset = defaults.
-  uint32_t maxw = 1920, fps = 0;
-  if (const char* e = getenv("XNC_DESKTOP_MAXW")) maxw = static_cast<uint32_t>(atoi(e));
-  if (const char* e = getenv("XNC_DESKTOP_FPS")) fps = static_cast<uint32_t>(atoi(e));
-  if (maxw > 0) {
-    args.push_back(L"--max-w");
-    args.push_back(std::to_wstring(maxw));
-  }
-  if (fps > 0 && fps <= 120) {
-    args.push_back(L"--fps");
-    args.push_back(std::to_wstring(fps));
-  }
-  XNC_LOG_INFO("capture_spawn max_w=%u fps=%u", maxw, fps);
-  // --log-file: desktop opens its own log (service spawns have no console;
-  // inherited-stdio redirection proved unreliable — 2026-08-24 incident).
+  // quoting shapes (embedded quotes / trailing backslash) as defense in
+  // depth - the cmdline carries nothing sensitive either way.
+  std::vector<std::wstring> args = {L"--stdin-config"};
+  // --log-file: host opens its own log (service spawns have no console;
+  // inherited-stdio redirection proved unreliable - 2026-08-24 incident).
   args.push_back(L"--log-file");
-  args.push_back(JoinSiblingPath(OwnModuleDir(), L"xnc-desktop.log"));
+  args.push_back(JoinSiblingPath(OwnModuleDir(), L"xnc-host.log"));
   if (degraded) {
-    // Crash-loop lock (spec 15.2): GDI capture + software encoder only.
-    args.push_back(L"--backend");
-    args.push_back(L"gdi");
+    // Crash-loop lock (spec 15.2 对应物): Rust host 无 --backend 旋钮，
+    // DXGI->GDI 回退由其内部状态机处理；core 侧降级=锁定软件编码器
+    // （跳过 QSV/NVENC/AMF 探测链，规避驱动级崩溃循环）。
     args.push_back(L"--encoder");
-    args.push_back(L"software");
+    args.push_back(L"libx264");
   }
   std::vector<wchar_t*> av;
   for (auto& a : args) av.push_back(&a[0]);
   std::wstring cmd;
   std::string cmd_err;
-  if (!BuildChildCommandLine(L"xnc-desktop.exe", static_cast<int>(av.size()),
+  if (!BuildChildCommandLine(L"xnc-host.exe", static_cast<int>(av.size()),
                              av.data(), 0, &cmd, &cmd_err)) {
     CloseHandle(token);
-    CloseHandle(sec_rd);
-    CloseHandle(sec_wr);
+    CloseHandle(cfg_rd);
+    CloseHandle(cfg_wr);
     XNC_LOG_ERROR("start_capture: child cmdline rejected err=\"%s\"",
                   cmd_err.c_str());
     snprintf(r.err, sizeof(r.err), "%s", "INTERNAL");
@@ -659,46 +493,34 @@ CaptureSpawnResult RealCaptureSpawn(uint32_t session, const wchar_t* pipe_name,
 
   DWORD pid = 0;
   HANDLE child = nullptr;
-  if (!SpawnInSession(token, L"xnc-desktop.exe", cmd.c_str(), &pid, &child,
-                      &err, sec_rd)) {
+  if (!SpawnInSession(token, L"xnc-host.exe", cmd.c_str(), &pid, &child,
+                      &err, cfg_rd)) {
     CloseHandle(token);
-    CloseHandle(sec_rd);
-    CloseHandle(sec_wr);
+    CloseHandle(cfg_rd);
+    CloseHandle(cfg_wr);
     XNC_LOG_ERROR("start_capture: spawn failed err=\"%s\"", err.c_str());
     snprintf(r.err, sizeof(r.err), "%s", "SPAWN_FAILED");
     return r;
   }
   CloseHandle(token);
-  CloseHandle(sec_rd);  // the child's inheritance settled at CreateProcess
+  CloseHandle(cfg_rd);  // the child's inheritance settled at CreateProcess
 
-  // One line - 64 hex chars + '\n' - then close. Matches xnc-desktop's
-  // --secret-stdin contract exactly. Hex/secret never logged.
+  // The whole JSON blob then EOF; matches xnc-host --stdin-config's
+  // read-to-EOF contract exactly. Blob (incl. HostToken) never logged.
   {
-    char hexline[2 * kDesktopSecretLen + 2] = {0};
-    for (size_t i = 0; i < kDesktopSecretLen; i++)
-      sprintf_s(hexline + 2 * i, 3, "%02x", secret[i]);
-    hexline[2 * kDesktopSecretLen] = '\n';
     DWORD wrote = 0;
-    if (!WriteFile(sec_wr, hexline, 2 * kDesktopSecretLen + 1, &wrote,
+    if (!WriteFile(cfg_wr, cfg.data(), static_cast<DWORD>(cfg.size()), &wrote,
                    nullptr) ||
-        wrote != 2 * kDesktopSecretLen + 1) {
-      // Without the secret the child cannot serve and exits on its own
-      // stdin error; the pipe wait below times out and reaps any survivor.
-      XNC_LOG_ERROR("start_capture: secret stdin write failed err=%lu",
+        wrote != cfg.size()) {
+      // Without the config the child cannot dial the relay and exits on its
+      // own stdin error; the watcher thread reaps any survivor.
+      XNC_LOG_ERROR("start_capture: config stdin write failed err=%lu",
                     GetLastError());
     }
-    CloseHandle(sec_wr);
+    CloseHandle(cfg_wr);
   }
 
   wd->Heartbeat();
-  if (!WaitPipeReady(pipe_name, wd)) {
-    XNC_LOG_ERROR("start_capture: rt pipe not ready in %lums, killing pid=%lu",
-                  kPipeReadyWaitMs, pid);
-    TerminateProcess(child, 1);  // fresh child, before any watcher exists
-    CloseHandle(child);
-    snprintf(r.err, sizeof(r.err), "%s", "PIPE_TIMEOUT");
-    return r;
-  }
 
   r.ok = true;
   r.pid = pid;
@@ -713,7 +535,7 @@ CaptureSpawnResult RealCaptureSpawn(uint32_t session, const wchar_t* pipe_name,
 // on a deliberate stop (epoch moved on) or when an agent-driven
 // StartCapture re-spawned first (g_capture.valid).
 void DesktopRestartLoop(uint32_t spawn_epoch, uint32_t session,
-                        std::wstring pipe_name, std::vector<uint8_t> secret) {
+                        std::string cfg) {
   for (;;) {
     uint32_t delay = 0, idx = 0;
     bool degraded = false;
@@ -736,9 +558,7 @@ void DesktopRestartLoop(uint32_t spawn_epoch, uint32_t session,
     if (g_wd != nullptr) g_wd->Heartbeat();
 
     Watchdog* wd = g_wd;  // may predate Start() in the selftest loopback
-    const CaptureSpawnResult r =
-        CurrentSpawnFn()(session, pipe_name.c_str(), secret.data(), wd,
-                         degraded);
+    const CaptureSpawnResult r = CurrentSpawnFn()(session, cfg, wd, degraded);
     std::lock_guard<std::mutex> lk(g_capture.mu);
     if (!r.ok) {
       XNC_LOG_ERROR("desktop restart spawn failed code=%s", r.err);
@@ -755,7 +575,7 @@ void DesktopRestartLoop(uint32_t spawn_epoch, uint32_t session,
         g_desktop.degraded = true;
         XNC_LOG_INFO(
             "crash_loop_degraded kind=desktop exits=%zu window_ms=%zu "
-            "(desktop locked to --backend gdi --encoder software)",
+            "(desktop locked to --encoder libx264)",
             g_desktop.exit_ms.size(), (size_t)kCrashLoopWindowMs);
       }
       g_desktop.crash_index += 1;
@@ -775,11 +595,10 @@ void DesktopRestartLoop(uint32_t spawn_epoch, uint32_t session,
     g_capture.child = r.child;
     g_capture.session = session;
     g_capture.gen += 1;
-    std::memcpy(g_capture.secret, secret.data(), kDesktopSecretLen);
-    g_capture.pipe_name = pipe_name;
+    g_capture.cfg = cfg;
     g_desktop.last_spawn_ms = GetTickCount64();
-    XNC_LOG_INFO("desktop restart spawned pid=%lu pipe=%ls gen=%u session=%u%s",
-                 r.pid, pipe_name.c_str(), g_capture.gen, session,
+    XNC_LOG_INFO("desktop restart spawned pid=%lu gen=%u session=%u%s",
+                 r.pid, g_capture.gen, session,
                  degraded ? " degraded" : "");
     g_desktop.restart_pending = false;
     std::thread(WatchCaptureChild, r.child, r.pid, g_desktop.restart_epoch)
@@ -1090,33 +909,31 @@ Frame HandleSas(const Frame& req, uint32_t client_pid) {
   return Frame{kFlagResponse, kMsgSas, req.request_id, std::move(p)};
 }
 
-// 0x0100: [u32 wts][u32 pad=0] -> spawn (or reuse) the desktop capture
-// child and answer its pipe descriptor. Idempotent while the child lives
+// 0x0100: [u32 wts][u16 cfg_len][cfg JSON] -> spawn (or reuse) the RTV
+// desktop host and answer [pid][gen]. Idempotent while the child lives
 // IN THE CURRENT SESSION: the wts argument is validated against the LIVE
-// active console session (CoreWts(), unified with the WTS monitor - Task
-// 4), and a child left over from a previous console session is terminated
-// (scoped by stored handle) and re-spawned into the current one.
+// active console session (CoreWts(), unified with the WTS monitor), and a
+// child left over from a previous console session is terminated (scoped by
+// stored handle) and re-spawned into the current one. cfg 对 core 不透明
+// （xnc-host 的 stdin 配置 JSON，含 HostToken）：只做长度与空校验，绝不
+// 记录内容；复用/重启路径原样重放。
 Frame HandleStartCapture(const Frame& req, Watchdog* wd) {
-  uint32_t wts = 0;
-  if (req.payload.size() != 8 || GetU32(req.payload.data() + 4) != 0) {
+  if (req.payload.size() < 6) {
     return ErrorFrame(kMsgStartCapture, req.request_id, "BAD_PAYLOAD");
   }
-  wts = GetU32(req.payload.data());
+  const uint32_t wts = GetU32(req.payload.data());
+  const size_t cfg_len = static_cast<uint16_t>(req.payload[4]) |
+                         static_cast<uint16_t>(req.payload[5]) << 8;
+  if (cfg_len == 0 || cfg_len > kMaxStartCfgBytes ||
+      req.payload.size() != 6 + cfg_len) {
+    return ErrorFrame(kMsgStartCapture, req.request_id, "BAD_PAYLOAD");
+  }
+  const std::string cfg(reinterpret_cast<const char*>(req.payload.data()) + 6,
+                        cfg_len);
   const uint32_t active_pre = CoreWts().console_session();
   if (!SessionTargetAllowed(wts, active_pre)) {
     return ErrorFrame(kMsgStartCapture, req.request_id, "SESSION_MISMATCH");
   }
-
-  uint8_t secret[kDesktopSecretLen];
-  NTSTATUS rng = BCryptGenRandom(nullptr, secret, sizeof(secret),
-                                 BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-  if (!BCRYPT_SUCCESS(rng)) {
-    XNC_LOG_ERROR("start_capture: secret RNG failed status=0x%08lX", (unsigned long)rng);
-    return ErrorFrame(kMsgStartCapture, req.request_id, "RNG_FAILED");
-  }
-
-  wchar_t pipe_name[80];
-  swprintf(pipe_name, 80, L"\\\\.\\pipe\\xnc-desktop-rt-%lu", GetCurrentProcessId());
 
   std::lock_guard<std::mutex> lk(g_capture.mu);
   // TOCTOU fix (Task 6 deferred list): the active console session is
@@ -1137,8 +954,7 @@ Frame HandleStartCapture(const Frame& req, Watchdog* wd) {
     case CaptureReuse::kReuse:
       XNC_LOG_INFO("start_capture: reuse pid=%lu gen=%u session=%u",
                    g_capture.pid, g_capture.gen, g_capture.session);
-      return EncodeStartCaptureOk(req, g_capture.pid, g_capture.pipe_name,
-                                  g_capture.secret, g_capture.gen);
+      return EncodeStartCaptureOk(req, g_capture.pid, g_capture.gen);
     case CaptureReuse::kRespawnStaleSession:
       // Console moved (fast user switch / logoff->logon) under a live
       // child: it belongs to the OLD session. Terminate by stored handle
@@ -1155,7 +971,7 @@ Frame HandleStartCapture(const Frame& req, Watchdog* wd) {
   }
 
   const CaptureSpawnResult r =
-      CurrentSpawnFn()(wts, pipe_name, secret, wd, g_desktop.degraded);
+      CurrentSpawnFn()(wts, cfg, wd, g_desktop.degraded);
   if (!r.ok) {
     XNC_LOG_ERROR("start_capture: spawn failed code=%s", r.err);
     return ErrorFrame(kMsgStartCapture, req.request_id, r.err);
@@ -1166,16 +982,15 @@ Frame HandleStartCapture(const Frame& req, Watchdog* wd) {
   g_capture.child = r.child;
   g_capture.session = wts;
   g_capture.gen += 1;
-  std::memcpy(g_capture.secret, secret, kDesktopSecretLen);
-  g_capture.pipe_name = pipe_name;
+  g_capture.cfg = cfg;
   g_desktop.last_spawn_ms = GetTickCount64();
-  // Secret/hex never logged; pid + pipe name + gen + session only.
-  XNC_LOG_INFO("start_capture: spawned pid=%lu pipe=%ls gen=%u session=%u%s",
-               r.pid, pipe_name, g_capture.gen, wts,
+  // cfg (incl. HostToken) never logged; pid + gen + session only.
+  XNC_LOG_INFO("start_capture: spawned pid=%lu gen=%u session=%u%s",
+               r.pid, g_capture.gen, wts,
                g_desktop.degraded ? " degraded" : "");
   std::thread(WatchCaptureChild, r.child, r.pid, g_desktop.restart_epoch)
       .detach();
-  return EncodeStartCaptureOk(req, r.pid, pipe_name, secret, g_capture.gen);
+  return EncodeStartCaptureOk(req, r.pid, g_capture.gen);
 }
 
 // 0x0101: stop the capture child if any; idempotent. TerminateProcess is
@@ -1396,31 +1211,6 @@ void SetTerminateForTest(BOOL(WINAPI* fn)(HANDLE, UINT)) {
 }
 void SetShellTokenForTest(ShellTokenFn fn) { g_shell_token_fn = fn; }
 void SetShellSpawnForTest(ShellSpawnFn fn) { g_shell_spawn_fn = fn; }
-void SetSnapshotSpawnForTest(SnapshotSpawnFn fn) { g_snapshot_spawn_fn = fn; }
-
-// ---- M2-Slice3 Task 3: 0x0111 payload codecs (selftest golden) ----
-
-// [u32 wts][u32 max_w], exactly 8 bytes; trailing/garbage -> false.
-bool DecodeSnapshotPayload(const uint8_t* p, size_t n, SnapshotReq* out) {
-  if (p == nullptr || out == nullptr || n != 8) return false;
-  out->wts = static_cast<uint32_t>(p[0]) | static_cast<uint32_t>(p[1]) << 8 |
-             static_cast<uint32_t>(p[2]) << 16 |
-             static_cast<uint32_t>(p[3]) << 24;
-  out->max_w = static_cast<uint32_t>(p[4]) | static_cast<uint32_t>(p[5]) << 8 |
-               static_cast<uint32_t>(p[6]) << 16 |
-               static_cast<uint32_t>(p[7]) << 24;
-  return true;
-}
-
-// [u32 len][jpeg bytes] (little-endian length prefix).
-Frame EncodeSnapshotResp(const Frame& req, const uint8_t* jpeg, size_t len) {
-  std::vector<uint8_t> p;
-  p.reserve(4 + len);
-  for (int i = 0; i < 4; i++)
-    p.push_back(static_cast<uint8_t>((static_cast<uint32_t>(len)) >> (8 * i)));
-  if (jpeg != nullptr && len > 0) p.insert(p.end(), jpeg, jpeg + len);
-  return Frame{kFlagResponse, kMsgSnapshot, req.request_id, std::move(p)};
-}
 
 // ---- M2-Slice2 Task 3 public surface (pipe_server.h declarations) ----
 
@@ -1543,23 +1333,15 @@ bool CrashLoopReached(const std::vector<uint64_t>& exit_ms, uint64_t now_ms) {
   return in_window >= kCrashLoopExits;
 }
 
-// [u32 pid][u16 nameLen][name utf8 bytes][32B secret][u32 gen]; the pipe
-// name is program-constructed ASCII, so the "utf8" pass is a plain copy.
+// [u32 pid][u32 gen]（RTV：host 自行向 relay 注册，无 pipe/secret 回传）。
 // Declared in pipe_server.h for the selftest's byte-level layout check.
-Frame EncodeStartCaptureOk(const Frame& req, DWORD pid, const std::wstring& pipe,
-                           const uint8_t* secret, uint32_t gen) {
-  std::string name;
-  for (wchar_t c : pipe) name.push_back(c < 128 ? static_cast<char>(c) : '?');
+Frame EncodeStartCaptureOk(const Frame& req, DWORD pid, uint32_t gen) {
   std::vector<uint8_t> p;
-  p.reserve(6 + name.size() + kDesktopSecretLen + 4);
+  p.reserve(8);
   auto put32 = [&p](uint32_t v) {
     for (int i = 0; i < 4; i++) p.push_back(static_cast<uint8_t>(v >> (8 * i)));
   };
   put32(pid);
-  p.push_back(static_cast<uint8_t>(name.size()));
-  p.push_back(static_cast<uint8_t>(name.size() >> 8));  // u16 LE nameLen
-  p.insert(p.end(), name.begin(), name.end());
-  p.insert(p.end(), secret, secret + kDesktopSecretLen);
   put32(gen);
   return Frame{kFlagResponse, kMsgStartCapture, req.request_id, std::move(p)};
 }

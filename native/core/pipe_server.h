@@ -27,16 +27,21 @@ class Watchdog;
 constexpr size_t kMaxPipeSecretBytes = 128;
 
 // App RPC types, start of the 0x0100 registry block (spec 9.2: 0x0001..0x000F
-// are frame-level, 0x0100+ are app RPC). M1-Slice2 fixed-binary layouts
-// (little-endian; protobuf migration is Slice3):
-//   kMsgStartCapture request  [wts_session u32][pad u32 = 0]
-//     -> ok response  [pid u32][name_len u16][pipe name utf8 bytes]
-//                     [secret 32B][gen u32]
+// are frame-level, 0x0100+ are app RPC). RTV 重构后的布局（little-endian）：
+//   kMsgStartCapture request  [wts_session u32][cfg_len u16][cfg JSON utf8]
+//     cfg = xnc-host 的 stdin 配置 blob（endpoint/serverName/nodeId/token/
+//     fps/bitrateKbps/fec/display/sendKbps），对 core 不透明；含 HostToken
+//     密钥，绝不入日志/argv（spec 1.5）。长度上限 kMaxStartCfgBytes。
+//     -> ok response  [pid u32][gen u32]
 //     -> error response = FlagError frame, payload ASCII stable code
-//        (BAD_PAYLOAD / SESSION_MISMATCH / RNG_FAILED / TOKEN_FAILED /
-//         SPAWN_FAILED / PIPE_TIMEOUT / INTERNAL)
+//        (BAD_PAYLOAD / SESSION_MISMATCH / TOKEN_FAILED / SPAWN_FAILED /
+//         INTERNAL)
+//     host 自身经 QUIC 直连 server 注册（不再回建 rt pipe），响应只报
+//     pid+gen；崩溃监督（退避重启/降级锁定）仍由 core 承担，重启沿用
+//     首次 StartCapture 的 cfg blob（HostToken 在 server 侧按节点绑定）。
 //   kMsgStopCapture  request  (empty) -> empty FlagResponse (idempotent)
 constexpr uint16_t kMsgStartCapture = 0x0100, kMsgStopCapture = 0x0101;
+constexpr size_t kMaxStartCfgBytes = 4096;
 
 //   kMsgSas (M2-Slice1 Task 4) request [char reason[24]] (NUL-padded
 //   fixed field) -> ok response [u32 hr] | FlagError (SAS_DENIED /
@@ -50,46 +55,15 @@ constexpr uint16_t kMsgStartCapture = 0x0100, kMsgStopCapture = 0x0101;
 constexpr uint16_t kMsgSas = 0x0110;
 inline constexpr size_t kSasReasonLen = 24;
 
-// ---- M2-Slice3 Task 3: MSG_SNAPSHOT 0x0111 (screen-retirement snapshot
-// lane: `xnc screen --snap` now rides xnc-desktop --jpeg-single instead of
-// the retired xnc-screen-helper stream) ----
-//   request  (LE) [u32 wts][u32 max_w]; wts may be the 0xFFFFFFFF "live
-//             active console" sentinel (same agent<->core contract as
-//             0x0120); max_w 0 = no downscale clamp.
-//     -> ok response [u32 len][jpeg bytes]
-//     -> FlagError stable code (BAD_PAYLOAD / SESSION_MISMATCH /
-//        TOKEN_FAILED / SPAWN_FAILED / SNAPSHOT_TIMEOUT / SNAPSHOT_FAILED /
-//        SNAPSHOT_TOO_LARGE)
-// Core spawns ONE-SHOT "xnc-desktop.exe --jpeg-single <tmp.jpg> --max-w <w>"
-// into the target session (SessionSystemToken + SpawnInSession), waits its
-// exit (15s budget), reads the file (<= 8 MiB, the 9 MiB frame cap minus
-// overhead), deletes the temp, answers the bytes. Program-constructed argv
-// only; the temp path lives under core's %TEMP% (SYSTEM-writable).
-constexpr uint16_t kMsgSnapshot = 0x0111;
-constexpr uint32_t kSnapshotMaxWCap = 7680;  // 8K width sanity cap
-struct SnapshotReq {
-  uint32_t wts = 0;
-  uint32_t max_w = 0;
-};
-bool DecodeSnapshotPayload(const uint8_t* p, size_t n, SnapshotReq* out);
-Frame EncodeSnapshotResp(const Frame& req, const uint8_t* jpeg, size_t len);
-// Injectable spawn+collect seam (selftest only; nullptr = production
-// RealSnapshotSpawn). ok=false + err = stable ASCII code; jpeg filled on ok.
-struct SnapshotSpawnResult {
-  bool ok = false;
-  std::vector<uint8_t> jpeg;
-  char err[24] = {0};
-};
-using SnapshotSpawnFn = SnapshotSpawnResult (*)(uint32_t session,
-                                                uint32_t max_w);
-void SetSnapshotSpawnForTest(SnapshotSpawnFn fn);
+// Pure ok-response codec for kMsgStartCapture：[pid u32][gen u32]（8 字节）。
+// 暴露给 selftest 做逐字节断言。
+Frame EncodeStartCaptureOk(const Frame& req, DWORD pid, uint32_t gen);
 
-// Pure ok-response codec for kMsgStartCapture (little-endian layout above;
-// the pipe name is program-constructed ASCII so the utf8 pass is a plain
-// copy). Exposed so the selftest can assert the success layout byte for
-// byte (native/desktop rt codec precedent). Secret/gen never logged.
-Frame EncodeStartCaptureOk(const Frame& req, DWORD pid, const std::wstring& pipe,
-                           const uint8_t* secret, uint32_t gen);
+// ---- kMsgSnapshot 0x0111 已随 RTV 重构退役（xnc-desktop --jpeg-single
+// 一次性快照通道删除，spec 2026-09-08 §8.4：JPEG 快照为后续 PATCH）。
+// 常量保留：dispatcher 对该类型稳定回 SNAPSHOT_RETIRED FlagError，
+// 旧调用方得到明确错误而非 unknown-type。 ----
+constexpr uint16_t kMsgSnapshot = 0x0111;
 
 // ---- M2-Slice2 Task 3: CreateShell / KillShell + worker supervision ----
 //   kMsgCreateShell request (LE) [u32 wts][u8 token_kind 0=user,1=system]
@@ -238,9 +212,10 @@ using SasResolveFn = SasSendFn (*)();  // default: dynamic sas.dll resolve
 void SetSasSendForTest(SasSendFn fn);
 void SetSasResolveForTest(SasResolveFn fn);
 
-// Capture-spawn seam: everything from token minting to WaitPipeReady
-// (production default = RealCaptureSpawn). err = stable ASCII code
-// (TOKEN_FAILED / SPAWN_FAILED / INTERNAL / PIPE_TIMEOUT).
+// Capture-spawn seam: everything from token minting to the stdin config
+// handoff (production default = RealCaptureSpawn). cfg = 不透明的 xnc-host
+// stdin 配置 JSON（含 HostToken，绝不入日志/argv）。err = stable ASCII
+// code (TOKEN_FAILED / SPAWN_FAILED / INTERNAL).
 struct CaptureSpawnResult {
   bool ok = false;
   DWORD pid = 0;
@@ -248,10 +223,8 @@ struct CaptureSpawnResult {
   char err[24] = {0};
 };
 using CaptureSpawnFn = CaptureSpawnResult (*)(uint32_t session,
-                                              const wchar_t* pipe_name,
-                                              const uint8_t* secret,
-                                              Watchdog* wd,
-                                              bool degraded);
+                                              const std::string& cfg,
+                                              Watchdog* wd, bool degraded);
 void SetCaptureSpawnForTest(CaptureSpawnFn fn);
 
 // Terminate seam (default TerminateProcess); the fake records + signals.

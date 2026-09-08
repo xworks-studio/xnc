@@ -22,9 +22,10 @@ bool SpawnExeArgAllowed(const wchar_t* exe) {
   if (!exe) return false;
   const wchar_t* name = exe;
   if (exe[0] == L'.' && exe[1] == L'\\') name = exe + 2;  // ".\" prefix ok
-  // lstrcmpiW: case-insensitive wide compare (filesystem-like). M2-Slice2
-  // Task 3 adds xnc-shell.exe (CreateShell spawns it next to xnc-core.exe).
-  return lstrcmpiW(name, L"xnc-desktop.exe") == 0 ||
+  // lstrcmpiW: case-insensitive wide compare (filesystem-like). RTV 重构后
+  // 桌面工作进程为 xnc-host.exe（Rust），xnc-shell.exe 不变（CreateShell
+  // spawns it next to xnc-core.exe）。
+  return lstrcmpiW(name, L"xnc-host.exe") == 0 ||
          lstrcmpiW(name, L"xnc-shell.exe") == 0;
 }
 
@@ -136,7 +137,7 @@ bool SpawnInSession(HANDLE token, const wchar_t* exe, const wchar_t* cmdline,
 
   if (!SpawnExeArgAllowed(exe)) {
     if (err)
-      *err = "exe rejected by whitelist (only xnc-desktop.exe / xnc-shell.exe "
+      *err = "exe rejected by whitelist (only xnc-host.exe / xnc-shell.exe "
              "next to xnc-core.exe): " + Narrow(exe);
     return false;
   }

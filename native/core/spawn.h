@@ -1,12 +1,12 @@
 // spawn.h - CreateProcessAsUserW into the console session, the M1 session
 // bridge (spec 4.2: lpDesktop = "winsta0\default"; the child command line
-// carries no secrets - the pipe_secret travels via the inherited stdin
-// handle, never argv, spec 1.5). The spawnable exe is WHITELISTED to the
-// plain relative name xnc-desktop.exe, resolved against xnc-core.exe's own
-// directory (spec 6.4 spirit: core resolves to fixed executable paths and
-// never accepts path parameters). The string helpers are pure and covered
-// by the selftest; SpawnInSession itself needs the TokenManager token and
-// is verified live on LABS-XIAOXIN.
+// carries no secrets - the RTV host's endpoint/token config blob travels via
+// the inherited stdin handle, never argv, spec 1.5). The spawnable exe is
+// WHITELISTED to the plain relative name xnc-host.exe, resolved against
+// xnc-core.exe's own directory (spec 6.4 spirit: core resolves to fixed
+// executable paths and never accepts path parameters). The string helpers
+// are pure and covered by the selftest; SpawnInSession itself needs the
+// TokenManager token and is verified live on LABS-XIAOXIN.
 #ifndef XNC_NATIVE_CORE_SPAWN_H_
 #define XNC_NATIVE_CORE_SPAWN_H_
 
@@ -19,12 +19,12 @@
 
 namespace xnc {
 
-// Whitelist check (pure): the only accepted forms are "xnc-desktop.exe" /
+// Whitelist check (pure): the only accepted forms are "xnc-host.exe" /
 // "xnc-shell.exe" (each optionally with a ".\" prefix, case-insensitive,
 // like the filesystem). Absolute paths, UNC, "..", subdirectories, suffix
 // tricks, embedded or trailing whitespace are all rejected by the
-// exact-name comparison. M2-Slice2 Task 3 adds xnc-shell.exe for the
-// CreateShell RPC's worker spawn.
+// exact-name comparison. xnc-host.exe is the RTV desktop worker (Rust);
+// xnc-shell.exe serves the CreateShell RPC's worker spawn.
 bool SpawnExeArgAllowed(const wchar_t* exe);
 
 // dir + "\" + name, collapsing a single trailing slash on dir (pure; used

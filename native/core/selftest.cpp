@@ -55,8 +55,7 @@ static std::atomic<bool> s_degraded_last{false};  // last fake capture spawn's d
 // Fake child = manual-reset NON-signaled event: WaitForSingleObject(h,0)
 // is WAIT_TIMEOUT (models "running"), and the detached WatchCaptureChild's
 // INFINITE wait unblocks exactly when the fake terminate signals it.
-static xnc::CaptureSpawnResult FakeCaptureSpawn(uint32_t, const wchar_t*,
-                                                const uint8_t*,
+static xnc::CaptureSpawnResult FakeCaptureSpawn(uint32_t, const std::string&,
                                                 xnc::Watchdog*, bool) {
   HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   s_spawn_events.push_back(ev);
@@ -235,30 +234,30 @@ int SelftestMain() {
       CHECK("sess-swapped", !SessionTargetAllowed(1, 2));
       CHECK("sess-no-console", !SessionTargetAllowed(1, 0xFFFFFFFF)); // 无物理 console
       CHECK("sess-invalid-target", !SessionTargetAllowed(0xFFFFFFFF, 1));
-      // exe 白名单:仅接受同目录相对名 xnc-desktop.exe(可带 .\ 前缀,
+      // exe 白名单:仅接受同目录相对名 xnc-host.exe(可带 .\ 前缀,
       // 大小写不敏感);绝对路径/穿越/子目录/多余后缀一律拒绝。
-      CHECK("exe-allowed", SpawnExeArgAllowed(L"xnc-desktop.exe"));
-      CHECK("exe-allowed-dotslash", SpawnExeArgAllowed(L".\\xnc-desktop.exe"));
-      CHECK("exe-allowed-case", SpawnExeArgAllowed(L"XNC-Desktop.Exe"));
+      CHECK("exe-allowed", SpawnExeArgAllowed(L"xnc-host.exe"));
+      CHECK("exe-allowed-dotslash", SpawnExeArgAllowed(L".\\xnc-host.exe"));
+      CHECK("exe-allowed-case", SpawnExeArgAllowed(L"XNC-Host.Exe"));
       CHECK("exe-wrong-name", !SpawnExeArgAllowed(L"cmd.exe"));
-      CHECK("exe-double-ext", !SpawnExeArgAllowed(L"xnc-desktop.exe.exe"));
-      CHECK("exe-absolute", !SpawnExeArgAllowed(L"C:\\xnc-diag\\xnc-desktop.exe"));
-      CHECK("exe-unc", !SpawnExeArgAllowed(L"\\\\srv\\share\\xnc-desktop.exe"));
-      CHECK("exe-traversal", !SpawnExeArgAllowed(L"..\\xnc-desktop.exe"));
-      CHECK("exe-subdir", !SpawnExeArgAllowed(L"bin\\xnc-desktop.exe"));
-      CHECK("exe-double-dotslash", !SpawnExeArgAllowed(L".\\.\\xnc-desktop.exe"));
+      CHECK("exe-double-ext", !SpawnExeArgAllowed(L"xnc-host.exe.exe"));
+      CHECK("exe-absolute", !SpawnExeArgAllowed(L"C:\\xnc-diag\\xnc-host.exe"));
+      CHECK("exe-unc", !SpawnExeArgAllowed(L"\\\\srv\\share\\xnc-host.exe"));
+      CHECK("exe-traversal", !SpawnExeArgAllowed(L"..\\xnc-host.exe"));
+      CHECK("exe-subdir", !SpawnExeArgAllowed(L"bin\\xnc-host.exe"));
+      CHECK("exe-double-dotslash", !SpawnExeArgAllowed(L".\\.\\xnc-host.exe"));
       CHECK("exe-empty", !SpawnExeArgAllowed(L""));
       CHECK("exe-null", !SpawnExeArgAllowed(nullptr));
-      CHECK("exe-leading-space", !SpawnExeArgAllowed(L" xnc-desktop.exe"));
-      CHECK("exe-trailing-space", !SpawnExeArgAllowed(L"xnc-desktop.exe "));
+      CHECK("exe-leading-space", !SpawnExeArgAllowed(L" xnc-host.exe"));
+      CHECK("exe-trailing-space", !SpawnExeArgAllowed(L"xnc-host.exe "));
       CHECK("exe-only-dotslash", !SpawnExeArgAllowed(L".\\"));
       // 同目录解析:dir + "\" + name(容忍 dir 尾斜杠,不产生双斜杠)。
-      CHECK("join-plain", JoinSiblingPath(L"C:\\xnc-diag", L"xnc-desktop.exe")
-                             == L"C:\\xnc-diag\\xnc-desktop.exe");
-      CHECK("join-trailing-slash", JoinSiblingPath(L"C:\\xnc-diag\\", L"xnc-desktop.exe")
-                             == L"C:\\xnc-diag\\xnc-desktop.exe");
-      CHECK("join-empty-dir", JoinSiblingPath(L"", L"xnc-desktop.exe")
-                             == L"xnc-desktop.exe");
+      CHECK("join-plain", JoinSiblingPath(L"C:\\xnc-diag", L"xnc-host.exe")
+                             == L"C:\\xnc-diag\\xnc-host.exe");
+      CHECK("join-trailing-slash", JoinSiblingPath(L"C:\\xnc-diag\\", L"xnc-host.exe")
+                             == L"C:\\xnc-diag\\xnc-host.exe");
+      CHECK("join-empty-dir", JoinSiblingPath(L"", L"xnc-host.exe")
+                             == L"xnc-host.exe");
       // 令牌派生环境(spawn-env 修复):自身令牌 → 非空 UTF-16 块,含
       // APPDATA=/USERPROFILE=/Path=(每用户变量与系统变量都在),块以
       // double-null 收尾;空指针/非令牌句柄 → false 且 *env 置空。
@@ -322,18 +321,18 @@ int SelftestMain() {
                 a3[] = L"60", sp[] = L"C:\\my dir\\out.h264";
         wchar_t* av[] = {a0, a1, a2, a3};
         std::wstring cmd;
-        CHECK("cmd-simple", BuildChildCommandLine(L"xnc-desktop.exe", 4, av, 1, &cmd)
-                             && cmd == L"xnc-desktop.exe --console-diag --duration 60");
+        CHECK("cmd-simple", BuildChildCommandLine(L"xnc-host.exe", 4, av, 1, &cmd)
+                             && cmd == L"xnc-host.exe --console-diag --duration 60");
         wchar_t* av2[] = {a0, a1, sp};
-        CHECK("cmd-quotes-spaces", BuildChildCommandLine(L"xnc-desktop.exe", 3, av2, 1, &cmd)
-                             && cmd == L"xnc-desktop.exe --console-diag \"C:\\my dir\\out.h264\"");
-        CHECK("cmd-exe-only", BuildChildCommandLine(L"xnc-desktop.exe", 1, av, 1, &cmd)
-                             && cmd == L"xnc-desktop.exe");
-        CHECK("cmd-bad-from", !BuildChildCommandLine(L"xnc-desktop.exe", 2, av, 3, &cmd));
+        CHECK("cmd-quotes-spaces", BuildChildCommandLine(L"xnc-host.exe", 3, av2, 1, &cmd)
+                             && cmd == L"xnc-host.exe --console-diag \"C:\\my dir\\out.h264\"");
+        CHECK("cmd-exe-only", BuildChildCommandLine(L"xnc-host.exe", 1, av, 1, &cmd)
+                             && cmd == L"xnc-host.exe");
+        CHECK("cmd-bad-from", !BuildChildCommandLine(L"xnc-host.exe", 2, av, 3, &cmd));
         wchar_t* av3[] = {a0, nullptr};
-        CHECK("cmd-null-arg", !BuildChildCommandLine(L"xnc-desktop.exe", 2, av3, 1, &cmd));
+        CHECK("cmd-null-arg", !BuildChildCommandLine(L"xnc-host.exe", 2, av3, 1, &cmd));
         wchar_t* av4[] = {a0, (wchar_t*)L""};
-        CHECK("cmd-empty-arg", !BuildChildCommandLine(L"xnc-desktop.exe", 2, av4, 1, &cmd));
+        CHECK("cmd-empty-arg", !BuildChildCommandLine(L"xnc-host.exe", 2, av4, 1, &cmd));
         // M1-Slice3 must-fix matrix: embedded quotes (incl. \" shapes) and
         // trailing backslash are rejected, never escaped; err names the
         // argv index and 0-based wchar position. Interior backslashes,
@@ -344,58 +343,51 @@ int SelftestMain() {
         const wchar_t* qp = std::wcschr(bad_q, L'"');
         wchar_t* avq[] = {a0, bad_q};
         CHECK("cmd-quote-reject",
-              !BuildChildCommandLine(L"xnc-desktop.exe", 2, avq, 1, &cmd, &cerr));
+              !BuildChildCommandLine(L"xnc-host.exe", 2, avq, 1, &cmd, &cerr));
         CHECK("cmd-quote-err",
               cerr.find("embedded quote in arg[1] at char " +
                         std::to_string((int)(qp - bad_q))) != std::string::npos);
         wchar_t bad_eq[] = L"he said \\\"hi\\\"";  // arg text: he said \"hi\"
         wchar_t* avq2[] = {a0, bad_eq};
         CHECK("cmd-escaped-quote-reject",
-              !BuildChildCommandLine(L"xnc-desktop.exe", 2, avq2, 1, &cmd, &cerr));
+              !BuildChildCommandLine(L"xnc-host.exe", 2, avq2, 1, &cmd, &cerr));
         CHECK("cmd-escaped-quote-err",
               cerr.find("embedded quote in arg[1] at char 9") != std::string::npos);
         wchar_t bad_bs[] = L"C:\\dir\\";
         wchar_t* avb[] = {a0, bad_bs};
         CHECK("cmd-trailing-backslash-reject",
-              !BuildChildCommandLine(L"xnc-desktop.exe", 2, avb, 1, &cmd, &cerr));
+              !BuildChildCommandLine(L"xnc-host.exe", 2, avb, 1, &cmd, &cerr));
         CHECK("cmd-trailing-backslash-err",
               cerr.find("trailing backslash in arg[1] at char 6") != std::string::npos);
         // 合法混合路径 + unicode(内部反斜杠、空格、项目名)照常通过。
         wchar_t uni1[] = L"C:\\proj 项目\\out file.h264", uni2[] = L"项目";
         wchar_t* avu[] = {a0, uni1, uni2};
         CHECK("cmd-unicode-path-ok",
-              BuildChildCommandLine(L"xnc-desktop.exe", 3, avu, 1, &cmd) &&
-              cmd == L"xnc-desktop.exe \"C:\\proj 项目\\out file.h264\" 项目");
+              BuildChildCommandLine(L"xnc-host.exe", 3, avu, 1, &cmd) &&
+              cmd == L"xnc-host.exe \"C:\\proj 项目\\out file.h264\" 项目");
         // unicode 内嵌引号:位置按 wchar 计(项0 目1 \2 "3)。
         wchar_t uq[] = L"项目\\\"";
         wchar_t* avu2[] = {a0, uq};
         CHECK("cmd-unicode-quote-reject",
-              !BuildChildCommandLine(L"xnc-desktop.exe", 2, avu2, 1, &cmd, &cerr));
+              !BuildChildCommandLine(L"xnc-host.exe", 2, avu2, 1, &cmd, &cerr));
         CHECK("cmd-unicode-quote-err",
               cerr.find("embedded quote in arg[1] at char 3") != std::string::npos);
         // 空参 err 信息(行为与 slice3 之前一致,仅补上原因)。
         CHECK("cmd-empty-arg-err",
-              !BuildChildCommandLine(L"xnc-desktop.exe", 2, av4, 1, &cmd, &cerr) &&
+              !BuildChildCommandLine(L"xnc-host.exe", 2, av4, 1, &cmd, &cerr) &&
               cerr.find("empty argument at arg[1]") != std::string::npos);
       }
     }
-    { // M1-Slice2 Task 3 fix wave: EncodeStartCaptureOk success layout,
+    { // RTV: EncodeStartCaptureOk success layout [pid u32][gen u32],
       // byte-level (test side builds the expected payload independently).
-      uint8_t secret[32];
-      for (int i = 0; i < 32; i++) secret[i] = (uint8_t)(i + 1);
       Frame ok = EncodeStartCaptureOk(Frame{0, kMsgStartCapture, 0xABCD, {}},
-                                      0x11223344,
-                                      L"\\\\.\\pipe\\xnc-desktop-rt-77", secret, 9);
-      const char* name = "\\\\.\\pipe\\xnc-desktop-rt-77";  // 26 chars
+                                      0x11223344, 9);
       std::vector<uint8_t> want;
       auto put32 = [&want](uint32_t v) {
         for (int i = 0; i < 4; i++) want.push_back((uint8_t)(v >> (8 * i)));
       };
-      put32(0x11223344);                       // pid u32 LE
-      want.push_back(26); want.push_back(0);   // name_len u16 LE
-      for (const char* p = name; *p; ++p) want.push_back((uint8_t)*p);
-      for (int i = 0; i < 32; i++) want.push_back(secret[i]);
-      put32(9);                                // gen u32 LE
+      put32(0x11223344);  // pid u32 LE
+      put32(9);           // gen u32 LE
       CHECK("sc-ok-frame-meta",
             ok.message_type == kMsgStartCapture && ok.flags == kFlagResponse &&
             ok.request_id == 0xABCD);
@@ -485,7 +477,7 @@ int SelftestMain() {
         // stays behind the elevated gate coreclient.TestStartCaptureCross.
         CHECK("loopback-start-capture-badpayload-send",
               WriteFrame(c, Frame{0, kMsgStartCapture, 8,
-                                  {0x01,0,0,0, 0x09,0,0,0}}));
+                                  {0x01,0,0,0, 0x03,0, '{', '}'}}));  // len 3 != 2 字节
         Frame sc;
         CHECK("loopback-start-capture-badpayload",
               ReadFrame(c, sc) == DecodeResult::Ok && sc.message_type == kMsgStartCapture &&
@@ -494,7 +486,7 @@ int SelftestMain() {
               std::memcmp(sc.payload.data(), "BAD_PAYLOAD", 11) == 0);
         CHECK("loopback-start-capture-badsession-send",
               WriteFrame(c, Frame{0, kMsgStartCapture, 11,
-                                  {0xEF,0xBC,0xAB,0x00, 0,0,0,0}}));
+                                  {0xEF,0xBC,0xAB,0x00, 0x02,0, '{', '}'}}));
         Frame sc2;
         CHECK("loopback-start-capture-badsession",
               ReadFrame(c, sc2) == DecodeResult::Ok && sc2.message_type == kMsgStartCapture &&
@@ -599,7 +591,7 @@ int SelftestMain() {
     { // M2-Slice1 Task 4, part 2: SAS gate matrix + StartCapture session
       // unification / respawn on a SECOND loopback against the REAL
       // ServeConnection, with the fake spawn/terminate/session/SAS seams
-      // injected (no real token mint, no real xnc-desktop, no real sas.dll).
+      // injected (no real token mint, no real xnc-host, no real sas.dll).
       using namespace xnc;
       const uint8_t secret[16] = {'t','e','s','t','-','p','i','p','e','-','s','e','c','r','e','t'};
       wchar_t name[96];
@@ -712,31 +704,31 @@ int SelftestMain() {
         s_spawn_count.store(0);
 
         CHECK("sc-fake-start-send",
-              WriteFrame(c, Frame{0, kMsgStartCapture, 30, {0x01,0,0,0, 0,0,0,0}}));
+              WriteFrame(c, Frame{0, kMsgStartCapture, 30, {0x01,0,0,0, 0x02,0, '{', '}'}}));
         Frame r30;
         CHECK("sc-fake-start",
               ReadFrame(c, r30) == DecodeResult::Ok && r30.message_type == kMsgStartCapture &&
-              (r30.flags & kFlagError) == 0 && r30.payload.size() > 36 &&
-              get32(r30.payload, r30.payload.size() - 4) == 1 &&   // gen 1
+              (r30.flags & kFlagError) == 0 && r30.payload.size() == 8 &&
+              get32(r30.payload, 4) == 1 &&                        // gen 1
               s_spawn_count.load() == 1);
         const uint32_t pidA = get32(r30.payload, 0);
 
         CHECK("sc-fake-reuse-send",
-              WriteFrame(c, Frame{0, kMsgStartCapture, 31, {0x01,0,0,0, 0,0,0,0}}));
+              WriteFrame(c, Frame{0, kMsgStartCapture, 31, {0x01,0,0,0, 0x02,0, '{', '}'}}));
         Frame r31;
         CHECK("sc-fake-reuse",
               ReadFrame(c, r31) == DecodeResult::Ok &&
-              get32(r31.payload, r31.payload.size() - 4) == 1 &&   // still gen 1
+              get32(r31.payload, 4) == 1 &&                        // still gen 1
               get32(r31.payload, 0) == pidA &&                     // same child
               s_spawn_count.load() == 1);                          // no respawn
 
         s_script_session.store(2);  // console session moved under the child
         CHECK("sc-respawn-send",
-              WriteFrame(c, Frame{0, kMsgStartCapture, 32, {0x02,0,0,0, 0,0,0,0}}));
+              WriteFrame(c, Frame{0, kMsgStartCapture, 32, {0x02,0,0,0, 0x02,0, '{', '}'}}));
         Frame r32;
         CHECK("sc-respawn-on-session-change",
               ReadFrame(c, r32) == DecodeResult::Ok &&
-              get32(r32.payload, r32.payload.size() - 4) == 2 &&   // gen 2
+              get32(r32.payload, 4) == 2 &&                        // gen 2
               get32(r32.payload, 0) != pidA &&                     // new child
               s_spawn_count.load() == 2);
         CHECK("sc-respawn-terminated-old-scoped",
@@ -752,11 +744,11 @@ int SelftestMain() {
               s_terminated_events[1] == s_spawn_events[1]);
         s_script_session.store(3);
         CHECK("sc-post-monitor-send",
-              WriteFrame(c, Frame{0, kMsgStartCapture, 33, {0x03,0,0,0, 0,0,0,0}}));
+              WriteFrame(c, Frame{0, kMsgStartCapture, 33, {0x03,0,0,0, 0x02,0, '{', '}'}}));
         Frame r33;
         CHECK("sc-post-monitor-respawn",
               ReadFrame(c, r33) == DecodeResult::Ok &&
-              get32(r33.payload, r33.payload.size() - 4) == 3 &&   // gen 3
+              get32(r33.payload, 4) == 3 &&                        // gen 3
               s_spawn_count.load() == 3);
 
         CHECK("sc-stop-send", WriteFrame(c, Frame{0, kMsgStopCapture, 34, {}}));
@@ -1057,36 +1049,7 @@ int SelftestMain() {
                 {now - 1, now - 2, now - 3, now - 4, now - 70000}, now));
       CHECK("cs-crashloop-empty", !CrashLoopReached({}, now));
     }
-    { // M2-Slice3 Task 3: 0x0111 snapshot payload codec + response golden.
-      SnapshotReq sr;
-      const uint8_t req8[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0x80, 0x0B, 0x00, 0x00};
-      CHECK("sn-decode-ok",
-            DecodeSnapshotPayload(req8, sizeof(req8), &sr) &&
-            sr.wts == 0xFFFFFFFFu && sr.max_w == 0x0B80);  // 1920
-      const uint8_t zero8[8] = {0};
-      CHECK("sn-decode-zero",
-            DecodeSnapshotPayload(zero8, sizeof(zero8), &sr) &&
-            sr.wts == 0 && sr.max_w == 0);
-      CHECK("sn-decode-trailing-reject",
-            !DecodeSnapshotPayload(req8, sizeof(req8) + 1, &sr));
-      CHECK("sn-decode-trunc-reject",
-            !DecodeSnapshotPayload(req8, sizeof(req8) - 1, &sr));
-      CHECK("sn-decode-null-reject",
-            !DecodeSnapshotPayload(nullptr, sizeof(req8), &sr) &&
-            !DecodeSnapshotPayload(req8, sizeof(req8), nullptr));
-      // Response golden: [u32 len][bytes], frame meta preserved.
-      const uint8_t jpeg[3] = {0xFF, 0xD8, 0xFF};
-      Frame ok = EncodeSnapshotResp(Frame{0, kMsgSnapshot, 0xABCF, {}}, jpeg, 3);
-      CHECK("sn-resp-meta",
-            ok.message_type == kMsgSnapshot && ok.flags == kFlagResponse &&
-            ok.request_id == 0xABCF);
-      CHECK("sn-resp-bytes",
-            ok.payload.size() == 7 && ok.payload[0] == 3 && ok.payload[1] == 0 &&
-            ok.payload[2] == 0 && ok.payload[3] == 0 &&
-            ok.payload[4] == 0xFF && ok.payload[5] == 0xD8 &&
-            ok.payload[6] == 0xFF);
-      Frame empty = EncodeSnapshotResp(Frame{0, kMsgSnapshot, 1, {}}, nullptr, 0);
-      CHECK("sn-resp-empty", empty.payload.size() == 4);
+    { // 0x0111 快照通道已随 RTV 重构退役（SNAPSHOT_RETIRED）；codec 黄金测试随之删除。
     }
     { // prod bootstrap: --secret-file round-trip + DACL lock.
       wchar_t tmp[MAX_PATH];
