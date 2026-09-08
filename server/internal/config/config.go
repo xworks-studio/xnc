@@ -75,6 +75,7 @@ func Load() (Config, error) {
 		ShellMaxLifetime:      envDur("XNC_SHELL_MAX", 8*time.Hour),
 		RTVStreamEndpoint:     env("XNC_RTV_ENDPOINT", ""),
 		RTVHostAddr:           env("XNC_RTV_HOST_ADDR", ":4433"),
+		RTVWTPublicPort:       os.Getenv("XNC_RTV_WT_PORT"),
 		RTVWTAddr:             env("XNC_RTV_WT_ADDR", ":443"),
 		RTVCertFile:           os.Getenv("XNC_RTV_CERT_FILE"),
 		RTVKeyFile:            os.Getenv("XNC_RTV_KEY_FILE"),
