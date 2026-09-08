@@ -1,15 +1,20 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
 	"xnc/proto"
+	"xnc/rtv"
+	"xnc/server/internal/auth"
 	"xnc/server/internal/session"
 )
 
@@ -17,27 +22,31 @@ import (
 // 此，先于解码生效，杜绝无限缓冲。
 const desktopBodyMaxBytes = 4 * 1024
 
+// viewerTicketTTL viewer 张票有效期上限（relay-plane spec §3.1：与会话
+// 生命周期对齐；撤销靠墓碑，不靠短 exp）。
+const viewerTicketTTL = 24 * time.Hour
+
 // desktopReq 是客户端可影响的**白名单全集**：wtsSession。
 // StreamEndpoint/HostToken 等安全敏感字段绝不从客户端接受——endpoint 只
-// 来自 server config（XNC_RTV_ENDPOINT），HostToken 只来自 relay Hub 的
-// per-node 签发（经 SESSION_OPEN→agent→core→stdin 下发到 xnc-host）。
+// 来自 server config（XNC_RTV_ENDPOINT），HostToken 只来自签发器的
+// per-(node,relay) 表（经 SESSION_OPEN→agent→core→stdin 下发到 xnc-host）。
 // 未知字段经 json.Decode 默认忽略，等效剥离。
 type desktopReq struct {
 	WTSSession uint32 `json:"wtsSession"`
 }
 
-// desktopStart 处理 POST /api/nodes/{id}/desktop（RTV，2026-09-08 重构）：
-// ① RTV endpoint 检查——XNC_RTV_ENDPOINT 未配置时 503 RTV_UNCONFIGURED
-// （拒绝开会话优于开一个必死的会话）；
+// desktopStart 处理 POST /api/nodes/{id}/desktop（RTV，relay-plane P1）：
+// ① RTV endpoint 检查——XNC_RTV_ENDPOINT 未配置时 503 RTV_UNCONFIGURED；
 // ② 4KB 体上限 + 白名单解码；
-// ③ HostToken 签发/复用（relay Hub per-node 表——core StartCapture 幂等
-// 复用运行中的 host，token 必须跨会话可重放）；
+// ③ host 张票签发/复用（(node,relay) 粒度字节等值——core StartCapture
+// 幂等复用运行中的 host，同节点第二个 viewer 不得触发换血）；
 // ④ 服务端构造 DesktopParams（StreamEndpoint/HostToken/WTSSession）；
-// ⑤ 委托 startSession（KindDesktop，审计 desktop.open/desktop.close，RBAC
-// operator+ 由 startSession 统一判定，每节点并发上限由 manager 治理）；
-// ⑥ 202 响应并入 viewer 腿地址（同源推导）与 lease 判定。
+// ⑤ 委托 startSession（RBAC、并发上限、审计同现状）；
+// ⑥ 202 响应：viewer 张票（会话粒度，覆盖 token 字段）+ viewer 腿地址 +
+// lease 判定 + 被动首约；会话终局经 finishExtra 触发 relay 撤销（墓碑+
+// 断连，spec §3.4）。
 func (h *handlers) desktopStart(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.RTVStreamEndpoint == "" || h.rtv == nil {
+	if h.cfg.RTVStreamEndpoint == "" || h.rtv == nil || h.rtvSign == nil {
 		respondError(w, proto.Err(503, proto.CodeRtvUnconfigured,
 			"desktop sessions require RTV; server has no XNC_RTV_ENDPOINT configuration"))
 		return
@@ -55,10 +64,10 @@ func (h *handlers) desktopStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	nodeID := chi.URLParam(r, "id")
-	hostToken := h.rtv.Hub.HostTokenFor(nodeID)
+	hostToken := h.rtvSign.HostTicketFor(nodeID, rtv.EmbeddedRelayID)
 	params, err := json.Marshal(proto.DesktopParams{
 		StreamEndpoint: h.cfg.RTVStreamEndpoint, // server config 独占
-		HostToken:      hostToken,               // relay Hub 签发；绝不回显给客户端
+		HostToken:      hostToken,               // 签发器 (node,relay) 表；绝不回显给客户端
 		WTSSession:     req.WTSSession,
 		TLSInsecure:    h.cfg.RTVInsecureTLS, // dev 自签栈专用（server config 独占）
 	})
@@ -80,16 +89,47 @@ func (h *handlers) desktopStart(w http.ResponseWriter, r *http.Request) {
 	wtURL := "https://" + wtHost + "/wt"
 	wsURL := "wss://" + r.Host + "/ws"
 
+	name := h.viewerName(r)
 	h.startSession(w, r, proto.KindDesktop, params, "desktop.open", "desktop.close",
 		map[string]any{"wtUrl": wtURL, "wsUrl": wsURL},
 		nil,
 		func(res *session.CreateResult) map[string]any {
-			// lease 判定随 202 下发（RTV 后 lease 为 server 侧簿记，relay 的
-			// input 门控按 desktopLeases 表判定；granted=false = view-only）。
-			return map[string]any{"lease": map[string]any{
+			out := map[string]any{"lease": map[string]any{
+				// lease 判定随 202 下发（manager 侧簿记，granted=false =
+				// view-only 提示；实际门控以 relay 仲裁机的 controlState 为准）。
 				"granted": res.LeaseGranted, "leaseId": res.LeaseID,
 			}}
+			// viewer 张票（会话粒度）覆盖响应 token：web/rtvload 不感知变化，
+			// 仍以 ?token= 连腿。P1 caps：operator 恒可控可输入（RBAC 门已由
+			// startSession 把守），能力差异化留给后续策略演进。
+			vtok, err := h.rtvSign.ViewerTicket(res.Session.ID, nodeID,
+				rtv.EmbeddedRelayID, name, true, true, viewerTicketTTL)
+			if err != nil {
+				slog.Error("rtv: mint viewer ticket failed", "err", err)
+				return out
+			}
+			out["token"] = vtok
+			// 被动首约（manager 先到先得语义的 relay 侧等价物）：仅空闲时授予。
+			h.rtv.Hub.Arbiter().Grant(nodeID, res.Session.ID, name)
+			return out
+		},
+		func(sessionID, reason string) {
+			// 会话终局 → relay 撤销：墓碑（防可重放票复活）+ 断连（spec §3.4）。
+			h.rtv.KillSession(nodeID, sessionID, reason)
 		})
+}
+
+// viewerName 解析当前用户的显示名（随 viewer 票走——relay 无 DB，
+// controlState 广播的名字只能来自签发时）。回退 email。
+func (h *handlers) viewerName(r *http.Request) string {
+	u := auth.UserFrom(r.Context())
+	name := u.Email
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if usr, err := h.st.Q().GetUserByID(ctx, u.ID); err == nil && usr.DisplayName != "" {
+		name = usr.DisplayName
+	}
+	return name
 }
 
 // hostOnly 剥离 Host 头的 :port 部分（空 = 形态异常，调用方保底原样）。

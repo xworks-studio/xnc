@@ -64,5 +64,5 @@ func (h *handlers) screenStart(w http.ResponseWriter, r *http.Request) {
 		respondError(w, proto.Err(500, proto.CodeInternal, "encode params"))
 		return
 	}
-	h.startSession(w, r, proto.KindScreen, params, "screen.open", "screen.close", nil, nil, nil)
+	h.startSession(w, r, proto.KindScreen, params, "screen.open", "screen.close", nil, nil, nil, nil)
 }

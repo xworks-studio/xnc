@@ -60,7 +60,7 @@ func (h *handlers) fileUpload(w http.ResponseWriter, r *http.Request) {
 		respondError(w, proto.Err(500, proto.CodeInternal, "encode params"))
 		return
 	}
-	h.startSession(w, r, proto.KindFile, params, "file.upload", "file.upload", nil, nil, nil)
+	h.startSession(w, r, proto.KindFile, params, "file.upload", "file.upload", nil, nil, nil, nil)
 }
 
 // fileDownload 处理 POST /api/nodes/{id}/files/download：仅 path 绝对路径校验
@@ -84,5 +84,5 @@ func (h *handlers) fileDownload(w http.ResponseWriter, r *http.Request) {
 		respondError(w, proto.Err(500, proto.CodeInternal, "encode params"))
 		return
 	}
-	h.startSession(w, r, proto.KindFile, params, "file.download", "file.download", nil, nil, nil)
+	h.startSession(w, r, proto.KindFile, params, "file.download", "file.download", nil, nil, nil, nil)
 }

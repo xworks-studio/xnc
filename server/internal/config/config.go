@@ -50,6 +50,11 @@ type Config struct {
 	// RTVWSOrigins WS 兜底腿的 Origin 白名单（空 = coder/websocket 同源
 	// 校验；生产经 caddy 同源反代即正确语义，dev 跨源联调时配置）。
 	RTVWSOrigins []string // XNC_RTV_WS_ORIGINS，逗号分隔
+	// RTVSigningKey（relay-plane）：RelayTicket 签名私钥（ed25519 64B hex）。
+	// 空 = 进程内临时生成并告警（重启作废——relay-0 会话本就随进程消亡，
+	// 可接受；部署外部 relay 前必须显式配置，否则 server 重启后外部 relay
+	// 需重连控制连接同步新公钥）。
+	RTVSigningKey string // XNC_RTV_SIGNING_KEY
 
 	DesktopPerNode     int           // XNC_DESKTOP_PER_NODE，默认 8（多 viewer 各自独立会话），0 = 不限
 	DesktopIdleTimeout time.Duration // XNC_DESKTOP_IDLE，默认 5m（无信令活动即关），0 = 不限
@@ -81,6 +86,7 @@ func Load() (Config, error) {
 		RTVKeyFile:            os.Getenv("XNC_RTV_KEY_FILE"),
 		RTVInsecureTLS:        envBool("XNC_RTV_INSECURE_TLS", false),
 		RTVWSOrigins:          envList("XNC_RTV_WS_ORIGINS"),
+		RTVSigningKey:         os.Getenv("XNC_RTV_SIGNING_KEY"),
 		DesktopPerNode:        envInt("XNC_DESKTOP_PER_NODE", 8),
 		DesktopIdleTimeout:    envDur("XNC_DESKTOP_IDLE", 5*time.Minute),
 		InstallerSyncRepo:     env("XNC_INSTALLER_SYNC_REPO", "xworks-studio/xnc"),

@@ -1,23 +1,18 @@
 package api
 
 import (
-	"context"
 	"crypto/tls"
-	"encoding/json"
 	"log/slog"
 	"net/http"
-	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/google/uuid"
 
-	"xnc/proto"
+	"xnc/rtv"
 	"xnc/server"
 	"xnc/server/internal/auth"
 	"xnc/server/internal/config"
 	"xnc/server/internal/db"
 	"xnc/server/internal/registry"
-	"xnc/rtv"
 	"xnc/server/internal/session"
 	"xnc/server/internal/version"
 )
@@ -28,6 +23,9 @@ type handlers struct {
 	reg  *registry.Registry
 	sess *session.Manager
 	rtv  *rtv.Server // RTV 中继（desktop 媒体面；XNC_RTV_ENDPOINT 未配置时腿仍监听但会话 503）
+	// rtvSign RelayTicket 签发器（relay-plane spec §3.1：host 张按
+	// (node,relay) 等值复用、viewer 张按会话铸造；私钥绝不外流）。
+	rtvSign *rtv.Signer
 }
 
 // Close 停止 handler 的后台 worker（RTV 中继随进程生命周期，无独立停止面）。
@@ -84,11 +82,9 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 	}
 	h := &handlers{st: st, cfg: cfg, reg: reg, sess: sess}
 	// RTV 中继（desktop 媒体面）：host QUIC + WT 两腿绑 UDP；WS 兜底腿挂主
-	// mux（/ws，经 caddy TCP443 反代）。viewer 鉴权 = 会话 client token；
-	// input 门控 = per-node 输入活约（janitor TTL 撤约语义不变）。
-	// TLS 证书链：ACME DNS-01（生产，真实 CA）→ 文件对 → dev 自签（高声
-	// 告警；WT 腿浏览器不可用，WS 兜底腿经 caddy 自有证书仍可用——ACME
-	// 瞬时失败不 bricks 整个 server）。
+	// mux（/ws，经 caddy TCP443 反代）。relay-plane：准入 = RelayTicket 离线
+	// 验签（PlaneHost 单缝取代原五处注入），控制权仲裁在中继本地 Arbiter
+	// （策略留在签发侧的 ticket claims）。
 	var tlsProv func([]string) *tls.Config
 	switch {
 	case cfg.RTVACMEDomain != "":
@@ -108,77 +104,39 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 	default:
 		tlsProv = rtv.DevSelfSigned()
 	}
+	// RelayTicket 签发/验签（relay-plane spec §3.1/§3.4）：签名密钥 env
+	// 注入（部署持久）；缺省进程内生成并告警（重启作废——relay-0 会话本就
+	// 随进程消亡，可接受；部署外部 relay 前必须配置 XNC_RTV_SIGNING_KEY）。
+	var rtvSign *rtv.Signer
+	if hexKey := cfg.RTVSigningKey; hexKey != "" {
+		s, err := rtv.NewSignerFromHex(hexKey)
+		if err != nil {
+			slog.Error("rtv: bad XNC_RTV_SIGNING_KEY, falling back to ephemeral key", "err", err)
+		} else {
+			rtvSign = s
+		}
+	}
+	if rtvSign == nil {
+		priv, err := rtv.GenerateSigningKey()
+		if err != nil {
+			slog.Error("rtv: signing keygen failed", "err", err)
+		} else {
+			rtvSign = rtv.NewSignerFromKey(priv)
+		}
+		slog.Warn("rtv: using EPHEMERAL ticket signing key (no XNC_RTV_SIGNING_KEY); tickets die with process restart")
+	}
+	verifier, err := rtv.NewVerifier([]string{rtvSign.PublicKeyHex()})
+	if err != nil {
+		slog.Error("rtv: verifier init failed", "err", err)
+	}
+	rtvHost := &rtv.SimpleHost{Verifier: verifier,
+		TouchFn: sess.TouchActivity, // viewer 控制帧 → janitor idle/lease 判据
+		EventFn: func(typ, node, session string) {
+			slog.Info("rtv event", "typ", typ, "node", node, "session", session)
+		}}
 	h.rtv = rtv.New(rtv.Options{HostAddr: cfg.RTVHostAddr, WTAddr: cfg.RTVWTAddr},
-		tlsProv,
-		func(token string) (rtv.ViewerBinding, *rtv.AuthError) {
-			node, sid, aerr := sess.AttachClientRTV(token)
-			if aerr != nil {
-				return rtv.ViewerBinding{}, &rtv.AuthError{Status: aerr.Status, Message: aerr.Message}
-			}
-			return rtv.ViewerBinding{Node: node.String(), Session: sid}, nil
-		},
-		cfg.RTVWSOrigins)
-	h.rtv.Touch = sess.TouchActivity
-	// HostToken 活跃会话回查：server 重启后 minted 表清空，运行中 host 的
-	// 重连注册经此恢复（凭据随会话存续）。
-	h.rtv.Hub.SetHostTokenOf(func(node string) string {
-		n, err := uuid.Parse(node)
-		if err != nil {
-			return ""
-		}
-		for _, s := range sess.SessionsOf(n, proto.KindDesktop) {
-			var p proto.DesktopParams
-			if json.Unmarshal(s.Params, &p) == nil && p.HostToken != "" {
-				return p.HostToken
-			}
-		}
-		return ""
-	})
-	h.rtv.Hub.SetInputGate(func(node, sessionID string) bool {
-		n, err := uuid.Parse(node)
-		if err != nil {
-			return false
-		}
-		holder, _ := sess.DesktopLeaseOf(n)
-		return holder != "" && holder == sessionID
-	})
-	// 控制权流转仲裁：session manager 控制表为事实源；State 顺带把持有者
-	// UserID 解析成显示名（controlState 广播用；查不到回退 email→空）。
-	h.rtv.Hub.SetControlHooks(rtv.ControlHooks{
-		Take: func(node, sessionID string) (bool, string) {
-			n, err := uuid.Parse(node)
-			if err != nil {
-				return false, "bad-node"
-			}
-			return sess.TakeDesktopControl(n, sessionID, time.Now())
-		},
-		Release: func(node, sessionID string) {
-			if n, err := uuid.Parse(node); err == nil {
-				sess.ReleaseDesktopControl(n, sessionID)
-			}
-		},
-		State: func(node string) (string, string) {
-			n, err := uuid.Parse(node)
-			if err != nil {
-				return "", ""
-			}
-			sid, uid := sess.DesktopControlOf(n)
-			if sid == "" {
-				return "", ""
-			}
-			name := ""
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
-			if u, err := st.Q().GetUserByID(ctx, uid); err == nil {
-				if u.DisplayName != "" {
-					name = u.DisplayName
-				} else {
-					name = u.Email
-				}
-			}
-			return sid, name
-		},
-	})
+		tlsProv, rtvHost, cfg.RTVWSOrigins)
+	h.rtvSign = rtvSign
 	if err := h.rtv.Start(); err != nil {
 		slog.Error("rtv legs failed to start", "err", err)
 	}

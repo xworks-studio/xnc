@@ -63,7 +63,7 @@ func (s *Server) serveWTLeg(addr string) error {
 		CheckOrigin: wtSameHost,
 	}
 	mux.HandleFunc(wtMuxPath, func(w http.ResponseWriter, r *http.Request) {
-		binding, apiErr := s.AuthViewer(r.URL.Query().Get("token"))
+		binding, apiErr := s.authViewer(r.URL.Query().Get("token"))
 		if apiErr != nil {
 			http.Error(w, apiErr.Message, apiErr.Status)
 			return
@@ -133,9 +133,7 @@ func (s *Server) serveViewerLoop(v Viewer, r io.Reader) {
 	defer cleanup()
 
 	err := readCtrlFrames(r, func(b json.RawMessage) bool {
-		if s.Touch != nil {
-			s.Touch(v.Session())
-		}
+		s.Host.Touch(v.Session())
 		var m struct {
 			Type string `json:"type"`
 			Role string `json:"role"`
@@ -183,10 +181,13 @@ func newWTViewer(id uint64, binding ViewerBinding, sess *webtransport.Session, s
 	return v
 }
 
-func (v *wtViewer) ID() uint64      { return v.id }
-func (v *wtViewer) Kind() string    { return "wt" }
-func (v *wtViewer) Node() string    { return v.binding.Node }
-func (v *wtViewer) Session() string { return v.binding.Session }
+func (v *wtViewer) ID() uint64          { return v.id }
+func (v *wtViewer) Kind() string        { return "wt" }
+func (v *wtViewer) CanControl() bool    { return v.binding.Control }
+func (v *wtViewer) CanInput() bool      { return v.binding.Input }
+func (v *wtViewer) DisplayName() string { return v.binding.Name }
+func (v *wtViewer) Node() string        { return v.binding.Node }
+func (v *wtViewer) Session() string     { return v.binding.Session }
 
 func (v *wtViewer) SendDatagram(b []byte) error {
 	return v.sess.SendDatagram(b)

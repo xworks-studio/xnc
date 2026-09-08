@@ -18,7 +18,7 @@ import (
 // WSHandler 返回挂到主 HTTP mux 的 /ws 处理器（caddy → xnc-server:8080）。
 func (s *Server) WSHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		binding, apiErr := s.AuthViewer(r.URL.Query().Get("token"))
+		binding, apiErr := s.authViewer(r.URL.Query().Get("token"))
 		if apiErr != nil {
 			http.Error(w, apiErr.Message, apiErr.Status)
 			return
@@ -56,9 +56,7 @@ func (s *Server) handleWSSession(binding ViewerBinding, c *websocket.Conn) {
 		if typ != websocket.MessageText {
 			continue // 忽略二进制上行
 		}
-		if s.Touch != nil {
-			s.Touch(v.Session())
-		}
+		s.Host.Touch(v.Session())
 		if err := json.Unmarshal(data, &m); err != nil {
 			slog.Warn("rtv: bad ws json", "err", err)
 			continue
@@ -87,10 +85,13 @@ type wsViewer struct {
 	mu      sync.Mutex
 }
 
-func (v *wsViewer) ID() uint64      { return v.id }
-func (v *wsViewer) Kind() string    { return "ws" }
-func (v *wsViewer) Node() string    { return v.binding.Node }
-func (v *wsViewer) Session() string { return v.binding.Session }
+func (v *wsViewer) ID() uint64          { return v.id }
+func (v *wsViewer) Kind() string        { return "ws" }
+func (v *wsViewer) CanControl() bool    { return v.binding.Control }
+func (v *wsViewer) CanInput() bool      { return v.binding.Input }
+func (v *wsViewer) DisplayName() string { return v.binding.Name }
+func (v *wsViewer) Node() string        { return v.binding.Node }
+func (v *wsViewer) Session() string     { return v.binding.Session }
 
 func (v *wsViewer) SendDatagram(b []byte) error {
 	v.mu.Lock()

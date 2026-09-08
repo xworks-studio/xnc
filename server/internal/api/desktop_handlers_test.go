@@ -72,9 +72,10 @@ func TestDesktopSessionEndToEnd(t *testing.T) {
 		require.Equal(t, proto.KindDesktop, so.Kind)
 		var p proto.DesktopParams
 		require.NoError(t, jsonUnmarshal(so.Params, &p))
-		// endpoint 只来自 server config；hostToken 只来自 relay Hub（64 hex）。
+		// endpoint 只来自 server config；hostToken 只来自签发器（RelayTicket
+		// 双段形态：payloadB64url..sigB64url）。
 		assert.Equal(t, env.Cfg.RTVStreamEndpoint, p.StreamEndpoint)
-		assert.Regexp(t, "^[0-9a-f]{64}$", p.HostToken)
+		assert.Regexp(t, "^[A-Za-z0-9_-]+[.][.][A-Za-z0-9_-]+$", p.HostToken)
 		// 白名单剥离：客户端的 endpoint/token 绝不透传。
 		assert.NotContains(t, string(so.Params), "evil.example")
 		assert.NotContains(t, string(so.Params), "evil-token")
