@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 
 	"github.com/quic-go/quic-go/http3"
@@ -18,6 +20,29 @@ import (
 
 // wtMuxPath WT 会话路径（浏览器与 host 端约定无关，仅浏览器腿使用）。
 const wtMuxPath = "/wt"
+
+// wtSameHost：Origin 的 host 与请求 Host 的 host 一致即放行（忽略端口差，
+// 供非规范 WT 公网端口的过渡形态；空 Origin 一并放行——非浏览器客户端
+// 如 rtvload 不发 Origin）。
+func wtSameHost(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	oh, _, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		oh = u.Host
+	}
+	rh, _, err := net.SplitHostPort(r.Host)
+	if err != nil {
+		rh = r.Host
+	}
+	return oh != "" && strings.EqualFold(oh, rh)
+}
 
 func (s *Server) serveWTLeg(addr string) error {
 	udp, err := net.ListenUDP("udp", mustResolveUDP(addr))
@@ -31,6 +56,11 @@ func (s *Server) serveWTLeg(addr string) error {
 			TLSConfig:       s.TLSConfig([]string{"h3"}),
 			EnableDatagrams: true,
 		},
+		// 库缺省做严格同源（含端口）校验：过渡期 WT 走非规范端口（14433）时
+		// Origin=https://xnc.app 与 Host=xnc.app:14433 端口不一致被拒
+		//（"request origin not allowed"，生产实测）。放宽为同 host 校验：
+		// 会话 token 才是本腿的真实凭据，Origin 仅防跨站冒用。
+		CheckOrigin: wtSameHost,
 	}
 	mux.HandleFunc(wtMuxPath, func(w http.ResponseWriter, r *http.Request) {
 		binding, apiErr := s.AuthViewer(r.URL.Query().Get("token"))
@@ -136,10 +166,10 @@ func (s *Server) serveViewerLoop(v Viewer, r io.Reader) {
 // ---------------- WT Viewer 适配器 ----------------
 
 type wtViewer struct {
-	id      uint64
-	binding ViewerBinding
-	sess    *webtransport.Session
-	wmu     sync.Mutex
+	id        uint64
+	binding   ViewerBinding
+	sess      *webtransport.Session
+	wmu       sync.Mutex
 	ctrlWrite func(json.RawMessage) error
 }
 
@@ -153,10 +183,10 @@ func newWTViewer(id uint64, binding ViewerBinding, sess *webtransport.Session, s
 	return v
 }
 
-func (v *wtViewer) ID() uint64       { return v.id }
-func (v *wtViewer) Kind() string     { return "wt" }
-func (v *wtViewer) Node() string     { return v.binding.Node }
-func (v *wtViewer) Session() string  { return v.binding.Session }
+func (v *wtViewer) ID() uint64      { return v.id }
+func (v *wtViewer) Kind() string    { return "wt" }
+func (v *wtViewer) Node() string    { return v.binding.Node }
+func (v *wtViewer) Session() string { return v.binding.Session }
 
 func (v *wtViewer) SendDatagram(b []byte) error {
 	return v.sess.SendDatagram(b)

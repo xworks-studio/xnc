@@ -376,12 +376,10 @@ func (m *Manager) AttachClientRTV(token string) (uuid.UUID, string, *proto.APIEr
 		m.mu.Unlock()
 		return uuid.Nil, "", proto.Err(410, proto.CodeSessionExpired, "session expired")
 	}
-	if s.clientToken == "" { // 已消耗：重放
-		m.mu.Unlock()
-		return uuid.Nil, "", proto.Err(401, proto.CodeUnauthorized, "session token already used")
-	}
-	s.usedClientToken = s.clientToken
-	s.clientToken = ""
+	_ = s.clientToken
+	// RTV viewer 的 token 允许重附（不烧毁）：WT 握手失败后的 WS 兜底会用
+	// 同一 token 重连（单用途烧毁曾把传输回退变成 401 死路，生产实测）。
+	// 会话仍按"一个 viewer 会话"建模；relay 侧另有 node/lease 门控。
 	if !s.glued {
 		s.glued = true
 		if s.ttl != nil {

@@ -188,17 +188,17 @@ func TestMaxLifetimeClosesShell(t *testing.T) {
 	}
 }
 
-// —— M1-Slice2 desktop 会话治理：每节点并发上限（默认 4，对齐 agent host
-// pipe 的 max_subs=4——多 viewer）+ idle 5min janitor ——
+// —— desktop 会话治理：每节点并发上限（RTV 后默认 8，XNC_DESKTOP_PER_NODE
+// 可覆写）+ idle 5min janitor ——
 
 func TestDesktopPerNodeLimit(t *testing.T) {
 	id, m := onlineMgr(t)
 	defer m.Close()
-	// New 默认 DesktopPerNode=4（多 viewer）；显式覆盖证明配置生效。
-	require.Equal(t, 4, m.DesktopPerNode)
+	// New 默认 DesktopPerNode=8（多 viewer）；显式覆盖证明配置生效。
+	require.Equal(t, 8, m.DesktopPerNode)
 	m.DesktopPerNode = 4
 
-	// 默认 4 并发：第 2 个会话（T6 门 ③ 的第二 viewer）至第 4 个均允许
+	// 覆写 4 并发：第 2 个会话（第二 viewer）至第 4 个均允许
 	for i := 0; i < 4; i++ {
 		_, apiErr := m.Create(id, uuid.New(), proto.KindDesktop, []byte(`{}`))
 		require.Nil(t, apiErr)
