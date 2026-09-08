@@ -100,8 +100,10 @@ build（web dist + 版本镜像）→ `docker save` → SFTP 上 SRV → `docker
 启用需在 SRV 重启 watchtower。server 发布节奏由人决定，不随 push main
 自动出。
 
-- **本地路径**：`powershell deploy/build-server-local.ps1 -Version <v>`
-  （凭据读 `deploy/.env` 的 SRV_* 键；脚本内嵌版本注入与 CI 等价）。
+- **本地路径**：`powershell deploy/build-server-local.ps1 -ServerVersion <v>`
+  （参数名刻意避开 -Version——powershell.exe -File 会把它吞作引擎参数；
+  远端推送经 deploy/push_server_image.py 走 paramiko 密码认证，凭据读
+  `deploy/.env` 的 SRV_* 键）。
 - **备用 CI 路径**：Actions → build-server → Run workflow → 填版本号
   （须先合入 main；格式 X.Y.Z[-dev]，段 ≤4 位）→ 等 watchtower 轮询换版。
 - **验证**：`curl https://xnc.app/api/health` 的 version == 输入的版本号。

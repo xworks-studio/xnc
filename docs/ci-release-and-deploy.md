@@ -197,12 +197,14 @@ Watchtower（compose 内独立容器）轮询注册表自动拉取重建。与 s
 
 ### 4.4 现行路径：本地构建直推（2026-09-08 运维决策）
 
-远端构建/注册表中转耗时不做——`deploy/build-server-local.ps1`：
+远端构建/注册表中转耗时不做——`deploy/build-server-local.ps1
+-ServerVersion <v>`（参数名避开 -Version：powershell.exe -File 引擎参数
+冲突）：
 
 ```
-本地 docker build（web dist 先入上下文，XNC_VERSION 注入）
-→ docker save → SFTP 上 SRV → docker load + tag ghcr.io/...:latest
-→ docker compose up -d --no-pull
+本地 docker build（web dist 先入上下文，XNC_VERSION 注入）→ docker save
+→ deploy/push_server_image.py（paramiko 密码认证，.env 的 SRV_*）：
+SFTP 上 SRV → docker load + tag ghcr.io/...:latest → docker compose up -d
 ```
 
 - 凭据读 `deploy/.env` 的 `SRV_HOST/SRV_SSH_USER/SRV_SSH_KEY`。
