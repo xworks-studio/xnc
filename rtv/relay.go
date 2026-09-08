@@ -413,6 +413,23 @@ func (g *Hub) dropForKill(node, session string) {
 	}
 }
 
+// ActiveSessions 在服 viewer 的会话键 → viewer 数（控制连接 stats 上报
+// 用：server 侧据此 Touch 活跃会话——外部 relay 的 viewer 触碰不出
+// 进程，粘合与 idle 治理依赖此旁路）。
+func (g *Hub) ActiveSessions() map[string]int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := map[string]int{}
+	for _, h := range g.hosts {
+		h.mu.Lock()
+		for _, w := range h.viewers {
+			out[w.Session()]++
+		}
+		h.mu.Unlock()
+	}
+	return out
+}
+
 // Snapshot statsz 输出（管理端挂载）。
 func (g *Hub) Snapshot() map[string]any {
 	g.mu.Lock()

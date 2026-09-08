@@ -182,11 +182,12 @@ type RelayHeartbeat struct {
 
 // RelayStats 10s 一报的负载画像；MbpsOut 是分配打分口径（扇出瓶颈在 egress）。
 type RelayStats struct {
-	Sessions int     `json:"sessions"`
-	Viewers  int     `json:"viewers"`
-	MbpsIn   float64 `json:"mbpsIn"`
-	MbpsOut  float64 `json:"mbpsOut"`
-	RttP50Ms float64 `json:"rttP50Ms,omitempty"`
+	Sessions   int      `json:"sessions"`
+	Viewers    int      `json:"viewers"`
+	MbpsIn     float64  `json:"mbpsIn"`
+	MbpsOut    float64  `json:"mbpsOut"`
+	RttP50Ms   float64  `json:"rttP50Ms,omitempty"`
+	ActiveSids []string `json:"activeSids,omitempty"` // 在服 viewer 会话键（server 侧代为 Touch：外部 relay 的 viewer 触碰不出进程）
 }
 
 // RelayReconcile （重）建立控制连接时的双向对账：relay → server 上报在服

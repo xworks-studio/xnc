@@ -78,6 +78,9 @@ type Manager struct {
 	allow map[string]bool
 	// pubkey server 当前票据签名公钥（hex）——认证通过即下发给 relay。
 	pubkey string
+	// touch 活跃会话代触碰（stats 的 ActiveSids → session manager：外部
+	// relay 的 viewer 触碰不出进程，粘合/idle 治理经此旁路）。
+	touch func(sessionID string)
 
 	mu     sync.Mutex
 	conns  map[string]*relayConn // relayID → conn
@@ -89,13 +92,14 @@ type Manager struct {
 
 // New 构造池管理器；signingPubkey 为 server 票据签名公钥（hex），经
 // RELAY_CONFIG 下发给已认证 relay。
-func New(st *db.Store, cfg config.Config, log *slog.Logger, signingPubkey string) *Manager {
+func New(st *db.Store, cfg config.Config, log *slog.Logger, signingPubkey string,
+	touch func(sessionID string)) *Manager {
 	allow := map[string]bool{}
 	for _, k := range cfg.RTVRelayAllowlist {
 		allow[normalizeHex(k)] = true
 	}
 	return &Manager{
-		st: st, cfg: cfg, log: log, allow: allow, pubkey: signingPubkey,
+		st: st, cfg: cfg, log: log, allow: allow, pubkey: signingPubkey, touch: touch,
 		conns: map[string]*relayConn{}, sticky: map[string]string{},
 		stop: make(chan struct{}),
 	}
@@ -233,6 +237,13 @@ func (m *Manager) serveRelay(c *websocket.Conn) {
 				conn.stats = st
 				conn.lastBeat = time.Now()
 				conn.sendMu.Unlock()
+				// 代触碰活跃会话（粘合 + idle 治理；10s 粒度 << 60s
+				// opening / 5m idle，时序安全）。
+				if m.touch != nil {
+					for _, sid := range st.ActiveSids {
+						m.touch(sid)
+					}
+				}
 			}
 		case proto.TypeRelayReconcile:
 			var rc proto.RelayReconcile

@@ -299,10 +299,16 @@ func (r *statsReporter) loop() {
 			if secs <= 0 {
 				secs = 10
 			}
+			// 活跃 sid 集：server 侧代触碰（粘合/idle 旁路，见 pool 注释）。
+			active := make([]string, 0)
+			for sid := range r.srv.Hub.ActiveSessions() {
+				active = append(active, sid)
+			}
 			r.send(proto.RelayStats{
 				Sessions: sessions, Viewers: viewers,
-				MbpsIn:  float64(rx-lastRx) * 8 / secs / 1e6,
-				MbpsOut: float64(tx-lastTx) * 8 / secs / 1e6,
+				MbpsIn:     float64(rx-lastRx) * 8 / secs / 1e6,
+				MbpsOut:    float64(tx-lastTx) * 8 / secs / 1e6,
+				ActiveSids: active,
 			})
 			lastRx, lastTx, last = rx, tx, now
 		}
