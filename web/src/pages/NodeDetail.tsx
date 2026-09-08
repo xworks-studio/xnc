@@ -84,7 +84,7 @@ export default function NodeDetail() {
       <h1>{node.name}</h1>
       <div className="btn-row">
         <Link className="btn" to={`/terminal/${node.id}`}>Terminal</Link>
-        <Link className="btn" to={`/screen/${node.id}`}>Screen Preview</Link>
+        <Link className="btn" to={`/desktop/${node.id}`}>远程桌面</Link>
         <button type="button" onClick={() => setShowRdp((v) => !v)}>
           {showRdp ? "Hide Remote Desktop" : "Remote Desktop"}
         </button>

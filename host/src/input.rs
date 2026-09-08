@@ -1,10 +1,11 @@
 //! 输入注入：鼠标（移动/按键/滚轮）—— Windows SendInput / SetCursorPos。
 //!
 //! 对应 rustdesk 的 enigo→SendInput 路径（win_impl.rs）：绝对坐标模式（远程桌面
-//! 风格），坐标为显示器物理像素（与 DXGI 采集坐标系一致，DPI 缩放无关）。
+//! 风格），注入坐标为显示器物理像素（与 DXGI 采集坐标系一致，DPI 缩放无关）。
 //! 在交互会话内运行（部署方式保证了这一点，见 deploy-host.ps1）。
 
 use serde_json::Value;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use winapi::ctypes::c_int;
 use winapi::shared::minwindef::UINT;
 use winapi::um::winuser::{
@@ -13,6 +14,40 @@ use winapi::um::winuser::{
     MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
     WHEEL_DELTA, XBUTTON1, XBUTTON2,
 };
+
+// web 端坐标在编码分辨率空间（等比降采样后 ≠ 原生桌面分辨率），注入前
+// 换算回原生物理像素。采集分辨率在 host 生命周期内不变（变更即重启），
+// 用原子量保存即可。
+static NATIVE_W: AtomicUsize = AtomicUsize::new(0);
+static NATIVE_H: AtomicUsize = AtomicUsize::new(0);
+static ENC_W: AtomicUsize = AtomicUsize::new(0);
+static ENC_H: AtomicUsize = AtomicUsize::new(0);
+
+/// 采集管线启动时登记两套分辨率（run_pipeline 调用）。
+pub fn set_viewport(native: (usize, usize), encoded: (usize, usize)) {
+    NATIVE_W.store(native.0, Ordering::Relaxed);
+    NATIVE_H.store(native.1, Ordering::Relaxed);
+    ENC_W.store(encoded.0, Ordering::Relaxed);
+    ENC_H.store(encoded.1, Ordering::Relaxed);
+}
+
+/// 编码空间坐标 → 原生物理像素（像素中心对齐 + 边界钳制）。
+fn to_native(x: f64, y: f64) -> (i32, i32) {
+    let (nw, nh, ew, eh) = (
+        NATIVE_W.load(Ordering::Relaxed) as f64,
+        NATIVE_H.load(Ordering::Relaxed) as f64,
+        ENC_W.load(Ordering::Relaxed) as f64,
+        ENC_H.load(Ordering::Relaxed) as f64,
+    );
+    if ew <= 0.0 || eh <= 0.0 {
+        return (x as i32, y as i32); // 未登记（直连调试形态）——按原样注入
+    }
+    let sx = nw / ew;
+    let sy = nh / eh;
+    let nx = ((x + 0.5) * sx).floor().clamp(0.0, (nw - 1.0).max(0.0));
+    let ny = ((y + 0.5) * sy).floor().clamp(0.0, (nh - 1.0).max(0.0));
+    (nx as i32, ny as i32)
+}
 
 /// 处理 web 端发来的 input 控制消息（docs/proto.md §2 控制面扩展）。
 /// 出错只告警不中断——注入失败不应影响媒体流。
@@ -24,10 +59,10 @@ pub fn handle(v: &Value) {
     match kind {
         "move" => {
             let (Some(x), Some(y)) = (v["x"].as_f64(), v["y"].as_f64()) else { return };
-            // 物理像素（web 端已按视频分辨率映射；视频=整屏物理分辨率）
+            let (nx, ny) = to_native(x, y);
             unsafe {
-                if SetCursorPos(x as c_int, y as c_int) == 0 {
-                    tracing::debug!(x, y, "SetCursorPos failed");
+                if SetCursorPos(nx, ny) == 0 {
+                    tracing::debug!(nx, ny, "SetCursorPos failed");
                 }
             }
         }

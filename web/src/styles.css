@@ -542,105 +542,232 @@ h2 {
 .screen-state-streaming { background: #2d6a4f; color: #b7e4c7; }
 .screen-state-opening { background: #0f3460; color: #cfe2ff; }
 
-/* Desktop live (experimental WebRTC page, M1-Slice2) */
-.desktop-video-wrap {
-  position: relative;
-  flex: 1;
-  min-height: 0;
+/* Desktop live — RTV 沉浸式查看器（2026-09-08 重构，独立全屏路由） */
+
+.dt-root {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
   display: flex;
+  flex-direction: column;
+  background: #0d0d16;
 }
 
-.desktop-stats {
-  position: absolute;
-  left: 12px;
-  bottom: 12px;
-  padding: 8px 12px;
-  background: rgba(0, 0, 0, 0.65);
-  border: 1px solid #0f3460;
-  border-radius: 6px;
-  font-size: 12px;
-  line-height: 1.6;
-  color: #dee2e6;
-  pointer-events: none;
-  min-width: 110px;
-}
-
-.desktop-pli {
-  padding: 2px 12px;
-  border-radius: 4px;
-  border: 1px solid #0f3460;
-  background: #16213e;
-  color: #cfe2ff;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-}
-.desktop-pli:hover { background: #0f3460; }
-.desktop-pli:disabled {
-  opacity: 0.6;
-  cursor: default;
-}
-
-/* M1-Slice3 input capture / lease UI / cursor overlay */
-
-/* While the input lease is held the local pointer hides (the remote dot
-   represents it) and touch gestures stay on the video element. */
-.desktop-video-wrap.lease-held {
-  cursor: none;
-  touch-action: none;
-}
-
-/* Remote cursor dot (cursor channel); sized by the video letterbox scale. */
-.desktop-cursor {
-  position: absolute;
-  border-radius: 50%;
-  background: rgba(255, 255, 255, 0.92);
-  border: 2px solid #0f3460;
-  box-shadow: 0 0 4px rgba(0, 0, 0, 0.65);
-  pointer-events: none;
-  transform: translate(-50%, -50%);
-  z-index: 2;
-}
-
-.desktop-lease-chip {
-  padding: 2px 8px;
-  border-radius: 4px;
-  font-size: 12px;
-  border: 1px solid #0f3460;
-}
-.desktop-lease-chip.ok {
-  background: #14532d;
-  color: #d1fae5;
-}
-.desktop-lease-chip.bad {
-  background: #5f1d1d;
-  color: #fecaca;
-}
-
-.desktop-notice {
-  padding: 2px 8px;
-  border-radius: 4px;
-  font-size: 12px;
-  background: #3b2f0b;
-  color: #fde68a;
-  border: 1px solid #665826;
-}
-
-/* TEXT injection row (sends only on Enter/Send — IME composition safe). */
-.desktop-textbar {
+.dt-topbar {
   display: flex;
   align-items: center;
+  gap: 12px;
+  padding: 8px 14px;
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.dt-back {
+  color: var(--text-dim);
+  font-size: 16px;
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+.dt-back:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.dt-title {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.dt-chips {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.dt-chip {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 340px;
+}
+.dt-chip.ok {
+  color: var(--ok);
+  border-color: rgba(53, 201, 138, 0.45);
+}
+.dt-chip.warn {
+  color: var(--warn);
+  border-color: rgba(224, 179, 65, 0.45);
+}
+.dt-chip.bad {
+  color: var(--danger);
+  border-color: rgba(255, 90, 106, 0.45);
+}
+
+.dt-actions {
+  display: flex;
   gap: 8px;
-  padding: 6px 16px;
-  background: #16213e;
-  border-bottom: 1px solid #0f3460;
 }
-.desktop-textbar input {
-  flex: 0 1 380px;
-  min-width: 120px;
+.dt-btn-on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
 }
-.desktop-textbar input:disabled {
-  opacity: 0.5;
+
+.dt-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.dt-stage {
+  flex: 1;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  background: #000;
+  overflow: hidden;
+}
+
+.dt-canvas {
+  max-width: 100%;
+  max-height: 100%;
+}
+.dt-canvas.dt-capture {
+  cursor: none; /* 远端光标已在视频流内，隐藏本地指针避免双影 */
+}
+
+.dt-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  background: rgba(13, 13, 22, 0.78);
+  z-index: 5;
+  color: var(--text-dim);
+}
+.dt-overlay.dim {
+  background: rgba(13, 13, 22, 0.42);
+}
+.dt-err {
+  color: var(--danger);
+  max-width: 420px;
+  text-align: center;
+}
+
+.dt-spin {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  animation: dt-rotate 0.9s linear infinite;
+}
+@keyframes dt-rotate {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.dt-pulse {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--danger);
+  animation: dt-blink 1.4s ease-in-out infinite;
+}
+@keyframes dt-blink {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+.dt-stats {
+  width: 0;
+  overflow: hidden;
+  transition: width 0.18s ease;
+  background: var(--bg-raised);
+  border-left: 1px solid var(--border);
+}
+.dt-stats.open {
+  width: 304px;
+}
+
+.dt-stats-inner {
+  width: 304px;
+  height: 100%;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+}
+
+.dt-stats-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+.dt-mgrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.dt-m {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  min-width: 0;
+}
+.dt-m .k {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.dt-m .v {
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+}
+
+.dt-log {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-dim);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  max-height: 200px;
+  overflow: auto;
+  flex-shrink: 0;
+}
+
+.dt-hint {
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-dim);
+  background: var(--bg-raised);
+  border-top: 1px solid var(--border);
+  padding: 5px;
 }
 
 /* Login card footer (installer download link) */

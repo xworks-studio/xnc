@@ -36,13 +36,27 @@ createRoot(document.getElementById("root")!).render(
             <Route path="/nodes" element={<Nodes />} />
             <Route path="/nodes/:id" element={<NodeDetail />} />
             <Route path="/terminal/:id" element={<Terminal />} />
-            <Route path="/screen/:nodeId" element={<DesktopLive />} />
-            {/* experimental, not in the sidebar — direct URL only */}
-            <Route path="/desktop/:nodeId" element={<DesktopLive />} />
             <Route path="/users" element={<Users />} />
             <Route path="/profile" element={<Profile />} />
             <Route path="/monitor" element={<Monitor />} />
           </Route>
+          {/* 远程桌面：沉浸式独立布局（无侧栏，占满视口），LoginGuard 保护 */}
+          <Route
+            path="/screen/:nodeId"
+            element={
+              <LoginGuard>
+                <DesktopLive />
+              </LoginGuard>
+            }
+          />
+          <Route
+            path="/desktop/:nodeId"
+            element={
+              <LoginGuard>
+                <DesktopLive />
+              </LoginGuard>
+            }
+          />
         </Routes>
       </AuthProvider>
     </BrowserRouter>
