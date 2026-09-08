@@ -120,6 +120,14 @@ func serve(o *serverOpts) int {
 		if err := serveConn(conn, o); err != nil {
 			o.logger().Warn("shellhost connection ended", "err", err)
 		}
+		// oneshot 是一次性契约:命令终态(EXIT / 断连 / KILL)即使命结束,
+		// 继续回到 accept 只会变成无人认领的僵尸(真机踩坑:正常完成的
+		// exec 都泄漏一个 xnc-shell——agent 正常路径只 Close 断管不杀
+		// 进程,Kill 路径才有 core KillShell 兜底)。interactive 维持
+		// 单连接串行模型(agent 四条收线路径均显式 Kill)。
+		if o.mode == "oneshot" {
+			return 0
+		}
 	}
 }
 

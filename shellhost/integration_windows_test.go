@@ -267,3 +267,77 @@ func TestHandshakeRejectsWrongSecret(t *testing.T) {
 	_, err = ipc.ReadFrame(conn)
 	require.Error(t, err, "server must disconnect on bad proof")
 }
+
+// TestOneshotServeExitsAfterConnection — oneshot 单连接即退回归(真机
+// 踩坑:serve() 服务完回到 accept,每个正常完成的 exec 泄漏一个
+// xnc-shell)。serve 在 goroutine 内自听管道;首连接完成 oneshot 后
+// serve 必须返回(监听关闭)——第二次拨号在时限内失败。
+func TestOneshotServeExitsAfterConnection(t *testing.T) {
+	exe, err := exec.LookPath("cmd.exe")
+	require.NoError(t, err)
+	pipe := `\\.\\pipe\\xnc-shell-test-` + fmt.Sprint(os.Getpid()) + "-" + t.Name()
+	o := &serverOpts{
+		pipe: pipe, secret: testSecret(), profile: "CMD", exe: exe,
+		mode: "oneshot", command: "echo done", timeout: 30, log: testLogger(),
+	}
+	done := make(chan int, 1)
+	start := time.Now()
+	go func() { done <- serve(o) }()
+
+	// serve 在 goroutine 内自听:等管道就绪(拨号竞态重试)。
+	var conn net.Conn
+	ready := time.Now().Add(3 * time.Second)
+	for {
+		c, err := winio.DialPipe(pipe, nil)
+		if err == nil {
+			conn = c
+			t.Cleanup(func() { _ = c.Close() })
+			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+			break
+		}
+		if time.Now().After(ready) {
+			t.Fatalf("pipe never ready: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	myNonce := ipc.NewNonce()
+	require.NoError(t, ipc.WriteFrame(conn, &ipc.Frame{MessageType: ipc.MsgHello, Payload: ipc.EncodeHello(uint32(os.Getpid()), myNonce)}))
+	f, err := ipc.ReadFrame(conn)
+	require.NoError(t, err)
+	require.Equal(t, ipc.MsgHelloProof, f.MessageType)
+	_, serverNonce, _, err := ipc.DecodeHelloProof(f.Payload)
+	require.NoError(t, err)
+	require.NoError(t, ipc.WriteFrame(conn, &ipc.Frame{MessageType: ipc.MsgProof, Payload: ipc.Proof(o.secret, serverNonce)}))
+	sawExit := false
+	for !sawExit {
+		f, err := ipc.ReadFrame(conn)
+		require.NoError(t, err)
+		if f.MessageType == msgShellExit {
+			sawExit = true
+		}
+	}
+	_ = conn.Close()
+
+	// serve 返回码 0;第二次拨号必须失败(监听已随 serve 返回关闭)。
+	select {
+	case code := <-done:
+		assert.Equal(t, 0, code)
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not return after oneshot completion")
+	}
+	dialTimeout := 2 * time.Second
+	for {
+		c, err := winio.DialPipe(pipe, &dialTimeout)
+		if err != nil {
+			break // 管道已不存在 = 泄漏修复生效
+		}
+		_ = c.Close()
+		if time.Now().Add(dialTimeout).After(time.Now().Add(3 * time.Second)) {
+			// 不可达占位:窗口判断统一走下方计时
+		}
+		if time.Now().After(start.Add(3 * time.Second)) {
+			t.Fatal("listener still accepting after oneshot - process would leak")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
