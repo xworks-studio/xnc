@@ -321,10 +321,10 @@ func (a *Agent) runConnected(ctx context.Context, b *binding.Binding) error {
 		engine.Register(proto.KindFile, session.NewFile(slog.Default()))
 		engine.Register(proto.KindTunnel, session.NewTunnel(slog.Default()))
 		engine.Register(proto.KindScreen, session.NewScreenHandler(a.StateDir))
-		// desktop:凭据 = env(dev)→ 生产缺省(XNCCore 服务的
-		// \\.\pipe\xnc-core + <StateDir>\core-secret.hex)。缺省零行为
-		// 变化(refused 路径不变)。
-		if dh := desktop.NewHandler(a.StateDir, slog.Default()); dh != nil {
+		// desktop(RTV thin):凭据 = env(dev)→ 生产缺省(XNCCore 服务的
+		// \\.\pipe\xnc-core + <StateDir>\core-secret.hex)；nodeId 取注册
+		// 身份(host 向 relay 注册用)。缺省零行为变化(refused 路径不变)。
+		if dh := desktop.NewHandler(a.StateDir, k.NodeID, slog.Default()); dh != nil {
 			engine.Register(proto.KindDesktop, dh)
 		}
 		c.Handler = engine

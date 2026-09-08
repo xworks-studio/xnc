@@ -40,11 +40,12 @@ type TestEnv struct {
 func NewTestEnv(t *testing.T) *TestEnv {
 	t.Helper()
 	return newTestEnvWithCfg(t, func(c *config.Config) {
-		// desktop 会话需要服务端 TURN 配置（生产读 XNC_TURN_* env；测试注入
-		// 固定值，未配置 → 503 路径经 newTestEnvWithCfg 显式清空）。
-		c.TurnURLs = []string{"turn:test-turn:3478?transport=tcp", "turn:test-turn:3478"}
-		c.TurnUsername = "testuser"
-		c.TurnCredential = "testcred"
+		// desktop 会话需要 RTV endpoint（生产读 XNC_RTV_ENDPOINT；测试注入
+		// 固定值，未配置 → 503 路径经 newTestEnvWithCfg 显式清空）。UDP 腿
+		// 绑 :0（ephemeral）避免并行测试端口冲突。
+		c.RTVStreamEndpoint = "test-rtv:4433"
+		c.RTVHostAddr = ":0"
+		c.RTVWTAddr = ":0"
 	})
 }
 

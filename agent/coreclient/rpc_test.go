@@ -19,25 +19,18 @@ import (
 	"xnc/proto/ipc"
 )
 
-// encodeStartCaptureRespT 是测试侧服务端编码器(布局 = C++ core):
-// [u32 pid][u16 nameLen][name utf8][32B secret][u32 gen]。
-func encodeStartCaptureRespT(pid uint32, pipe string, secret []byte, gen uint32) []byte {
-	p := make([]byte, 0, 6+len(pipe)+len(secret)+4)
-	var b [4]byte
-	binary.LittleEndian.PutUint32(b[:], pid)
-	p = append(p, b[:]...)
-	binary.LittleEndian.PutUint16(b[:2], uint16(len(pipe)))
-	p = append(p, b[:2]...)
-	p = append(p, pipe...)
-	p = append(p, secret...)
-	binary.LittleEndian.PutUint32(b[:], gen)
-	p = append(p, b[:]...)
+// encodeStartCaptureRespT 是测试侧服务端编码器(布局 = C++ core, RTV):
+// [u32 pid][u32 gen]。
+func encodeStartCaptureRespT(pid uint32, gen uint32) []byte {
+	p := make([]byte, 8)
+	binary.LittleEndian.PutUint32(p, pid)
+	binary.LittleEndian.PutUint32(p[4:], gen)
 	return p
 }
 
 // startFakeCore accepts one connection, handshakes as the server, then
 // answers requests until EOF:
-//   - MsgStartCapture: asserts [u32 wts][u32 pad=0], first injects one
+//   - MsgStartCapture: asserts [u32 wts][u16 cfgLen][cfg], first injects one
 //     unsolicited event frame (the client pump must drop it, not mispair),
 //     then responds with the capture descriptor (or a FlagError frame when
 //     startErr != "").
@@ -45,8 +38,8 @@ func encodeStartCaptureRespT(pid uint32, pipe string, secret []byte, gen uint32)
 //   - MsgPing: responds Pong.
 //
 // wantWts == nil disables the wts assertion (any value accepted).
-func startFakeCore(t *testing.T, ln net.Listener, secret, captureSecret []byte,
-	wantWts *uint32, pid uint32, pipe string, gen uint32, startErr string) {
+func startFakeCore(t *testing.T, ln net.Listener, secret []byte,
+	wantWts *uint32, pid uint32, gen uint32, startErr string) {
 	t.Helper()
 	go func() {
 		conn, err := ln.Accept()
@@ -66,9 +59,13 @@ func startFakeCore(t *testing.T, ln net.Listener, secret, captureSecret []byte,
 			switch f.MessageType {
 			case MsgStartCapture:
 				if wantWts != nil {
-					if len(f.Payload) != 8 || binary.LittleEndian.Uint32(f.Payload) != *wantWts ||
-						!bytes.Equal(f.Payload[4:8], []byte{0, 0, 0, 0}) {
-						t.Errorf("start_capture payload = %x, want [u32 %d][u32 0]", f.Payload, *wantWts)
+					cfgLen := 0
+					if len(f.Payload) >= 6 {
+						cfgLen = int(binary.LittleEndian.Uint16(f.Payload[4:6]))
+					}
+					if len(f.Payload) != 6+cfgLen || cfgLen == 0 ||
+						binary.LittleEndian.Uint32(f.Payload) != *wantWts {
+						t.Errorf("start_capture payload = %x, want [u32 %d][u16 cfgLen][cfg]", f.Payload, *wantWts)
 						return
 					}
 				}
@@ -86,7 +83,7 @@ func startFakeCore(t *testing.T, ln net.Listener, secret, captureSecret []byte,
 				_ = ipc.WriteFrame(conn, &ipc.Frame{
 					Flags: ipc.FlagResponse, MessageType: MsgStartCapture,
 					RequestID: f.RequestID,
-					Payload:   encodeStartCaptureRespT(pid, pipe, captureSecret, gen),
+					Payload:   encodeStartCaptureRespT(pid, gen),
 				})
 			case MsgStopCapture:
 				_ = ipc.WriteFrame(conn, &ipc.Frame{
@@ -104,35 +101,29 @@ func startFakeCore(t *testing.T, ln net.Listener, secret, captureSecret []byte,
 	}()
 }
 
-// TestStartCaptureRoundTrip 覆盖:请求 payload 布局([u32 wts][u32 pad=0])、
-// 响应解码([u32 pid][u16 nameLen][name utf8][32B secret][u32 gen])、
-// 事件帧不串扰、StopCapture 空响应即成功。
+// TestStartCaptureRoundTrip 覆盖:请求 payload 布局([u32 wts][u16 cfgLen]
+// [cfg])、响应解码([u32 pid][u32 gen])、事件帧不串扰、StopCapture 空
+// 响应即成功。
 func TestStartCaptureRoundTrip(t *testing.T) {
 	name, ln := listen(t)
 	const secret = "test-pipe-secret"
-	captureSecret := make([]byte, 32)
-	for i := range captureSecret {
-		captureSecret[i] = byte(i*3 + 1)
-	}
 	wts := uint32(5)
-	startFakeCore(t, ln, []byte(secret), captureSecret, &wts, 1234,
-		`\\.\pipe\xnc-desktop-rt-77`, 7, "")
+	startFakeCore(t, ln, []byte(secret), &wts, 1234, 7, "")
 
 	c, err := Dial(name, []byte(secret))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	pid, pipe, sec, gen, err := c.StartCapture(wts)
+	cfg := []byte(`{"endpoint":"xnc.app:4433","nodeId":"n1","token":"t"}`)
+	pid, gen, err := c.StartCapture(wts, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pid != 1234 || pipe != `\\.\pipe\xnc-desktop-rt-77` || gen != 7 {
-		t.Fatalf("StartCapture = pid %d pipe %q gen %d", pid, pipe, gen)
+	if pid != 1234 || gen != 7 {
+		t.Fatalf("StartCapture = pid %d gen %d", pid, gen)
 	}
-	if !bytes.Equal(sec, captureSecret) {
-		t.Fatalf("secret mismatch: %x", sec)
-	}
+
 	if err := c.StopCapture(); err != nil {
 		t.Fatalf("StopCapture: %v", err)
 	}
@@ -143,13 +134,13 @@ func TestStartCaptureRoundTrip(t *testing.T) {
 func TestStartCaptureErrorFrame(t *testing.T) {
 	name, ln := listen(t)
 	const secret = "test-pipe-secret"
-	startFakeCore(t, ln, []byte(secret), nil, nil, 0, "", 0, "SPAWN_FAILED")
+	startFakeCore(t, ln, []byte(secret), nil, 0, 0, "SPAWN_FAILED")
 	c, err := Dial(name, []byte(secret))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	_, _, _, _, err = c.StartCapture(1)
+	_, _, err = c.StartCapture(1, []byte(`{}`))
 	if err == nil || !strings.Contains(err.Error(), "SPAWN_FAILED") {
 		t.Fatalf("want SPAWN_FAILED error, got %v", err)
 	}
@@ -160,12 +151,7 @@ func TestStartCaptureErrorFrame(t *testing.T) {
 func TestConcurrentRequests(t *testing.T) {
 	name, ln := listen(t)
 	const secret = "test-pipe-secret"
-	captureSecret := make([]byte, 32)
-	for i := range captureSecret {
-		captureSecret[i] = byte(0xA0 + i)
-	}
-	startFakeCore(t, ln, []byte(secret), captureSecret, nil, 99,
-		`\\.\pipe\xnc-desktop-rt-99`, 1, "")
+	startFakeCore(t, ln, []byte(secret), nil, 99, 1, "")
 
 	c, err := Dial(name, []byte(secret))
 	if err != nil {
@@ -184,12 +170,9 @@ func TestConcurrentRequests(t *testing.T) {
 				case 0:
 					_, err = c.Ping()
 				case 1:
-					var pid uint32
-					var pipe string
-					var sec []byte
-					var gen uint32
-					pid, pipe, sec, gen, err = c.StartCapture(3)
-					if err == nil && (pid != 99 || pipe != `\\.\pipe\xnc-desktop-rt-99` || gen != 1 || !bytes.Equal(sec, captureSecret)) {
+					var pid, gen uint32
+					pid, gen, err = c.StartCapture(3, []byte(`{}`))
+					if err == nil && (pid != 99 || gen != 1) {
 						err = errBadValues
 					}
 				case 2:
@@ -356,22 +339,4 @@ func (*badValuesError) Error() string { return "StartCapture returned mismatched
 
 // TestSnapshotRespCodec — 0x0111 响应编解码(布局 [u32 len][jpeg bytes];
 // 长度不自洽即协议错误)。请求侧为纯小端打包,核心侧 golden 覆盖,此处
-// 只测本侧解码契约。
-func TestSnapshotRespCodec(t *testing.T) {
-	jpeg, err := decodeSnapshotResp([]byte{3, 0, 0, 0, 0xFF, 0xD8, 0xFF})
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if len(jpeg) != 3 || jpeg[0] != 0xFF || jpeg[2] != 0xFF {
-		t.Fatalf("jpeg bytes mismatch: %v", jpeg)
-	}
-	if _, err := decodeSnapshotResp([]byte{4, 0, 0, 0, 1, 2, 3}); err == nil {
-		t.Fatal("length mismatch must fail")
-	}
-	if _, err := decodeSnapshotResp([]byte{3}); err == nil {
-		t.Fatal("short payload must fail")
-	}
-	if _, err := decodeSnapshotResp([]byte{0, 0, 0, 0}); err == nil {
-		t.Fatal("empty jpeg must fail")
-	}
-}
+

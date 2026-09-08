@@ -10,10 +10,8 @@
 package coreclient
 
 import (
-	"bytes"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,7 +22,6 @@ import (
 	"time"
 
 	"golang.org/x/sys/windows"
-	"xnc/agent/desktoppipe"
 )
 
 // XNC_CORE_EXE 指向 xnc-core.exe 时启用(默认跳过);CI 与本地验收:
@@ -105,20 +102,19 @@ func TestCrossLanguageHandshake(t *testing.T) {
 	t.Logf("cross-language PING/PONG ok, rtt=%v", rtt)
 }
 
-// TestStartCaptureCross — M1-Slice2 Task 3 真 core 冒烟:START_CAPTURE
-// 经 xnc-core spawn xnc-desktop(session bridge + rt pipe),agent 侧再以
-// desktoppipe 订阅收到 HOST_HELLO,STOP_CAPTURE 终止子进程。门:
-// XNC_CORE_EXE 指向 xnc-core.exe;DACL 拒绝(非提权)→ skip;TOKEN_
-// FAILED(提权 admin 无 SeTcb,需 SYSTEM)/ SPAWN_FAILED(bin 无
-// xnc-desktop.exe)→ skip 并给指引;其余失败 fail。子进程清理:
-// STOP 先于杀 core(kill core 不会走其优雅清理,避免孤儿 xnc-desktop)。
+// TestStartCaptureCross — RTV 真 core 冒烟:START_CAPTURE 经 xnc-core
+// spawn xnc-host(session bridge + stdin 配置 blob),响应回 [pid][gen];
+// STOP_CAPTURE 终止子进程。门:XNC_CORE_EXE 指向 xnc-core.exe(同目录
+// 需有 xnc-host.exe);DACL 拒绝(非提权)→ skip;TOKEN_FAILED(提权
+// admin 无 SeTcb,需 SYSTEM)/ SPAWN_FAILED(bin 无 xnc-host.exe)→
+// skip 并给指引;其余失败 fail。子进程清理:STOP 先于杀 core。
 func TestStartCaptureCross(t *testing.T) {
 	exe := os.Getenv("XNC_CORE_EXE")
 	if exe == "" {
 		t.Skip("set XNC_CORE_EXE to run the start-capture cross smoke")
 	}
 	const secret = "test-pipe-secret"
-	const corePipe = `\\.\pipe\xnc-core-smoke-rt`
+	const corePipe = `\.\pipe\xnc-core-smoke-rt`
 
 	stderrPath := filepath.Join(t.TempDir(), "xnc-core-stderr.log")
 	stderrFile, err := os.Create(stderrPath)
@@ -152,11 +148,7 @@ func TestStartCaptureCross(t *testing.T) {
 		finishServer()
 		t.Fatalf("handshake with xnc-core failed: %v (server stderr: %s)", err, stderrPath)
 	}
-	var sub *desktoppipe.Sub
-	defer func() { // 先停采集再杀 core,避免孤儿 xnc-desktop
-		if sub != nil {
-			sub.Close()
-		}
+	defer func() { // 先停采集再杀 core,避免孤儿 xnc-host
 		if c != nil {
 			_ = c.StopCapture()
 		}
@@ -167,48 +159,31 @@ func TestStartCaptureCross(t *testing.T) {
 	if session == 0xFFFFFFFF {
 		t.Skip("no active console session (headless); StartCapture needs one")
 	}
-	pid, pipeName, capSecret, gen, err := c.StartCapture(session)
+	cfg := []byte(`{"endpoint":"127.0.0.1:14433","nodeId":"cross-test","token":"tok"}`)
+	pid, gen, err := c.StartCapture(session, cfg)
 	if err != nil {
 		switch {
 		case strings.Contains(err.Error(), "TOKEN_FAILED"):
 			t.Skipf("core not running as SYSTEM (SeTcb needed for the session token): %v", err)
 		case strings.Contains(err.Error(), "SPAWN_FAILED"):
-			t.Skipf("xnc-desktop.exe missing next to %s: %v", exe, err)
+			t.Skipf("xnc-host.exe missing next to %s: %v", exe, err)
 		}
 		finishServer()
 		t.Fatalf("StartCapture: %v (server stderr: %s)", err, stderrPath)
 	}
-	wantPipe := fmt.Sprintf(`\\.\pipe\xnc-desktop-rt-%d`, cmd.Process.Pid)
-	if pid == 0 || pipeName != wantPipe || len(capSecret) != 32 || gen == 0 {
-		t.Fatalf("StartCapture = pid %d pipe %q gen %d secretLen %d", pid, pipeName, gen, len(capSecret))
+	if pid == 0 || gen == 0 {
+		t.Fatalf("StartCapture = pid %d gen %d", pid, gen)
 	}
-	t.Logf("start_capture ok: desktop pid=%d pipe=%s gen=%d", pid, pipeName, gen)
+	t.Logf("start_capture ok: host pid=%d gen=%d", pid, gen)
 
-	// 幂等:重复 START 返回同一 pid/pipe/secret/gen,不重复 spawn。
-	pid2, pipe2, sec2, gen2, err := c.StartCapture(session)
+	// 幂等:重复 START 返回同一 pid/gen,不重复 spawn。
+	pid2, gen2, err := c.StartCapture(session, cfg)
 	if err != nil {
 		t.Fatalf("idempotent StartCapture: %v", err)
 	}
-	if pid2 != pid || pipe2 != pipeName || gen2 != gen || !bytes.Equal(sec2, capSecret) {
-		t.Fatalf("idempotent StartCapture diverged: pid %d pipe %q gen %d", pid2, pipe2, gen2)
+	if pid2 != pid || gen2 != gen {
+		t.Fatalf("idempotent StartCapture diverged: pid %d gen %d", pid2, gen2)
 	}
-
-	// 端到端:agent 侧 desktoppipe 订阅真实 xnc-desktop,HOST_HELLO
-	// 即 ATTACH 确认;收到即退(帧消费属 T4)。
-	subID := uint32(time.Now().UnixNano() & 0xFFFFFFFF)
-	if subID == 0 {
-		subID = 1
-	}
-	sub, err = desktoppipe.Dial(pipeName, hex.EncodeToString(capSecret), subID,
-		desktoppipe.SubOpts{MaxFPS: 30, MaxW: 1920, Bitrate: 2300000})
-	if err != nil {
-		t.Fatalf("desktoppipe.Dial against the spawned host: %v", err)
-	}
-	hello := sub.Hello()
-	if hello == nil || hello.W == 0 || hello.H == 0 || hello.Fps == 0 {
-		t.Fatalf("HOST_HELLO = %+v", hello)
-	}
-	t.Logf("desktop host hello: %+v", hello)
 
 	if err := c.StopCapture(); err != nil {
 		t.Fatalf("StopCapture: %v", err)

@@ -26,10 +26,10 @@ const (
 	CodeFileTooLarge            = "FILE_TOO_LARGE"
 	CodeAccessDenied            = "ACCESS_DENIED" // 目标存在但不可写/被占用（如覆盖运行中的 exe）
 	CodeAgentVersionUnsupported = "AGENT_VERSION_UNSUPPORTED"
-	// CodeTurnUnconfigured：server 无 TURN 配置时拒绝 desktop 会话
-	// （M1-Slice2：relay-only 无 TURN 不可用，503 优于开一个必死的会话）。
-	CodeTurnUnconfigured = "TURN_UNCONFIGURED"
-	CodeInternal         = "INTERNAL"
+	// CodeRtvUnconfigured：server 无 RTV 配置（XNC_RTV_ENDPOINT）时拒绝
+	// desktop 会话（RTV 重构：503 优于开一个必死的会话；TURN 语义随栈退役）。
+	CodeRtvUnconfigured = "RTV_UNCONFIGURED"
+	CodeInternal        = "INTERNAL"
 )
 
 // APIError is the REST error envelope body: {"error":{"code","message"}}.

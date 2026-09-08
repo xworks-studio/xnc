@@ -134,18 +134,11 @@ func (h *handlers) startSession(w http.ResponseWriter, r *http.Request,
 		respondError(w, proto.Err(404, proto.CodeNodeNotFound, "node not found"))
 		return nil, false
 	}
-	// RBAC：operator 及以上方可开会话（exec/shell/file/tunnel 全经此路径）；
-	// 非成员 404、viewer 403 由 requireMinRole 统一写出。
-	node, ok := h.requireMinRole(w, r, nodeID, "operator")
-	if !ok {
+	// RBAC：operator 及以上方可开会话（exec/shell/file/tunnel/desktop 全经
+	// 此路径）；非成员 404、viewer 403 由 requireMinRole 统一写出。
+	if _, ok := h.requireMinRole(w, r, nodeID, "operator"); !ok {
 		return nil, false
 	}
-	// desktop（M2-Slice3 Task 4）：按请求者角色计算 capability 集并入 params
-	//（客户端提交值已在 handler 白名单剥离——这里只来自 server RBAC）。
-	if kind == proto.KindDesktop {
-		params = withDesktopCapabilities(r.Context(), h, node, u.ID, params)
-	}
-
 	// Create 内部检查 reg.Online：节点无控制连接 → 409 NODE_OFFLINE。
 	res, apiErr := h.sess.Create(nodeID, u.ID, kind, params)
 	if apiErr != nil {

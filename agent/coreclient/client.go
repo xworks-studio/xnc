@@ -2,7 +2,7 @@
 
 // Package coreclient 实现 agent 侧 XNIP named pipe 客户端(spec §9):
 // winio 拨号 + 双向认证握手(§9.3)+ 保活 Ping + START/STOP_CAPTURE
-// RPC(M1-Slice2)+ SendSAS(M2-Slice1 Task 4/5;固定二进制 payload,
+// RPC(RTV:cfg blob 经 stdin 下发 xnc-host)+ SendSAS(M2-Slice1;固定二进制 payload,
 // protobuf 迁移 Slice3)。帧编解码与证明计算复用 xnc/proto/ipc;
 // PID/映像路径校验(OpenProcess + Authenticode)属连接层,由 xnc-core
 // 侧(M1)补全,本包不感知。
@@ -36,11 +36,11 @@ const (
 	handshakeTimeout = 5 * time.Second
 	// pingTimeout 是 Ping 等待 Pong 的时限。
 	pingTimeout = 2 * time.Second
-	// rpcTimeout 覆盖 START/STOP_CAPTURE:核心侧含子进程 spawn +
-	// pipe 就绪等待(≤2s)+ 会话令牌铸造,取充裕上界。
+	// rpcTimeout 覆盖 START/STOP_CAPTURE:核心侧含子进程 spawn 与
+	// stdin 配置写回,取充裕上界(RTV:无 pipe 就绪等待)。
 	rpcTimeout = 15 * time.Second
-	// captureSecretLen 是 START_CAPTURE 响应携带的 desktop pipe secret
-	// 固定长度(与 native/core 生成侧一致)。
+	// captureSecretLen 是 CREATE_SHELL 响应携带的 shell pipe secret
+	// 固定长度(与 native/core 生成侧一致;RTV 后 START_CAPTURE 不再携带)。
 	captureSecretLen = 32
 )
 
@@ -51,8 +51,8 @@ const (
 	// MsgSas 是 SendSAS 请求(M2-Slice1 Task 4:capability 门控的
 	// secure attention;Task 5 = 本侧调用方)。
 	MsgSas uint16 = 0x0110
-	// MsgSnapshot 是单帧 JPEG 快照请求(M2-Slice3 Task 3:screen 退役,
-	// 快照经 core 一次性 spawn xnc-desktop --jpeg-single 回传 JPEG 字节)。
+	// MsgSnapshot 已随 RTV 重构退役:核心侧对该类型稳定回
+	// SNAPSHOT_RETIRED(JPEG 快照为后续 PATCH)。常量保留作文档锚点。
 	MsgSnapshot uint16 = 0x0111
 	// MsgCreateShell / MsgKillShell(M2-Slice2 Task 3/4:exec/shell 经
 	// xnc-core 的令牌语义进程创建)。
@@ -177,16 +177,20 @@ func (c *Client) Ping() (time.Duration, error) {
 	return time.Since(start), nil
 }
 
-// StartCapture 请求核心在指定 WTS 会话启动桌面采集(0x0100):
-// 请求 payload `[u32 wts][u32 pad=0]`;成功响应 payload
-// `[u32 pid][u16 nameLen][name utf8 字节][32B secret][u32 gen]`
-// (nameLen = name 的 UTF-8 字节长度)。核心侧幂等:采集已运行时返回
-// 既有 pipe/secret/gen,不重复 spawn。FlagError 响应以 payload 文本
-// (ASCII 错误码)进错误。
-func (c *Client) StartCapture(wtsSession uint32) (hostPid uint32, pipeName string, secret []byte, gen uint32, err error) {
-	f, err := c.roundTrip(rpcTimeout, MsgStartCapture, encodeStartCaptureReq(wtsSession))
+// StartCapture 请求核心在指定 WTS 会话拉起 RTV 桌面工作进程(0x0100):
+// 请求 payload `[u32 wts][u16 cfgLen][cfg JSON utf8]`;cfg 是 xnc-host 的
+// stdin 配置 blob(endpoint/serverName/nodeId/token 等,含 HostToken 密钥)
+// ——本包对内容不透明,只做长度钳制;成功响应 payload `[u32 pid][u32 gen]`
+// (host 自行经 QUIC 直连 relay 注册,不再回传 pipe/secret)。核心侧幂等:
+// 采集已运行时返回既有 pid/gen,不重复 spawn。FlagError 响应以 payload
+// 文本(ASCII 错误码)进错误。
+func (c *Client) StartCapture(wtsSession uint32, cfg []byte) (hostPid, gen uint32, err error) {
+	if len(cfg) == 0 || len(cfg) > 0xFFFF {
+		return 0, 0, fmt.Errorf("coreclient: start_capture cfg length %d out of range", len(cfg))
+	}
+	f, err := c.roundTrip(rpcTimeout, MsgStartCapture, encodeStartCaptureReq(wtsSession, cfg))
 	if err != nil {
-		return 0, "", nil, 0, err
+		return 0, 0, err
 	}
 	return decodeStartCaptureResp(f.Payload)
 }
@@ -254,43 +258,6 @@ func (c *Client) KillShell(pid uint32) error {
 	binary.LittleEndian.PutUint32(p, pid)
 	_, err := c.roundTrip(rpcTimeout, MsgKillShell, p)
 	return err
-}
-
-// Snapshot 请求核心单帧 JPEG 快照(0x0111,M2-Slice3 Task 3):请求
-// payload `[u32 wts][u32 max_w]`(wts 可填 WTSActiveConsole 哨兵,
-// max_w 0 = 不降采样);成功响应 `[u32 len][jpeg bytes]`。核心侧 spawn
-// 一次性 xnc-desktop --jpeg-single 并回传 JPEG 字节。拒绝走
-// RejectedError(SESSION_MISMATCH / TOKEN_FAILED / SPAWN_FAILED /
-// SNAPSHOT_TIMEOUT / SNAPSHOT_FAILED / SNAPSHOT_TOO_LARGE)。
-func (c *Client) Snapshot(wtsSession, maxWidth uint32) ([]byte, error) {
-	req := make([]byte, 8)
-	binary.LittleEndian.PutUint32(req, wtsSession)
-	binary.LittleEndian.PutUint32(req[4:], maxWidth)
-	f, err := c.roundTrip(snapshotTimeout, MsgSnapshot, req)
-	if err != nil {
-		return nil, err
-	}
-	return decodeSnapshotResp(f.Payload)
-}
-
-// snapshotTimeout 覆盖 0x0111:核心含子进程 spawn + 采帧 + WIC 编码
-// (核心侧 15s 预算),取上界 30s。
-const snapshotTimeout = 30 * time.Second
-
-// decodeSnapshotResp 解码 `[u32 len][jpeg bytes]`;长度不自洽即协议错误。
-func decodeSnapshotResp(p []byte) ([]byte, error) {
-	if len(p) < 4 {
-		return nil, fmt.Errorf("coreclient: snapshot response %d bytes, want >= 4", len(p))
-	}
-	n := binary.LittleEndian.Uint32(p)
-	if int(n) != len(p)-4 {
-		return nil, fmt.Errorf("coreclient: snapshot response length mismatch: len=%d total=%d", n, len(p))
-	}
-	jpeg := append([]byte(nil), p[4:]...)
-	if len(jpeg) == 0 {
-		return nil, errors.New("coreclient: snapshot response: empty jpeg")
-	}
-	return jpeg, nil
 }
 
 // EncodeShellCreateReq 编码 0x0120 请求(布局见 pipe_server.h;小端):
@@ -501,36 +468,21 @@ func (e *RejectedError) Error() string {
 	return fmt.Sprintf("coreclient: %s rejected: %s", e.RPC, e.Code)
 }
 
-// encodeStartCaptureReq 编码请求 `[u32 wts][u32 pad=0]`。
-func encodeStartCaptureReq(wts uint32) []byte {
-	p := make([]byte, 8)
+// encodeStartCaptureReq 编码请求 `[u32 wts][u16 cfgLen][cfg bytes]`。
+func encodeStartCaptureReq(wts uint32, cfg []byte) []byte {
+	p := make([]byte, 6+len(cfg))
 	binary.LittleEndian.PutUint32(p, wts)
-	binary.LittleEndian.PutUint32(p[4:], 0) // 保留位,发送侧恒 0
+	binary.LittleEndian.PutUint16(p[4:], uint16(len(cfg)))
+	copy(p[6:], cfg)
 	return p
 }
 
-// decodeStartCaptureResp 解码响应 `[u32 pid][u16 nameLen][name utf8]
-// [32B secret][u32 gen]`;长度不自洽或 name 为空即协议错误。
-func decodeStartCaptureResp(p []byte) (pid uint32, name string, secret []byte, gen uint32, err error) {
-	const hdr = 6 // u32 pid + u16 nameLen
-	if len(p) < hdr+captureSecretLen+4 {
-		return 0, "", nil, 0, fmt.Errorf("coreclient: start_capture response %d bytes, want >= %d", len(p), hdr+captureSecretLen+4)
+// decodeStartCaptureResp 解码响应 `[u32 pid][u32 gen]`;长度不自洽即协议错误。
+func decodeStartCaptureResp(p []byte) (pid, gen uint32, err error) {
+	if len(p) != 8 {
+		return 0, 0, fmt.Errorf("coreclient: start_capture response %d bytes, want 8", len(p))
 	}
-	pid = binary.LittleEndian.Uint32(p)
-	nameLen := int(binary.LittleEndian.Uint16(p[4:hdr]))
-	if len(p) != hdr+nameLen+captureSecretLen+4 {
-		return 0, "", nil, 0, fmt.Errorf("coreclient: start_capture response length mismatch: nameLen=%d total=%d", nameLen, len(p))
-	}
-	off := hdr
-	name = string(p[off : off+nameLen])
-	off += nameLen
-	if name == "" {
-		return 0, "", nil, 0, errors.New("coreclient: start_capture response: empty pipe name")
-	}
-	secret = append([]byte(nil), p[off:off+captureSecretLen]...)
-	off += captureSecretLen
-	gen = binary.LittleEndian.Uint32(p[off:])
-	return pid, name, secret, gen, nil
+	return binary.LittleEndian.Uint32(p), binary.LittleEndian.Uint32(p[4:]), nil
 }
 
 // encodeSasReason 编码 0x0110 请求 [char reason[24]]:NUL 填充定长,

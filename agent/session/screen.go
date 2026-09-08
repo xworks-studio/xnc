@@ -1,14 +1,10 @@
 // screen.go — 会话 kind=screen 的 agent 侧处理器(M2-Slice3 Task 3 换轨)。
 //
-// screen 流式管线(xnc-screen-helper + named pipe + FrameHub)已退役:
-// 本文件只保留单帧快照——经 xnc-core MSG_SNAPSHOT(0x0111)一次性 spawn
-// xnc-desktop --jpeg-single,取回 JPEG 字节,以既有 screen 会话 WS 二进制
-// 子帧协议(proto.ScreenBinJPEG=0x03)回送,随即收线。快照默认 max_width
-// = 1920(核心侧 box-filter 降采样)。
-//
-// 流式观看走 desktop 会话(StartCapture → xnc-desktop --console-rt);
-// 对 stream 请求(screen 参数无 snapshot=true)以稳定码
-// SCREEN_STREAM_RETIRED 拒绝。
+// RTV 重构(2026-09-08):流式(screen 参数无 snapshot=true)与单帧快照
+// 均退役——流式走 desktop 会话(RTV 链路),快照通道(xnc-core 0x0111 →
+// xnc-desktop --jpeg-single)已随 C++ 栈删除,恢复为后续 PATCH(spec §8.4)。
+// 两种请求分别以稳定码 SCREEN_STREAM_RETIRED / SCREEN_SNAPSHOT_
+// UNSUPPORTED 拒绝。
 package session
 
 import (
@@ -25,8 +21,8 @@ import (
 const (
 	// CodeScreenStreamRetired:screen 流式模式已退役,使用 desktop 会话。
 	CodeScreenStreamRetired = "SCREEN_STREAM_RETIRED"
-	// CodeSnapshotFailed:快照失败(core 拒绝码或传输层错误并入消息)。
-	CodeSnapshotFailed = "SNAPSHOT_FAILED"
+	// CodeSnapshotUnsupported:快照通道已随 RTV 重构退役(后续 PATCH 恢复)。
+	CodeSnapshotUnsupported = "SCREEN_SNAPSHOT_UNSUPPORTED"
 )
 
 const (
@@ -73,24 +69,12 @@ func (h *ScreenHandler) Handle(ctx context.Context, ws *websocket.Conn, sessionI
 		return
 	}
 
-	maxW := p.MaxWidth
-	if maxW <= 0 {
-		maxW = screenDefaultMaxWidth
-	}
-	jpeg, err := h.Snap.Snapshot(uint32(maxW))
-	if err != nil {
-		h.log().Warn("screen snapshot failed", "err", err)
-		writeScreenText(ctx, ws, proto.TypeError, proto.ErrorPayload{
-			Code:    CodeSnapshotFailed,
-			Message: err.Error(),
-		})
-		return
-	}
-	writeScreenText(ctx, ws, typeScreenBegin, proto.ScreenBegin{
-		State: "capturing", Codec: "jpeg",
+	_ = h.Snap // 快照通路已退役(见文件头);保留字段供 PATCH 恢复
+	h.log().Warn("screen snapshot rejected (retired)", "session", sessionID)
+	writeScreenText(ctx, ws, proto.TypeError, proto.ErrorPayload{
+		Code:    CodeSnapshotUnsupported,
+		Message: "screen snapshot is retired with the RTV rewrite; live view via desktop sessions",
 	})
-	writeScreenBinary(ctx, ws, append([]byte{proto.ScreenBinJPEG}, jpeg...))
-	_ = ws.Close(websocket.StatusNormalClosure, "snapshot done")
 }
 
 func (h *ScreenHandler) log() *slog.Logger {

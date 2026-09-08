@@ -24,13 +24,21 @@ type Handler interface {
 	Handle(ctx context.Context, ws *websocket.Conn, sessionID string, params json.RawMessage)
 }
 
+// WslessHandler 无会话 WS 的处理器（RTV desktop 形态：SESSION_OPEN 只
+// 触发本地编排——拉起 xnc-host；媒体经 host QUIC 直连 relay，不经 agent，
+// 因此没有会话 WS 可拨）。SessionStart 应阻塞至 ctx 取消（引擎在
+// SESSION_CLOSE 时取消 ctx），并在退出前完成自有清理。
+type WslessHandler interface {
+	SessionStart(ctx context.Context, sessionID string, params json.RawMessage)
+}
+
 // Engine 实现 connect.Handler：消费控制连接下发的 SESSION_OPEN/SESSION_CLOSE。
 // 注意：分发器的 ctx 随控制连接死亡而取消，因此 HandleSessionOpen/Close 一律
 // 忽略入参 ctx——每个会话自持 context.WithCancel(context.Background())。
 type Engine struct {
 	log         *slog.Logger
 	sendControl func(m proto.Message) error
-	handlers    map[string]Handler
+	handlers    map[string]any // Handler 或 WslessHandler（见 Register）
 
 	mu     sync.Mutex
 	active map[string]context.CancelFunc
@@ -38,11 +46,17 @@ type Engine struct {
 
 func NewEngine(log *slog.Logger, sendControl func(m proto.Message) error) *Engine {
 	return &Engine{log: log, sendControl: sendControl,
-		handlers: map[string]Handler{}, active: map[string]context.CancelFunc{}}
+		handlers: map[string]any{}, active: map[string]context.CancelFunc{}}
 }
 
-// Register 注册 kind 处理器；须在进入 Run 前完成（无并发写保护需求）。
-func (e *Engine) Register(kind string, h Handler) {
+// Register 注册 kind 处理器（Handler 或 WslessHandler 二选一；注册时
+// 校验形态，Run 后调用仍属未定义行为——无并发写保护需求）。
+func (e *Engine) Register(kind string, h any) {
+	switch h.(type) {
+	case Handler, WslessHandler:
+	default:
+		panic("session: handler must implement Handler or WslessHandler")
+	}
 	e.handlers[kind] = h
 }
 
@@ -72,6 +86,11 @@ func (e *Engine) HandleSessionOpen(_ context.Context, so proto.SessionOpen) {
 			e.mu.Unlock()
 			cancel()
 		}()
+		// RTV desktop：无会话 WS（媒体不经 agent），直接进编排路径。
+		if wl, ok := h.(WslessHandler); ok {
+			wl.SessionStart(ctx, so.SessionID, so.Params)
+			return
+		}
 		ws, _, err := websocket.Dial(ctx, so.WsURL, nil)
 		if err != nil {
 			e.log.Warn("session dial failed", "session", so.SessionID, "err", err)
@@ -81,7 +100,7 @@ func (e *Engine) HandleSessionOpen(_ context.Context, so proto.SessionOpen) {
 		// coder/websocket 默认 32768，不抬会首帧即断（1MiB 留余量仍防滥用）。
 		ws.SetReadLimit(wsReadLimit)
 		defer ws.CloseNow()
-		h.Handle(ctx, ws, so.SessionID, so.Params)
+		h.(Handler).Handle(ctx, ws, so.SessionID, so.Params)
 	}()
 }
 

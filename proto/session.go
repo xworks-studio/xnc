@@ -24,69 +24,27 @@ const KindTunnel = "tunnel"
 // 稳定码 SCREEN_STREAM_RETIRED 拒绝。
 const KindScreen = "screen"
 
-// KindDesktop 实时桌面会话（M1-Slice2）：agent 侧 xnc-desktop rt pipe →
-// Pion WebRTC publisher（relay-only）→ 会话 WS 只走 JSON 信令（词汇契约
-// 见 agent/desktop/session.go 文件头，T5/T6 消费）。
+// KindDesktop 实时桌面会话（RTV 重构，2026-09-08）：agent 收到 SESSION_OPEN
+// 后经 xnc-core 拉起 xnc-host（Rust），host 持本参数的 StreamEndpoint+
+// HostToken 直连 server QUIC 腿注册；媒体不经 agent，浏览器经 server 的
+// WT/WS 腿观看（中继协议见 server/internal/rtv 与重构 spec）。
 const KindDesktop = "desktop"
 
-// DesktopIceAll 是 iceTransportPolicy 的非 relay 覆盖值：server config
-// XNC_DESKTOP_ICE_POLICY=all 时随 SESSION_OPEN params 下发（M4 Task 7 LAN
-// 直连），回环单测亦用（无 TURN 环境）；缺省（空或 "relay"）= 生产强约束
-// relay——agent 侧 p.IceTransportPolicy != DesktopIceAll 即 RelayOnly。
-const DesktopIceAll = "all"
-
-// DesktopTurnConfig 是 desktop 会话的 TURN 中继配置（server 经
-// SESSION_OPEN params 下发；dev = 非 TLS turn:<host>:3478?transport=tcp，
-// TLS/443 = M2）。credential 绝不入任何日志。
-type DesktopTurnConfig struct {
-	URLs       []string `json:"urls"`
-	Username   string   `json:"username"`
-	Credential string   `json:"credential"`
-}
-
-// Configured 报告 TURN 配置是否完整（URLs/username/credential 全非空）。
-// desktop 会话 relay-only：任一缺失即视为未配置（server 侧 503
-// TURN_UNCONFIGURED 的判定；nil 接收者安全）。
-func (t *DesktopTurnConfig) Configured() bool {
-	return t != nil && len(t.URLs) > 0 && t.Username != "" && t.Credential != ""
-}
-
-// Desktop mediaProtocol 词汇（M4 Task 4：server 侧 canary 选择 / agent 侧
-// 强制）。空 = 缺省 v1——旧 server 未选择时 agent fail closed 到 v1。
-const (
-	MediaProtocolV1 = "v1"
-	MediaProtocolV2 = "v2"
-)
-
-// DesktopParams 会话 Params 的 desktop 形态（M1-Slice2）。
+// DesktopParams 会话 Params 的 desktop 形态（RTV）。
 type DesktopParams struct {
-	// Signaling 目前仅 "webrtc"；空视同 "webrtc"（本片唯一形态）。
-	Signaling string             `json:"signaling,omitempty"`
-	Turn      *DesktopTurnConfig `json:"turn,omitempty"`
+	// StreamEndpoint host 腿 QUIC 地址（host:port，UDP 4433 形态）。
+	StreamEndpoint string `json:"streamEndpoint,omitempty"`
+	// HostToken host 注册令牌：server 会话创建时签发、绑定节点，经
+	// SESSION_OPEN → agent → xnc-core → stdin 交给 xnc-host；host 凭它
+	// 向 relay 注册（重连/崩溃重启重放同一 token = 合法再注册）。
+	// 绝不入日志/argv。
+	HostToken string `json:"hostToken,omitempty"`
 	// WTSSession 目标 WTS 会话 id；0 = 活动控制台会话（dev 默认）。
 	WTSSession uint32 `json:"wtsSession,omitempty"`
-	// IceTransportPolicy 缺省 "relay"（不下发字段）；DesktopIceAll 由 server
-	// config（XNC_DESKTOP_ICE_POLICY=all）或回环单测显式放开直连。
-	IceTransportPolicy string `json:"iceTransportPolicy,omitempty"`
-	// LeaseID（M2-Slice3 Task 4）：server 侧 per-node 仲裁的唯一活约 id。
-	// 仅授予会话的 params 携带（每节点同时至多一个）；未携带 = view-only。
-	// agent 侧输入转发以本字段为凭（本地仲裁表已退役，spec §11.1）。
-	LeaseID string `json:"leaseId,omitempty"`
-	// Capabilities（M2-Slice3 Task 4）：server 按 RBAC 角色在会话创建时
-	// 计算并下发（viewer: [screen.view]; operator: +[input.mouse,
-	// input.keyboard]; owner: +[input.secure_attention, shell.system]），
-	// agent 侧强制：input.* 缺失拒转发对应输入、input.secure_attention
-	// 缺失拒 SAS（spec §14）。客户端提交值被白名单剥离，只来自 server。
-	Capabilities []string `json:"capabilities,omitempty"`
-	// MediaProtocol（M4 Task 4）：server 在会话创建时一次性选定的媒体管线
-	// 版本（MediaProtocolV1/V2）。canary 控制 = server config（节点
-	// allowlist + 百分比 + 回滚开关），选择先于 Host/Publisher 启动并随
-	// params 快照——live 会话绝不换版；agent 强制 HOST_HELLO 的
-	// media_protocol 与此一致，不符即收线。客户端提交值被白名单剥离。
-	MediaProtocol string `json:"mediaProtocol,omitempty"`
 }
 
-// Desktop capability 词汇（server 下发 / agent 强制，spec §14）。
+// Desktop capability 词汇（RTV 后由 server 中继侧强制：input 门控按
+// 会话 lease + capability；保留词汇供 RBAC 计算与 relay 门控共用）。
 const (
 	CapScreenView      = "screen.view"
 	CapInputMouse      = "input.mouse"

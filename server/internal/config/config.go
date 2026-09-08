@@ -20,34 +20,24 @@ type Config struct {
 	ShellIdleTimeout time.Duration // XNC_SHELL_IDLE，默认 30m，0 = 不限
 	ShellMaxLifetime time.Duration // XNC_SHELL_MAX，默认 8h，0 = 不限
 
-	// —— M1-Slice2 desktop/TURN。TURN 缺省为空 = desktop 会话 503
-	// TURN_UNCONFIGURED（relay-only 无 TURN 不可用）；凭据绝不入日志。
-	TurnURLs       []string // XNC_TURN_URLS，逗号分隔（turn:/turns: URL）
-	TurnUsername   string   // XNC_TURN_USERNAME（dev = lt-cred 静态用户）
-	TurnCredential string   // XNC_TURN_CREDENTIAL（M2 换 REST 时效凭据）
-	// TurnPool 境内 TURN 中转池（XNC_TURN_POOL，逗号分隔 ip[:port]，缺省端口
-	// 3478）。空 = 未配置 → 沿用 TurnURLs 全列表（现状）。非空时 desktop 会话
-	// 从池中 round-robin 分配单台（udp 优先 + tcp 兜底两个 URL），凭据与
-	// TurnUsername/TurnCredential 共用。
-	TurnPool           []string
-	DesktopPerNode     int           // XNC_DESKTOP_PER_NODE，默认 4（对齐 agent host max_subs=4，多 viewer），0 = 不限
+	// —— RTV 桌面中继（2026-09-08 重构，替代 TURN/WebRTC 面）。
+	// RTVStreamEndpoint 缺省为空 = desktop 会话 503 RTV_UNCONFIGURED；
+	// 形态 host:port（host 腿 QUIC，生产 xnc.app:4433）。凭据绝不入日志。
+	RTVStreamEndpoint string // XNC_RTV_ENDPOINT
+	// RTVHostAddr/RTVWTAddr 是两条 UDP 腿的容器内监听地址（空 = 不启对应
+	// 腿；compose 映射 4433/udp 与 443/udp）。
+	RTVHostAddr string // XNC_RTV_HOST_ADDR，默认 ":4433"
+	RTVWTAddr   string // XNC_RTV_WT_ADDR，默认 ":443"
+	// RTV 证书（ACME 就绪前的文件形态；两者全缺 = 进程内自签 dev 证书，
+	// 高声告警——生产必须配置，浏览器 WT 走标准 Web PKI 校验）。
+	RTVCertFile string // XNC_RTV_CERT_FILE
+	RTVKeyFile  string // XNC_RTV_KEY_FILE
+	// RTVWSOrigins WS 兜底腿的 Origin 白名单（空 = coder/websocket 同源
+	// 校验；生产经 caddy 同源反代即正确语义，dev 跨源联调时配置）。
+	RTVWSOrigins []string // XNC_RTV_WS_ORIGINS，逗号分隔
+
+	DesktopPerNode     int           // XNC_DESKTOP_PER_NODE，默认 4（多 viewer 各自独立会话），0 = 不限
 	DesktopIdleTimeout time.Duration // XNC_DESKTOP_IDLE，默认 5m（无信令活动即关），0 = 不限
-
-	// DesktopICEPolicy（M4 Task 7 LAN 直连）：desktop 会话 ICE transport
-	// policy 的 server 侧总开关。"relay"（缺省，spec 强约束）= 不下发字段，
-	// agent 强制 relay-only；"all"（XNC_DESKTOP_ICE_POLICY，LAN 场景放开）
-	// = SESSION_OPEN params 携带 proto.DesktopIceAll，允许 host/srflx 直连
-	// 候选（绕开公网 TURN 中继的同网回环丢包）。归一化后只有这两个值：
-	// 空/未知值一律 fail closed 回 "relay"（不配置 = 行为不变）。
-	DesktopICEPolicy string // XNC_DESKTOP_ICE_POLICY，"relay"（缺省）| "all"
-
-	// —— M4 Task 4：desktop 媒体管线 v2 canary（server 侧 per-session
-	// 选择 = 生产控制点；节点本机 XNC_DESKTOP_PIPELINE_V2 仍是 host 侧
-	// force，二者不一致时 agent 按会话钉子响亮拒绝）。百分比桶按节点 UUID
-	// 哈希（rt-pipe host 每节点共享，一个节点的并发会话必须同版）。
-	DesktopMediaV2Percent   int      // XNC_DESKTOP_MEDIA_V2_PERCENT，0-100，默认 0（全 v1）；越界视为 0
-	DesktopMediaV2Allowlist []string // XNC_DESKTOP_MEDIA_V2_ALLOWLIST，逗号分隔节点 UUID（显式胜百分比）
-	DesktopMediaV2Rollback  bool     // XNC_DESKTOP_MEDIA_V2_ROLLBACK，true = 一切新会话钉回 v1（回滚开关）
 
 	// —— installer 分发同步（installersync）：GitHub Releases 是唯一事实
 	// 源，server 定时拉回本地 release store（/installer 服务路径不变）。
@@ -58,29 +48,27 @@ type Config struct {
 
 func Load() (Config, error) {
 	c := Config{
-		ListenAddr:              env("XNC_LISTEN", ":8080"),
-		DatabaseURL:             os.Getenv("XNC_DATABASE_URL"),
-		JWTSecret:               []byte(os.Getenv("XNC_JWT_SECRET")),
-		AdminEmail:              os.Getenv("XNC_ADMIN_EMAIL"),
-		AdminPassword:           os.Getenv("XNC_ADMIN_PASSWORD"),
-		HeartbeatTimeout:        envDur("XNC_HEARTBEAT_TIMEOUT", 90*time.Second),
-		EnrollTokenTTL:          envDur("XNC_ENROLL_TOKEN_TTL", 30*time.Minute),
-		ShellPerNode:            envInt("XNC_SHELL_PER_NODE", 10),
-		ShellIdleTimeout:        envDur("XNC_SHELL_IDLE", 30*time.Minute),
-		ShellMaxLifetime:        envDur("XNC_SHELL_MAX", 8*time.Hour),
-		TurnURLs:                envList("XNC_TURN_URLS"),
-		TurnUsername:            os.Getenv("XNC_TURN_USERNAME"),
-		TurnCredential:          os.Getenv("XNC_TURN_CREDENTIAL"),
-		TurnPool:                envList("XNC_TURN_POOL"),
-		DesktopPerNode:          envInt("XNC_DESKTOP_PER_NODE", 4),
-		DesktopIdleTimeout:      envDur("XNC_DESKTOP_IDLE", 5*time.Minute),
-		DesktopICEPolicy:        icePolicy(os.Getenv("XNC_DESKTOP_ICE_POLICY")),
-		DesktopMediaV2Percent:   envInt("XNC_DESKTOP_MEDIA_V2_PERCENT", 0),
-		DesktopMediaV2Allowlist: envList("XNC_DESKTOP_MEDIA_V2_ALLOWLIST"),
-		DesktopMediaV2Rollback:  envBool("XNC_DESKTOP_MEDIA_V2_ROLLBACK", false),
-		InstallerSyncRepo:       env("XNC_INSTALLER_SYNC_REPO", "xworks-studio/xnc"),
-		InstallerSyncInterval:   envDur("XNC_INSTALLER_SYNC_INTERVAL", 5*time.Minute),
-		GitHubToken:             os.Getenv("XNC_GITHUB_TOKEN"),
+		ListenAddr:            env("XNC_LISTEN", ":8080"),
+		DatabaseURL:           os.Getenv("XNC_DATABASE_URL"),
+		JWTSecret:             []byte(os.Getenv("XNC_JWT_SECRET")),
+		AdminEmail:            os.Getenv("XNC_ADMIN_EMAIL"),
+		AdminPassword:         os.Getenv("XNC_ADMIN_PASSWORD"),
+		HeartbeatTimeout:      envDur("XNC_HEARTBEAT_TIMEOUT", 90*time.Second),
+		EnrollTokenTTL:        envDur("XNC_ENROLL_TOKEN_TTL", 30*time.Minute),
+		ShellPerNode:          envInt("XNC_SHELL_PER_NODE", 10),
+		ShellIdleTimeout:      envDur("XNC_SHELL_IDLE", 30*time.Minute),
+		ShellMaxLifetime:      envDur("XNC_SHELL_MAX", 8*time.Hour),
+		RTVStreamEndpoint:     env("XNC_RTV_ENDPOINT", ""),
+		RTVHostAddr:           env("XNC_RTV_HOST_ADDR", ":4433"),
+		RTVWTAddr:             env("XNC_RTV_WT_ADDR", ":443"),
+		RTVCertFile:           os.Getenv("XNC_RTV_CERT_FILE"),
+		RTVKeyFile:            os.Getenv("XNC_RTV_KEY_FILE"),
+		RTVWSOrigins:          envList("XNC_RTV_WS_ORIGINS"),
+		DesktopPerNode:        envInt("XNC_DESKTOP_PER_NODE", 4),
+		DesktopIdleTimeout:    envDur("XNC_DESKTOP_IDLE", 5*time.Minute),
+		InstallerSyncRepo:     env("XNC_INSTALLER_SYNC_REPO", "xworks-studio/xnc"),
+		InstallerSyncInterval: envDur("XNC_INSTALLER_SYNC_INTERVAL", 5*time.Minute),
+		GitHubToken:           os.Getenv("XNC_GITHUB_TOKEN"),
 	}
 	if c.DatabaseURL == "" {
 		return c, fmt.Errorf("XNC_DATABASE_URL is required")
@@ -145,15 +133,4 @@ func envBool(k string, d bool) bool {
 		}
 	}
 	return d
-}
-
-// icePolicy 归一化 XNC_DESKTOP_ICE_POLICY：仅 "all" 视为放开直连，其余
-// （空/未知值）fail closed 回 "relay"——缺省行为与旧版完全一致（不配置 =
-// agent 侧强制 relay）。字面量对应 proto.DesktopIceAll（"all"），此处不引
-// proto 依赖以保持 config 只依赖标准库。
-func icePolicy(v string) string {
-	if v == "all" {
-		return "all"
-	}
-	return "relay"
 }

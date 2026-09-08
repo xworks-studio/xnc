@@ -188,10 +188,10 @@ func (m *Manager) Create(nodeID, userID uuid.UUID, kind string, params json.RawM
 	m.sessions[s.ID] = s
 	var res CreateResult
 	if kind == proto.KindDesktop {
-		// per-node lease 仲裁（spec §11.1）：授予则 leaseId 嵌入 params
-		// （SESSION_OPEN 与 REST 响应同源）；拒绝则会话照常创建（view-only）。
+		// per-node lease 仲裁（spec §11.1）：RTV 后 lease 为 server 侧簿记
+		// （relay 的 input 门控按 desktopLeases 表判定持有会话），不再
+		// 写入 agent params——agent 不感知输入权限。
 		if leaseID, ok := m.grantDesktopLeaseLocked(s, time.Now()); ok {
-			s.Params = embedDesktopLeaseID(s.Params, leaseID)
 			res.LeaseGranted, res.LeaseID = true, leaseID
 		}
 	}
@@ -218,22 +218,8 @@ func (m *Manager) grantDesktopLeaseLocked(s *session, now time.Time) (string, bo
 	return leaseID, true
 }
 
-// embedDesktopLeaseID 把授予的 leaseId 写回 desktop params（解码失败 =
-// 非法形态，原样返回；handler 侧保证是 DesktopParams）。
-func embedDesktopLeaseID(params json.RawMessage, leaseID string) json.RawMessage {
-	var p proto.DesktopParams
-	if json.Unmarshal(params, &p) != nil {
-		return params
-	}
-	p.LeaseID = leaseID
-	b, err := json.Marshal(p)
-	if err != nil {
-		return params
-	}
-	return b
-}
-
 // DesktopLeaseOf 返回某节点当前输入约持有者（测试/观测；无活约 = 零值）。
+// relay 的 input 门控以本表为准：仅持有会话的输入消息放行到 host。
 func (m *Manager) DesktopLeaseOf(nodeID uuid.UUID) (sessionID, leaseID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -352,6 +338,70 @@ func (m *Manager) AttachAgent(sessionID, token string, ws *websocket.Conn) *prot
 
 func (m *Manager) AttachClient(sessionID, token string, ws *websocket.Conn) *proto.APIError {
 	return m.attach("client", sessionID, token, ws)
+}
+
+// sessionByClientToken 按 client token 定位会话（RTV viewer 腿无路径 id）。
+// 调用方持 mu。命中已消耗 token 时返回该会话（clientToken=="" 形态）供
+// 调用方回 401 重放识别。
+func (m *Manager) sessionByClientToken(token string) *session {
+	for _, s := range m.sessions {
+		if s.clientToken != "" && token == s.clientToken {
+			return s
+		}
+	}
+	if token != "" {
+		for _, s := range m.sessions {
+			if s.clientToken == "" && s.usedClientToken == token {
+				return s
+			}
+		}
+	}
+	return nil
+}
+
+// AttachClientRTV — RTV desktop viewer 粘合（经 rtv WT/WS 腿，无会话 WS）。
+// client token 单用途语义与 attach(client) 同（重放 401）；desktop 会话无
+// agent WS 侧，client 侧到达即 glue（停 Opening TTL）。
+func (m *Manager) AttachClientRTV(token string) (uuid.UUID, string, *proto.APIError) {
+	if token == "" {
+		return uuid.Nil, "", proto.Err(401, proto.CodeUnauthorized, "missing session token")
+	}
+	m.mu.Lock()
+	s := m.sessionByClientToken(token)
+	if s == nil {
+		m.mu.Unlock()
+		return uuid.Nil, "", proto.Err(404, proto.CodeSessionNotFound, "session not found")
+	}
+	if time.Now().After(s.expiresAt) {
+		m.mu.Unlock()
+		return uuid.Nil, "", proto.Err(410, proto.CodeSessionExpired, "session expired")
+	}
+	if s.clientToken == "" { // 已消耗：重放
+		m.mu.Unlock()
+		return uuid.Nil, "", proto.Err(401, proto.CodeUnauthorized, "session token already used")
+	}
+	s.usedClientToken = s.clientToken
+	s.clientToken = ""
+	if !s.glued {
+		s.glued = true
+		if s.ttl != nil {
+			s.ttl.Stop()
+		}
+	}
+	m.mu.Unlock()
+	s.lastActivity.Store(time.Now().UnixNano())
+	return s.NodeID, s.ID, nil
+}
+
+// TouchActivity 刷新会话 lastActivity（RTV viewer 控制流量：janitor 的
+// desktop idle 关闭与 lease TTL 撤约判据）。
+func (m *Manager) TouchActivity(sessionID string) {
+	m.mu.Lock()
+	s := m.sessions[sessionID]
+	m.mu.Unlock()
+	if s != nil {
+		s.lastActivity.Store(time.Now().UnixNano())
+	}
 }
 
 // NotifyClose 幂等关闭：关双侧连接、清表、回调 finish、通知 agent。

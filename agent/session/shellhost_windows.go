@@ -4,10 +4,10 @@
 // coreclient(core XNIP pipe)CreateShell(0x0120,wts=活动控制台哨兵,
 // 令牌 kind 由 System 决定)→ shellpipe.Dial(xnc-shell pipe, secret)。
 // 连接模型镜像 desktop/core_windows.go:进程内共享一条 core 连接
-// (Ping 探活,死则重拨);凭据解析统一委托 desktop.ResolveCoreEndpoint
+// (Ping 探活,死则重拨);凭据解析统一委托 coreclient.ResolveCoreEndpoint
 // (单一事实:env 链 XNC_CORE_* → XNC_DESKTOP_CORE_*,全缺回落 state-dir
-// 服务约定),缺失 = CORE_UNAVAILABLE(dev 构建文档化行为:exec/shell
-// 依赖运行中的 xnc-core)。
+// 服务约定;自 desktop 包迁入),缺失 = CORE_UNAVAILABLE(dev 构建文档化
+// 行为:exec/shell 依赖运行中的 xnc-core)。
 package session
 
 import (
@@ -16,7 +16,6 @@ import (
 	"sync"
 
 	"xnc/agent/coreclient"
-	"xnc/agent/desktop"
 	"xnc/agent/shellpipe"
 )
 
@@ -29,11 +28,11 @@ var profileEnum = map[string]uint8{
 }
 
 // DefaultShellHost 按环境变量构造共享 core 连接的 ShellHost;凭据解析
-// 委托 desktop.ResolveCoreEndpoint(stateDir="",不读盘)——env 链
+// 委托 coreclient.ResolveCoreEndpoint(stateDir="",不读盘)——env 链
 // XNC_CORE_* 优先、回落 XNC_DESKTOP_CORE_*。缺失/损坏返回 nil(调用方
 // 以 CORE_UNAVAILABLE 拒绝每次创建)。
 func DefaultShellHost(log *slog.Logger) ShellHost {
-	pipe, secret, err := desktop.ResolveCoreEndpoint("")
+	pipe, secret, err := coreclient.ResolveCoreEndpoint("")
 	if err != nil || len(secret) == 0 {
 		return nil
 	}
@@ -45,7 +44,7 @@ func DefaultShellHost(log *slog.Logger) ShellHost {
 // 与 desktop handler 同一凭据源)。失败返回 nil(CORE_UNAVAILABLE)。
 // 2026-08-24 生产事故修复:此前缺 stateDir 回落,生产 exec/shell 全废。
 func ShellHostFromStateDir(stateDir string, log *slog.Logger) ShellHost {
-	pipe, secret, err := desktop.ResolveCoreEndpoint(stateDir)
+	pipe, secret, err := coreclient.ResolveCoreEndpoint(stateDir)
 	if err != nil || len(secret) == 0 {
 		if log != nil {
 			log.Warn("exec/shell: no core credentials (env unset, state-dir fallback failed)", "err", err)
@@ -202,23 +201,11 @@ func (p *coreShellProc) Dropped() uint64 { return p.conn.DroppedBytes() }
 var _ ShellProc = (*coreShellProc)(nil)
 var _ ShellHost = (*coreShellHost)(nil)
 
-// Snapshot 经共享 core 连接发 0x0111 快照请求(M2-Slice3 Task 3:screen
-// 退役换轨;wts=活动控制台哨兵,核心解析)。拒绝码透传为 ShellHostError
-// 形态,传输层错误并入 CORE_UNAVAILABLE。
-func (h *coreShellHost) Snapshot(maxWidth uint32) ([]byte, error) {
-	c, err := h.ensureClient()
-	if err != nil {
-		return nil, &ShellHostError{Code: CodeCoreUnavailable}
-	}
-	jpeg, err := c.Snapshot(coreclient.WTSActiveConsole, maxWidth)
-	if err != nil {
-		var rej *coreclient.RejectedError
-		if errors.As(err, &rej) {
-			return nil, &ShellHostError{Code: rej.Code}
-		}
-		return nil, &ShellHostError{Code: CodeCoreUnavailable}
-	}
-	return jpeg, nil
+// Snapshot 已随 RTV 重构退役(xnc-desktop --jpeg-single 通道删除,
+// spec 2026-09-08 §8.4;恢复为后续 PATCH)。保留方法形状以稳住
+// ShellHost 接口,恒回 SNAPSHOT_RETIRED 拒绝码。
+func (h *coreShellHost) Snapshot(uint32) ([]byte, error) {
+	return nil, &ShellHostError{Code: "SNAPSHOT_RETIRED"}
 }
 
 // defaultSnapshotProvider 构造默认快照通路(与 exec/shell 同源的共享 core

@@ -13,46 +13,21 @@ func setRequiredEnv(t *testing.T) {
 	t.Setenv("XNC_JWT_SECRET", "0123456789abcdef0123456789abcdef")
 }
 
-// TestTurnPoolEnv：XNC_TURN_POOL 逗号分隔 ip[:port]，复用 envList 语义
-// （去空白/跳空项）；未配置 → nil。
-func TestTurnPoolEnv(t *testing.T) {
+
+// TestRTVEnv（RTV 重构）：XNC_RTV_ENDPOINT 缺省空；配置后透传；
+// 腿地址缺省 :4433/:443。
+func TestRTVEnv(t *testing.T) {
 	setRequiredEnv(t)
-	t.Setenv("XNC_TURN_POOL", "1.2.3.4, 5.6.7.8:3479 ,,9.9.9.9")
 	c, err := Load()
 	require.NoError(t, err)
-	assert.Equal(t, []string{"1.2.3.4", "5.6.7.8:3479", "9.9.9.9"}, c.TurnPool)
+	assert.Empty(t, c.RTVStreamEndpoint)
+	assert.Equal(t, ":4433", c.RTVHostAddr)
+	assert.Equal(t, ":443", c.RTVWTAddr)
 
-	t.Setenv("XNC_TURN_POOL", "")
+	t.Setenv("XNC_RTV_ENDPOINT", "xnc.app:4433")
+	t.Setenv("XNC_RTV_HOST_ADDR", ":9443")
 	c, err = Load()
 	require.NoError(t, err)
-	assert.Nil(t, c.TurnPool)
-}
-
-// TestDesktopICEPolicyEnv（M4 Task 7）：XNC_DESKTOP_ICE_POLICY 缺省 =
-// "relay"（向后兼容：不配置与旧版 relay-only 行为一致）；"all" = 放开 LAN
-// 直连；未知值 fail closed 回 "relay"。
-func TestDesktopICEPolicyEnv(t *testing.T) {
-	setRequiredEnv(t)
-
-	// 缺省：未配置 → relay（不配置 = 行为不变）。
-	c, err := Load()
-	require.NoError(t, err)
-	assert.Equal(t, "relay", c.DesktopICEPolicy)
-
-	// 显式 all → 放开直连。
-	t.Setenv("XNC_DESKTOP_ICE_POLICY", "all")
-	c, err = Load()
-	require.NoError(t, err)
-	assert.Equal(t, "all", c.DesktopICEPolicy)
-
-	// 未知值（拼错/恶意）→ fail closed 回 relay。
-	t.Setenv("XNC_DESKTOP_ICE_POLICY", "ALL")
-	c, err = Load()
-	require.NoError(t, err)
-	assert.Equal(t, "relay", c.DesktopICEPolicy)
-
-	t.Setenv("XNC_DESKTOP_ICE_POLICY", "direct")
-	c, err = Load()
-	require.NoError(t, err)
-	assert.Equal(t, "relay", c.DesktopICEPolicy)
+	assert.Equal(t, "xnc.app:4433", c.RTVStreamEndpoint)
+	assert.Equal(t, ":9443", c.RTVHostAddr)
 }

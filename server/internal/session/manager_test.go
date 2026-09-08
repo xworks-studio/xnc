@@ -334,10 +334,8 @@ func TestDesktopLeaseArbitration(t *testing.T) {
 	require.Nil(t, apiErr)
 	assert.True(t, r1.LeaseGranted)
 	assert.Len(t, r1.LeaseID, 16)
-	// params 已嵌入 leaseId(SESSION_OPEN/REST 同源)。
-	var p1 proto.DesktopParams
-	require.NoError(t, json.Unmarshal(r1.Session.Params, &p1))
-	assert.Equal(t, r1.LeaseID, p1.LeaseID)
+	// RTV：lease 为 server 侧簿记（relay input 门控键），params 不再嵌入
+	// leaseId——只断言仲裁表与响应同源。
 	sid, lid := m.DesktopLeaseOf(id)
 	assert.Equal(t, r1.Session.ID, sid)
 	assert.Equal(t, r1.LeaseID, lid)
@@ -347,9 +345,6 @@ func TestDesktopLeaseArbitration(t *testing.T) {
 	require.Nil(t, apiErr)
 	assert.False(t, r2.LeaseGranted)
 	assert.Empty(t, r2.LeaseID)
-	var p2 proto.DesktopParams
-	require.NoError(t, json.Unmarshal(r2.Session.Params, &p2))
-	assert.Empty(t, p2.LeaseID)
 	// 约仍归 r1。
 	sid, _ = m.DesktopLeaseOf(id)
 	assert.Equal(t, r1.Session.ID, sid)

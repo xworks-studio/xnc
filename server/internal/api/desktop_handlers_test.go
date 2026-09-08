@@ -26,27 +26,28 @@ func desktopPost(t *testing.T, env *TestEnv, nodeID, body string) *http.Response
 	return resp
 }
 
-// desktopOpenResp 是 REST 响应形态（T4 e2eviewer server 模式同一契约）。
+// desktopOpenResp 是 REST 响应形态（RTV：wtUrl/wsUrl + lease；无 turn）。
 type desktopOpenResp struct {
-	SessionID     string                   `json:"sessionId"`
-	Token         string                   `json:"token"`
-	ExpiresAt     time.Time                `json:"expiresAt"`
-	WebsocketURL  string                   `json:"websocketUrl"`
-	Turn          *proto.DesktopTurnConfig `json:"turn"`
-	Lease         *desktopLeaseResp        `json:"lease"`
-	MediaProtocol string                   `json:"mediaProtocol"`
+	SessionID string `json:"sessionId"`
+	Token     string `json:"token"`
+	ExpiresAt time.Time `json:"expiresAt"`
+	WTURL     string `json:"wtUrl"`
+	WSURL     string `json:"wsUrl"`
+	Lease     *desktopLeaseResp `json:"lease"`
 }
 
-// desktopLeaseResp：202 响应的 lease 判定（M2-Slice3 Task 4）。
+// desktopLeaseResp：202 响应的 lease 判定（RTV 后 lease 为 server 侧簿记，
+// relay 的 input 门控键）。
 type desktopLeaseResp struct {
 	Granted bool   `json:"granted"`
 	LeaseID string `json:"leaseId"`
 }
 
 // TestDesktopSessionEndToEnd：202 → SESSION_OPEN 携带 KindDesktop + 服务端
-// TURN 配置 + 白名单后的客户端字段；REST 响应携带 token/websocketUrl/turn；
-// 审计 desktop.open。
-// 关键安全断言：客户端提交的 turn / iceTransportPolicy / 任意未知字段绝不下发。
+// RTV endpoint + Hub 签发的 HostToken + 白名单后的客户端字段；REST 响应
+// 携带 token/wtUrl/wsUrl/lease；审计 desktop.open。
+// 关键安全断言：客户端提交的 streamEndpoint / hostToken / 任意未知字段绝
+// 不透传（hostToken 是 relay 注册凭据，泄漏 = 会话劫持）。
 func TestDesktopSessionEndToEnd(t *testing.T) {
 	env := NewTestEnv(t)
 	nodeID := env.EnrollNode(t, "WEB-DT1", "mid-dt1")
@@ -54,8 +55,8 @@ func TestDesktopSessionEndToEnd(t *testing.T) {
 	openCh := captureSessionOpen(t, ctrl)
 
 	resp := desktopPost(t, env, nodeID,
-		`{"signaling":"webrtc","wtsSession":0,"iceTransportPolicy":"all",`+
-			`"turn":{"urls":["turn:evil.example:3478"],"username":"evil","credential":"evil"}}`)
+		`{"wtsSession":0,"streamEndpoint":"evil.example:6666",`+
+			`"hostToken":"evil-token","iceTransportPolicy":"all"}`)
 	defer resp.Body.Close()
 	require.Equal(t, 202, resp.StatusCode)
 
@@ -63,28 +64,20 @@ func TestDesktopSessionEndToEnd(t *testing.T) {
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
 	assert.NotEmpty(t, body.SessionID)
 	assert.NotEmpty(t, body.Token)
-	assert.Contains(t, body.WebsocketURL, "/api/session/"+body.SessionID+"?token=")
-	// REST turn = 服务端配置（testenv 注入），非客户端提交值
-	require.NotNil(t, body.Turn)
-	assert.Equal(t, env.Cfg.TurnURLs, body.Turn.URLs)
-	assert.Equal(t, env.Cfg.TurnUsername, body.Turn.Username)
-	assert.Equal(t, env.Cfg.TurnCredential, body.Turn.Credential)
+	assert.Contains(t, body.WTURL, "/wt")
+	assert.Contains(t, body.WSURL, "/ws")
 
 	select {
 	case so := <-openCh:
 		require.Equal(t, proto.KindDesktop, so.Kind)
 		var p proto.DesktopParams
 		require.NoError(t, jsonUnmarshal(so.Params, &p))
-		assert.Equal(t, "webrtc", p.Signaling)
-		// 服务端 TURN 配置原样下发
-		require.NotNil(t, p.Turn)
-		assert.Equal(t, env.Cfg.TurnURLs, p.Turn.URLs)
-		assert.Equal(t, env.Cfg.TurnUsername, p.Turn.Username)
-		assert.Equal(t, env.Cfg.TurnCredential, p.Turn.Credential)
-		// 白名单剥离：客户端的 iceTransportPolicy 绝不透传（缺省 = agent 侧
-		// 强制 relay）；客户端 turn 配置被服务端配置覆盖。
-		assert.Empty(t, p.IceTransportPolicy)
+		// endpoint 只来自 server config；hostToken 只来自 relay Hub（64 hex）。
+		assert.Equal(t, env.Cfg.RTVStreamEndpoint, p.StreamEndpoint)
+		assert.Regexp(t, "^[0-9a-f]{64}$", p.HostToken)
+		// 白名单剥离：客户端的 endpoint/token 绝不透传。
 		assert.NotContains(t, string(so.Params), "evil.example")
+		assert.NotContains(t, string(so.Params), "evil-token")
 	case <-time.After(3 * time.Second):
 		t.Fatal("no SESSION_OPEN")
 	}
@@ -97,8 +90,50 @@ func TestDesktopSessionEndToEnd(t *testing.T) {
 	}, 5*time.Second, 200*time.Millisecond)
 }
 
-// TestDesktopDefaultsAndValidation：空体 = 缺省 webrtc；非法 signaling → 400；
-// 坏 JSON → 400。
+// TestDesktopHostTokenStablePerNode：HostToken 按节点签发且跨会话稳定——
+// core StartCapture 幂等复用运行中的 host，第二会话的 cfg 不会送达 host，
+// token 必须可重放；不同节点 token 不同。
+func TestDesktopHostTokenStablePerNode(t *testing.T) {
+	env := NewTestEnv(t)
+	nodeA := env.EnrollNode(t, "WEB-DT1B", "mid-dt1b")
+	nodeB := env.EnrollNode(t, "WEB-DT1C", "mid-dt1c")
+	ctrl := dialControl(t, env, nodeA)
+	opens := captureManySessionOpens(t, ctrl, 2)
+
+	tokOf := func(node string) string {
+		resp := desktopPost(t, env, node, `{}`)
+		defer resp.Body.Close()
+		require.Equal(t, 202, resp.StatusCode)
+		select {
+		case so := <-opens:
+			require.Equal(t, proto.KindDesktop, so.Kind)
+			var p proto.DesktopParams
+			require.NoError(t, jsonUnmarshal(so.Params, &p))
+			return p.HostToken
+		case <-time.After(3 * time.Second):
+			t.Fatal("no SESSION_OPEN")
+			return ""
+		}
+	}
+	assert.Equal(t, tokOf(nodeA), tokOf(nodeA), "same node must reuse the host token")
+
+	ctrlB := dialControl(t, env, nodeB)
+	openB := captureSessionOpen(t, ctrlB)
+	resp := desktopPost(t, env, nodeB, `{}`)
+	defer resp.Body.Close()
+	require.Equal(t, 202, resp.StatusCode)
+	select {
+	case so := <-openB:
+		var p proto.DesktopParams
+		require.NoError(t, jsonUnmarshal(so.Params, &p))
+		// 不同节点 token 不同（B 在 Hub 未签发过——惰性 mint）。
+		assert.NotEmpty(t, p.HostToken)
+	case <-time.After(3 * time.Second):
+		t.Fatal("no SESSION_OPEN (node B)")
+	}
+}
+
+// TestDesktopDefaultsAndValidation：空体 = 缺省；坏 JSON → 400。
 func TestDesktopDefaultsAndValidation(t *testing.T) {
 	env := NewTestEnv(t)
 	nodeID := env.EnrollNode(t, "WEB-DT2", "mid-dt2")
@@ -112,29 +147,26 @@ func TestDesktopDefaultsAndValidation(t *testing.T) {
 	case so := <-openCh:
 		var p proto.DesktopParams
 		require.NoError(t, jsonUnmarshal(so.Params, &p))
-		assert.Equal(t, "webrtc", p.Signaling)
-		assert.NotNil(t, p.Turn)
-		assert.Empty(t, p.IceTransportPolicy)
+		assert.Equal(t, env.Cfg.RTVStreamEndpoint, p.StreamEndpoint)
+		assert.NotEmpty(t, p.HostToken)
 	case <-time.After(3 * time.Second):
 		t.Fatal("no SESSION_OPEN")
 	}
 
-	for _, b := range []string{`{"signaling":"proprietary"}`, `{not json`} {
-		r := desktopPost(t, env, nodeID, b)
-		_ = r.Body.Close()
-		assert.Equal(t, 400, r.StatusCode, b)
-	}
+	r := desktopPost(t, env, nodeID, `{not json`)
+	_ = r.Body.Close()
+	assert.Equal(t, 400, r.StatusCode)
 }
 
 // TestDesktopPerNodeLimit：desktop 每节点并发默认 4（多 viewer）——第 2 个
-// 会话 202（T6 门 ③ 的第二 viewer），第 5 个 409 SESSION_LIMIT_EXCEEDED；
-// 关闭后名额归还。
+// 会话 202（第二 viewer），第 5 个 409 SESSION_LIMIT_EXCEEDED；关闭后
+// 名额归还。
 func TestDesktopPerNodeLimit(t *testing.T) {
 	env := NewTestEnv(t)
 	nodeID := env.EnrollNode(t, "WEB-DT3", "mid-dt3")
 	_ = dialControl(t, env, nodeID)
 
-	// 默认 4（含 manager.New 零值兜底，对齐 agent host max_subs=4）：前 4 发均 202
+	// 默认 4（含 manager.New 零值兜底）：前 4 发均 202
 	for i := 0; i < 4; i++ {
 		resp := desktopPost(t, env, nodeID, `{}`)
 		_ = resp.Body.Close()
@@ -161,11 +193,11 @@ func TestDesktopPerNodeLimit(t *testing.T) {
 	}, 3*time.Second, 100*time.Millisecond)
 }
 
-// TestDesktopTurnUnconfigured：无 TURN 配置的服务器 → 503 TURN_UNCONFIGURED
-// （desktop relay-only 无 TURN 不可用，拒绝开会话优于开一个必死的会话）。
-func TestDesktopTurnUnconfigured(t *testing.T) {
+// TestDesktopRtvUnconfigured：无 RTV endpoint 配置的服务器 → 503
+// RTV_UNCONFIGURED（拒绝开会话优于开一个必死的会话）。
+func TestDesktopRtvUnconfigured(t *testing.T) {
 	env := newTestEnvWithCfg(t, func(c *config.Config) {
-		c.TurnURLs, c.TurnUsername, c.TurnCredential = nil, "", ""
+		c.RTVStreamEndpoint = ""
 	})
 	nodeID := env.EnrollNode(t, "WEB-DT4", "mid-dt4")
 	_ = dialControl(t, env, nodeID)
@@ -177,7 +209,7 @@ func TestDesktopTurnUnconfigured(t *testing.T) {
 	}
 	require.Equal(t, 503, resp.StatusCode)
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&e))
-	assert.Equal(t, "TURN_UNCONFIGURED", e.Error.Code)
+	assert.Equal(t, proto.CodeRtvUnconfigured, e.Error.Code)
 }
 
 // TestDesktopRBAC：Scenario F——owner/operator → 202；viewer → 403 FORBIDDEN；
@@ -211,20 +243,11 @@ func TestDesktopRBAC(t *testing.T) {
 	}
 }
 
-// TestDesktopLeaseAndCapabilities（M2-Slice3 Task 4）：
-// ① 首会话 202 + lease{granted:true,leaseId} 且 SESSION_OPEN params 嵌入
-//
-//	同一 leaseId（REST/agent 同源）；
-//
-// ② 第二会话（并发上限内）202 + granted:false（view-only），params 无
-//
-//	leaseId；
-//
-// ③ capability 集按角色下发：owner 含 input.secure_attention/shell.system，
-//
-//	operator 含 input.mouse/keyboard 无 SAS；viewer 403（RBAC 层拒绝，
-//	capability 只对已建会话生效）。
-func TestDesktopLeaseAndCapabilities(t *testing.T) {
+// TestDesktopLease（RTV 后语义）：① 首会话 202 + lease{granted:true,
+// leaseId}（server 侧簿记，relay input 门控键——不再嵌入 agent params）；
+// ② 第二会话（并发上限内）202 + granted:false（view-only）；③ viewer
+// 403（RBAC 层拒绝）；④ 持有者关闭 → 约 → 新会话授予（仲裁移交闭环）。
+func TestDesktopLease(t *testing.T) {
 	f := newRBACFixture(t)
 	ctrl := dialControl(t, f.env, f.nodeID)
 	openCh := captureManySessionOpens(t, ctrl, 3)
@@ -241,7 +264,7 @@ func TestDesktopLeaseAndCapabilities(t *testing.T) {
 		return &body, code
 	}
 
-	// ① owner（非 admin 用户）：授予 + capability 全集。
+	// ① owner（非 admin 用户）：授予。
 	body, code := postDesk(f.tokens["owner"])
 	require.Equal(t, 202, code)
 	require.NotNil(t, body.Lease)
@@ -249,42 +272,26 @@ func TestDesktopLeaseAndCapabilities(t *testing.T) {
 	assert.Len(t, body.Lease.LeaseID, 16)
 	select {
 	case so := <-openCh:
-		var p proto.DesktopParams
-		require.NoError(t, jsonUnmarshal(so.Params, &p))
-		assert.Equal(t, body.Lease.LeaseID, p.LeaseID, "SESSION_OPEN params must embed the REST leaseId")
-		require.ElementsMatch(t, []string{
-			proto.CapScreenView, proto.CapInputMouse, proto.CapInputKeyboard,
-			proto.CapInputSecureAttn, proto.CapShellSystem,
-		}, p.Capabilities)
+		// params 绝不携带 leaseId/capability（agent 不感知输入权限；
+		// relay 门控按 manager 的 desktopLeases 表判定）。
+		assert.NotContains(t, string(so.Params), "leaseId")
+		assert.NotContains(t, string(so.Params), "capabilities")
 	case <-time.After(3 * time.Second):
 		t.Fatal("no SESSION_OPEN (owner)")
 	}
 
-	// ② operator（并发上限内第二 viewer）：view-only + operator 集。
+	// ② operator（并发上限内第二 viewer）：view-only。
 	body2, code := postDesk(f.tokens["operator"])
 	require.Equal(t, 202, code)
 	require.NotNil(t, body2.Lease)
 	assert.False(t, body2.Lease.Granted, "second concurrent session must be view-only")
-	select {
-	case so := <-openCh:
-		var p proto.DesktopParams
-		require.NoError(t, jsonUnmarshal(so.Params, &p))
-		assert.Empty(t, p.LeaseID)
-		require.ElementsMatch(t, []string{
-			proto.CapScreenView, proto.CapInputMouse, proto.CapInputKeyboard,
-		}, p.Capabilities)
-	case <-time.After(3 * time.Second):
-		t.Fatal("no SESSION_OPEN (operator)")
-	}
 
-	// ③ viewer：RBAC 拒绝（403）——capability 集只对已建会话有意义。
+	// ③ viewer：RBAC 拒绝（403）。
 	_, code = postDesk(f.tokens["viewer"])
 	assert.Equal(t, 403, code)
 
-	// 持有者关闭 → 约 → 新会话授予（server 仲裁移交闭环）。
-	// SessionsOf 是 map 序遍历（随机序），sess[0] 不保证是持有者——并发上限内
-	// 还有 operator 的 view-only 会话，误关它会留下未释放的约导致断言抖动。
-	// 全部关闭使「持有者关闭释放约」断言与遍历顺序无关。
+	// 持有者关闭 → 约 → 新会话授予。SessionsOf 是 map 序遍历（随机序），
+	// 全部关闭使断言与遍历顺序无关。
 	for _, s := range f.env.Sess.SessionsOf(mustUUID(f.nodeID), proto.KindDesktop) {
 		f.env.Sess.NotifyClose(s.ID, "test")
 	}
@@ -292,125 +299,4 @@ func TestDesktopLeaseAndCapabilities(t *testing.T) {
 	require.Equal(t, 202, code)
 	require.NotNil(t, body3.Lease)
 	assert.True(t, body3.Lease.Granted, "lease must be re-grantable after holder close")
-}
-
-// openDesktopForMedia 起一套 env（可变异 config）+ 节点 + 控制连接，开一个
-// desktop 会话并返回（REST 响应体, SESSION_OPEN params, env, nodeID）。
-// M4 Task 4 的 mediaProtocol 回环共用。
-func openDesktopForMedia(t *testing.T, mutate func(*config.Config), body string) (*desktopOpenResp, json.RawMessage, *TestEnv, string) {
-	t.Helper()
-	env := newTestEnvWithCfg(t, func(c *config.Config) {
-		// desktop 会话需要 TURN（NewTestEnv 同款注入；openDesktopForMedia
-		// 不配置 TURN 时 503 TURN_UNCONFIGURED 先于媒体断言）。
-		c.TurnURLs = []string{"turn:test-turn:3478?transport=tcp", "turn:test-turn:3478"}
-		c.TurnUsername = "testuser"
-		c.TurnCredential = "testcred"
-		if mutate != nil {
-			mutate(c)
-		}
-	})
-	nodeID := env.EnrollNode(t, "WEB-MEDIA", "mid-media")
-	ctrl := dialControl(t, env, nodeID)
-	openCh := captureSessionOpen(t, ctrl)
-
-	resp := desktopPost(t, env, nodeID, body)
-	defer resp.Body.Close()
-	require.Equal(t, 202, resp.StatusCode)
-	var body202 desktopOpenResp
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body202))
-
-	select {
-	case so := <-openCh:
-		require.Equal(t, proto.KindDesktop, so.Kind)
-		return &body202, so.Params, env, nodeID
-	case <-time.After(3 * time.Second):
-		t.Fatal("no SESSION_OPEN")
-		return nil, nil, nil, ""
-	}
-}
-
-// TestDesktopMediaProtocolRollout（M4 Task 4）：百分比 100 → 一切新会话选
-// v2：SESSION_OPEN params、REST 202、manager 快照三处同源；客户端提交的
-// mediaProtocol 被白名单剥离（server 独占控制点）；审计行携带选定值。
-func TestDesktopMediaProtocolRollout(t *testing.T) {
-	body, openParams, env, nodeID := openDesktopForMedia(t, func(c *config.Config) {
-		c.DesktopMediaV2Percent = 100
-	}, `{"mediaProtocol":"v1"}`) // 客户端试图倒退回 v1——必须被忽略
-
-	assert.Equal(t, proto.MediaProtocolV2, body.MediaProtocol,
-		"REST body must report the server-selected protocol")
-
-	var p proto.DesktopParams
-	require.NoError(t, jsonUnmarshal(openParams, &p))
-	assert.Equal(t, proto.MediaProtocolV2, p.MediaProtocol,
-		"SESSION_OPEN params must embed the server selection (client value stripped)")
-
-	// 快照语义：manager 存的 params 与 SESSION_OPEN 下发的逐字节一致——
-	// 选择在会话打开时定死，live 会话没有重选路径。
-	sess := env.Sess.SessionsOf(mustUUID(nodeID), proto.KindDesktop)
-	require.NotEmpty(t, sess)
-	assert.JSONEq(t, string(openParams), string(sess[0].Params),
-		"stored session params must equal SESSION_OPEN params (selection snapshotted at open)")
-
-	// 审计：desktop.open 行携带 mediaProtocol（canary 运维证据）。
-	require.Eventually(t, func() bool {
-		var n int
-		require.NoError(t, env.Store.Pool().QueryRow(t.Context(),
-			`SELECT count(*) FROM audit_logs WHERE action = 'desktop.open'`+
-				` AND metadata ->> 'mediaProtocol' = 'v2'`).Scan(&n))
-		return n >= 1
-	}, 5*time.Second, 200*time.Millisecond)
-}
-
-// TestDesktopMediaProtocolDefaultAndRollback（M4 Task 4）：未配置（百分比 0）
-// → fail closed 到 v1；回滚开关开着时即使百分比 100 也一切新会话 v1。
-func TestDesktopMediaProtocolDefaultAndRollback(t *testing.T) {
-	// 缺省：未配置 rollout → v1。
-	body, openParams, _, _ := openDesktopForMedia(t, nil, `{}`)
-	assert.Equal(t, proto.MediaProtocolV1, body.MediaProtocol)
-	var p proto.DesktopParams
-	require.NoError(t, jsonUnmarshal(openParams, &p))
-	assert.Equal(t, proto.MediaProtocolV1, p.MediaProtocol)
-
-	// 回滚：百分比 100 + 回滚开关 → 新会话仍 v1（allowlist 胜百分比、
-	// 回滚胜一切的纯单测见 desktop_media_select_test.go）。
-	body2, openParams2, _, _ := openDesktopForMedia(t, func(c *config.Config) {
-		c.DesktopMediaV2Percent = 100
-		c.DesktopMediaV2Rollback = true
-	}, `{}`)
-	assert.Equal(t, proto.MediaProtocolV1, body2.MediaProtocol, "rollback must pin all new sessions to v1")
-	var p2 proto.DesktopParams
-	require.NoError(t, jsonUnmarshal(openParams2, &p2))
-	assert.Equal(t, proto.MediaProtocolV1, p2.MediaProtocol)
-}
-
-// TestDesktopICEPolicy（M4 Task 7）：缺省（config 未配置）→ SESSION_OPEN
-// params 不携带 iceTransportPolicy（agent 侧强制 relay，行为与旧版一致）；
-// server config 显式 "all"（XNC_DESKTOP_ICE_POLICY，env → 字段的解析见
-// config 包 TestDesktopICEPolicyEnv）→ params 携带 proto.DesktopIceAll，
-// 允许 LAN 直连候选。客户端提交的 iceTransportPolicy 无论何种配置都绝不透传。
-func TestDesktopICEPolicy(t *testing.T) {
-	// ① 缺省：无配置 → 不下发字段（= agent relay-only）。
-	_, openParams, _, _ := openDesktopForMedia(t, nil,
-		`{"iceTransportPolicy":"all"}`) // 客户端试图放开——必须被白名单剥离
-	var p proto.DesktopParams
-	require.NoError(t, jsonUnmarshal(openParams, &p))
-	assert.Empty(t, p.IceTransportPolicy,
-		"default config must not send iceTransportPolicy (agent enforces relay)")
-
-	// ② server config "all" → params 携带 DesktopIceAll；客户端提交值
-	//（试图钉回 relay）仍被剥离，server 独占控制点。
-	_, openParams2, env2, nodeID2 := openDesktopForMedia(t, func(c *config.Config) {
-		c.DesktopICEPolicy = proto.DesktopIceAll
-	}, `{"iceTransportPolicy":"relay"}`)
-	var p2 proto.DesktopParams
-	require.NoError(t, jsonUnmarshal(openParams2, &p2))
-	assert.Equal(t, proto.DesktopIceAll, p2.IceTransportPolicy,
-		"config all must inject proto.DesktopIceAll into SESSION_OPEN params")
-
-	// 快照语义：manager 存的 params 与 SESSION_OPEN 下发逐字节一致（ICE
-	// policy 同 mediaProtocol 一样在会话打开时定死）。
-	sess := env2.Sess.SessionsOf(mustUUID(nodeID2), proto.KindDesktop)
-	require.NotEmpty(t, sess)
-	assert.JSONEq(t, string(openParams2), string(sess[0].Params))
 }

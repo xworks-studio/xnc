@@ -1,34 +1,34 @@
 package api
 
 import (
+	"crypto/tls"
 	"log/slog"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 
 	"xnc/server"
 	"xnc/server/internal/auth"
 	"xnc/server/internal/config"
 	"xnc/server/internal/db"
 	"xnc/server/internal/registry"
+	"xnc/server/internal/rtv"
 	"xnc/server/internal/session"
 	"xnc/server/internal/version"
 )
 
 type handlers struct {
-	st       *db.Store
-	cfg      config.Config
-	reg      *registry.Registry
-	sess     *session.Manager
-	turnPool *TurnPoolManager // XNC_TURN_POOL 配置时非 nil（后台健康探测随 router 生命周期 Start/Stop）
+	st   *db.Store
+	cfg  config.Config
+	reg  *registry.Registry
+	sess *session.Manager
+	rtv  *rtv.Server // RTV 中继（desktop 媒体面；XNC_RTV_ENDPOINT 未配置时腿仍监听但会话 503）
 }
 
-// Close 停止 handler 的后台 worker（TURN 池健康探测）。生产经 NewApp().Close()
-// 在 cmd/xnc-server/main.go 优雅停机时调用；测试直接经 manager.Stop() 治理。
+// Close 停止 handler 的后台 worker（RTV 中继随进程生命周期，无独立停止面）。
+// 生产经 NewApp().Close() 在 cmd/xnc-server/main.go 优雅停机时调用。
 func (h *handlers) Close() error {
-	if h.turnPool != nil {
-		h.turnPool.Stop()
-	}
 	return nil
 }
 
@@ -79,11 +79,36 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		sess.DesktopIdleTimeout = cfg.DesktopIdleTimeout
 	}
 	h := &handlers{st: st, cfg: cfg, reg: reg, sess: sess}
-	// 池配置（XNC_TURN_POOL 非空）→ 启动后台健康探测；未配置 → nil，desktop
-	// turnConfig 走旧路径（XNC_TURN_URLS 全列表），行为与现状完全一致。
-	if len(cfg.TurnPool) > 0 {
-		h.turnPool = NewTurnPoolManager(cfg.TurnPool, cfg.TurnUsername, cfg.TurnCredential)
-		h.turnPool.Start()
+	// RTV 中继（desktop 媒体面）：host QUIC + WT 两腿绑 UDP；WS 兜底腿挂主
+	// mux（/ws，经 caddy TCP443 反代）。viewer 鉴权 = 会话 client token；
+	// input 门控 = per-node 输入活约（janitor TTL 撤约语义不变）。
+	var tlsProv func([]string) *tls.Config
+	if cfg.RTVCertFile != "" && cfg.RTVKeyFile != "" {
+		tlsProv = rtv.CertFiles(cfg.RTVCertFile, cfg.RTVKeyFile)
+	} else {
+		tlsProv = rtv.DevSelfSigned()
+	}
+	h.rtv = rtv.New(rtv.Options{HostAddr: cfg.RTVHostAddr, WTAddr: cfg.RTVWTAddr},
+		tlsProv,
+		func(token string) (rtv.ViewerBinding, *rtv.AuthError) {
+			node, sid, aerr := sess.AttachClientRTV(token)
+			if aerr != nil {
+				return rtv.ViewerBinding{}, &rtv.AuthError{Status: aerr.Status, Message: aerr.Message}
+			}
+			return rtv.ViewerBinding{Node: node.String(), Session: sid}, nil
+		},
+		cfg.RTVWSOrigins)
+	h.rtv.Touch = sess.TouchActivity
+	h.rtv.Hub.SetInputGate(func(node, sessionID string) bool {
+		n, err := uuid.Parse(node)
+		if err != nil {
+			return false
+		}
+		holder, _ := sess.DesktopLeaseOf(n)
+		return holder != "" && holder == sessionID
+	})
+	if err := h.rtv.Start(); err != nil {
+		slog.Error("rtv legs failed to start", "err", err)
 	}
 	r := chi.NewRouter()
 
@@ -118,10 +143,10 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		ur.Get("/", h.listUsers)
 	})
 
-	// TURN 服务状态（监控页）：用户 JWT；凭据与会话下发同源（设计 §3.1）。
-	r.Route("/api/turn", func(tr chi.Router) {
+	// RTV 中继观测面（管理端；原 MVP /statsz 的收权版本）。
+	r.Route("/api/rtv", func(tr chi.Router) {
 		tr.Use(auth.Middleware(cfg.JWTSecret, st))
-		tr.Get("/status", h.turnStatus)
+		tr.Get("/stats", h.rtvStats)
 	})
 
 	// 审计查询：admin-only，可选过滤 + 分页（handler 内判定）。
@@ -146,6 +171,8 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 	// 会话 WS（两侧均 token 即凭证，不走 JWT）
 	r.Get("/api/session/{id}", h.clientSessionWS)
 	r.Get("/api/agent/session", h.agentSessionWS)
+	// RTV WS 兜底腿（token 即凭证；经 caddy TCP443 → 主 mux）
+	r.Get("/ws", h.rtv.WSHandler())
 
 	// 自更新管理面（admin：部署流水线上传制品 + 灰度 pin/强制下发）
 	r.Route("/api/admin", func(ar chi.Router) {
@@ -184,8 +211,8 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		nr.Post("/{id}/tunnel", h.tunnelStart)
 		// screen：桌面流会话，kind=screen（Phase 6，DXGI+H.264），startSession 路径
 		nr.Post("/{id}/screen", h.screenStart)
-		// desktop：实时桌面会话（M1-Slice2，WebRTC relay-only + TURN），startSession
-		// 路径；TURN 未配置 → 503 TURN_UNCONFIGURED，每节点并发上限（默认 4）+ idle 治理
+		// desktop：实时桌面会话（RTV 中继），startSession 路径；
+		// XNC_RTV_ENDPOINT 未配置 → 503 RTV_UNCONFIGURED，每节点并发上限 + idle 治理
 		nr.Post("/{id}/desktop", h.desktopStart)
 		// 管理动作：owner-only（handler 内经 requireMinRoleIgnoreDisabled 判定）
 		nr.Post("/{id}/disable", h.nodeDisable)
