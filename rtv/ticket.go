@@ -245,6 +245,7 @@ func (v *Verifier) SetKeys(pubHexes []string) error {
 //     踩坑：host 全部 401、换血后也注册不上）。
 //   - sessionID 为空且 nodeID 非空 = 节点级撤销（管理端禁用/删除节点）：
 //     记节点键，挡下该节点全部 host 张。
+//
 // 保留期覆盖最长票 exp。
 func (v *Verifier) Kill(nodeID, sessionID string) {
 	now := time.Now()

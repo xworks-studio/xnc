@@ -488,3 +488,32 @@ func TestControlFlow(t *testing.T) {
 		t.Fatalf("AddViewer must unicast controlState, got %v", m)
 	}
 }
+
+// TestLeaseRenewalOnViewerActivity — 持约续约回归（真机踩坑：接管 60s
+// 后鼠标失效——Arbiter.Touch 无调用者，租约失活后 input 被静默丢弃）：
+// viewer 控制帧续约则活约跨 TTL 存活；无活动则按 TTL 失活。
+func TestLeaseRenewalOnViewerActivity(t *testing.T) {
+	hub := &Hub{arbiter: NewArbiter()}
+	v := &stubViewer{node: "n1", sess: "sess-A", control: true, input: true}
+	inputMsg := mustJSON(map[string]any{"type": "input", "event": "mouse", "kind": "move"})
+
+	if ok, reason := hub.arbiter.Take("n1", "sess-A", "t", true); !ok {
+		t.Fatalf("take: %v", reason)
+	}
+	// 回溯 2 分钟：无续约 → 门控失效。
+	hub.arbiter.mu.Lock()
+	hub.arbiter.leases["n1"].LastActivity = time.Now().Add(-2 * time.Minute)
+	hub.arbiter.mu.Unlock()
+	if hub.gateInputFor(v) {
+		t.Fatal("stale lease must gate input")
+	}
+	// viewer 活动续约（心跳/任何控制帧）→ 跨 TTL 门控放行。
+	hub.arbiter.mu.Lock()
+	hub.arbiter.leases["n1"].LastActivity = time.Now().Add(-2 * time.Minute)
+	hub.arbiter.mu.Unlock()
+	hub.TouchViewer("n1", "sess-A")
+	if !hub.gateInputFor(v) {
+		t.Fatal("renewed lease must pass input gate")
+	}
+	_ = inputMsg
+}

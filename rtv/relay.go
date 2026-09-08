@@ -218,6 +218,14 @@ func (g *Hub) emit(typ, node, session string) {
 	}
 }
 
+// TouchViewer 持约 viewer 的活动续约：任何控制帧（心跳/反馈/input）都算
+// ——web 心跳 1s 一发 << 60s TTL，连接在即活约在；离场由 RemoveViewer
+// 撤约。此前漏接导致接管 60s 后租约失活、input 被静默丢弃（真机表现：
+// 获得控制权一段时间后鼠标失效，UI 仍显示持控）。
+func (g *Hub) TouchViewer(node, session string) {
+	g.arbiter.Touch(node, session)
+}
+
 // gateInputFor input 门控：持有活约（TTL 内）且票据 cap.input。
 func (g *Hub) gateInputFor(v Viewer) bool {
 	holder, _ := g.arbiter.Holder(v.Node())

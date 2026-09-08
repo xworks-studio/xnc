@@ -57,6 +57,7 @@ func (s *Server) handleWSSession(binding ViewerBinding, c *websocket.Conn) {
 			continue // 忽略二进制上行
 		}
 		s.Host.Touch(v.Session())
+		s.Hub.TouchViewer(v.Node(), v.Session()) // 持约续约（见 TouchViewer 注释）
 		if err := json.Unmarshal(data, &m); err != nil {
 			slog.Warn("rtv: bad ws json", "err", err)
 			continue

@@ -152,6 +152,7 @@ func (s *Server) serveViewerLoop(v Viewer, r io.Reader) {
 
 	err := readCtrlFrames(r, func(b json.RawMessage) bool {
 		s.Host.Touch(v.Session())
+		s.Hub.TouchViewer(v.Node(), v.Session()) // 持约续约（见 TouchViewer 注释）
 		var m struct {
 			Type string `json:"type"`
 			Role string `json:"role"`
