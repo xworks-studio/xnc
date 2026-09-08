@@ -9,6 +9,7 @@ param(
     [string]$Server = "wss://xnc.app/api/relay/connect",
     [Parameter(Mandatory = $true)][string]$PublicHost,
     [string]$Region = "cn-hangzhou",
+    [string]$AllowOrigin = "https://xnc.app",
     [int]$MaxSessions = 100,
     [int]$MaxMbpsOut = 500,
     [switch]$SkipDeploy
@@ -34,6 +35,6 @@ if ($SkipDeploy) { Write-Host "-SkipDeploy: done."; exit 0 }
 
 Write-Host "== deploy to relay host =="
 py -3 "$repo\deploy\push_relay.py" $out --server $Server --public-host $PublicHost `
-    --region $Region --max-sessions $MaxSessions --max-mbps-out $MaxMbpsOut
+    --region $Region --allow-origin $AllowOrigin --max-sessions $MaxSessions --max-mbps-out $MaxMbpsOut
 if ($LASTEXITCODE -ne 0) { throw "push_relay.py failed" }
 Write-Host "relay deployed. Approve at server if pending: PATCH /api/admin/relays/{id}"

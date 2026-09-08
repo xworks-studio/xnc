@@ -27,6 +27,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -34,6 +35,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -56,6 +58,7 @@ func main() {
 		hostPort    = flag.Int("host-port", 4433, "注册端点：host 腿对外端口")
 		wtPort      = flag.Int("wt-port", 443, "注册端点：WT 腿对外端口")
 		region      = flag.String("region", "", "区域标签（分配打分的区域权重）")
+		allowOrigin = flag.String("allow-origin", "", "WT 腿放行的页面 Origin（逗号分隔，如 https://xnc.app）——跨 host 外部 relay 必配：同 host 校验对 主站页面→relay 地址 的连接必拒")
 		maxSessions = flag.Int("max-sessions", 100, "容量声明：并发会话上限（打分用）")
 		maxMbpsOut  = flag.Int("max-mbps-out", 500, "容量声明：出带宽上限 Mbps")
 	)
@@ -76,8 +79,11 @@ func main() {
 	// relay id：首注册由 server 分配（挑战回传），此后持久化复用。
 	relayID := loadRelayID(*dataDir)
 
-	// 自签证书 + 钉扎指纹（纯 IP 模式的浏览器可用性来源）。
-	tlsProv, certSHA := selfSignedTLS()
+	// 自签证书 + 钉扎指纹（纯 IP 模式的浏览器可用性来源）。有效期 7 天
+	// 持久化：WebTransport serverCertificateHashes 钉扎规范要求证书有效
+	// 期 ≤14 天（825 天的通用自签会被浏览器拒绝——真机验收踩坑）；剩余
+	// <24h 自动重签，指纹随注册端点自动流转到新会话。
+	tlsProv, certSHA := loadOrCreateCert(*dataDir)
 
 	// 验票器：bootstrap 态空钥（RELAY_CONFIG 到达前全拒——无会话无害）。
 	verifier, err := rtv.NewVerifier(nil)
@@ -87,9 +93,16 @@ func main() {
 	}
 	host := &rtv.SimpleHost{Verifier: verifier}
 
+	var allowOrigins []string
+	for _, o := range strings.Split(*allowOrigin, ",") {
+		if o = strings.TrimSpace(o); o != "" {
+			allowOrigins = append(allowOrigins, o)
+		}
+	}
 	srv := rtv.New(rtv.Options{
 		HostAddr: *hostAddr, WTAddr: *wtAddr,
-		RelayID: relayID, // 空则首个合法 host hello 之前由控制连接回填
+		RelayID:        relayID, // 空则首个合法 host hello 之前由控制连接回填
+		WTAllowOrigins: allowOrigins,
 	}, tlsProv, host, nil)
 	if err := srv.Start(); err != nil {
 		log.Error("legs start", "err", err)
@@ -378,19 +391,31 @@ func saveRelayID(dir, id string) {
 	_ = os.WriteFile(filepath.Join(dir, "relay.json"), b, 0o600)
 }
 
-// selfSignedTLS 自签证书（纯 IP 模式）：进程生命周期内固定，指纹随注册
-// 端点下发（浏览器 serverCertificateHashes / host cfg certSha256 钉扎）。
-func selfSignedTLS() (func([]string) *tls.Config, string) {
+// loadOrCreateCert 自签证书（纯 IP 模式）：有效期 7 天（WebTransport
+// serverCertificateHashes 钉扎要求证书有效期 ≤14 天）、落盘复用（剩余
+// >24h）、到期重签。指纹随注册端点下发（浏览器 serverCertificateHashes /
+// host cfg certSha256 钉扎）。
+func loadOrCreateCert(dir string) (func([]string) *tls.Config, string) {
+	certPath := filepath.Join(dir, "wt-cert.pem")
+	keyPath := filepath.Join(dir, "wt-key.pem")
+	if cert, err := tls.LoadX509KeyPair(certPath, keyPath); err == nil {
+		if leaf, err := x509.ParseCertificate(cert.Certificate[0]); err == nil &&
+			time.Until(leaf.NotAfter) > 24*time.Hour {
+			sum := sha256.Sum256(cert.Certificate[0])
+			log.Info("wt cert loaded", "notAfter", leaf.NotAfter.Format(time.RFC3339))
+			return tlsProvider(cert), hex.EncodeToString(sum[:])
+		}
+	}
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		log.Error("cert keygen", "err", err)
 		os.Exit(1)
 	}
 	tpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
+		SerialNumber: big.NewInt(time.Now().Unix()),
 		Subject:      pkix.Name{CommonName: "xnc-relay"},
 		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(825 * 24 * time.Hour),
+		NotAfter:     time.Now().Add(7 * 24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
@@ -399,15 +424,24 @@ func selfSignedTLS() (func([]string) *tls.Config, string) {
 		log.Error("cert create", "err", err)
 		os.Exit(1)
 	}
+	// 落盘（0600）；失败不致命——进程内证书仍可用，重启换指纹而已。
+	keyDER, _ := x509.MarshalECPrivateKey(key)
+	_ = os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600)
+	_ = os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600)
 	sum := sha256.Sum256(der)
 	cert := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+	log.Info("wt cert generated", "notAfter", tpl.NotAfter.Format(time.RFC3339))
+	return tlsProvider(cert), hex.EncodeToString(sum[:])
+}
+
+func tlsProvider(cert tls.Certificate) func([]string) *tls.Config {
 	return func(alpn []string) *tls.Config {
 		return &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			NextProtos:   alpn,
 			MinVersion:   tls.VersionTLS13,
 		}
-	}, hex.EncodeToString(sum[:])
+	}
 }
 
 func mustJSON(v any) json.RawMessage {

@@ -11,6 +11,7 @@ ExecStart=/usr/local/bin/xnc-relay \
   --public-host {{PUBLIC_HOST}} \
   --data-dir /var/lib/xnc-relay \
   --region {{REGION}} \
+  --allow-origin {{ALLOW_ORIGIN}} \
   --max-sessions {{MAX_SESSIONS}} \
   --max-mbps-out {{MAX_MBPS_OUT}}
 Restart=always

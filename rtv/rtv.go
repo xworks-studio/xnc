@@ -63,6 +63,9 @@ type Server struct {
 	wtAddr   string // UDP（如 ":443"）
 	hostAddr string // host 腿 QUIC（如 ":4433"）
 
+	// wtAllowOrigins 额外放行 Origin 精确匹配表（见 Options.WTAllowOrigins）。
+	wtAllowOrigins map[string]bool
+
 	// 实际监听地址（":0" → ephemeral 后回填；测试读取）。
 	addrMu       sync.Mutex
 	hostAddrInfo string
@@ -81,6 +84,12 @@ type Options struct {
 	HostAddr string // host 腿 QUIC 监听（如 ":4433"）
 	WTAddr   string // 浏览器 WT 腿 UDP 监听（如 ":443"）
 	RelayID  string // 本中继 rid（空 = EmbeddedRelayID）
+	// WTAllowOrigins WT 腿放行的额外 Origin（形如 https://xnc.app，与
+	// Origin 头精确匹配；空 = 仅同 host——嵌入 relay-0 的现状语义）。
+	// 跨 host 外部 relay 必配：页面 Origin 是主站域而请求 Host 是
+	// relay 地址，同 host 校验必拒；会话票据才是本腿真实凭据，Origin
+	// 仅防跨站冒用。
+	WTAllowOrigins []string
 }
 
 // New 组装 RTV 服务器（不监听；Start 才绑端口）。
@@ -89,8 +98,14 @@ func New(opts Options, tlsCfg func(alpn []string) *tls.Config,
 	if opts.RelayID == "" {
 		opts.RelayID = EmbeddedRelayID
 	}
+	origins := map[string]bool{}
+	for _, o := range opts.WTAllowOrigins {
+		if o != "" {
+			origins[o] = true
+		}
+	}
 	s := &Server{Hub: NewHub(), Host: host, TLSConfig: tlsCfg,
-		WSOrigins: wsOrigins, RelayID: opts.RelayID}
+		WSOrigins: wsOrigins, RelayID: opts.RelayID, wtAllowOrigins: origins}
 	s.Hub.events = host.SessionEvent
 	s.wtAddr = opts.WTAddr
 	s.hostAddr = opts.HostAddr

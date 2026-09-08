@@ -44,6 +44,23 @@ func wtSameHost(r *http.Request) bool {
 	return oh != "" && strings.EqualFold(oh, rh)
 }
 
+// wtCheckOrigin：空 Origin 放行（非浏览器客户端）；同 host 放行；
+// 其余按 wtAllowOrigins 精确匹配（Origin 头原样形态，默认端口省略）。
+func (s *Server) wtCheckOrigin(r *http.Request) bool {
+	if wtSameHost(r) {
+		return true
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	if s.wtAllowOrigins[origin] {
+		return true
+	}
+	slog.Warn("rtv: wt origin rejected", "origin", origin, "host", r.Host)
+	return false
+}
+
 func (s *Server) serveWTLeg(addr string) error {
 	udp, err := net.ListenUDP("udp", mustResolveUDP(addr))
 	if err != nil {
@@ -56,11 +73,12 @@ func (s *Server) serveWTLeg(addr string) error {
 			TLSConfig:       s.TLSConfig([]string{"h3"}),
 			EnableDatagrams: true,
 		},
-		// 库缺省做严格同源（含端口）校验：过渡期 WT 走非规范端口（14433）时
-		// Origin=https://xnc.app 与 Host=xnc.app:14433 端口不一致被拒
-		//（"request origin not allowed"，生产实测）。放宽为同 host 校验：
-		// 会话 token 才是本腿的真实凭据，Origin 仅防跨站冒用。
-		CheckOrigin: wtSameHost,
+		// 库缺省做严格同源（含端口）校验：放宽为"同 host 或显式放行表"。
+		// 同 host 覆盖嵌入 relay-0（含非规范端口的过渡形态，生产实测踩坑）；
+		// 跨 host 外部 relay 的页面 Origin 是主站域（Origin=https://xnc.app
+		// vs Host=47.x.x.x），必须经 WTAllowOrigins 显式放行——会话票据
+		// 才是本腿的真实凭据，Origin 仅防跨站冒用。
+		CheckOrigin: s.wtCheckOrigin,
 	}
 	mux.HandleFunc(wtMuxPath, func(w http.ResponseWriter, r *http.Request) {
 		binding, apiErr := s.authViewer(r.URL.Query().Get("token"))
