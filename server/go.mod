@@ -13,6 +13,7 @@ require (
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.44.0
 	golang.org/x/crypto v0.55.0
 	xnc/proto v0.0.0-00010101000000-000000000000
+	xnc/rtv v0.0.0-00010101000000-000000000000
 )
 
 require (
@@ -69,3 +70,5 @@ require (
 )
 
 replace xnc/proto => ../proto
+
+replace xnc/rtv => ../rtv
