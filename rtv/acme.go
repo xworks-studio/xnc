@@ -23,8 +23,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/certificate"
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/lego"
 	"github.com/go-acme/lego/v4/providers/dns/alidns"
 	"github.com/go-acme/lego/v4/registration"

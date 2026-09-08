@@ -14,9 +14,10 @@ XNC = Windows 节点远程管理平台：Go server（xnc.app）+ Windows agent
 
 ```
                  ┌─ SRV（阿里云，xnc.app）docker：caddy(TLS) ─ xnc-server ─ postgres
-                 │                                    coturn(TURN)   watchtower(自动更新)
+                 │                                    cert-sync(LE 证书同步)  watchtower(已停用)
    浏览器 ───────┤  TCP443(caddy)：Web UI / REST / RTV WS 兜底腿（/ws）
-                 │  UDP443：RTV WebTransport 主路（H3，ACME 真实 CA 证书）
+                 │  UDP443：RTV WebTransport 主路（H3，LE 真实 CA 证书；
+                 │    过渡期安全组未放行 443/udp，浏览器暂走 14433/udp）
                  │  分发：/installer + /installer.json + /download 页（无认证）
                  │
    Windows 节点 ─┘  纯出站 wss 控制连接（agent 自报版本，server 推送更新）
@@ -28,21 +29,26 @@ XNC = Windows 节点远程管理平台：Go server（xnc.app）+ Windows agent
      用户流：装安装器（零凭据）→ xnc register（登录→选 cluster→秒级上线）
 ```
 
-- **交付面**：agent/CLI 经 Inno Setup 安装器（手动触发 release.yml（版本号
-  输入，CI 在 main HEAD 打 tag）→ 签名构建 → **GitHub Release 即发布终点**；
-  生产 server 的 installersync 定时拉回本地 release store，在线节点自更新）；
-  server 经 build-server.yml（**手动触发、版本号输入** → GHCR
-  `v<版本>+latest+sha` → Watchtower 轮询 `:latest` 自动换版）。
+- **交付面**：agent/CLI 经 Inno Setup 安装器（**现行路径：本地
+  `installer/build.ps1` 签名构建 → 管理员 API `POST /api/admin/releases`
+  直传生产 release store**；CI publish.yml 因 vcpkg 陈旧 ffmpeg 基线暂不可
+  用，修复后恢复"tag+GitHub Release+installersync 拉回"的正规路径）；
+  server 经 `deploy/build-server-local.ps1`（本地 docker build → save →
+  SFTP → SRV load + `up -d --no-pull`；watchtower 已在 SRV 停用，CI
+  build-server.yml → GHCR 保留为备用通道）。
 - **信任**：自签 Authenticode（安装器内置信任装卸）；更新 sha256 强校验 +
   回滚看门狗；凭据唯一源 `deploy/.env`。
-- **开发流**：worktree 分支 → PR（ci.yml 五矩阵门禁）→ main。实验机
+- **开发流**：worktree 分支 → PR（ci.yml 六矩阵门禁：go-linux/go-windows/
+  web/native/host-rust/installer-dryrun）→ main。实验机
   XIAOXIN/TB16G7（PS remoting），本机不装产品组件。
 
 模块地图（Go workspace，`go.work` 串联）：`proto`（协议）· `server`（控制面，
 chi + sqlc + 真 PG 测试）· `agent`（节点侧，Windows 服务）· `cli` · `shellhost`
 （ConPTY 宿主）· `mockagent`（负载/一致性测试用，**保留勿删**）· `shellsmoke` ·
-`tools/{desktopreport,e2eviewer,nalcheck}`（桌面报告/e2e 回放/码流分析，均在职）。
-`native/` 为 C++（core=SYSTEM 管道服务、desktop=桌面会话、common=共享头）。
+`tools/{desktopreport,rtvload,nalcheck}`（桌面报告/RTV 合成查看器/码流
+分析，均在职）。`native/` 为 C++（core=SYSTEM 管道服务、common=共享头；
+desktop 已随 RTV 重构删除）。`host/` 为 Rust crate `xnc-host`（桌面采集/
+编码/FEC/QUIC 发送），vendor 依赖在 `third_party/scrap`（rustdesk fork 裁剪）。
 `web/` 为 React+Vite（产物嵌入 server 二进制）。`installer/` 为 Inno Setup 打包。
 
 ## 2. 硬性契约（违反即事故）
@@ -84,53 +90,63 @@ chi + sqlc + 真 PG 测试）· `agent`（节点侧，Windows 服务）· `cli` 
 - 遗留坑：`agent/session` 存在预存在的 GOOS=linux 构建失败（非 Windows 路径），
   与新改动无关时勿"顺手修"。
 
-## 4. 部署流程（server → xnc.app，GHCR + Watchtower）
+## 4. 部署流程（server → xnc.app，本地构建直推）
 
-**部署 = 手动触发 `build-server` workflow，输入版本号（X.Y.Z[-dev]）**：
-CI 构建当前 main 的 web + 版本镜像 → 推 GHCR（`v<版本>` + `latest` +
-`sha-<哈希>`）；SRV 上的 Watchtower（compose 内独立容器，5 分钟轮询、
-label 圈定仅管 xnc-server，跟踪 `:latest`）自动拉取重建——触发后约
-5–10 分钟线上换版。server 发布节奏由人决定，不随 push main 自动出。
+**部署（现行）= 本地跑 `deploy/build-server-local.ps1`**：本地 docker
+build（web dist + 版本镜像）→ `docker save` → SFTP 上 SRV → `docker load`
++ tag `latest` → `compose up -d --no-pull`。SRV 上的 watchtower 已停用
+（2026-09-08 运维决策：不走远端构建/注册表中转，省时且可控）；CI 的
+`build-server` workflow（→ GHCR `v<版本>+latest+sha`）保留为备用通道，
+启用需在 SRV 重启 watchtower。server 发布节奏由人决定，不随 push main
+自动出。
 
-- **触发**：Actions → build-server → Run workflow → 填版本号（须先合入
-  main；版本格式 X.Y.Z[-dev]，段 ≤4 位）。
+- **本地路径**：`powershell deploy/build-server-local.ps1 -ServerVersion <v>`
+  （参数名刻意避开 -Version——powershell.exe -File 会把它吞作引擎参数；
+  远端推送经 deploy/push_server_image.py 走 paramiko 密码认证，凭据读
+  `deploy/.env` 的 SRV_* 键）。
+- **备用 CI 路径**：Actions → build-server → Run workflow → 填版本号
+  （须先合入 main；格式 X.Y.Z[-dev]，段 ≤4 位）→ 等 watchtower 轮询换版。
 - **验证**：`curl https://xnc.app/api/health` 的 version == 输入的版本号。
 - **锁版本/回滚**：改 compose 的镜像 tag 为 `:vX.Y.Z` 或 `:sha-<哈希>`
   后 `up -d`（SRV 上直接改，改完记得回改仓库保持一致）。
 - **Caddyfile 变更**仍需 SSH：替换文件后 `docker compose up -d
   --force-recreate caddy`（tar/编辑器换文件产生新 inode，restart 不够，
   必须重建容器重绑挂载——域名翻转时实战踩过）。
-- **turnserver.conf 是模板**：`${VAR}` 须经 `deploy_srv.py up` 渲染才可用。
-  `push` 的 tar 会把未渲染模板直接盖到 SRV——之后 recreate coturn 前必须
-  先渲染，否则字面量 `${...}` 入配置（2026-09-06 发现的隐患）。relay-ip
-  已刻意移除：静态容器 IP 会随 compose 网络重建漂移，导致所有 TURN 分配
-  508（生产实测）；coturn 自动选本机地址，公网映射只靠 external-ip。
+- **turnserver/coturn 已退役**（2026-09-08 随 RTV 重构移出 compose）：RTV
+  走 QUIC/WT，TURN 无用户。`deploy/turnserver.conf` 模板与 `deploy_srv.py`
+  的渲染逻辑仅为 pre-RTV 回滚窗口保留；compose 里 coturn 服务已删，回滚需
+  先恢复旧 compose 再渲染（`${VAR}` 模板不能直用，2026-09-06 踩过）。
 - 服务器上**没有源码、没有脚本、没有 cron**：`/opt/xnc` 只有 `deploy/`。
-  `deploy_srv.py` 的 push/up 等命令已退役为应急手段（远端无构建上下文，
-  仅 turnserver 渲染等还有用）。
+  `deploy_srv.py` 的 push/up 等命令已退役为应急手段（远端无构建上下文）。
 - GHCR 拉取授权：SRV root 的 docker config（PAT read:packages）；
-  watchtower 挂载同一 config。
+  watchtower 挂载同一 config（已停用，重启容器前先确认要不要恢复自动换版）。
 - 本机**禁止**运行 xnc-server 栈（spec 红线）；server 只活在 SRV 的 docker。
 
 ## 5. 发布流程（安装器/更新）
 
-**发布 = 手动触发 release workflow**：Actions → release → Run workflow →
-输入版本号（X.Y.Z[-dev]，段 ≤4 位；须选 main 分支）→ release.yml 在当前
-main HEAD 创建并推 tag `v<版本>`（**构建成功后才打 tag**——构建/签名失败
-不产生孤儿 tag，可直接重触发；tag 已存在即拒绝 = 版本不可变）→ 签名构建 →
-GitHub Release（附件安装器 + .sha256 边车；dev 频道标 prerelease）。
-**CI 的终点就是 GitHub Release，不直传生产**。极端恢复：tag 已推而
-Release 步骤失败时，管理员删 tag 后重触发，或直接发下一 PATCH 版本。
+**发布（现行）= 本地构建 + 管理员 API 直传**：`powershell
+installer/build.ps1 -Version <v> -Channel stable|dev` 签名构建 →
+`POST /api/admin/releases`（multipart 上传 exe + .sha256，生产 admin
+JWT 鉴权）写入生产 release store。在线 agent 经 WS 推送秒级升级，语义
+与正规路径完全一致。
 
-1. 生效即达：生产 server 内置 installersync（默认 5 分钟轮询
+**正规路径（CI，暂不可用）**：Actions → publish → Run workflow（原
+release.yml，2026-09-08 因步骤名未引号冒号损坏注册表而重命名）→ 在
+main HEAD 创建并推 tag `v<版本>`（**构建成功后才打 tag**；tag 已存在
+即拒绝 = 版本不可变）→ 签名构建 → GitHub Release。当前卡点：CI 的
+vcpkg 无基线锁定，ffmpeg 头漂移（FF_PROFILE_* 枚举缺定义）编译失败
+——修复（锁 vcpkg baseline 或自带 vendor）前用本地直传。注意：本地
+直传不经 tag，**版本不可变靠自觉**（同版本禁止重传不同内容）。
+
+1. installersync 拉回路径仍在运行（默认 5 分钟轮询
    `XNC_INSTALLER_SYNC_REPO`；`XNC_INSTALLER_SYNC_INTERVAL` / `XNC_GITHUB_TOKEN`
-   可调）把各频道最新安装器拉回本地 release store（sha256 边车强校验 +
-   事务入库，半截行自愈）；`/installer.json` 与下载页随后更新。在线
-   agent 经 WS 推送/6h 轮询/`xnc upgrade` 升级（秒级中断，失败自动回滚+拉黑）。
-2. 本地构建（未发布验证/实验机手装）：`powershell installer/build.ps1
-   -Version <v> -Channel stable|dev`（或 `make installer VERSION=<v>`）——
-   产 `bin/XNC-Installer[-dev]-<v>.exe` + sha256。五二进制（agent/core/
-   desktop/shell/CLI）版本同源注入。
+   可调；sha256 边车强校验 + 事务入库，半截行自愈）——CI 恢复后即接回
+   "GitHub Release → 生产" 的自动链。`/installer.json` 与下载页随后更新。
+   在线 agent 经 WS 推送/6h 轮询/`xnc upgrade` 升级（秒级中断，失败自动
+   回滚+拉黑）。
+2. 本地构建：`make installer VERSION=<v>` 等价。五二进制（agent/core/
+   host/shell/CLI，xnc-desktop 已换 xnc-host）版本同源注入；host 为
+   cargo 构建（需 VCPKG_ROOT/LIBCLANG_PATH，`-ReuseNative` 可复用缓存）。
 3. **升级安全网**：看门狗 schtask + installer-cache 回滚源 + 24h 过期
    pending 兜底；发布坏版本的自愈路径已内建（修复 = 新 PATCH 版本，同版本
    禁止重发）。
@@ -188,8 +204,14 @@ Release 步骤失败时，管理员删 tag 后重触发，或直接发下一 PAT
 - `HEAD /installer` 落到 SPA（chi Get 不含 Head）。
 - 安装器 PATH 写回会展开 REG_EXPAND_SZ 引用（触发于增删 XNC 项时）。
 - 同版本重传 release 不删除缺席制品（旧制品可能残留可下载）。
-- `deploy_srv.py push` 未实现"先删后解"（本文 §4.3 的人工规程即其替代）。
-- `.dockerignore` 使本地 compose build 失败（部署用远端构建不受影响）。
+- `deploy_srv.py push` 未实现"先删后解"（push 已退役为应急手段）。
+- `.dockerignore` 使本地 compose build 失败（`build-server-local.ps1` 走
+  同一 Dockerfile，构建前临时清掉即可；CI 远端构建不受影响）。
+- CI publish.yml 的 vcpkg 无基线锁定：ffmpeg 头漂移（FF_PROFILE_* 枚举
+  缺失）致 host 编译失败——安装器发布暂走本地构建直传。
+- 阿里云安全组未放行 UDP443：RTV WT 主路暂用 14433/udp 过渡（compose
+  `XNC_RTV_WT_PORT`）；放行后清空该变量回规范 URL。
+- web HUD 码率/收包显示累计值（未做每秒差分）；e2e 显示跨时钟偏差。
 
 ## 9. 索引
 

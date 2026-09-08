@@ -109,7 +109,7 @@ func (s *Server) handleHostConn(conn *quic.Conn) {
 			if m.Role != "host" {
 				return true
 			}
-			if !s.Hub.validateHost(m.NodeID, m.Token) {
+			if !s.validateHostHello(m.NodeID, m.Token) {
 				// 无效/未知 token：拒绝注册并断开（防任意顶替劫持）。
 				slog.Warn("rtv: host hello rejected (bad token)", "remote", remote)
 				_ = h.sendControl(mustJSON(map[string]any{

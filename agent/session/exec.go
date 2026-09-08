@@ -192,6 +192,11 @@ func (ex *Exec) Handle(ctx context.Context, ws *websocket.Conn, sessionID string
 			c := int(code)
 			exitCode = &c
 		}
+		// 幂等兜底:确保 xnc-shell 进程终结(EXIT 只代表命令结束,
+		// 不代表宿主进程退出——旧版 shellhost 服务完回到 accept 泄漏,
+		// core KillShell 按存储句柄幂等终结;与 shell.go 的无条件
+		// Kill 对齐)。
+		_ = proc.Kill()
 	case <-ctx.Done():
 		_ = proc.Kill()
 		<-exit

@@ -4,18 +4,16 @@ go 1.26.0
 
 require (
 	github.com/coder/websocket v1.8.15
-	github.com/go-acme/lego/v4 v4.35.2
 	github.com/go-chi/chi/v5 v5.3.1
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
-	github.com/quic-go/quic-go v0.62.0
-	github.com/quic-go/webtransport-go v0.13.0
 	github.com/stretchr/testify v1.12.1
 	github.com/testcontainers/testcontainers-go v0.44.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.44.0
 	golang.org/x/crypto v0.55.0
 	xnc/proto v0.0.0-00010101000000-000000000000
+	xnc/rtv v0.0.0-00010101000000-000000000000
 )
 
 require (
@@ -44,6 +42,7 @@ require (
 	github.com/ebitengine/purego v0.10.1 // indirect
 	github.com/felixge/httpsnoop v1.1.0 // indirect
 	github.com/go-acme/alidns-20150109/v4 v4.7.0 // indirect
+	github.com/go-acme/lego/v4 v4.35.2 // indirect
 	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
@@ -71,6 +70,8 @@ require (
 	github.com/opencontainers/image-spec v1.1.1 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
+	github.com/quic-go/quic-go v0.62.0 // indirect
+	github.com/quic-go/webtransport-go v0.13.0 // indirect
 	github.com/shirou/gopsutil/v4 v4.26.6 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
 	github.com/tjfoc/gmsm v1.4.1 // indirect
@@ -93,3 +94,5 @@ require (
 )
 
 replace xnc/proto => ../proto
+
+replace xnc/rtv => ../rtv

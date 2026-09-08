@@ -26,21 +26,38 @@ const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 const CONTROL_BUF: usize = 256 * 1024;
 
 /// 连接服务器并运行到进程结束（内部自动重连）。
+/// cert_sha256 = Some 时启用 relay 自签证书钉扎（见 PinnedCertVerifier）。
 pub async fn run(
     shared: Arc<Shared>,
     server: SocketAddr,
     server_name: &str,
     send_kbps: u32,
     tls_insecure: bool,
+    cert_sha256: Option<&str>,
 ) -> Result<()> {
+    // 钉扎指纹在循环外预解析：非法 hex 直接让本任务失败退出（配置错误
+    // 重试也修不好，与其静默无限重连不如高声报错）。
+    let pin = match cert_sha256 {
+        Some(hex) => Some(PinnedCertVerifier::new(hex)?),
+        None => None,
+    };
+
     let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
         .context("bind quic client endpoint")?;
 
     let mut backoff = RECONNECT_BACKOFF;
     loop {
         let t0 = std::time::Instant::now();
-        match connect_and_serve(&endpoint, server, server_name, &shared, send_kbps, tls_insecure)
-            .await
+        match connect_and_serve(
+            &endpoint,
+            server,
+            server_name,
+            &shared,
+            send_kbps,
+            tls_insecure,
+            pin.as_ref(),
+        )
+        .await
         {
             Err(e) => {
                 shared.disconnect();
@@ -65,10 +82,11 @@ async fn connect_and_serve(
     shared: &Arc<Shared>,
     send_kbps: u32,
     tls_insecure: bool,
+    pin: Option<&PinnedCertVerifier>,
 ) -> anyhow::Result<()> {
     let t0 = std::time::Instant::now();
     let conn = endpoint
-        .connect_with(client_config(tls_insecure)?, server, server_name)?
+        .connect_with(client_config(tls_insecure, pin)?, server, server_name)?
         .await
         .context("quic connect")?;
     tracing::info!(
@@ -246,14 +264,24 @@ fn now_ms() -> u64 {
 }
 
 // ---------------- rustls 配置 ----------------
-// 生产：系统根校验（server 证书为 CA 签发，SNI=server_name）。
-// 调试：--tls-insecure 接受任意证书（仅本地自签 dev server，日志高声告警）。
+// 生产（域名 relay）：系统根校验（server 证书为 CA 签发，SNI=server_name）。
+// 生产（纯 IP relay）：cert_sha256 钉扎（自签证书按 DER SHA-256 指纹校验）。
+// 调试：--tls-insecure 接受任意证书（仅本地自签 dev server，日志高声告警；
+//       优先级最高以保持既有 dev 行为）。
 
-fn client_config(insecure: bool) -> anyhow::Result<quinn::ClientConfig> {
+fn client_config(
+    insecure: bool,
+    pin: Option<&PinnedCertVerifier>,
+) -> anyhow::Result<quinn::ClientConfig> {
     let mut tls = if insecure {
         rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(AcceptAnyServer))
+            .with_no_client_auth()
+    } else if let Some(verifier) = pin {
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier.clone()))
             .with_no_client_auth()
     } else {
         let mut roots = rustls::RootCertStore::empty();
@@ -323,6 +351,99 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyServer {
             ECDSA_NISTP384_SHA384,
         ]
     }
+}
+
+/// relay 自签证书钉扎校验器（纯 IP relay 形态）：服务器实体证书 DER 的
+/// SHA-256 必须精确等于下发指纹（certSha256，64 位 hex）——不查信任链/
+/// 有效期/域名（自签证书查也无意义），信任完全锚定在指纹上，任意
+/// server name（含 IP）均放行到指纹比对。握手签名校验仍按真实算法
+/// （ring provider，与系统根路径同源）：仅持公开证书内容、无私钥的
+/// 中间人无法伪造 CertificateVerify——不能复用 AcceptAnyServer 的
+/// 直通放行（否则等于没有钉扎）。
+#[derive(Clone)]
+struct PinnedCertVerifier {
+    /// 期望指纹（服务器证书 DER 的 SHA-256）
+    expected: [u8; 32],
+    /// 握手签名校验算法集（CryptoProvider.signature_verification_algorithms）
+    algs: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl PinnedCertVerifier {
+    /// 解析 64 位 hex 指纹；非法输入报错（绝不静默降级为放行）。
+    fn new(hex: &str) -> anyhow::Result<Self> {
+        let hex = hex.trim();
+        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            anyhow::bail!("certSha256 must be 64 hex chars (got {})", hex.len());
+        }
+        let mut expected = [0u8; 32];
+        for (i, b) in expected.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)?;
+        }
+        Ok(Self {
+            expected,
+            algs: rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        })
+    }
+}
+
+// trait 要求 Debug；算法集不可 Debug，手工实现且只暴露指纹前缀。
+impl std::fmt::Debug for PinnedCertVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinnedCertVerifier")
+            .field("sha256", &hex_prefix(&self.expected))
+            .finish()
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        use sha2::Digest;
+        let digest: [u8; 32] = sha2::Sha256::digest(end_entity.as_ref()).into();
+        if digest != self.expected {
+            // 指纹非机密（随 API 响应分发），打短前缀供诊断；token 等
+            // 敏感内容绝不出现在日志。
+            tracing::warn!(
+                expected = %hex_prefix(&self.expected),
+                actual = %hex_prefix(&digest),
+                "relay cert sha256 mismatch"
+            );
+            return Err(rustls::Error::General(
+                "relay certificate sha256 mismatch".into(),
+            ));
+        }
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algs)
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.algs.supported_schemes()
+    }
+}
+
+/// 指纹日志短前缀（前 4 字节 = 8 个 hex 字符）。
+fn hex_prefix(b: &[u8]) -> String {
+    b.iter().take(4).map(|x| format!("{x:02x}")).collect()
 }
 
 /// 防未使用告警（Mutex 在重构后仅用于类型命名空间）

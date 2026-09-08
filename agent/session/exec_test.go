@@ -378,3 +378,25 @@ func TestExecNotTruncatedWhenNoDrop(t *testing.T) {
 	_, _, res := collectExec(t, ws)
 	assert.False(t, res.Truncated)
 }
+
+
+// TestExecKillsShellProcOnNaturalExit — 正常完成路径也必须 Kill(幂等
+// 兜底:EXIT 只代表命令结束,xnc-shell 宿主进程的终结靠 Kill 的
+// core KillShell;真机踩坑:旧版正常路径只 Close 断管,每个完成的
+// exec 泄漏一个 xnc-shell)。
+func TestExecKillsShellProcOnNaturalExit(t *testing.T) {
+	host := &fakeHost{build: func(spec ShellSpec) *fakeProc {
+		p := &fakeProc{spec: spec, profile: spec.Profile,
+			streamCh: make(chan ShellStream, 16), exitCh: make(chan uint32, 1)}
+		p.exitCh <- 0
+		close(p.streamCh)
+		return p
+	}}
+	_, _, res := collectExec(t, runExec(t, host, proto.ExecParams{Command: "echo done", Shell: "cmd"}))
+	require.NotNil(t, res.ExitCode)
+	require.Len(t, host.procs, 1)
+	host.procs[0].mu.Lock()
+	killed := host.procs[0].killed
+	host.procs[0].mu.Unlock()
+	assert.GreaterOrEqual(t, killed, 1, "natural exit must still Kill the shell proc")
+}

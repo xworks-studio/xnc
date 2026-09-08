@@ -13,6 +13,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-native-certs = "0.8"
+# relay 自签证书钉扎（certSha256）：指纹 = 证书 DER 的 SHA-256
+sha2 = "0.10"
 bytes = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

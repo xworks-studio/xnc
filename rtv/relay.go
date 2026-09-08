@@ -1,22 +1,21 @@
-// Package rtv — 桌面流中继（RTV，2026-09-08 重构）：host 注册、viewer 加入、
-// 媒体字节扇出、控制最小路由。移植自 MVP-RTV server/relay.go（踩坑结晶的
-// viewer 迁移 / hello 重试门闩 / hostOffline 语义原样保留），XNC 集成缝：
+// Package rtv — 桌面流中继（RTV，2026-09-08 重构；relay-plane 2026-09-08
+// 抽包为共享模块）：host 注册、viewer 加入、媒体字节扇出、控制最小路由。
+// 移植自 MVP-RTV server/relay.go（踩坑结晶的 viewer 迁移 / hello 重试门闩 /
+// hostOffline 语义原样保留），relay-plane 集成缝：
 //
 //   - Hub 键 = nodeId（host 按节点注册，多 XNC 会话共享同一 host 流）；
-//   - host 注册必须持有效 HostToken（会话创建时经 SESSION_OPEN→agent→
-//     core→stdin 下发；重连/崩溃重启重放同一 token = 合法再注册）；
-//   - viewer 腿在连接期经回调鉴权（会话 token → node/session 绑定）；
-//   - input 控制消息按 lease 门控（仅该节点当前活约持有会话放行）。
+//   - host/viewer 准入 = RelayTicket 离线验签（PlaneHost.VerifyToken，
+//     spec §3.1：host 张按 (node,relay) 等值可重放，viewer 张带能力 claims）；
+//   - 控制权仲裁 = 本地 Arbiter（spec §3.5：last-take-wins + 3s 冷却 +
+//     60s 租约 TTL，准入判据 = ticket cap，策略留在签发侧）；
+//   - 撤销 = 墓碑 + 断连（Server.KillSession，spec §3.4）。
 //
-// 设计原则（协议规范 §0/§3）：服务器对媒体包按字节转发（不解析媒体语义，
-// 仅读取 34B 头中的 captureUnixUs 用于 host→server 腿延迟统计），控制消息
-// 做最小路由。多 viewer 扇出对应"多观察者"能力。
+// 设计原则（协议规范 §0/§3）：对媒体包按字节转发（不解析媒体语义，仅读
+// 包头 captureUnixUs 用于延迟统计），控制消息做最小路由。
 package rtv
 
 import (
-	"crypto/rand"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"sync"
@@ -28,9 +27,14 @@ import (
 type Viewer interface {
 	ID() uint64
 	Kind() string // "wt" | "ws"
-	// Node/Session 是连接期鉴权得到的绑定（hub 操作与 input 门控用）。
+	// Node/Session 是连接期验签得到的绑定（hub 操作与 input 门控用）。
 	Node() string
 	Session() string
+	// CanControl/CanInput/DisplayName 来自 viewer 票据 claims（cap/nm）——
+	// 仲裁与门控的准入判据，relay 不做任何角色计算。
+	CanControl() bool
+	CanInput() bool
+	DisplayName() string
 	SendDatagram(b []byte) error
 	SendControlJSON(v json.RawMessage) error
 	Close()
@@ -40,7 +44,7 @@ type Viewer interface {
 type HostSession struct {
 	NodeID      string
 	ConnectedAt time.Time
-	hub         *Hub // RegisterHost 注入（input 门控回调用）
+	hub         *Hub // RegisterHost 注入（input 门控/仲裁用）
 
 	ctrlMu sync.Mutex
 	// host 控制流（首个 bidi stream），由 legquic 持有注入
@@ -55,7 +59,7 @@ type HostSession struct {
 	rxPkgs, rxBytes   atomic.Uint64
 	txPkgs, txBytes   atomic.Uint64
 	ctrlRx, ctrlTx    atomic.Uint64
-	latEMAUs          atomic.Int64 // host→server 腿延迟（含时钟偏差，观测用）
+	latEMAUs          atomic.Int64 // host→relay 腿延迟（含时钟偏差，观测用）
 	framesSeen        atomic.Uint64
 	lastCaptureUnixUs atomic.Int64
 }
@@ -122,17 +126,29 @@ func (h *HostSession) fanoutMedia(data []byte) {
 	}
 }
 
-// forwardToHost viewer→host 控制消息转发（input 消息按门控放行——由
-// Hub.gateInput 判定该 viewer 会话是否持节点活约）。
+// forwardToHost viewer→host 控制消息转发（input 消息按仲裁机门控：持有
+// 活约且 cap.input）。控制权流转消息（takeControl/releaseControl）在
+// relay 终结（Arbiter 仲裁），不转发给 host。
 func (h *HostSession) forwardToHost(v json.RawMessage, from Viewer) {
 	var probe struct {
 		Type string `json:"type"`
 	}
 	_ = json.Unmarshal(v, &probe)
-	if probe.Type == "input" {
-		if h.hub == nil || !h.hub.gateInput(from.Node(), from.Session()) {
+	switch probe.Type {
+	case "input":
+		if h.hub == nil || !h.hub.gateInputFor(from) {
 			return // 无输入权：静默丢弃（不回错——旧栈同语义，view-only）
 		}
+	case "takeControl":
+		if h.hub != nil {
+			h.hub.handleTakeControl(from)
+		}
+		return
+	case "releaseControl":
+		if h.hub != nil {
+			h.hub.handleReleaseControl(from.Node(), from)
+		}
+		return
 	}
 	h.ctrlMu.Lock()
 	defer h.ctrlMu.Unlock()
@@ -173,72 +189,90 @@ func (h *HostSession) cachedConfig() json.RawMessage {
 	return h.lastConfg
 }
 
-// Hub 全局会话表（node 键）+ per-node HostToken 注册表。
+// Hub 全局会话表（node 键）。控制权仲裁在本地 Arbiter（spec §3.5），
+// 准入/活跃/事件上行经 events 回调（宿主注入：server = 日志/审计，
+// relay 独立进程 = 控制连接转发）。
 type Hub struct {
 	mu      sync.Mutex
 	hosts   map[string]*HostSession
-	tokens  map[string]string // nodeID → HostToken（会话创建时签发/复用）
 	started time.Time
 	nextID  atomic.Uint64
 
-	// gateInput 由 api 层注入：该 (node, session) 是否持节点输入活约。
-	gateInput func(node, session string) bool
+	// arbiter 传输级控制权仲裁机（票据 cap 为准入判据）。
+	arbiter *Arbiter
 
-	// hostTokenOf 由 api 层注入：节点当前活跃 desktop 会话 params 里的
-	// HostToken（无活约/解析失败 = ""）。server 重启后 minted 表清空，而
-	// 运行中的 host 重连时重放的是 spawn 时的 token——经活跃会话回查即可
-	// 无持久化地恢复注册（会话仍在 = 凭据仍有效）。
-	hostTokenOf func(node string) string
+	// events 生命周期事件上行（nil = 无观测）。
+	events func(typ, node, session string)
 }
 
 func NewHub() *Hub {
-	return &Hub{hosts: map[string]*HostSession{}, tokens: map[string]string{},
-		started: time.Now()}
+	return &Hub{hosts: map[string]*HostSession{}, started: time.Now(), arbiter: NewArbiter()}
 }
 
-// SetInputGate 注入 input 门控（须在 Start 前完成）。
-func (g *Hub) SetInputGate(fn func(node, session string) bool) { g.gateInput = fn }
+// Arbiter 暴露仲裁机（desktopStart 被动首约 / 测试直驱）。
+func (g *Hub) Arbiter() *Arbiter { return g.arbiter }
 
-// SetHostTokenOf 注入活跃会话 token 回查（server 重启后的 host 重注册路径）。
-func (g *Hub) SetHostTokenOf(fn func(node string) string) { g.hostTokenOf = fn }
+func (g *Hub) emit(typ, node, session string) {
+	if g.events != nil {
+		g.events(typ, node, session)
+	}
+}
+
+// TouchViewer 持约 viewer 的活动续约：任何控制帧（心跳/反馈/input）都算
+// ——web 心跳 1s 一发 << 60s TTL，连接在即活约在；离场由 RemoveViewer
+// 撤约。此前漏接导致接管 60s 后租约失活、input 被静默丢弃（真机表现：
+// 获得控制权一段时间后鼠标失效，UI 仍显示持控）。
+func (g *Hub) TouchViewer(node, session string) {
+	g.arbiter.Touch(node, session)
+}
+
+// gateInputFor input 门控：持有活约（TTL 内）且票据 cap.input。
+func (g *Hub) gateInputFor(v Viewer) bool {
+	holder, _ := g.arbiter.Holder(v.Node())
+	return holder != "" && holder == v.Session() && v.CanInput()
+}
+
+// controlStateMsg 当前控制权归属消息（广播/单发共用）。
+func (g *Hub) controlStateMsg(node string) json.RawMessage {
+	holder, name := g.arbiter.Holder(node)
+	return mustJSON(map[string]any{
+		"type": "controlState", "holderSession": holder, "holderName": name,
+	})
+}
+
+// broadcastControlState 向该节点当前全部 viewer 广播控制权归属。
+func (g *Hub) broadcastControlState(node string) {
+	msg := g.controlStateMsg(node)
+	if h := g.Host(node); h != nil {
+		h.broadcastControl(msg)
+	}
+}
+
+// handleTakeControl viewer 显式接管：成功 → 广播 controlState（含接管者
+// 自己，UI 据此切换）；失败（冷却/无能力）→ 仅回执发起者 + 同步一次状态。
+func (g *Hub) handleTakeControl(from Viewer) {
+	ok, reason := g.arbiter.Take(from.Node(), from.Session(), from.DisplayName(), from.CanControl())
+	if !ok {
+		slog.Info("control take denied", "node", from.Node(), "viewer", from.ID(), "reason", reason)
+		_ = from.SendControlJSON(mustJSON(map[string]any{
+			"type": "controlResult", "ok": false, "reason": reason,
+		}))
+		_ = from.SendControlJSON(g.controlStateMsg(from.Node()))
+		return
+	}
+	slog.Info("control taken", "node", from.Node(), "viewer", from.ID(), "session", from.Session(), "reason", reason)
+	g.broadcastControlState(from.Node())
+}
+
+// handleReleaseControl viewer 显式释放：广播（非持有者释放 = 无操作，
+// 广播无害且让 UI 对齐）。
+func (g *Hub) handleReleaseControl(node string, from Viewer) {
+	g.arbiter.Release(node, from.Session())
+	slog.Info("control released", "node", node, "viewer", from.ID(), "session", from.Session())
+	g.broadcastControlState(node)
+}
 
 func (g *Hub) NextViewerID() uint64 { return g.nextID.Add(1) }
-
-// HostTokenFor 返回（必要时签发）节点的 HostToken。签发后跨会话稳定：
-// core 侧 StartCapture 幂等复用运行中的 host，第二次会话的 cfg 不会送达
-// host，故 token 必须可重放。32 字节随机（hex 传递）。
-func (g *Hub) HostTokenFor(nodeID string) string {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if t, ok := g.tokens[nodeID]; ok {
-		return t
-	}
-	var b [32]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic(err) // crypto/rand 失败不可恢复
-	}
-	t := hex.EncodeToString(b[:])
-	g.tokens[nodeID] = t
-	return t
-}
-
-// validateHost 校验 host 注册凭据（hello{nodeId, token}）：命中 minted 表，
-// 或回查该节点任一活跃 desktop 会话的 params token（server 重启恢复路径）。
-func (g *Hub) validateHost(nodeID, token string) bool {
-	if nodeID == "" || token == "" {
-		return false
-	}
-	g.mu.Lock()
-	want := g.tokens[nodeID]
-	g.mu.Unlock()
-	if token == want && want != "" {
-		return true
-	}
-	if g.hostTokenOf != nil {
-		return token == g.hostTokenOf(nodeID) && token != ""
-	}
-	return false
-}
 
 // RegisterHost 注册/替换 host 连接（同节点旧连接被关闭——重启场景）。
 // 替换时把旧会话的 viewer 迁移到新会话：否则快速重启会静默丢弃所有
@@ -272,6 +306,7 @@ func (g *Hub) RegisterHost(nodeID string, h *HostSession) (replaced bool) {
 		slog.Info("viewers migrated to new host", "node", nodeID, "count", len(migrated))
 	}
 	slog.Info("host registered", "node", nodeID, "replaced", replaced)
+	g.emit("host.register", nodeID, "")
 	return replaced
 }
 
@@ -296,6 +331,7 @@ func (g *Hub) UnregisterHost(nodeID string, h *HostSession) {
 		_ = w.SendControlJSON(mustJSON(map[string]any{"type": "hostOffline", "node": nodeID}))
 	}
 	slog.Info("host unregistered", "node", nodeID, "viewersNotified", len(orphans))
+	g.emit("host.unregister", nodeID, "")
 }
 
 func (g *Hub) Host(nodeID string) *HostSession {
@@ -331,10 +367,13 @@ func (g *Hub) AddViewer(nodeID string, w Viewer) {
 	if cfg := h.cachedConfig(); cfg != nil {
 		_ = w.SendControlJSON(cfg)
 	}
+	// 单发当前控制权归属（晚加入者立即知道自己是否 view-only、谁在控）
+	_ = w.SendControlJSON(g.controlStateMsg(nodeID))
 	// 通知 host 新 viewer 数 + 合成一次 IDR 请求（rustdesk 新订阅者触发关键帧的对应物）
 	h.notifyViewers()
 	h.forwardToHostNoGate(mustJSON(map[string]any{"type": "frameLoss", "frameIndex": 0, "reason": "new-viewer"}))
 	slog.Info("viewer joined", "node", nodeID, "viewer", w.ID(), "kind", w.Kind(), "total", h.viewerCount())
+	g.emit("viewer.joined", nodeID, w.Session())
 }
 
 func (g *Hub) RemoveViewer(nodeID string, w Viewer) {
@@ -345,8 +384,58 @@ func (g *Hub) RemoveViewer(nodeID string, w Viewer) {
 	h.mu.Lock()
 	delete(h.viewers, w.ID())
 	h.mu.Unlock()
+	// 持有控制权的 viewer 离场即撤约（别让死会话占着等 TTL）
+	g.arbiter.DropSession(nodeID, w.Session())
 	h.notifyViewers()
 	slog.Info("viewer left", "node", nodeID, "viewer", w.ID(), "total", h.viewerCount())
+	g.emit("viewer.left", nodeID, w.Session())
+}
+
+// dropForKill 撤销断连：session 为空 = 节点级（host + 全部 viewer）；
+// 否则仅踢该会话的 viewer（host 张按 node 铸造，会话级撤销不动 host）。
+func (g *Hub) dropForKill(node, session string) {
+	h := g.Host(node)
+	if h == nil {
+		return
+	}
+	if session == "" {
+		g.UnregisterHost(node, h) // 向 viewer 广播 hostOffline
+		h.closeConn()
+		return
+	}
+	h.mu.Lock()
+	var doomed []Viewer
+	for id, w := range h.viewers {
+		if w.Session() == session {
+			doomed = append(doomed, w)
+			delete(h.viewers, id)
+		}
+	}
+	h.mu.Unlock()
+	for _, w := range doomed {
+		w.Close()
+	}
+	if len(doomed) > 0 {
+		g.arbiter.DropSession(node, session)
+		h.notifyViewers()
+	}
+}
+
+// ActiveSessions 在服 viewer 的会话键 → viewer 数（控制连接 stats 上报
+// 用：server 侧据此 Touch 活跃会话——外部 relay 的 viewer 触碰不出
+// 进程，粘合与 idle 治理依赖此旁路）。
+func (g *Hub) ActiveSessions() map[string]int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := map[string]int{}
+	for _, h := range g.hosts {
+		h.mu.Lock()
+		for _, w := range h.viewers {
+			out[w.Session()]++
+		}
+		h.mu.Unlock()
+	}
+	return out
 }
 
 // Snapshot statsz 输出（管理端挂载）。
@@ -356,14 +445,14 @@ func (g *Hub) Snapshot() map[string]any {
 	hosts := []map[string]any{}
 	for id, h := range g.hosts {
 		hosts = append(hosts, map[string]any{
-			"node":             id,
-			"connectedSince":   h.ConnectedAt.Format(time.RFC3339),
-			"viewers":          h.viewerCount(),
-			"rxPkgs":           h.rxPkgs.Load(),
-			"rxBytes":          h.rxBytes.Load(),
-			"txPkgs":           h.txPkgs.Load(),
-			"txBytes":          h.txBytes.Load(),
-			"framesSeen":       h.framesSeen.Load(),
+			"node":           id,
+			"connectedSince": h.ConnectedAt.Format(time.RFC3339),
+			"viewers":        h.viewerCount(),
+			"rxPkgs":         h.rxPkgs.Load(),
+			"rxBytes":        h.rxBytes.Load(),
+			"txPkgs":         h.txPkgs.Load(),
+			"txBytes":        h.txBytes.Load(),
+			"framesSeen":     h.framesSeen.Load(),
 			"hostLegLatencyMs": func() float64 {
 				v := h.latEMAUs.Load()
 				if v == 0 {

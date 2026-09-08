@@ -15,6 +15,7 @@ WORKDIR /src
 # 即可让 compose build 透传。
 ARG XNC_VERSION=0.0.0-dev
 COPY proto ./proto
+COPY rtv ./rtv
 COPY server ./server
 # 覆盖仓库占位（server/web/dist/index.html），embed 命中真实产物
 COPY --from=web /web/dist ./server/web/dist

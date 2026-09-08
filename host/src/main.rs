@@ -109,6 +109,10 @@ struct StdinConfig {
     log_file: Option<String>,
     #[serde(default, rename = "tlsInsecure")]
     tls_insecure: Option<bool>,
+    /// relay 自签证书钉扎指纹（纯 IP relay 形态，64 位 hex，证书 DER 的
+    /// SHA-256）；缺省 = 标准 Web PKI（系统根校验）。
+    #[serde(default, rename = "certSha256")]
+    cert_sha256: Option<String>,
 }
 
 /// 解析后的有效配置（stdin 优先，CLI 回退）。
@@ -124,6 +128,8 @@ struct RunConfig {
     send_kbps: u32,
     log_file: Option<String>,
     tls_insecure: bool,
+    // relay 自签证书钉扎指纹（Some = 钉扎校验，None = 系统根校验）
+    cert_sha256: Option<String>,
     // 仅 CLI 的调试旋钮
     display: usize,
     no_cursor: bool,
@@ -176,6 +182,7 @@ fn resolve_config(args: &Args) -> Result<RunConfig> {
         send_kbps: stdin_cfg.send_kbps.unwrap_or(args.send_kbps),
         log_file: stdin_cfg.log_file.or_else(|| args.log_file.clone()),
         tls_insecure: stdin_cfg.tls_insecure.unwrap_or(args.tls_insecure),
+        cert_sha256: stdin_cfg.cert_sha256,
         display: args.display,
         max_w: stdin_cfg.max_width.unwrap_or(args.max_w),
         no_cursor: args.no_cursor,
@@ -201,6 +208,9 @@ fn main() -> Result<()> {
     );
     if cfg.tls_insecure {
         tracing::warn!("TLS certificate verification DISABLED (debug only)");
+    } else if cfg.cert_sha256.is_some() {
+        // 钉扎模式（指纹本身非机密；绝不打印 token 等其余配置内容）
+        tracing::info!("TLS relay certificate pinning enabled (certSha256)");
     }
 
     let shared = Arc::new(Shared::new(
@@ -223,9 +233,17 @@ fn main() -> Result<()> {
         let server_name = cfg.server_name.clone();
         let send_kbps = cfg.send_kbps;
         let tls_insecure = cfg.tls_insecure;
+        let cert_sha256 = cfg.cert_sha256.clone();
         rt.spawn(async move {
-            if let Err(e) =
-                transport::run(shared, endpoint, &server_name, send_kbps, tls_insecure).await
+            if let Err(e) = transport::run(
+                shared,
+                endpoint,
+                &server_name,
+                send_kbps,
+                tls_insecure,
+                cert_sha256.as_deref(),
+            )
+            .await
             {
                 tracing::error!(?e, "transport task exited");
                 std::process::exit(2);
@@ -302,6 +320,8 @@ fn run_pipeline(shared: &Arc<Shared>, cfg: &RunConfig) -> Result<()> {
     if (ew, eh) != (w, h) {
         tracing::info!(from = format!("{w}x{h}"), to = format!("{ew}x{eh}"), "downscale enabled");
     }
+    // 输入注入坐标换算基准：web 端在编码空间，桌面在原生空间
+    input::set_viewport((w, h), (ew, eh));
     let mut scale_buf: Vec<u8> = Vec::new();
     let mut enc = match &cfg.encoder {
         Some(name) => VideoEncoder::with_name(name, ew, eh, fps0, bitrate)?,

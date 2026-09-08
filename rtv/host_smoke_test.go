@@ -25,10 +25,10 @@ func TestRealHostSmoke(t *testing.T) {
 	if exe == "" {
 		t.Skip("set XNC_HOST_EXE to host/target/release/xnc-host.exe to run the real-host smoke")
 	}
-	s := newLoopSrv(t, nil)
+	s, signer := newLoopSrv(t)
 	hostAddr, wtAddr := s.ActualAddrs()
-	wtURL := fmt.Sprintf("https://%s/wt?token=vtok", wtAddr)
-	token := s.Hub.HostTokenFor("smoke-node")
+	wtURL := "https://" + wtAddr + "/wt?token=" + viewerTok(t, signer, "sess-A", "smoke-node", true, true)
+	token := signer.HostTicketFor("smoke-node", EmbeddedRelayID)
 
 	// stdin 配置（与 xnc-core spawn 契约同型）+ CLI 同值兜底。
 	cfg := fmt.Sprintf(`{"endpoint":%q,"nodeId":"smoke-node","token":%q,"fps":15,"bitrateKbps":2000,"fec":20}`,

@@ -99,7 +99,7 @@ func (h *handlers) execStart(w http.ResponseWriter, r *http.Request) {
 	if req.System {
 		audit = map[string]string{"system": "true"}
 	}
-	h.startSession(w, r, proto.KindExec, params, "exec.start", "exec.finish", nil, audit, nil)
+	h.startSession(w, r, proto.KindExec, params, "exec.start", "exec.finish", nil, audit, nil, nil)
 }
 
 // requireSystemRole 校验 system 令牌请求的 owner 身份(403 已写出时
@@ -127,6 +127,7 @@ func (h *handlers) startSession(w http.ResponseWriter, r *http.Request,
 	kind string, params json.RawMessage, openAction, closeAction string,
 	extra map[string]any, auditExtra map[string]string,
 	extraFn func(res *session.CreateResult) map[string]any,
+	finishExtra func(sessionID, reason string),
 ) (*session.CreateResult, bool) {
 	u := auth.UserFrom(r.Context())
 	nodeID, err := uuid.Parse(chi.URLParam(r, "id"))
@@ -159,6 +160,9 @@ func (h *handlers) startSession(w http.ResponseWriter, r *http.Request,
 				"reason": reason, "kind": kind, "sessionId": res.Session.ID,
 			}),
 		})
+		if finishExtra != nil {
+			finishExtra(res.Session.ID, reason)
+		}
 	})
 	// NotifyClose → SESSION_CLOSE 经控制连接下发；连接已失则跳过
 	// （manager 的 close 路径已完成双侧清理）。

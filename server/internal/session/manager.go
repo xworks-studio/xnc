@@ -54,10 +54,15 @@ type Manager struct {
 	// （会话保留 = view-only；测试可缩短）。
 	DesktopLeaseTTL time.Duration
 
+	// DesktopStealCooldown：显式接管（TakeDesktopControl 抢他人活约）后的
+	// 防抖窗口——窗口内第三个会话再抢会被拒（防两人对点互抢；测试可缩短）。
+	DesktopStealCooldown time.Duration
+
 	// desktopLeases：per-node 输入 lease 仲裁表（M2-Slice3 Task 4，spec
 	// §11.1）。server 只裁「谁 MAY hold」——每节点同时至多一个活约；执行
 	// （输入放行/SAS capability）在 agent 侧凭 params.leaseId 完成
-	// （split-arbitration，见任务报告）。
+	// （split-arbitration，见任务报告）。RTV 后此表同时是控制权流转
+	// （takeControl/releaseControl）的事实源。
 	desktopLeases map[uuid.UUID]*desktopLease
 
 	janitorInterval time.Duration // mu 保护；janitorLoop 每轮重读
@@ -102,9 +107,14 @@ type session struct {
 type Session session
 
 // desktopLease 一次 per-node 输入约（node → 单条，存 Manager.desktopLeases）。
+// 控制权流转（takeControl/releaseControl）与被动授予共用此表：
+// UserID 供 controlState 广播解析持有者名字；LastStealAt 是接管防抖。
 type desktopLease struct {
-	SessionID string
-	LeaseID   string
+	SessionID   string
+	LeaseID     string
+	UserID      uuid.UUID
+	TakenAt     time.Time
+	LastStealAt time.Time
 }
 
 type CreateResult struct {
@@ -113,8 +123,9 @@ type CreateResult struct {
 	ClientToken string // REST 响应的 token
 	ExpiresAt   time.Time
 	ClientPath  string // "/api/session/<id>"
-	// LeaseGranted/LeaseID（desktop 专属）：本会话是否夺得该节点输入约；
-	// 授予时 LeaseID 已嵌入 Session.Params（SESSION_OPEN 与 REST 同源）。
+	// LeaseGranted/LeaseID（desktop 专属）：创建时是否被动夺得该节点输入约
+	// （先到先得；主动接管/释放走 TakeDesktopControl/ReleaseDesktopControl，
+	// 授予后此字段不再更新——实时归属以控制表为准）。
 	LeaseGranted bool
 	LeaseID      string
 }
@@ -125,9 +136,10 @@ func New(reg *registry.Registry, log *slog.Logger) *Manager {
 		desktopLeases: map[uuid.UUID]*desktopLease{},
 		ShellPerNode:  10, ShellIdleTimeout: 30 * time.Minute, ShellMaxLifetime: 8 * time.Hour,
 		DesktopPerNode: 8, DesktopIdleTimeout: 5 * time.Minute, DesktopLeaseTTL: 60 * time.Second,
-		janitorInterval: janitorDefaultInterval,
-		stopJanitor:     make(chan struct{}),
-		kickJanitor:     make(chan struct{}, 1),
+		DesktopStealCooldown: 3 * time.Second,
+		janitorInterval:      janitorDefaultInterval,
+		stopJanitor:          make(chan struct{}),
+		kickJanitor:          make(chan struct{}, 1),
 	}
 	go m.janitorLoop()
 	return m
@@ -204,7 +216,8 @@ func (m *Manager) Create(nodeID, userID uuid.UUID, kind string, params json.RawM
 
 // grantDesktopLeaseLocked 尝试把 node 的输入约授予 s：空闲/持有者已关闭/
 // 持有者 TTL 内无信令活动（janitor 兜底；正常撤销走 close 钩子）→ 授予；
-// 否则拒绝（会话仍创建，view-only）。调用方持 mu 且 s 已入表。
+// 否则拒绝（会话仍创建，view-only）。被动授予从不抢占他人活约——主动
+// 接管走 TakeDesktopControl。调用方持 mu 且 s 已入表。
 func (m *Manager) grantDesktopLeaseLocked(s *session, now time.Time) (string, bool) {
 	if old := m.desktopLeases[s.NodeID]; old != nil {
 		if holder, ok := m.sessions[old.SessionID]; ok && holder.ID == old.SessionID &&
@@ -214,8 +227,72 @@ func (m *Manager) grantDesktopLeaseLocked(s *session, now time.Time) (string, bo
 		delete(m.desktopLeases, s.NodeID) // 持有者已关/超时：回收再授予
 	}
 	leaseID := newToken()[:16]
-	m.desktopLeases[s.NodeID] = &desktopLease{SessionID: s.ID, LeaseID: leaseID}
+	m.desktopLeases[s.NodeID] = &desktopLease{
+		SessionID: s.ID, LeaseID: leaseID, UserID: s.UserID, TakenAt: now,
+	}
 	return leaseID, true
+}
+
+// holderAliveLocked 判定当前约的持有者会话是否存在且 TTL 内有信令活动。
+func (m *Manager) holderAliveLocked(nodeID uuid.UUID, now time.Time) bool {
+	l := m.desktopLeases[nodeID]
+	if l == nil {
+		return false
+	}
+	holder, ok := m.sessions[l.SessionID]
+	return ok && holder.ID == l.SessionID &&
+		now.Sub(time.Unix(0, holder.lastActivity.Load())) <= m.DesktopLeaseTTL
+}
+
+// TakeDesktopControl 显式接管节点控制权（viewer takeControl 消息）。
+// 语义：自己已持有 = 幂等成功；空闲/持有者失活 = 授予；他人活约在手 =
+// 抢占（运营工具 last-take-wins），但 DesktopStealCooldown 窗口内拒绝
+// （防对点互抢）。返回 reason 供 controlResult 回执。
+func (m *Manager) TakeDesktopControl(nodeID uuid.UUID, sessionID string, now time.Time) (ok bool, reason string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[sessionID]
+	if !ok || s.ID != sessionID {
+		return false, "no-session"
+	}
+	l := m.desktopLeases[nodeID]
+	if l == nil {
+		m.desktopLeases[nodeID] = &desktopLease{
+			SessionID: sessionID, LeaseID: newToken()[:16], UserID: s.UserID, TakenAt: now,
+		}
+		return true, "granted"
+	}
+	if l.SessionID == sessionID {
+		return true, "held" // 幂等（传输层切换重连后重取）
+	}
+	if m.holderAliveLocked(nodeID, now) {
+		if now.Sub(l.LastStealAt) < m.DesktopStealCooldown {
+			return false, "cooldown"
+		}
+		l.LastStealAt = now
+	}
+	l.SessionID, l.UserID, l.TakenAt = sessionID, s.UserID, now
+	return true, "taken"
+}
+
+// ReleaseDesktopControl 显式释放（仅持有者有效；非持有者 = 无操作）。
+func (m *Manager) ReleaseDesktopControl(nodeID uuid.UUID, sessionID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if l := m.desktopLeases[nodeID]; l != nil && l.SessionID == sessionID {
+		delete(m.desktopLeases, nodeID)
+	}
+}
+
+// DesktopControlOf 返回节点当前控制权归属（session 空串 = 空闲）。
+// controlState 广播用：UserID 供 api 层解析持有者显示名。
+func (m *Manager) DesktopControlOf(nodeID uuid.UUID) (sessionID string, userID uuid.UUID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if l := m.desktopLeases[nodeID]; l != nil {
+		return l.SessionID, l.UserID
+	}
+	return "", uuid.UUID{}
 }
 
 // DesktopLeaseOf 返回某节点当前输入约持有者（测试/观测；无活约 = 零值）。
@@ -396,6 +473,13 @@ func (m *Manager) AttachClientRTV(token string) (uuid.UUID, string, *proto.APIEr
 func (m *Manager) TouchActivity(sessionID string) {
 	m.mu.Lock()
 	s := m.sessions[sessionID]
+	if s != nil && !s.glued && s.Kind == proto.KindDesktop {
+		// relay-plane：viewer 不再经 AttachClientRTV 粘合（票据验签在
+		// relay 侧离线完成），首个 viewer 控制帧即视为粘合——否则 60s
+		// Opening TTL 会把正常在看的会话当"未粘合"收掉（真机验收踩坑：
+		// 首个 viewer 在 60s 内没问题，重连/晚到的 viewer 401）。
+		s.glued = true
+	}
 	m.mu.Unlock()
 	if s != nil {
 		s.lastActivity.Store(time.Now().UnixNano())

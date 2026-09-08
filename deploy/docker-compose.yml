@@ -43,6 +43,11 @@ services:
       # 换用 server 内嵌 ACME DNS-01（XNC_ACME_DOMAIN + ALIDNS_*，凭据入
       # deploy/.env）时移除这两项与 cert-sync 服务即可。
       XNC_RTV_CERT_FILE: /certs/xnc.app.crt
+      # —— relay-plane P1：RelayTicket 签名密钥（ed25519 64B hex；空 = 进程
+      # 内临时生成，重启作废——部署外部 relay 时必须显式配置）与 relay
+      # 公钥准入清单（逗号分隔 hex；命中注册即 active，未命中落 pending）。——
+      XNC_RTV_SIGNING_KEY: ${XNC_RTV_SIGNING_KEY:-}
+      XNC_RTV_RELAY_ALLOWLIST: ${XNC_RTV_RELAY_ALLOWLIST:-}
       XNC_RTV_KEY_FILE: /certs/xnc.app.key
       XNC_RTV_WT_PORT: ${XNC_RTV_WT_PORT:-}
     depends_on:

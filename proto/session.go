@@ -45,6 +45,10 @@ type DesktopParams struct {
 	// 只来自 server config XNC_RTV_INSECURE_TLS；客户端提交值被白名单
 	// 剥离；生产绝不开（server 侧高声告警）。
 	TLSInsecure bool `json:"tlsInsecure,omitempty"`
+	// CertSHA256 纯 IP relay 自签证书钉扎：host 腿 rustls 按此指纹
+	// （relay 自签证书 DER 的 SHA-256，64 位 hex）校验服务器证书，跳过
+	// 系统 Web PKI；空 = 标准 Web PKI（域名 relay，系统根校验）。
+	CertSHA256 string `json:"certSha256,omitempty"`
 }
 
 // Desktop capability 词汇（RTV 后由 server 中继侧强制：input 门控按
