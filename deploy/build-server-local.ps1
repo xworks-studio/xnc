@@ -1,4 +1,4 @@
-# build-server-local.ps1 - 本地构建 server 镜像并直推 SRV（不过 CI/GHCR）。
+﻿# build-server-local.ps1 - 本地构建 server 镜像并直推 SRV（不过 CI/GHCR）。
 # 用法: powershell -File deploy\build-server-local.ps1 -ServerVersion 0.10.9
 # 注意参数名不能用 -Version：powershell.exe -File 会把它吞作引擎参数
 # （脚本收到空值，tar 名缺版本即此症状）。

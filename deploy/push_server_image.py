@@ -53,7 +53,10 @@ def main():
         cmd = (
             f"docker load -i {REMOTE_TAR} && docker tag {IMAGE} {IMAGE} && "
             "cd /opt/xnc/deploy && docker compose up -d xnc-server && "
-            "sleep 8 && curl -sk https://127.0.0.1/api/health -H 'Host: xnc.app' && "
+            # 容器起来后 TLS 需几秒热身：重试探测代替固定 sleep（装饰性 35）
+            "for i in $(seq 1 15); do "
+            "out=$(curl -sk https://127.0.0.1/api/health -H 'Host: xnc.app') && "
+            "echo \"$out\" && break; sleep 2; done && "
             f"rm -f {REMOTE_TAR}"
         )
         _, stdout, stderr = c.exec_command(cmd, timeout=300)
