@@ -4,6 +4,14 @@
 
 ### 1.1 一句话定位
 
+> **桌面管线章节状态（2026-09-08 RTV 重构）**：远程桌面媒体面已整体重构为
+> Rust host + QUIC/WT/WS 三腿中继 + WebCodecs 渲染（替换 WebRTC/TURN/
+> rt-pipe/C++ 采集栈）。本文涉及桌面媒体/TURN/rt-pipe/IDR/QoS 的章节按
+> 历史存档理解；现行权威设计见
+> `docs/superpowers/specs/2026-09-08-desktop-rtv-rewrite-design.md` 与
+> `server/internal/rtv`、`host/` 源码。JPEG 快照/键盘输入/多显示器切换/
+> SAS 为已确认的后续 PATCH 项。
+
 XNC 是小团队和 AI Agent 的 Windows 节点统一运维入口：节点只需**出站 443 长连接**，即获得状态观测、命令执行、交互终端、脚本/文件分发和远程桌面。不是穿透工具，是合规友好的反向连接平面。
 
 ### 1.2 目标用户与角色（内部阶段 ≤10 人）
