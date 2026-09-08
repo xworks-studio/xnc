@@ -38,14 +38,12 @@ services:
       # 容器内监听（host 腿 UDP4433 / WT 腿 UDP443；均需 compose 端口映射）。
       XNC_RTV_HOST_ADDR: ":4433"
       XNC_RTV_WT_ADDR: ":443"
-      # ACME DNS-01（lego + Aliyun DNS）：浏览器 WT 走标准 Web PKI。凭据在
-      # deploy/.env（ALIDNS_*），证书/账号密钥持久化于 rtv-certs 卷。
-      XNC_ACME_DOMAIN: ${XNC_ACME_DOMAIN:-xnc.app}
-      XNC_ACME_EMAIL: ${XNC_ACME_EMAIL:-}
-      XNC_ACME_CERT_DIR: /data/rtv-certs
-      XNC_ACME_STAGING: ${XNC_ACME_STAGING:-false}
-      ALIDNS_ACCESS_KEY: ${ALIDNS_ACCESS_KEY:-}
-      ALIDNS_SECRET_KEY: ${ALIDNS_SECRET_KEY:-}
+      # RTV 腿证书：复用 caddy 的 LE 证书（cert-sync sidecar 每小时同步到
+      # ./rtv-certs，热加载按 mtime）——真实 CA，浏览器 WT 走标准 Web PKI。
+      # 换用 server 内嵌 ACME DNS-01（XNC_ACME_DOMAIN + ALIDNS_*，凭据入
+      # deploy/.env）时移除这两项与 cert-sync 服务即可。
+      XNC_RTV_CERT_FILE: /certs/xnc.app.crt
+      XNC_RTV_KEY_FILE: /certs/xnc.app.key
     depends_on:
       postgres:
         condition: service_healthy
@@ -58,6 +56,22 @@ services:
       - "4433:4433/udp"
     volumes:
       - rtv-certs:/data/rtv-certs
+      # caddy 签发的 LE 证书（cert-sync 每小时同步；热加载按 mtime）。
+      - ./rtv-certs:/certs:ro
+
+  # cert-sync：caddy_data → ./rtv-certs 证书同步（每小时）。caddy 的 ACME
+  # 自动续期保持 TCP443 有效，本 sidecar 让 RTV 腿共用同一真实 CA 证书
+  # （免新增 DNS-01 凭据；文件 0644 供 distroless nonroot 读取）。换用
+  # server 内嵌 ACME（XNC_ACME_DOMAIN + ALIDNS_*）时本服务可整体移除。
+  cert-sync:
+    image: alpine:3.20
+    restart: unless-stopped
+    volumes:
+      - caddy_data:/caddy:ro
+      - ./rtv-certs:/out
+    entrypoint: ["/bin/sh", "-c", "while true; do cp /caddy/certificates/*/xnc.app/xnc.app.crt /out/xnc.app.crt 2>/dev/null; cp /caddy/certificates/*/xnc.app/xnc.app.key /out/xnc.app.key 2>/dev/null; chmod 0644 /out/xnc.app.crt /out/xnc.app.key 2>/dev/null; sleep 3600; done"]
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
 
   # Watchtower：轮询 GHCR 自动更新 xnc-server（label 圈定范围，仅此一个
   # 服务被管理；5 分钟一轮；--cleanup 清旧镜像；不做滚动重启——单实例）。
