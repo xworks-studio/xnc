@@ -76,6 +76,8 @@ type Manager struct {
 	cfg   config.Config
 	log   *slog.Logger
 	allow map[string]bool
+	// pubkey server 当前票据签名公钥（hex）——认证通过即下发给 relay。
+	pubkey string
 
 	mu     sync.Mutex
 	conns  map[string]*relayConn // relayID → conn
@@ -85,13 +87,15 @@ type Manager struct {
 	once sync.Once
 }
 
-func New(st *db.Store, cfg config.Config, log *slog.Logger) *Manager {
+// New 构造池管理器；signingPubkey 为 server 票据签名公钥（hex），经
+// RELAY_CONFIG 下发给已认证 relay。
+func New(st *db.Store, cfg config.Config, log *slog.Logger, signingPubkey string) *Manager {
 	allow := map[string]bool{}
 	for _, k := range cfg.RTVRelayAllowlist {
 		allow[normalizeHex(k)] = true
 	}
 	return &Manager{
-		st: st, cfg: cfg, log: log, allow: allow,
+		st: st, cfg: cfg, log: log, allow: allow, pubkey: signingPubkey,
 		conns: map[string]*relayConn{}, sticky: map[string]string{},
 		stop: make(chan struct{}),
 	}
@@ -164,7 +168,9 @@ func (m *Manager) serveRelay(c *websocket.Conn) {
 		defer wcancel()
 		return c.Write(wctx, websocket.MessageText, b)
 	}
-	if send(proto.Message{Type: proto.TypeChallenge, Payload: mustJSON(proto.Challenge{Nonce: nonceStr})}) != nil {
+	// RelayID 随挑战回传：首注册时 relay 尚不知被分配的 id。
+	if send(proto.Message{Type: proto.TypeChallenge,
+		Payload: mustJSON(proto.Challenge{Nonce: nonceStr, RelayID: row.ID})}) != nil {
 		return
 	}
 	if !m.challengeOK(c, row.ID, pub, nonceStr) {
@@ -179,6 +185,12 @@ func (m *Manager) serveRelay(c *websocket.Conn) {
 		maxSess: reg.MaxSessions, maxMbps: reg.MaxMbpsOut,
 		endpoints: reg.Endpoints, lastBeat: time.Now(),
 		send: send,
+	}
+	// 下发音票公钥：relay 离线验票的信任根（relay-plane spec §3.4 的
+	// RELAY_CONFIG；P1 认证后立即一次，轮换推送留 P2）。
+	if m.pubkey != "" {
+		_ = send(proto.Message{Type: proto.TypeRelayConfig,
+			Payload: mustJSON(proto.RelayConfig{SigningPubkeys: []string{m.pubkey}})})
 	}
 	m.attach(conn)
 	defer m.detach(conn)

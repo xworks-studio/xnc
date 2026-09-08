@@ -167,11 +167,10 @@ type Verifier struct {
 	tomb map[string]time.Time // 墓碑 key → 失效时刻（有界：≤ tombstoneHorizon）
 }
 
-// NewVerifier 从公钥 hex 清单构造（至少一把，否则报错——无钥即拒一切）。
+// NewVerifier 从公钥 hex 清单构造。空清单 = bootstrap 态（xnc-relay 在
+// RELAY_CONFIG 下发前的占位——Verify 一律 ErrBadToken，此时无会话），
+// SetKeys 注满后正常验签。
 func NewVerifier(pubHexes []string) (*Verifier, error) {
-	if len(pubHexes) == 0 {
-		return nil, errors.New("rtv: verifier needs at least one public key")
-	}
 	v := &Verifier{tomb: map[string]time.Time{}}
 	for _, h := range pubHexes {
 		b, err := hex.DecodeString(strings.TrimSpace(h))
@@ -224,6 +223,19 @@ func (v *Verifier) Verify(token string) (Ticket, error) {
 		return Ticket{}, ErrKilled
 	}
 	return tk, nil
+}
+
+// SetKeys 热替换公钥集合（RELAY_CONFIG 下发时调用；双窗口期新旧并存。
+// 换钥不触碰墓碑）。
+func (v *Verifier) SetKeys(pubHexes []string) error {
+	nv, err := NewVerifier(pubHexes)
+	if err != nil {
+		return err
+	}
+	v.mu.Lock()
+	v.keys = nv.keys
+	v.mu.Unlock()
+	return nil
 }
 
 // Kill 记墓碑（撤销语义，spec §3.4）：sessionID 非空记会话键，nodeID 非空

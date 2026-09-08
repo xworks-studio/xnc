@@ -142,7 +142,7 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 	h.rtvSign = rtvSign
 	// relay 池管理器（外部中继；relay-0 之外的全部）。控制连接挂公开路由
 	// （身份 = 注册公钥的挑战-应答）；健康探测随 router 生命周期。
-	h.pool = rtvpool.New(st, cfg, slog.Default())
+	h.pool = rtvpool.New(st, cfg, slog.Default(), rtvSign.PublicKeyHex())
 	h.pool.Start()
 	if err := h.rtv.Start(); err != nil {
 		slog.Error("rtv legs failed to start", "err", err)

@@ -43,6 +43,9 @@ const (
 	TypeRelayStats             = "RELAY_STATS"
 	TypeRelayReconcile         = "RELAY_RECONCILE"
 	TypeRelaySessionKill       = "RELAY_SESSION_KILL"
+	// RELAY_CONFIG：server → relay，下行票据验签公钥集合（双窗口轮换：
+	// 新旧并存；relay 收到即重建 Verifier）。认证通过后立即下发一次。
+	TypeRelayConfig = "RELAY_CONFIG"
 )
 
 func NewMsg(typ string, payload any) (Message, error) {
@@ -57,6 +60,9 @@ func (m Message) Decode(v any) error { return json.Unmarshal(m.Payload, v) }
 
 type Challenge struct {
 	Nonce string `json:"nonce"`
+	// RelayID 仅 relay 控制连接携带：server 在挑战里回传注册身份（首注册
+	// 时 relay 尚不知自己被分配的 id；agent 端永远为空）。
+	RelayID string `json:"relayId,omitempty"`
 }
 
 type ChallengeResponse struct {
@@ -196,6 +202,11 @@ type RelayLiveSession struct {
 	NodeID    string `json:"nid"`
 	Gen       int    `json:"gen"`
 	Viewers   int    `json:"viewers"`
+}
+
+// RelayConfig 票据验签公钥集合（server 签名公钥，hex；≥1）。
+type RelayConfig struct {
+	SigningPubkeys []string `json:"signingPubkeys"`
 }
 
 // RelaySessionKill 撤销语义（spec §3.4）：relay 收到后断开该键全部连接并
