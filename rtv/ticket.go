@@ -238,14 +238,21 @@ func (v *Verifier) SetKeys(pubHexes []string) error {
 	return nil
 }
 
-// Kill 记墓碑（撤销语义，spec §3.4）：sessionID 非空记会话键，nodeID 非空
-// 记节点键（host 张无 sid，节点级撤销打这）。保留期覆盖最长票 exp。
+// Kill 记墓碑（撤销语义，spec §3.4）：
+//   - sessionID 非空 = 会话级撤销：只记会话键（会话终局的常规路径——
+//     viewer 票随会话废止）。**不碰节点键**：host 张票按 node 铸造且
+//     跨会话复用，一次会话关闭就把节点拉黑 25h 是语义错误（真机验收
+//     踩坑：host 全部 401、换血后也注册不上）。
+//   - sessionID 为空且 nodeID 非空 = 节点级撤销（管理端禁用/删除节点）：
+//     记节点键，挡下该节点全部 host 张。
+// 保留期覆盖最长票 exp。
 func (v *Verifier) Kill(nodeID, sessionID string) {
 	now := time.Now()
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if sessionID != "" {
 		v.tomb["s:"+sessionID] = now.Add(tombstoneHorizon)
+		return
 	}
 	if nodeID != "" {
 		v.tomb["n:"+nodeID] = now.Add(tombstoneHorizon)
