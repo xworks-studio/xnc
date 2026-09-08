@@ -28,6 +28,10 @@ type Config struct {
 	// 腿；compose 映射 4433/udp 与 443/udp）。
 	RTVHostAddr string // XNC_RTV_HOST_ADDR，默认 ":4433"
 	RTVWTAddr   string // XNC_RTV_WT_ADDR，默认 ":443"
+	// RTVWTPublicPort：浏览器 WT URL 的公网端口（XNC_RTV_WT_PORT；空 = 443
+	// 规范端口。UDP443 被安全组拦截等过渡期用非规范端口，如 14433 映射
+	// 到容器 443）。
+	RTVWTPublicPort string // XNC_RTV_WT_PORT
 	// RTV 证书：ACME DNS-01（lego + Aliyun DNS）为主——浏览器 WT 走标准
 	// Web PKI（真实 CA 证书，无 serverCertificateHashes 层）。ACME 未配置时
 	// 回落 XNC_RTV_CERT_FILE/KEY_FILE 文件对；再缺 = 进程内自签 dev 证书

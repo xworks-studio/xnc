@@ -44,6 +44,7 @@ services:
       # deploy/.env）时移除这两项与 cert-sync 服务即可。
       XNC_RTV_CERT_FILE: /certs/xnc.app.crt
       XNC_RTV_KEY_FILE: /certs/xnc.app.key
+      XNC_RTV_WT_PORT: ${XNC_RTV_WT_PORT:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -54,6 +55,9 @@ services:
       # 网络不必要）。
       - "443:443/udp"
       - "4433:4433/udp"
+      # 过渡期 WT 非规范端口（UDP443 被安全组拦截时浏览器走这里；放行
+      # 443/udp 后置空 XNC_RTV_WT_PORT 即回规范 URL）。
+      - "14433:443/udp"
     volumes:
       - rtv-certs:/data/rtv-certs
       # caddy 签发的 LE 证书（cert-sync 每小时同步；热加载按 mtime）。
