@@ -16,12 +16,6 @@ import (
 // relayBodyMaxBytes：relay 管理端点请求体上限（状态流转一个字段）。
 const relayBodyMaxBytes = 4 * 1024
 
-// relayPool 池管理器接线面（rtvpool 注入；nil = 无在线通知——T5 前的
-// 过渡形态，状态变更对在线 relay 的推送由池管理器承担）。
-type relayPool interface {
-	RelayStatusChanged(id, status string)
-}
-
 // relayStatusLegal 状态流转合法性：pending→active（审批）/pending→retired
 // （拒绝）；active↔draining（摘除/回纳）；*→retired；retired→active
 // （重新启用）。pending 不得直接 draining（未准入者无存量会话可摘）。

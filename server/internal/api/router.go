@@ -13,6 +13,7 @@ import (
 	"xnc/server/internal/config"
 	"xnc/server/internal/db"
 	"xnc/server/internal/registry"
+	"xnc/server/internal/rtvpool"
 	"xnc/server/internal/session"
 	"xnc/server/internal/version"
 )
@@ -26,8 +27,8 @@ type handlers struct {
 	// rtvSign RelayTicket 签发器（relay-plane spec §3.1：host 张按
 	// (node,relay) 等值复用、viewer 张按会话铸造；私钥绝不外流）。
 	rtvSign *rtv.Signer
-	// pool relay 池管理器（T5 注入；nil = 未接线，状态变更无在线通知）。
-	pool relayPool
+	// pool relay 池管理器（nil 仅出现在未完成装配的测试构造里）。
+	pool *rtvpool.Manager
 }
 
 // Close 停止 handler 的后台 worker（RTV 中继随进程生命周期，无独立停止面）。
@@ -139,6 +140,10 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 	h.rtv = rtv.New(rtv.Options{HostAddr: cfg.RTVHostAddr, WTAddr: cfg.RTVWTAddr},
 		tlsProv, rtvHost, cfg.RTVWSOrigins)
 	h.rtvSign = rtvSign
+	// relay 池管理器（外部中继；relay-0 之外的全部）。控制连接挂公开路由
+	// （身份 = 注册公钥的挑战-应答）；健康探测随 router 生命周期。
+	h.pool = rtvpool.New(st, cfg, slog.Default())
+	h.pool.Start()
 	if err := h.rtv.Start(); err != nil {
 		slog.Error("rtv legs failed to start", "err", err)
 	}
@@ -205,6 +210,8 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 	r.Get("/api/agent/session", h.agentSessionWS)
 	// RTV WS 兜底腿（token 即凭证；经 caddy TCP443 → 主 mux）
 	r.Get("/ws", h.rtv.WSHandler())
+	// relay 控制连接（公开：身份凭据 = 注册公钥挑战-应答，无 JWT）
+	r.Get("/api/relay/connect", h.pool.Handler())
 
 	// 自更新管理面（admin：部署流水线上传制品 + 灰度 pin/强制下发）
 	r.Route("/api/admin", func(ar chi.Router) {
@@ -263,5 +270,5 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 	// index.html（react-router 客户端路由）；/api/* 前缀在 handler 内
 	// 保持 404，不被 SPA 吞掉。
 	r.Mount("/", server.SPAHandler())
-	return r, func() { _ = h.Close() }
+	return r, func() { h.pool.Stop(); _ = h.Close() }
 }
