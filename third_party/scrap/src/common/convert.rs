@@ -237,10 +237,11 @@ pub fn convert(captured: &PixelBuffer, pixfmt: crate::Pixfmt, dst: &mut Vec<u8>)
     Ok(())
 }
 
-/// BGRA 帧等比缩放（libyuv ARGBScale，bilinear）。dst 自动扩容到 dw*4*dh。
+/// BGRA 帧等比缩放（libyuv ARGBScale，bilinear）。src_stride 为源行距
+/// （DXGI pitch 可含对齐填充，不必等于 sw*4）；dst 紧凑 dw*4 行距。
 /// 供采集端降采样（宽源编码前收缩，IDR 体积随面积线性下降）。
-pub fn scale_bgra(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize, dst: &mut Vec<u8>) {
-    let src_stride = sw * 4;
+pub fn scale_bgra(src: &[u8], src_stride: usize, sw: usize, sh: usize, dw: usize, dh: usize, dst: &mut Vec<u8>) {
+    debug_assert!(src_stride >= sw * 4 && src.len() >= src_stride * sh);
     let dst_stride = dw * 4;
     dst.resize(dst_stride.checked_mul(dh).unwrap_or(usize::MAX), 0);
     let r = unsafe {

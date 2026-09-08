@@ -315,7 +315,7 @@ fn run_pipeline(shared: &Arc<Shared>, cfg: &RunConfig) -> Result<()> {
     });
     // config 在 transport 连接时/已连接时都会发送；已连接则补发一次
     shared.ctrl_send(ControlMsg(serde_json::json!({
-        "type": "config", "codec": "h264", "width": w, "height": h,
+        "type": "config", "codec": "h264", "width": ew, "height": eh,
         "fps": fps0, "fecPercentage": shared.fec_percentage.load(Ordering::SeqCst),
         "shardPayload": framing::SHARD_PAYLOAD_TARGET,
         "encoder": enc.name, "encoderHw": enc.hw,
@@ -376,7 +376,11 @@ fn run_pipeline(shared: &Arc<Shared>, cfg: &RunConfig) -> Result<()> {
                 // ---- 编码 ----
                 let t_enc = Instant::now();
                 let frame_in: &[u8] = if (ew, eh) != (w, h) {
-                    scrap::scale_bgra(bgra, w, h, ew, eh, &mut scale_buf);
+                    // composited 是 DXGI 原生 pitch 的行距缓冲（可能 > w*4，
+                    // 假设紧凑行距会造成行错位——生产实测）。以 len/h 取真实
+                    // 行距喂 ARGBScale。
+                    let pitch = bgra.len() / h.max(1);
+                    scrap::scale_bgra(bgra, pitch, w, h, ew, eh, &mut scale_buf);
                     &scale_buf
                 } else {
                     bgra
