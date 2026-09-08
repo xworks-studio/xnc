@@ -29,7 +29,10 @@ pub struct FeedbackSummary {
 }
 
 pub struct Shared {
-    pub session: String,
+    /// 节点标识（server 侧 Hub 键；XNC 部署形态下来自 stdin 配置，本地调试可缺省）
+    pub node_id: String,
+    /// HostToken（server 经 SESSION_OPEN→agent→core→stdin 下发；绝不写日志）
+    pub token: String,
     pub connected: AtomicBool,
     pub idr_requested: AtomicBool,
     /// QoS 调整后的采集帧率（初始为 CLI 值）
@@ -47,9 +50,10 @@ pub struct Shared {
 }
 
 impl Shared {
-    pub fn new(session: String, fps: i32, bitrate_kbs: i32, fec_percentage: u8) -> Self {
+    pub fn new(node_id: String, token: String, fps: i32, bitrate_kbs: i32, fec_percentage: u8) -> Self {
         Self {
-            session,
+            node_id,
+            token,
             connected: AtomicBool::new(false),
             idr_requested: AtomicBool::new(false),
             fps: AtomicI32::new(fps),

@@ -12,6 +12,7 @@ hwcodec = { git = "https://github.com/rustdesk-org/hwcodec" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-native-certs = "0.8"
 bytes = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

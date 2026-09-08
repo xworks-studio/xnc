@@ -26,14 +26,22 @@ const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 const CONTROL_BUF: usize = 256 * 1024;
 
 /// 连接服务器并运行到进程结束（内部自动重连）。
-pub async fn run(shared: Arc<Shared>, server: SocketAddr, send_kbps: u32) -> Result<()> {
+pub async fn run(
+    shared: Arc<Shared>,
+    server: SocketAddr,
+    server_name: &str,
+    send_kbps: u32,
+    tls_insecure: bool,
+) -> Result<()> {
     let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
         .context("bind quic client endpoint")?;
 
     let mut backoff = RECONNECT_BACKOFF;
     loop {
         let t0 = std::time::Instant::now();
-        match connect_and_serve(&endpoint, server, &shared, send_kbps).await {
+        match connect_and_serve(&endpoint, server, server_name, &shared, send_kbps, tls_insecure)
+            .await
+        {
             Err(e) => {
                 shared.disconnect();
                 tracing::warn!(
@@ -53,12 +61,14 @@ pub async fn run(shared: Arc<Shared>, server: SocketAddr, send_kbps: u32) -> Res
 async fn connect_and_serve(
     endpoint: &quinn::Endpoint,
     server: SocketAddr,
+    server_name: &str,
     shared: &Arc<Shared>,
     send_kbps: u32,
+    tls_insecure: bool,
 ) -> anyhow::Result<()> {
     let t0 = std::time::Instant::now();
     let conn = endpoint
-        .connect_with(client_config()?, server, "mvp-server")?
+        .connect_with(client_config(tls_insecure)?, server, server_name)?
         .await
         .context("quic connect")?;
     tracing::info!(
@@ -70,9 +80,10 @@ async fn connect_and_serve(
     // 控制流（host 主动 open_bi）
     let (mut ctrl_tx, ctrl_rx_stream) = conn.open_bi().await.context("open control stream")?;
 
-    // 注册 + 会话参数
+    // 注册 + 会话参数（token 为 server 经 SESSION_OPEN 链路下发的注册凭据）
     send_control(&mut ctrl_tx, &serde_json::json!({
-        "type": "hello", "role": "host", "sessionId": shared.session,
+        "type": "hello", "role": "host",
+        "nodeId": shared.node_id, "token": shared.token,
     }))
     .await?;
     if let Some(meta) = shared.encoder_meta() {
@@ -232,13 +243,31 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-// ---------------- rustls 配置（MVP 无鉴权：接受任意服务端证书） ----------------
+// ---------------- rustls 配置 ----------------
+// 生产：系统根校验（server 证书为 CA 签发，SNI=server_name）。
+// 调试：--tls-insecure 接受任意证书（仅本地自签 dev server，日志高声告警）。
 
-fn client_config() -> anyhow::Result<quinn::ClientConfig> {
-    let mut tls = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyServer))
-        .with_no_client_auth();
+fn client_config(insecure: bool) -> anyhow::Result<quinn::ClientConfig> {
+    let mut tls = if insecure {
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServer))
+            .with_no_client_auth()
+    } else {
+        let mut roots = rustls::RootCertStore::empty();
+        let native = rustls_native_certs::load_native_certs();
+        if !native.errors.is_empty() {
+            anyhow::bail!("load native certs: {:?}", native.errors);
+        }
+        for cert in native.certs {
+            roots
+                .add(cert)
+                .map_err(|e| anyhow::anyhow!("add native cert: {e}"))?;
+        }
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    };
     tls.alpn_protocols = ALPN.iter().map(|p| p.as_bytes().to_vec()).collect();
     let mut transport = quinn::TransportConfig::default();
     transport.datagram_receive_buffer_size(Some(64 * 1024));
@@ -250,6 +279,7 @@ fn client_config() -> anyhow::Result<quinn::ClientConfig> {
     Ok(cfg)
 }
 
+/// 仅 --tls-insecure 调试路径使用的跳过校验器。
 #[derive(Debug)]
 struct AcceptAnyServer;
 

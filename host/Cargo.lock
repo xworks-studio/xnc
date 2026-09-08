@@ -1822,6 +1822,7 @@ dependencies = [
  "hwcodec",
  "quinn",
  "rustls",
+ "rustls-native-certs",
  "scrap",
  "serde 1.0.229",
  "serde_json 1.0.151",
