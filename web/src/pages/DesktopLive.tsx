@@ -65,7 +65,12 @@ export default function DesktopLive() {
   const [fatalMsg, setFatalMsg] = useState("");
   const [transport, setTransport] = useState<"wt" | "ws" | "-">("-");
   const [codecInfo, setCodecInfo] = useState("");
-  const [leaseGranted, setLeaseGranted] = useState(false);
+  // 控制权归属（服务器 controlState 广播；null = 尚未收到）
+  const [control, setControl] = useState<{
+    holder: string;
+    name: string;
+  } | null>(null);
+  const selfSessionRef = useRef("");
   const [inputOn, setInputOn] = useState(false);
   const [statsOpen, setStatsOpen] = useState(false);
   const [isFs, setIsFs] = useState(false);
@@ -212,6 +217,30 @@ export default function DesktopLive() {
           log(
             `QoS: fps=${v.fps} kbps=${v.bitrateKbps} fec=${v.fecPercentage}% (${v.reason})`,
           );
+          break;
+        case "controlState": {
+          // 控制权归属变更（含自己接管/被接管/他人释放）。
+          const holder = typeof v.holderSession === "string" ? v.holderSession : "";
+          const name = typeof v.holderName === "string" ? v.holderName : "";
+          setControl({ holder, name });
+          // 被接管：持有者不再是自己且本地仍在注入 → 自动让位。
+          if (
+            holder &&
+            holder !== selfSessionRef.current &&
+            inputOnRef.current
+          ) {
+            setInputOn(false);
+            log(`控制权被 ${name || "其他用户"} 接管，输入已停止`);
+          }
+          break;
+        }
+        case "controlResult":
+          if (v.ok === false) {
+            const why =
+              v.reason === "cooldown" ? "接管过于频繁，稍候再试" : String(v.reason);
+            setInputOn(false);
+            log(`接管控制失败：${why}`);
+          }
           break;
         case "hostOffline":
           // 置空 config 恢复 hello 周期重发；host 回来后 config 重新下发。
@@ -428,7 +457,8 @@ export default function DesktopLive() {
         `/api/nodes/${encodeURIComponent(nodeId)}/desktop`,
         { method: "POST", body: "{}" },
       );
-      setLeaseGranted(resp.lease?.granted ?? false);
+      // lease.granted 仅是创建时刻的被动授予提示；实时归属以 controlState 为准
+      selfSessionRef.current = resp.sessionId;
       const wanted = new URLSearchParams(location.search).get("transport");
       const sep = (u: string) => (u.includes("?") ? "&" : "?");
       const wtUrl = `${resp.wtUrl}${sep(resp.wtUrl)}token=${encodeURIComponent(resp.token)}`;
@@ -512,11 +542,33 @@ export default function DesktopLive() {
     };
   };
 
-  const inputAllowed = leaseGranted && inputOn;
+  const controlSelf = control !== null && control.holder === selfSessionRef.current;
+  const controlOther =
+    control !== null && control.holder !== "" && control.holder !== selfSessionRef.current;
+  const inputAllowed = inputOn && controlSelf;
   const sendMouse = (kind: string, extra: Record<string, unknown>) => {
     if (!inputAllowed) return;
     sendCtrlRef.current?.({ type: "input", event: "mouse", kind, ...extra });
   };
+
+  // 控制权按钮：自己持约=开始/停止控制（本地开关）；他人持约或空闲=接管
+  // （takeControl——他人活约时为抢占，服务器 3s 防抖）。
+  const onControlClick = () => {
+    if (controlSelf && inputOn) {
+      setInputOn(false);
+      sendCtrlRef.current?.({ type: "releaseControl" });
+      return;
+    }
+    setInputOn(true);
+    if (!controlSelf) sendCtrlRef.current?.({ type: "takeControl" });
+  };
+  const controlLabel = controlSelf
+    ? inputOn
+      ? "停止控制"
+      : "开始控制"
+    : controlOther
+      ? `接管控制（当前：${control?.name || "其他用户"}）`
+      : "接管控制";
 
   const onMouseMove = (e: ReactMouseEvent<HTMLCanvasElement>) => {
     if (!inputAllowed) return;
@@ -552,6 +604,11 @@ export default function DesktopLive() {
           {phase === "hostOffline" && (
             <span className="dt-chip bad">○ 主机离线</span>
           )}
+          {controlOther && (
+            <span className="dt-chip warn" title="其他用户持有控制权">
+              控制权：{control?.name || "其他用户"}
+            </span>
+          )}
           <span className="dt-chip" title="控制环往返（心跳测得）">
             rtt {Math.round(rttMs)}ms
           </span>
@@ -574,18 +631,17 @@ export default function DesktopLive() {
         </div>
         <div className="dt-actions">
           <button
-            className={`btn${inputOn ? " dt-btn-on" : ""}`}
-            disabled={!leaseGranted}
+            className={`btn${inputAllowed ? " dt-btn-on" : ""}`}
             title={
-              leaseGranted
+              controlSelf
                 ? inputOn
-                  ? "关闭鼠标控制"
-                  : "开启鼠标控制（注入远程桌面）"
-                : "当前用户无输入权（需 desktop lease）"
+                  ? "停止注入并释放控制权"
+                  : "开始注入鼠标输入（已持有控制权）"
+                : "接管控制权（他人持有时为抢占，3 秒防抖）"
             }
-            onClick={() => setInputOn((v) => !v)}
+            onClick={onControlClick}
           >
-            鼠标控制{inputOn ? "：开" : ""}
+            {controlLabel}
           </button>
           <button
             className="btn"
@@ -697,7 +753,9 @@ export default function DesktopLive() {
 
       {inputOn && (
         <footer className="dt-hint">
-          鼠标控制已开启，移动/点击/滚轮将注入远程桌面（键盘输入为后续版本）
+          {inputAllowed
+            ? "鼠标控制已开启，移动/点击/滚轮将注入远程桌面（键盘输入为后续版本）"
+            : "正在接管控制权…（他人持有时为抢占）"}
         </footer>
       )}
     </div>

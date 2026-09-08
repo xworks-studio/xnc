@@ -1,10 +1,12 @@
 package api
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -139,6 +141,43 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		}
 		holder, _ := sess.DesktopLeaseOf(n)
 		return holder != "" && holder == sessionID
+	})
+	// 控制权流转仲裁：session manager 控制表为事实源；State 顺带把持有者
+	// UserID 解析成显示名（controlState 广播用；查不到回退 email→空）。
+	h.rtv.Hub.SetControlHooks(rtv.ControlHooks{
+		Take: func(node, sessionID string) (bool, string) {
+			n, err := uuid.Parse(node)
+			if err != nil {
+				return false, "bad-node"
+			}
+			return sess.TakeDesktopControl(n, sessionID, time.Now())
+		},
+		Release: func(node, sessionID string) {
+			if n, err := uuid.Parse(node); err == nil {
+				sess.ReleaseDesktopControl(n, sessionID)
+			}
+		},
+		State: func(node string) (string, string) {
+			n, err := uuid.Parse(node)
+			if err != nil {
+				return "", ""
+			}
+			sid, uid := sess.DesktopControlOf(n)
+			if sid == "" {
+				return "", ""
+			}
+			name := ""
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if u, err := st.Q().GetUserByID(ctx, uid); err == nil {
+				if u.DisplayName != "" {
+					name = u.DisplayName
+				} else {
+					name = u.Email
+				}
+			}
+			return sid, name
+		},
 	})
 	if err := h.rtv.Start(); err != nil {
 		slog.Error("rtv legs failed to start", "err", err)

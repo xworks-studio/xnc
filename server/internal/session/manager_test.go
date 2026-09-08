@@ -391,3 +391,54 @@ func TestDesktopLeaseIdleExpiry(t *testing.T) {
 	r2, _ := m.Create(id, uuid.New(), proto.KindDesktop, []byte(`{}`))
 	assert.True(t, r2.LeaseGranted)
 }
+
+// TestDesktopControlFlow:显式控制权流转——接管（抢占+冷却）/释放/幂等；
+// 控制表与 DesktopLeaseOf 门控视角同源。
+func TestDesktopControlFlow(t *testing.T) {
+	id, m := onlineMgr(t)
+	defer m.Close()
+	m.DesktopStealCooldown = 200 * time.Millisecond
+
+	u1, u2, u3 := uuid.New(), uuid.New(), uuid.New()
+	r1, apiErr := m.Create(id, u1, proto.KindDesktop, []byte(`{}`))
+	require.Nil(t, apiErr)
+	require.True(t, r1.LeaseGranted, "first session passively granted")
+
+	r2, apiErr := m.Create(id, u2, proto.KindDesktop, []byte(`{}`))
+	require.Nil(t, apiErr)
+	require.False(t, r2.LeaseGranted, "second session view-only at create")
+
+	// r2 显式接管（r1 活约在手 → 抢占）。
+	ok, reason := m.TakeDesktopControl(id, r2.Session.ID, time.Now())
+	require.True(t, ok)
+	assert.Equal(t, "taken", reason)
+	sid, uid := m.DesktopControlOf(id)
+	assert.Equal(t, r2.Session.ID, sid)
+	assert.Equal(t, u2, uid)
+	// 门控视角同步翻转：r1 输入被拒、r2 放行。
+	holder, _ := m.DesktopLeaseOf(id)
+	assert.Equal(t, r2.Session.ID, holder)
+
+	// r3 冷却窗口内接管 → 拒绝。
+	r3, apiErr := m.Create(id, u3, proto.KindDesktop, []byte(`{}`))
+	require.Nil(t, apiErr)
+	ok, reason = m.TakeDesktopControl(id, r3.Session.ID, time.Now())
+	assert.False(t, ok)
+	assert.Equal(t, "cooldown", reason)
+
+	// r2 释放 → 空闲 → r3 接管成功 → 幂等。
+	m.ReleaseDesktopControl(id, r2.Session.ID)
+	sid, _ = m.DesktopControlOf(id)
+	assert.Empty(t, sid)
+	ok, reason = m.TakeDesktopControl(id, r3.Session.ID, time.Now())
+	require.True(t, ok)
+	assert.Equal(t, "granted", reason)
+	ok, reason = m.TakeDesktopControl(id, r3.Session.ID, time.Now())
+	assert.True(t, ok)
+	assert.Equal(t, "held", reason)
+
+	// 未知会话接管 → 拒绝。
+	ok, reason = m.TakeDesktopControl(id, "no-such-session", time.Now())
+	assert.False(t, ok)
+	assert.Equal(t, "no-session", reason)
+}

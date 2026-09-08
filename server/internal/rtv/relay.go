@@ -123,16 +123,28 @@ func (h *HostSession) fanoutMedia(data []byte) {
 }
 
 // forwardToHost viewer→host 控制消息转发（input 消息按门控放行——由
-// Hub.gateInput 判定该 viewer 会话是否持节点活约）。
+// Hub.gateInput 判定该 viewer 会话是否持节点活约）。控制权流转消息
+// （takeControl/releaseControl）在服务器终结，不转发给 host。
 func (h *HostSession) forwardToHost(v json.RawMessage, from Viewer) {
 	var probe struct {
 		Type string `json:"type"`
 	}
 	_ = json.Unmarshal(v, &probe)
-	if probe.Type == "input" {
+	switch probe.Type {
+	case "input":
 		if h.hub == nil || !h.hub.gateInput(from.Node(), from.Session()) {
 			return // 无输入权：静默丢弃（不回错——旧栈同语义，view-only）
 		}
+	case "takeControl":
+		if h.hub != nil {
+			h.hub.handleTakeControl(from.Node(), from)
+		}
+		return
+	case "releaseControl":
+		if h.hub != nil {
+			h.hub.handleReleaseControl(from.Node(), from)
+		}
+		return
 	}
 	h.ctrlMu.Lock()
 	defer h.ctrlMu.Unlock()
@@ -184,11 +196,23 @@ type Hub struct {
 	// gateInput 由 api 层注入：该 (node, session) 是否持节点输入活约。
 	gateInput func(node, session string) bool
 
+	// control 控制权流转仲裁（api 层注入，session manager 控制表为事实源）。
+	control ControlHooks
+
 	// hostTokenOf 由 api 层注入：节点当前活跃 desktop 会话 params 里的
 	// HostToken（无活约/解析失败 = ""）。server 重启后 minted 表清空，而
 	// 运行中的 host 重连时重放的是 spawn 时的 token——经活跃会话回查即可
 	// 无持久化地恢复注册（会话仍在 = 凭据仍有效）。
 	hostTokenOf func(node string) string
+}
+
+// ControlHooks 控制权流转回调：Take（接管，reason 供回执）、Release
+// （释放）、State（当前归属；holderSession 空 = 空闲，holderName 为
+// api 层解析的显示名）。
+type ControlHooks struct {
+	Take    func(node, session string) (ok bool, reason string)
+	Release func(node, session string)
+	State   func(node string) (holderSession, holderName string)
 }
 
 func NewHub() *Hub {
@@ -198,6 +222,57 @@ func NewHub() *Hub {
 
 // SetInputGate 注入 input 门控（须在 Start 前完成）。
 func (g *Hub) SetInputGate(fn func(node, session string) bool) { g.gateInput = fn }
+
+// SetControlHooks 注入控制权仲裁（须在 Start 前完成）。
+func (g *Hub) SetControlHooks(c ControlHooks) { g.control = c }
+
+// controlStateMsg 当前控制权归属消息（广播/单发共用）。
+func (g *Hub) controlStateMsg(node string) json.RawMessage {
+	holder, name := "", ""
+	if g.control.State != nil {
+		holder, name = g.control.State(node)
+	}
+	return mustJSON(map[string]any{
+		"type": "controlState", "holderSession": holder, "holderName": name,
+	})
+}
+
+// broadcastControlState 向该节点当前全部 viewer 广播控制权归属。
+func (g *Hub) broadcastControlState(node string) {
+	msg := g.controlStateMsg(node)
+	if h := g.Host(node); h != nil {
+		h.broadcastControl(msg)
+	}
+}
+
+// handleTakeControl viewer 显式接管：成功 → 广播 controlState（含接管者
+// 自己，UI 据此切换）；失败（冷却等）→ 仅回执发起者 + 同步一次状态。
+func (g *Hub) handleTakeControl(node string, from Viewer) {
+	if g.control.Take == nil {
+		return
+	}
+	ok, reason := g.control.Take(node, from.Session())
+	if !ok {
+		slog.Info("control take denied", "node", node, "viewer", from.ID(), "reason", reason)
+		_ = from.SendControlJSON(mustJSON(map[string]any{
+			"type": "controlResult", "ok": false, "reason": reason,
+		}))
+		_ = from.SendControlJSON(g.controlStateMsg(node))
+		return
+	}
+	slog.Info("control taken", "node", node, "viewer", from.ID(), "session", from.Session(), "reason", reason)
+	g.broadcastControlState(node)
+}
+
+// handleReleaseControl viewer 显式释放：广播（非持有者释放 = 无操作，
+// 广播无害且让 UI 对齐）。
+func (g *Hub) handleReleaseControl(node string, from Viewer) {
+	if g.control.Release != nil {
+		g.control.Release(node, from.Session())
+	}
+	slog.Info("control released", "node", node, "viewer", from.ID(), "session", from.Session())
+	g.broadcastControlState(node)
+}
 
 // SetHostTokenOf 注入活跃会话 token 回查（server 重启后的 host 重注册路径）。
 func (g *Hub) SetHostTokenOf(fn func(node string) string) { g.hostTokenOf = fn }
@@ -331,6 +406,8 @@ func (g *Hub) AddViewer(nodeID string, w Viewer) {
 	if cfg := h.cachedConfig(); cfg != nil {
 		_ = w.SendControlJSON(cfg)
 	}
+	// 单发当前控制权归属（晚加入者立即知道自己是否 view-only、谁在控）
+	_ = w.SendControlJSON(g.controlStateMsg(nodeID))
 	// 通知 host 新 viewer 数 + 合成一次 IDR 请求（rustdesk 新订阅者触发关键帧的对应物）
 	h.notifyViewers()
 	h.forwardToHostNoGate(mustJSON(map[string]any{"type": "frameLoss", "frameIndex": 0, "reason": "new-viewer"}))
