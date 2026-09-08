@@ -119,7 +119,9 @@ async fn media_sender(
     mut rx: mpsc::UnboundedReceiver<Vec<Vec<u8>>>,
 ) -> anyhow::Result<()> {
     let rate = send_kbps as f64 * 1000.0 / 8.0; // bytes/s
-    let burst = 64.0 * 1024.0;
+    // 突发上限压到浏览器 QUIC 初始拥塞窗口（~32×MTU≈38KB）之下：64KB
+    // 突发会在新连接上制造即时拥塞/丢弃（首帧变慢，生产实测）。
+    let burst = 32.0 * 1024.0;
     let mut tokens = burst;
     let mut last = std::time::Instant::now();
     while let Some(packets) = rx.recv().await {

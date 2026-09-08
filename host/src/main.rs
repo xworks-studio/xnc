@@ -60,6 +60,11 @@ struct Args {
     /// 显示器序号（0 = 主屏）
     #[arg(long, default_value_t = 0)]
     display: usize,
+    /// 编码宽度上限（等比降采样；0 = 原生分辨率）。默认 1920：原生 2K/4K
+    /// 源的 IDR 数百 KB 会冲垮浏览器新 QUIC 连接的初始拥塞窗口（首帧
+    /// 等待数十秒，生产实测），对齐旧栈 --max-w 语义。
+    #[arg(long, default_value_t = 1920)]
+    max_w: usize,
     /// 发送端整流速率上限（kbps）
     #[arg(long, default_value_t = 50000)]
     send_kbps: u32,
@@ -98,6 +103,8 @@ struct StdinConfig {
     display: Option<usize>,
     #[serde(rename = "sendKbps")]
     send_kbps: Option<u32>,
+    #[serde(default, rename = "maxWidth")]
+    max_width: Option<usize>,
     #[serde(rename = "logFile")]
     log_file: Option<String>,
     #[serde(default, rename = "tlsInsecure")]
@@ -107,6 +114,7 @@ struct StdinConfig {
 /// 解析后的有效配置（stdin 优先，CLI 回退）。
 struct RunConfig {
     endpoint: SocketAddr,
+    max_w: usize,
     server_name: String,
     node_id: String,
     token: String,
@@ -169,6 +177,7 @@ fn resolve_config(args: &Args) -> Result<RunConfig> {
         log_file: stdin_cfg.log_file.or_else(|| args.log_file.clone()),
         tls_insecure: stdin_cfg.tls_insecure.unwrap_or(args.tls_insecure),
         display: args.display,
+        max_w: stdin_cfg.max_width.unwrap_or(args.max_w),
         no_cursor: args.no_cursor,
         encoder: args.encoder.clone(),
     })
@@ -282,15 +291,27 @@ fn run_pipeline(shared: &Arc<Shared>, cfg: &RunConfig) -> Result<()> {
 
     let fps0 = shared.fps.load(Ordering::SeqCst);
     let bitrate = shared.bitrate_kbs.load(Ordering::SeqCst);
+    // 等比降采样（宽 > max_w）：IDR 体积随面积收缩，浏览器首帧不再被
+    // 原生 2K/4K 突发冲垮。max_w=0 = 原生。
+    let (ew, eh) = if cfg.max_w > 0 && w > cfg.max_w {
+        let eh = (((h as u64 * cfg.max_w as u64) / w as u64) as usize).max(2) & !1usize; // 偶数
+        (cfg.max_w, eh)
+    } else {
+        (w, h)
+    };
+    if (ew, eh) != (w, h) {
+        tracing::info!(from = format!("{w}x{h}"), to = format!("{ew}x{eh}"), "downscale enabled");
+    }
+    let mut scale_buf: Vec<u8> = Vec::new();
     let mut enc = match &cfg.encoder {
-        Some(name) => VideoEncoder::with_name(name, w, h, fps0, bitrate)?,
-        None => VideoEncoder::new(w, h, fps0, bitrate)?,
+        Some(name) => VideoEncoder::with_name(name, ew, eh, fps0, bitrate)?,
+        None => VideoEncoder::new(ew, eh, fps0, bitrate)?,
     };
     shared.set_encoder_meta(EncoderMeta {
         name: enc.name.clone(),
         hw: enc.hw,
-        width: w,
-        height: h,
+        width: ew,
+        height: eh,
     });
     // config 在 transport 连接时/已连接时都会发送；已连接则补发一次
     shared.ctrl_send(ControlMsg(serde_json::json!({
@@ -354,8 +375,14 @@ fn run_pipeline(shared: &Arc<Shared>, cfg: &RunConfig) -> Result<()> {
 
                 // ---- 编码 ----
                 let t_enc = Instant::now();
+                let frame_in: &[u8] = if (ew, eh) != (w, h) {
+                    scrap::scale_bgra(bgra, w, h, ew, eh, &mut scale_buf);
+                    &scale_buf
+                } else {
+                    bgra
+                };
                 let packets = enc
-                    .encode_bgra(bgra, frame_index as i64)
+                    .encode_bgra(frame_in, frame_index as i64)
                     .with_context(|| format!("encode frame {frame_index}"))?;
                 let enc_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
                 shared.stats.encode_time(enc_ms);

@@ -236,3 +236,16 @@ pub fn convert(captured: &PixelBuffer, pixfmt: crate::Pixfmt, dst: &mut Vec<u8>)
     }
     Ok(())
 }
+
+/// BGRA 帧等比缩放（libyuv ARGBScale，bilinear）。dst 自动扩容到 dw*4*dh。
+/// 供采集端降采样（宽源编码前收缩，IDR 体积随面积线性下降）。
+pub fn scale_bgra(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize, dst: &mut Vec<u8>) {
+    let src_stride = sw * 4;
+    let dst_stride = dw * 4;
+    dst.resize(dst_stride.checked_mul(dh).unwrap_or(usize::MAX), 0);
+    let r = unsafe {
+        ARGBScale(src.as_ptr(), src_stride as _, sw as _, sh as _,
+                  dst.as_mut_ptr(), dst_stride as _, dw as _, dh as _, 2 /* bilinear */)
+    };
+    debug_assert_eq!(r, 0, "ARGBScale failed");
+}
