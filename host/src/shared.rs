@@ -85,6 +85,8 @@ impl Shared {
         *self.media_tx.lock().unwrap() = None;
         *self.ctrl_tx.lock().unwrap() = None;
         self.stats.session_disconnected();
+        // 控制通道已断：松开所有仍按住的键（粘键防漏）
+        crate::input::release_all_keys();
     }
 
     pub fn is_connected(&self) -> bool {

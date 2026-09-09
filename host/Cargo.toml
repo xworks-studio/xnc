@@ -25,6 +25,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 winapi = { version = "0.3", features = [
     "winuser", "wingdi", "errhandlingapi", "winerror", "libloaderapi", "handleapi",
+    "winbase", # GlobalAlloc/GlobalLock/GlobalSize 族（剪贴板 HGLOBAL）
 ] }
 
 [profile.release]
