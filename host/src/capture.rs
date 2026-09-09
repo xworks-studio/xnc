@@ -1,17 +1,18 @@
-//! 屏幕采集（Windows）：scrap DXGI → GDI 三层回退 + 帧比较跳帧 + 光标合成。
+//! 屏幕采集（Windows）：scrap DXGI → GDI 回退 + 帧比较跳帧 + 可选光标合成。
 //!
 //! - 回退/重试模式移植自 rustdesk `src/server/video_service.rs:805-864`
-//!   （连续 WouldBlock>3 或采集错误 → set_gdi；显示器变化 → 重建）。
+//!   （WouldBlock 持续超阈值或采集错误 → set_gdi；显示器变化 → 重建）。
 //! - 帧内容比较跳帧移植自 rustdesk `would_block_if_equal`（画面未变不编码）。
-//! - 光标服务端合成（Sunshine 方案）：DXGI 不含光标，CPU 端叠加；
-//!   桌面无新帧仅光标移动时，基于上帧原始数据重新合成（Sunshine
-//!   display_vram.cpp:1481-1505 的 CPU 版对应物）。
-//! - 光标防闪烁（2026-09 修订）：
+//! - 光标模型（2026-09-09 定稿）：**默认不合成进视频流**——web 端以本地
+//!   十字准星（浏览器原生渲染，零延迟）指示指针位置，流内光标只带来
+//!   光标移动逐帧重编码的 churn 与 GDI 模式 CAPTUREBLT 烤入光标的
+//!   双影/闪烁。`--cursor` 调试开关可恢复服务端合成（Sunshine 方案：
+//!   桌面无新帧仅光标移动时基于上帧原始数据重新合成）。
+//! - 合成路径的防闪烁实现（供 --cursor 调试形态使用）：
 //!   1) 判变与绘制共用一次 GetCursorInfo 采样（两次独立采样会被高频
 //!      SetCursorPos 注入插在中间，绘制位与判定位错帧 → 抖动）；
 //!   2) hCursor → 预乘 BGRA 精灵缓存（GetIconInfo+GetDIBits 一次转换，
-//!      逐帧手工混合），消灭每帧 DC/DIBSection 创建销毁与 GDI 争用，
-//!      构建失败回退 DrawIconEx 旧路径；
+//!      逐帧手工混合），构建失败回退 DrawIconEx 旧路径；
 //!   3) ptScreenPos 为虚拟屏绝对坐标，绘制/注入必须减加被采集显示器
 //!      原点（副屏错位修复）。
 
@@ -153,11 +154,15 @@ impl ScreenCapturer {
         let frame = match self.cap.frame(timeout) {
             Ok(f) => f,
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                // 静止桌面 DXGI 合法地不产生帧；仅当连续 2s 无帧才视为采集异常
-                // → 切 GDI（rustdesk "No image, fall back to gdi" 的时间量纲修正版）
+                // 静止桌面 DXGI 合法地不产生帧（本地光标模型下静止桌面
+                // 本就该零帧）。仅当连续 30s 无帧才视为 DXGI 采集异常 →
+                // 切 GDI（rustdesk "No image, fall back to gdi" 的量纲修正：
+                // 原承 2s 会在每次桌面静止 2s 后误降级——GDI 全屏 BitBlt
+                // 更慢，且 CAPTUREBLT 会把闪烁的物理光标烤进帧里，真机
+                // 表现为画面卡顿；30s 兼顾死 DXGI 的恢复时限）
                 let since = *self.would_block_since.get_or_insert_with(Instant::now);
-                if since.elapsed() > Duration::from_secs(2) && !self.cap.is_gdi() {
-                    tracing::warn!("no DXGI frames for 2s, falling back to GDI");
+                if since.elapsed() > Duration::from_secs(30) && !self.cap.is_gdi() {
+                    tracing::warn!("no DXGI frames for 30s, falling back to GDI");
                     if self.cap.set_gdi() {
                         tracing::info!("GDI capture enabled");
                     }
