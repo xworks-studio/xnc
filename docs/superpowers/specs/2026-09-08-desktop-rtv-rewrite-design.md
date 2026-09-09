@@ -299,8 +299,27 @@ canary 机制。REST `POST /desktop` 响应：`{sessionId, token, wtUrl, wsUrl}`
    GetDIBits 失败回退 DrawIconEx 旧路径。
 3. **副屏原点**：`ptScreenPos`/`SetCursorPos` 均为虚拟屏绝对坐标，绘制与
    注入统一减/加被采集显示器 origin（`input::set_viewport` 扩参）。
-4. web 侧：live 阶段 canvas 一律 `cursor:none`（观看态本地光标+流内远端光
-   标双影同样是闪烁感来源）。
+4. web 侧：仅 inputAllowed（控制中）隐藏本地光标（原有行为）。曾短暂改为
+   live 阶段一律隐藏，0.10.11 生产事故后回退——见下方事故记录。
 
 GDI 兜底路径的 CAPTUREBLT 物理光标闪烁属上游 scrap 行为（gdi.rs 注释），
 远控时桌面持续变化 DXGI 不易退化，暂不动。
+
+### 10.5 事故记录：0.10.11 流内光标不可见（2026-09-09 当日修复）
+
+**症状**：升级 0.10.11 后 web 端完全看不到光标。两个因素叠加：
+1. host 精灵构建存在 **GetDIBits 调色板栈溢出**：`dibits_1bpp/32bpp` 把裸
+   `BITMAPINFOHEADER` 强转 `*mut BITMAPINFO` 传给 GetDIBits——1bpp 格式会
+   回填 bmiColors 调色板（2 表项 8 字节），越界写穿栈上后续局部变量。本机
+   探针复现：精灵 `h` 字段被写成 `0x00FFFFFF00000000`（恰为调色板黑/白两
+   表项的拼接模式），release 内联布局不同则踩别的字段——数据损坏表现为
+   精灵全透明/尺寸错乱，流内光标不可见甚至捕获线程崩溃。修复：`BitmapInfo256`
+   （头 + 256 表项的完整 BITMAPINFO）承载所有 GetDIBits 调用。
+2. web 侧 0.10.11 把 canvas 改为 live 阶段一律 `cursor:none`，放大了 1 的
+   影响面（观看态本地光标也被隐藏）。已回退为仅 inputAllowed 隐藏。
+
+连带修复：彩色光标的 AND 掩码是**单倍高**（探针证实标准 arrow mask
+32×32 == color 32×32；双倍高只属单色光标），原 `mh/2` 只救了上半 alpha；
+现取满高。另加兜底：精灵零不透明像素 → 视为构建失败走 DrawIconEx 旧路径。
+本机探针（`cargo test -- --ignored --nocapture probe_cursor`，需交互桌面）
+三次连跑确定性输出 opaque=285/1024。

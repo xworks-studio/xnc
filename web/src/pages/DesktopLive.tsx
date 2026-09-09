@@ -1047,11 +1047,7 @@ export default function DesktopLive() {
         <div className="dt-stage">
           <canvas
             ref={canvasRef}
-            className={
-              inputAllowed || phase === "live"
-                ? "dt-canvas dt-capture"
-                : "dt-canvas"
-            }
+            className={inputAllowed ? "dt-canvas dt-capture" : "dt-canvas"}
             onMouseMove={onMouseMove}
             onMouseDown={(e) => {
               if (!inputAllowed) return;
