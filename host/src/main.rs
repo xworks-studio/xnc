@@ -70,9 +70,10 @@ struct Args {
     /// 发送端整流速率上限（kbps）
     #[arg(long, default_value_t = 50000)]
     send_kbps: u32,
-    /// 不叠加光标（调试用）
+    /// 把光标合成进视频流（调试用；生产默认关闭——web 端本地十字准星
+    /// 渲染，流内光标只会带来重编码churn与 GDI 双影）
     #[arg(long, default_value_t = false)]
-    no_cursor: bool,
+    cursor: bool,
     /// 强制指定编码器名（如 h264_qsv / libx264），跳过自动探测
     #[arg(long)]
     encoder: Option<String>,
@@ -134,7 +135,7 @@ struct RunConfig {
     cert_sha256: Option<String>,
     // 仅 CLI 的调试旋钮
     display: usize,
-    no_cursor: bool,
+    cursor: bool,
     encoder: Option<String>,
 }
 
@@ -187,7 +188,7 @@ fn resolve_config(args: &Args) -> Result<RunConfig> {
         cert_sha256: stdin_cfg.cert_sha256,
         display: args.display,
         max_w: stdin_cfg.max_width.unwrap_or(args.max_w),
-        no_cursor: args.no_cursor,
+        cursor: args.cursor,
         encoder: args.encoder.clone(),
     })
 }
@@ -306,7 +307,7 @@ fn main() -> Result<()> {
 /// 一轮完整采集→编码管线；返回 Err 时上层带退避重启（rustdesk SWITCH 模式）。
 fn run_pipeline(shared: &Arc<Shared>, cfg: &RunConfig) -> Result<()> {
     let mut capturer =
-        ScreenCapturer::new(cfg.display, !cfg.no_cursor).context("create capturer")?;
+        ScreenCapturer::new(cfg.display, cfg.cursor).context("create capturer")?;
     let (w, h) = (capturer.width, capturer.height);
     if capturer.is_gdi() {
         tracing::warn!("running on GDI capture (DXGI unavailable)");
