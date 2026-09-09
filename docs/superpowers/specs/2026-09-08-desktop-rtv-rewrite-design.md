@@ -221,7 +221,7 @@ canary 机制。REST `POST /desktop` 响应：`{sessionId, token, wtUrl, wsUrl}`
 
 ## 8. 已知功能回归（用户确认接受，后续 PATCH 序列）
 
-1. 键盘输入（含 TEXT/LOCK）——回归影响最直接，建议第一个 PATCH。
+1. ~~键盘输入（含 TEXT/LOCK）~~——**已完成**（2026-09-09 PATCH，见 §10 附录）。
 2. 多显示器枚举/切换（现 0x0128 能力随 C++ 栈退役）。
 3. SAS（Ctrl+Alt+Del；agent→core 0x0110 路径删除）。
 4. kind=screen JPEG 快照（core 0x0111 spawn --jpeg-single 路径删除；agent 以
@@ -235,3 +235,72 @@ canary 机制。REST `POST /desktop` 响应：`{sessionId, token, wtUrl, wsUrl}`
 - `tools/rtvload`：合成 WT viewer（鉴权版），30s 报告 + Annex-B 落盘。
 - nalcheck：IDR ratio / SPS+PPS 前置不变量。
 - 真机矩阵：LABS-XIAOXIN（干净实验台）→ LABS-TB16G7（用户机）。
+
+## 10. PATCH 附录：键盘输入 + 剪贴板同步 + 光标防闪烁（2026-09-09）
+
+零 relay/server/agent 协议改动（§8 版本兼容矩阵的"不触 relay"级）：键盘与
+粘贴走既有 `input` 信封（relay `gateInputFor` 租约+`cap.input` 整体门控后
+字节转发）；远端推送走 legquic `default:` 广播路径。旧 host 忽略新消息、
+旧 web 忽略新推送——新旧可混跑。
+
+### 10.1 新增控制词汇
+
+| 方向 | 消息 | 语义 |
+|---|---|---|
+| viewer→host | `{type:"input",event:"keyboard",kind:"down"\|"up",code}` | code = 浏览器 `KeyboardEvent.code`（物理键位）→ host keymap 查 VK 注入（`SendInput`，wVk+wScan 双填、扫描码取前台布局、扩展键 0xE0/0xE1 判定，enigo 同款） |
+| viewer→host | `{type:"input",event:"keyboard",kind:"text",text}` | 无修饰键可打印字符 → `KEYEVENTF_UNICODE` 按 UTF-16 码元逐个注入（布局无关，代理对拆两事件） |
+| viewer→host | `{type:"input",event:"clipboard",kind:"set-text",seq,index,total,text}` | 粘贴分块；块 ≤16KiB UTF-8 |
+| host→viewer | `{type:"clipboard",event:"set-ack",seq,ok,bytes}` | 写入回执；web 收 ack 才补发合成 Ctrl+V（时序闭环） |
+| host→viewer | `{type:"clipboard",event:"text-chunk"\|"text-end",seq,index,total,text,truncated}` | 远端剪贴板变化推送（同分块限制，总量 256KiB 截断） |
+
+分块尺寸依据：WS 兜底腿（`rtv/legws.go`）未 `SetReadLimit`，coder/websocket
+默认 32KiB 读上限——超限直接断连；WT/host 腿为显式 256KiB。16KiB 留 JSON
+开销余量，双端（`host/src/clipboard.rs` 与 `web/src/lib/rtvInput.ts`）码点
+边界切块、乱序组装、新 seq 丢半截。
+
+### 10.2 剪贴板机制
+
+- 变化检测：host 主循环限频 200ms 轮询 `GetClipboardSequenceNumber`（无需
+  开剪贴板，廉价；rustdesk 用隐藏窗口监听器，等价但更重）。非文本变化
+  （图片/文件）标记已见不推送；清空不推送。
+- 写入：专用 worker 线程从容重试 OpenClipboard（不阻塞 tokio 控制任务）；
+  读取在采集线程每 tick 只试一次（不阻塞 frame pacing）。
+- 回环抑制：写入后记录序号不回播（rustdesk 用私有格式 owner 标记；剪贴板
+  管理器改写内容时序号法最坏产生一次幂等回推，可接受）。
+- 审计纪律：日志/回执只记长度与序号，永不落内容（对齐 2026-08-22
+  rustdesk-inspired 设计）。
+- UX：远端更新 → 通知条 + 点击复制（writeText 需手势，机会性自动写静默
+  失败）；本地 → 远端：Ctrl+V 拦截（keydown=用户激活）或工具栏"粘贴"对
+  话框（IME 中文输入的正规路径）。
+
+### 10.3 键盘边界（平台限制，文档化）
+
+- 浏览器保留键（Ctrl+W/T/N、F12、Alt+Tab、全屏 Esc）拦不住——OS/浏览器先
+  于页面处理。
+- 锁定键（CapsLock/NumLock）状态不跨端同步（rustdesk 有 LockModesHandler；
+  文本路径发实际字符，行为可预期，无同步必要）。
+- 粘键清理：`Shared::disconnect` 与 viewers→0 时 `release_all_keys()`；已知
+  限制：连接不断但租约被抢时 relay 不通知 host（releaseControl 在 relay 终
+  结），旧控制者的修饰键可能残留——按一次该键即恢复。
+- IME 组合中的键（isComposing/Process）跳过，中文走剪贴板粘贴。
+
+### 10.4 光标防闪烁（host/src/capture.rs）
+
+三处修复（保持服务端合成方案——架构设计方案.md §6"第一版服务端合成进画
+面"的定位不变，客户端本地光标通道仍为远期项）：
+
+1. **单次采样**：判变与绘制共用一次 `GetCursorInfo`——两次独立采样会被高
+   频 `SetCursorPos` 注入插队，绘制位与判定位错帧产生抖动。
+2. **精灵缓存**：hCursor → 预乘 BGRA 精灵（LRU ≤8），GetIconInfo+GetDIBits
+   一次转换、逐帧手工 alpha 混合——消灭每帧 DC/DIBSection 创建销毁与 GDI
+   争用，绘制失败可复用旧精灵不再丢光标。单色光标（I-beam 等）按
+   TigerVNC 语义展开，反色像素画黑 + 外扩 1px 白环描边（热点 +1，rustdesk
+   get_cursor_data 同款）；彩色位图 alpha 全零时从 AND 掩码补 alpha。
+   GetDIBits 失败回退 DrawIconEx 旧路径。
+3. **副屏原点**：`ptScreenPos`/`SetCursorPos` 均为虚拟屏绝对坐标，绘制与
+   注入统一减/加被采集显示器 origin（`input::set_viewport` 扩参）。
+4. web 侧：live 阶段 canvas 一律 `cursor:none`（观看态本地光标+流内远端光
+   标双影同样是闪烁感来源）。
+
+GDI 兜底路径的 CAPTUREBLT 物理光标闪烁属上游 scrap 行为（gdi.rs 注释），
+远控时桌面持续变化 DXGI 不易退化，暂不动。
