@@ -3,17 +3,31 @@
 //! - 回退/重试模式移植自 rustdesk `src/server/video_service.rs:805-864`
 //!   （连续 WouldBlock>3 或采集错误 → set_gdi；显示器变化 → 重建）。
 //! - 帧内容比较跳帧移植自 rustdesk `would_block_if_equal`（画面未变不编码）。
-//! - 光标服务端合成（Sunshine 方案）：DXGI 不含光标，CPU 端 DrawIconEx 叠加；
+//! - 光标服务端合成（Sunshine 方案）：DXGI 不含光标，CPU 端叠加；
 //!   桌面无新帧仅光标移动时，基于上帧原始数据重新合成（Sunshine
 //!   display_vram.cpp:1481-1505 的 CPU 版对应物）。
+//! - 光标防闪烁（2026-09 修订）：
+//!   1) 判变与绘制共用一次 GetCursorInfo 采样（两次独立采样会被高频
+//!      SetCursorPos 注入插在中间，绘制位与判定位错帧 → 抖动）；
+//!   2) hCursor → 预乘 BGRA 精灵缓存（GetIconInfo+GetDIBits 一次转换，
+//!      逐帧手工混合），消灭每帧 DC/DIBSection 创建销毁与 GDI 争用，
+//!      构建失败回退 DrawIconEx 旧路径；
+//!   3) ptScreenPos 为虚拟屏绝对坐标，绘制/注入必须减加被采集显示器
+//!      原点（副屏错位修复）。
 
 use std::io::{ErrorKind, Result as IoResult};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use scrap::{Capturer, Display, Frame, TraitCapturer, TraitPixelBuffer};
 
 /// DrawIconEx: DI_MASK|DI_IMAGE（winapi 0.3 未导出）
 const DI_NORMAL: u32 = 0x0003;
+
+/// 光标精灵缓存容量（系统光标个位数；超过即 LRU 淘汰）。
+const CURSOR_CACHE_CAP: usize = 8;
+/// 精灵尺寸防御上限（正常光标 ≤64px；掩码位图高度为 2 倍）。
+const SPRITE_MAX_DIM: usize = 512;
 
 /// 采集结果
 pub enum CaptureOutcome<'a> {
@@ -29,6 +43,9 @@ pub struct ScreenCapturer {
     cap: Capturer,
     pub width: usize,
     pub height: usize,
+    /// 被采集显示器在虚拟屏中的原点（ptScreenPos/SetCursorPos 均为虚拟屏
+    /// 绝对坐标，绘制与注入需减/加该值）
+    pub origin: (i32, i32),
     /// 干净的上一帧原始数据（光标叠加的底图）
     last_raw: Vec<u8>,
     /// 叠加光标后的输出缓冲
@@ -71,11 +88,13 @@ impl ScreenCapturer {
         let display = displays.swap_remove(idx);
         let width = display.width();
         let height = display.height();
+        let origin = display.origin();
         let disp_name = display.name();
         tracing::info!(
             display_index = idx,
             name = %disp_name,
             width, height,
+            ?origin,
             "creating DXGI capturer"
         );
         let cap = Capturer::new(display)?; // 失败时内部自动可用 GDI 显示器（scrap 保证）
@@ -83,6 +102,7 @@ impl ScreenCapturer {
             cap,
             width,
             height,
+            origin,
             last_raw: Vec::new(),
             composited: Vec::new(),
             would_block_since: None,
@@ -172,9 +192,12 @@ impl ScreenCapturer {
             return Ok(CaptureOutcome::Reinit);
         }
 
-        // 帧内容比较跳帧（rustdesk would_block_if_equal）
+        // 帧内容比较跳帧（rustdesk would_block_if_equal）。
+        // 光标单次采样：判变与稍后绘制共用同一 snap（两次独立 GetCursorInfo
+        // 会被高频注入插队，绘制位与判定位错帧）。
         let changed = data != self.last_raw.as_slice();
-        let cursor_sig = self.cursor.signature();
+        let snap = self.cursor.snapshot();
+        let cursor_sig = CursorPainter::sig(&snap);
         let cursor_moved = cursor_sig != self.last_cursor_sig;
 
         if !changed && !cursor_moved {
@@ -194,7 +217,7 @@ impl ScreenCapturer {
         self.composited.clear();
         self.composited.extend_from_slice(&self.last_raw);
         if self.draw_cursor {
-            self.cursor.draw(&mut self.composited, w, h);
+            self.cursor.draw(&mut self.composited, w, h, &snap, self.origin);
         }
         Ok(CaptureOutcome::Frame(&self.composited))
     }
@@ -203,65 +226,134 @@ impl ScreenCapturer {
     /// force_next 时无条件产出一帧（新 viewer 需要首帧/关键帧）。
     fn cursor_only_or_none(&mut self) -> IoResult<CaptureOutcome<'_>> {
         let force = self.force_next && !self.last_raw.is_empty();
+        let mut snap_opt: Option<CursorSnap> = None;
         if force {
             self.force_next = false;
             self.cursor_only_frames += 1;
         } else if !self.draw_cursor || self.last_raw.is_empty() {
             return Ok(CaptureOutcome::NoChange);
         } else {
-            let sig = self.cursor.signature();
-            if sig == self.last_cursor_sig {
+            let snap = self.cursor.snapshot();
+            if CursorPainter::sig(&snap) == self.last_cursor_sig {
                 return Ok(CaptureOutcome::NoChange);
             }
-            self.last_cursor_sig = sig;
+            self.last_cursor_sig = CursorPainter::sig(&snap);
             self.cursor_only_frames += 1;
+            snap_opt = Some(snap);
         }
+        // force 路径没有采样过：补一次（首帧场景光标未必在屏幕上）
+        let snap = match snap_opt {
+            Some(s) => s,
+            None => self.cursor.snapshot(),
+        };
         self.composited.clear();
         self.composited.extend_from_slice(&self.last_raw);
         if self.draw_cursor {
-            self.cursor.draw(&mut self.composited, self.width, self.height);
+            self.cursor.draw(&mut self.composited, self.width, self.height, &snap, self.origin);
         }
         Ok(CaptureOutcome::Frame(&self.composited))
     }
 }
 
-// ---------------- 光标合成（winapi） ----------------
+// ---------------- 光标合成（精灵缓存 + 单次采样） ----------------
 
-/// (hCursor, x, y, visible)
+/// 一次 GetCursorInfo 采样的结果（判变与绘制共用）。
+struct CursorSnap {
+    hcursor: isize,
+    x: i32,
+    y: i32,
+    visible: bool,
+}
+
+/// 预乘 BGRA 光标精灵（构建自 GetIconInfo + GetDIBits，逐帧手工混合）。
+struct CursorSprite {
+    w: usize,
+    h: usize,
+    hot_x: i32,
+    hot_y: i32,
+    /// 行距 = w*4；预乘 Alpha（src over：dst = src + dst*(1-a)）
+    data: Vec<u8>,
+}
+
 struct CursorPainter {
-    initialized: bool,
+    /// LRU：表头最近使用。系统光标句柄进程内稳定；应用级自绘光标换图不换
+    /// 句柄的极端场景会短暂显示旧精灵（下一次句柄变化自愈）。
+    cache: Vec<(isize, Arc<CursorSprite>)>,
+    warned: bool,
 }
 
 impl CursorPainter {
     fn new() -> Self {
-        Self { initialized: false }
+        Self { cache: Vec::new(), warned: false }
     }
 
-    fn signature(&self) -> (isize, i32, i32, bool) {
+    fn sig(s: &CursorSnap) -> (isize, i32, i32, bool) {
+        (s.hcursor, s.x, s.y, s.visible)
+    }
+
+    /// 单次采样当前光标（失败视为不可见）。
+    fn snapshot(&self) -> CursorSnap {
         unsafe {
             let mut ci: winapi::um::winuser::CURSORINFO = std::mem::zeroed();
             ci.cbSize = std::mem::size_of::<winapi::um::winuser::CURSORINFO>() as u32;
             if winapi::um::winuser::GetCursorInfo(&mut ci) == 0 {
-                return (0, 0, 0, false);
+                return CursorSnap { hcursor: 0, x: 0, y: 0, visible: false };
             }
             let visible = ci.flags & winapi::um::winuser::CURSOR_SHOWING != 0;
-            (ci.hCursor as isize, ci.ptScreenPos.x, ci.ptScreenPos.y, visible)
+            CursorSnap {
+                hcursor: ci.hCursor as isize,
+                x: ci.ptScreenPos.x,
+                y: ci.ptScreenPos.y,
+                visible,
+            }
         }
     }
 
-    /// 在 BGRA 帧上叠加当前光标（失败静默跳过，仅告警一次）。
-    fn draw(&mut self, bgra: &mut [u8], w: usize, h: usize) {
+    fn lookup(&mut self, hcursor: isize) -> Option<Arc<CursorSprite>> {
+        if let Some(pos) = self.cache.iter().position(|(h, _)| *h == hcursor) {
+            let entry = self.cache.remove(pos);
+            self.cache.insert(0, entry); // LRU 前移
+            Some(self.cache[0].1.clone())
+        } else {
+            None
+        }
+    }
+
+    fn insert(&mut self, hcursor: isize, s: Arc<CursorSprite>) {
+        self.cache.insert(0, (hcursor, s));
+        self.cache.truncate(CURSOR_CACHE_CAP);
+    }
+
+    /// 在 BGRA 帧上叠加光标：优先精灵缓存；构建失败回退 DrawIconEx；
+    /// 再失败静默跳过（仅告警一次）。
+    fn draw(&mut self, bgra: &mut [u8], w: usize, h: usize, snap: &CursorSnap, origin: (i32, i32)) {
+        if !snap.visible || snap.hcursor == 0 {
+            return;
+        }
+        let sprite = match self.lookup(snap.hcursor) {
+            Some(s) => s,
+            None => match build_sprite(snap.hcursor) {
+                Some(s) => {
+                    let s = Arc::new(s);
+                    self.insert(snap.hcursor, s.clone());
+                    s
+                }
+                None => {
+                    self.draw_iconex_fallback(bgra, w, h, snap, origin);
+                    return;
+                }
+            },
+        };
+        let x = snap.x - origin.0 - sprite.hot_x;
+        let y = snap.y - origin.1 - sprite.hot_y;
+        blend_sprite(bgra, w, h, &sprite, x, y);
+    }
+
+    /// 旧路径兜底（GetDIBits 失败时；行为对齐修复前的 DrawIconEx 合成）。
+    fn draw_iconex_fallback(&mut self, bgra: &mut [u8], w: usize, h: usize, snap: &CursorSnap, origin: (i32, i32)) {
         unsafe {
-            let mut ci: winapi::um::winuser::CURSORINFO = std::mem::zeroed();
-            ci.cbSize = std::mem::size_of::<winapi::um::winuser::CURSORINFO>() as u32;
-            if winapi::um::winuser::GetCursorInfo(&mut ci) == 0
-                || ci.flags & winapi::um::winuser::CURSOR_SHOWING == 0
-                || ci.hCursor.is_null()
-            {
-                return;
-            }
             let mut ii: winapi::um::winuser::ICONINFO = std::mem::zeroed();
-            if winapi::um::winuser::GetIconInfo(ci.hCursor, &mut ii) == 0 {
+            if winapi::um::winuser::GetIconInfo(snap.hcursor as winapi::shared::windef::HCURSOR, &mut ii) == 0 {
                 self.warn_once("GetIconInfo failed");
                 return;
             }
@@ -312,11 +404,11 @@ impl CursorPainter {
             let buf_len = w * h * 4;
             std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits_ptr as *mut u8, buf_len.min(bgra.len()));
 
-            // 画光标（热点偏移；位置 clamp 到帧内）
-            let x = (ci.ptScreenPos.x - ii.xHotspot as i32).clamp(0, w as i32 - 1);
-            let y = (ci.ptScreenPos.y - ii.yHotspot as i32).clamp(0, h as i32 - 1);
+            // 画光标（热点偏移 + 虚拟屏原点；位置 clamp 到帧内）
+            let x = (snap.x - origin.0 - ii.xHotspot as i32).clamp(0, w as i32 - 1);
+            let y = (snap.y - origin.1 - ii.yHotspot as i32).clamp(0, h as i32 - 1);
             winapi::um::winuser::DrawIconEx(
-                hdc_mem, x, y, ci.hCursor, 0, 0, 0,
+                hdc_mem, x, y, snap.hcursor as winapi::shared::windef::HCURSOR, 0, 0, 0,
                 std::ptr::null_mut(),
                 DI_NORMAL,
             );
@@ -333,9 +425,341 @@ impl CursorPainter {
     }
 
     fn warn_once(&mut self, msg: &str) {
-        if !self.initialized {
+        if !self.warned {
             tracing::warn!(msg, "cursor compose failed (disabled logging for repeats)");
-            self.initialized = true;
+            self.warned = true;
         }
+    }
+}
+
+/// 预乘 BGRA 精灵 over 混合到 BGRA 帧（负坐标/越界逐像素裁剪）。
+fn blend_sprite(dst: &mut [u8], dw: usize, dh: usize, sprite: &CursorSprite, x: i32, y: i32) {
+    for sy in 0..sprite.h {
+        let dy = y + sy as i32;
+        if dy < 0 || dy >= dh as i32 {
+            continue;
+        }
+        for sx in 0..sprite.w {
+            let dx = x + sx as i32;
+            if dx < 0 || dx >= dw as i32 {
+                continue;
+            }
+            let si = (sy * sprite.w + sx) * 4;
+            let a = sprite.data[si + 3] as u32;
+            if a == 0 {
+                continue;
+            }
+            let di = (dy as usize * dw + dx as usize) * 4;
+            if a >= 255 {
+                dst[di] = sprite.data[si];
+                dst[di + 1] = sprite.data[si + 1];
+                dst[di + 2] = sprite.data[si + 2];
+                dst[di + 3] = 255;
+            } else {
+                // 预乘源：dst = src + dst*(1-a)
+                for c in 0..3 {
+                    let s = sprite.data[si + c] as u32;
+                    let d = dst[di + c] as u32;
+                    dst[di + c] = (s + (d * (255 - a) + 127) / 255).min(255) as u8;
+                }
+                dst[di + 3] = 255;
+            }
+        }
+    }
+}
+
+// ---------------- 精灵构建（GetIconInfo + GetDIBits） ----------------
+
+/// hCursor → 预乘 BGRA 精灵。彩色位图（32bpp）走直读 + 掩码补 alpha；
+/// 单色光标（I-beam/十字等，hbmColor 为空）按 AND/XOR 掩码语义展开。
+fn build_sprite(hcursor: isize) -> Option<CursorSprite> {
+    unsafe {
+        let mut ii: winapi::um::winuser::ICONINFO = std::mem::zeroed();
+        if winapi::um::winuser::GetIconInfo(hcursor as winapi::shared::windef::HCURSOR, &mut ii) == 0 {
+            return None;
+        }
+        let hdc = winapi::um::winuser::GetDC(std::ptr::null_mut());
+        let sprite = if hdc.is_null() {
+            None
+        } else if !ii.hbmColor.is_null() {
+            build_color_sprite(hdc, ii.hbmColor, ii.hbmMask, ii.xHotspot, ii.yHotspot)
+        } else {
+            build_mono_sprite(hdc, ii.hbmMask, ii.xHotspot, ii.yHotspot)
+        };
+        if !hdc.is_null() {
+            winapi::um::winuser::ReleaseDC(std::ptr::null_mut(), hdc);
+        }
+        if !ii.hbmMask.is_null() {
+            winapi::um::wingdi::DeleteObject(ii.hbmMask as *mut winapi::ctypes::c_void);
+        }
+        if !ii.hbmColor.is_null() {
+            winapi::um::wingdi::DeleteObject(ii.hbmColor as *mut winapi::ctypes::c_void);
+        }
+        sprite
+    }
+}
+
+/// 位图 → 32bpp top-down BGRA 像素（两次 GetDIBits：先查尺寸再取位）。
+unsafe fn dibits_32bpp(
+    hdc: winapi::shared::windef::HDC,
+    hbmp: winapi::shared::windef::HBITMAP,
+) -> Option<(usize, usize, Vec<u8>)> {
+    let mut bi = winapi::um::wingdi::BITMAPINFOHEADER {
+        biSize: std::mem::size_of::<winapi::um::wingdi::BITMAPINFOHEADER>() as u32,
+        ..std::mem::zeroed()
+    };
+    if winapi::um::wingdi::GetDIBits(
+        hdc, hbmp, 0, 0, std::ptr::null_mut(),
+        &mut bi as *mut winapi::um::wingdi::BITMAPINFOHEADER as *mut winapi::um::wingdi::BITMAPINFO,
+        winapi::um::wingdi::DIB_RGB_COLORS,
+    ) == 0 {
+        return None;
+    }
+    let w = bi.biWidth as usize;
+    let h = bi.biHeight.unsigned_abs() as usize;
+    if w == 0 || h == 0 || w > SPRITE_MAX_DIM || h > SPRITE_MAX_DIM {
+        return None;
+    }
+    bi.biHeight = -(h as i32); // top-down
+    bi.biBitCount = 32;
+    bi.biCompression = winapi::um::wingdi::BI_RGB;
+    let mut buf = vec![0u8; w * h * 4];
+    if winapi::um::wingdi::GetDIBits(
+        hdc, hbmp, 0, h as u32, buf.as_mut_ptr() as *mut winapi::ctypes::c_void,
+        &mut bi as *mut winapi::um::wingdi::BITMAPINFOHEADER as *mut winapi::um::wingdi::BITMAPINFO,
+        winapi::um::wingdi::DIB_RGB_COLORS,
+    ) == 0 {
+        return None;
+    }
+    Some((w, h, buf))
+}
+
+/// 位图 → 1bpp 位平面（行按 4 字节对齐）。返回 (宽, 高, 位数据)。
+unsafe fn dibits_1bpp(
+    hdc: winapi::shared::windef::HDC,
+    hbmp: winapi::shared::windef::HBITMAP,
+) -> Option<(usize, usize, Vec<u8>)> {
+    let mut bi = winapi::um::wingdi::BITMAPINFOHEADER {
+        biSize: std::mem::size_of::<winapi::um::wingdi::BITMAPINFOHEADER>() as u32,
+        ..std::mem::zeroed()
+    };
+    if winapi::um::wingdi::GetDIBits(
+        hdc, hbmp, 0, 0, std::ptr::null_mut(),
+        &mut bi as *mut winapi::um::wingdi::BITMAPINFOHEADER as *mut winapi::um::wingdi::BITMAPINFO,
+        winapi::um::wingdi::DIB_RGB_COLORS,
+    ) == 0 {
+        return None;
+    }
+    let w = bi.biWidth as usize;
+    let h = bi.biHeight.unsigned_abs() as usize;
+    if w == 0 || h == 0 || w > SPRITE_MAX_DIM || h > SPRITE_MAX_DIM * 2 {
+        return None;
+    }
+    let stride = ((w + 31) / 32) * 4;
+    bi.biHeight = -(h as i32); // top-down
+    bi.biBitCount = 1;
+    bi.biCompression = winapi::um::wingdi::BI_RGB;
+    let mut buf = vec![0u8; stride * h];
+    if winapi::um::wingdi::GetDIBits(
+        hdc, hbmp, 0, h as u32, buf.as_mut_ptr() as *mut winapi::ctypes::c_void,
+        &mut bi as *mut winapi::um::wingdi::BITMAPINFOHEADER as *mut winapi::um::wingdi::BITMAPINFO,
+        winapi::um::wingdi::DIB_RGB_COLORS,
+    ) == 0 {
+        return None;
+    }
+    Some((w, h, buf))
+}
+
+/// 单色掩码取位：bit=1 表示白（对 AND 掩码即“透明”）。
+fn mask_bit(bits: &[u8], stride: usize, x: usize, y: usize) -> u8 {
+    (bits[y * stride + x / 8] >> (7 - (x % 8))) & 1
+}
+
+/// 彩色光标：32bpp 位图（Windows 存预乘 BGRA）+ AND 掩码补老式光标的
+/// 缺失 alpha（alpha==0 且掩码不透明 → 不透明着色）。
+unsafe fn build_color_sprite(
+    hdc: winapi::shared::windef::HDC,
+    hbm_color: winapi::shared::windef::HBITMAP,
+    hbm_mask: winapi::shared::windef::HBITMAP,
+    hot_x: u32,
+    hot_y: u32,
+) -> Option<CursorSprite> {
+    let (w, h, mut data) = dibits_32bpp(hdc, hbm_color)?;
+    let mask = dibits_1bpp(hdc, hbm_mask);
+    if let Some((mw, mh, bits)) = &mask {
+        let stride = ((*mw + 31) / 32) * 4;
+        let and_h = mh / 2; // 掩码高两倍：上半 AND
+        for y in 0..h.min(and_h) {
+            for x in 0..w.min(*mw) {
+                let i = (y * w + x) * 4;
+                if data[i + 3] == 0 && mask_bit(bits, stride, x, y) == 0 {
+                    data[i + 3] = 255;
+                }
+            }
+        }
+    }
+    Some(CursorSprite { w, h, hot_x: hot_x as i32, hot_y: hot_y as i32, data })
+}
+
+/// 单色光标（hbmColor 空）：掩码位图高两倍——上半 AND、下半 XOR。
+/// (AND,XOR)：(0,0)=黑 (0,1)=白 (1,0)=透明 (1,1)=反色。
+/// 反色像素（I-beam 的字形边缘等）画白在白底不可见、画黑在黑底不可见——
+/// TigerVNC/rustdesk 的处理是“画黑 + 外扩 1px 白环描边”（热点 +1），任何
+/// 背景都可见；无反色像素时不外扩，1:1 展开。
+unsafe fn build_mono_sprite(
+    hdc: winapi::shared::windef::HDC,
+    hbm_mask: winapi::shared::windef::HBITMAP,
+    hot_x: u32,
+    hot_y: u32,
+) -> Option<CursorSprite> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Px {
+        Transparent,
+        Black,
+        White,
+        Invert,
+    }
+    let (mw, mh, bits) = dibits_1bpp(hdc, hbm_mask)?;
+    if mh % 2 != 0 || mw == 0 {
+        return None;
+    }
+    let h = mh / 2;
+    let stride = ((mw + 31) / 32) * 4;
+    let mut px = vec![Px::Transparent; mw * h];
+    let mut has_invert = false;
+    for y in 0..h {
+        for x in 0..mw {
+            let and = mask_bit(&bits, stride, x, y);
+            let xor = mask_bit(&bits, stride, x, y + h);
+            px[y * mw + x] = match (and, xor) {
+                (0, 0) => Px::Black,
+                (0, 1) => Px::White,
+                (1, 0) => Px::Transparent,
+                _ => {
+                    has_invert = true;
+                    Px::Invert
+                }
+            };
+        }
+    }
+
+    fn set(data: &mut [u8], w: usize, x: usize, y: usize, black: bool) {
+        let i = (y * w + x) * 4;
+        if black {
+            data[i + 3] = 255; // BGRA 全 0 + 不透明 = 黑
+        } else {
+            data[i] = 255;
+            data[i + 1] = 255;
+            data[i + 2] = 255;
+            data[i + 3] = 255;
+        }
+    }
+
+    if !has_invert {
+        let mut data = vec![0u8; mw * h * 4];
+        for (i, p) in px.iter().enumerate() {
+            match p {
+                Px::Transparent => {}
+                Px::Black => set(&mut data, mw, i % mw, i / mw, true),
+                _ => set(&mut data, mw, i % mw, i / mw, false),
+            }
+        }
+        return Some(CursorSprite { w: mw, h, hot_x: hot_x as i32, hot_y: hot_y as i32, data });
+    }
+
+    // 反色形态：先给所有不透明像素画 1px 白环，再画本体（反色画黑 =
+    // 反色的可见下界近似）
+    let (ow, oh) = (mw + 2, h + 2);
+    let mut data = vec![0u8; ow * oh * 4];
+    for y in 0..h {
+        for x in 0..mw {
+            if px[y * mw + x] == Px::Transparent {
+                continue;
+            }
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let ox = x as i32 + dx + 1;
+                    let oy = y as i32 + dy + 1;
+                    if ox < 0 || oy < 0 || ox >= ow as i32 || oy >= oh as i32 {
+                        continue;
+                    }
+                    let i = (oy as usize * ow + ox as usize) * 4;
+                    if data[i + 3] == 0 {
+                        data[i] = 255;
+                        data[i + 1] = 255;
+                        data[i + 2] = 255;
+                        data[i + 3] = 255;
+                    }
+                }
+            }
+        }
+    }
+    for y in 0..h {
+        for x in 0..mw {
+            match px[y * mw + x] {
+                Px::Transparent => {}
+                Px::Black | Px::Invert => set(&mut data, ow, x + 1, y + 1, true),
+                Px::White => set(&mut data, ow, x + 1, y + 1, false),
+            }
+        }
+    }
+    Some(CursorSprite { w: ow, h: oh, hot_x: hot_x as i32 + 1, hot_y: hot_y as i32 + 1, data })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sprite(w: usize, h: usize, data: Vec<u8>) -> CursorSprite {
+        CursorSprite { w, h, hot_x: 0, hot_y: 0, data }
+    }
+
+    #[test]
+    fn blend_opaque_overwrites() {
+        let mut dst = vec![9u8; 2 * 2 * 4];
+        let sp = sprite(1, 1, vec![10, 20, 30, 255]);
+        blend_sprite(&mut dst, 2, 2, &sp, 1, 1);
+        let i = (1 * 2 + 1) * 4;
+        assert_eq!(&dst[i..i + 4], &[10, 20, 30, 255]);
+        assert_eq!(dst[0], 9); // 其余不动
+    }
+
+    #[test]
+    fn blend_transparent_skips() {
+        let mut dst = vec![9u8; 4];
+        let sp = sprite(1, 1, vec![10, 20, 30, 0]);
+        blend_sprite(&mut dst, 1, 1, &sp, 0, 0);
+        assert_eq!(dst[0], 9);
+    }
+
+    #[test]
+    fn blend_partial_premultiplied() {
+        // 预乘 src(B=128,a=128) over dst(B=255)：128 + 255*127/255 ≈ 255
+        let mut dst = vec![255u8, 0, 0, 255];
+        let sp = sprite(1, 1, vec![128, 0, 0, 128]);
+        blend_sprite(&mut dst, 1, 1, &sp, 0, 0);
+        assert_eq!(dst[0], 255);
+        // 预乘 src(B=0,a=128) over dst(B=255)：0 + 127 = 127
+        let mut dst = vec![255u8, 0, 0, 255];
+        let sp = sprite(1, 1, vec![0, 0, 0, 128]);
+        blend_sprite(&mut dst, 1, 1, &sp, 0, 0);
+        assert_eq!(dst[0], 127);
+    }
+
+    #[test]
+    fn blend_clips_out_of_bounds() {
+        // 精灵中心压在画布角落：负坐标部分被裁掉，不 panic
+        let mut dst = vec![0u8; 3 * 3 * 4];
+        let sp = sprite(2, 2, [[200u8, 200, 200, 255]; 8].concat());
+        blend_sprite(&mut dst, 3, 3, &sp, -1, -1);
+        // 只有 (0,0) 落在画布内
+        assert_eq!(&dst[0..4], &[200, 200, 200, 255]);
+        assert_eq!(dst[4], 0);
+        // 完全出界：无操作
+        blend_sprite(&mut dst, 3, 3, &sp, 100, 100);
+        assert_eq!(dst[4], 0);
     }
 }

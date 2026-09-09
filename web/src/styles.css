@@ -776,6 +776,54 @@ h2 {
   padding: 5px;
 }
 
+/* 剪贴板通知条（远端剪贴板更新/粘贴回执） */
+.dt-clipnote {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+  background: var(--bg-raised);
+  border-top: 1px solid var(--border);
+  padding: 4px 8px;
+}
+.dt-clipnote .btn {
+  font-size: 12px;
+  padding: 2px 10px;
+}
+
+/* 手动粘贴对话框（IME 中文输入路径） */
+.dt-pastebox {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(480px, 90vw);
+  padding: 18px;
+  border-radius: 8px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 13px;
+}
+.dt-pastebox textarea {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  padding: 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+}
+.dt-pastebox-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 /* Login card footer (installer download link) */
 
 .login-foot {

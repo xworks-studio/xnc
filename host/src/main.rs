@@ -14,9 +14,11 @@
 //! 不入任何日志与 tracing 字段。
 
 mod capture;
+mod clipboard;
 mod encoder;
 mod framing;
 mod input;
+mod keymap;
 mod qos;
 mod rs;
 mod shared;
@@ -221,6 +223,9 @@ fn main() -> Result<()> {
         cfg.fec,
     ));
 
+    // 剪贴板同步（进程级：worker 线程 + 轮询状态；pipeline 重启不重建）
+    clipboard::init(shared.clone());
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -320,8 +325,9 @@ fn run_pipeline(shared: &Arc<Shared>, cfg: &RunConfig) -> Result<()> {
     if (ew, eh) != (w, h) {
         tracing::info!(from = format!("{w}x{h}"), to = format!("{ew}x{eh}"), "downscale enabled");
     }
-    // 输入注入坐标换算基准：web 端在编码空间，桌面在原生空间
-    input::set_viewport((w, h), (ew, eh));
+    // 输入注入坐标换算基准：web 端在编码空间，桌面在原生空间；原点用于
+    // 副屏（SetCursorPos 为虚拟屏绝对坐标）
+    input::set_viewport((w, h), (ew, eh), capturer.origin);
     let mut scale_buf: Vec<u8> = Vec::new();
     let mut enc = match &cfg.encoder {
         Some(name) => VideoEncoder::with_name(name, ew, eh, fps0, bitrate)?,
@@ -364,7 +370,15 @@ fn run_pipeline(shared: &Arc<Shared>, cfg: &RunConfig) -> Result<()> {
             tracing::info!(prev = prev_viewers, now = viewers, "viewer joined, force frame");
             capturer.force_frame();
         }
+        if viewers == 0 && prev_viewers > 0 {
+            // 最后一个 viewer 离开：无人注入，松开残留按键（连接仍在的
+            // 场景 Shared::disconnect 不会触发）
+            input::release_all_keys();
+        }
         prev_viewers = viewers;
+
+        // ---- 剪贴板轮询（内部限频 200ms；连接断开时 ctrl_send 自行丢弃）----
+        clipboard::poll(&shared);
 
         // ---- 采集 ----
         let t_cap = Instant::now();
