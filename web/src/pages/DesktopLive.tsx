@@ -30,6 +30,8 @@ import {
  * 5. 输入：鼠标 + 键盘；lease 授予方可开启（inputAllowed = 本地开关 &&
  *    controlSelf）。鼠标：绝对坐标 letterbox 映射，move 16ms 合并；canvas
  *    坐标即编码分辨率空间，host 侧换算回原生桌面像素（降采样场景）。
+ *    光标：本地十字准星（浏览器原生渲染，零延迟连续；mvp input.js 同
+ *    款），流内不含光标——host 默认不合成（--cursor 调试开关）。
  *    键盘：无修饰键的可打印字符走 text 事件（KEYEVENTF_UNICODE，布局
  *    无关），其余走 code 物理键位（快捷键在远端成立）；输入态全量
  *    preventDefault（F5/Tab/空格不再撞本地；Ctrl+W/T 等浏览器保留键除外）。
@@ -1047,7 +1049,7 @@ export default function DesktopLive() {
         <div className="dt-stage">
           <canvas
             ref={canvasRef}
-            className={inputAllowed ? "dt-canvas dt-capture" : "dt-canvas"}
+            className={phase === "live" ? "dt-canvas dt-live" : "dt-canvas"}
             onMouseMove={onMouseMove}
             onMouseDown={(e) => {
               if (!inputAllowed) return;
@@ -1191,7 +1193,7 @@ export default function DesktopLive() {
       {inputOn && (
         <footer className="dt-hint">
           {inputAllowed
-            ? "键鼠控制已开启：移动/点击/滚轮/按键注入远程桌面；Ctrl+V 粘贴本地剪贴板"
+            ? "键鼠控制已开启：十字准星即指针位置（本地渲染）；Ctrl+V 粘贴本地剪贴板"
             : "正在接管控制权…（他人持有时为抢占）"}
         </footer>
       )}
