@@ -486,6 +486,12 @@ fn build_sprite(hcursor: isize) -> Option<CursorSprite> {
         } else {
             build_mono_sprite(hdc, ii.hbmMask, ii.xHotspot, ii.yHotspot)
         };
+        // 兜底：全透明精灵毫无意义（任何上游转换异常最终形态就是不可见）
+        // ——视为构建失败，走 DrawIconEx 旧路径
+        let sprite = match sprite {
+            Some(s) if s.data.chunks(4).any(|c| c[3] > 0) => Some(s),
+            _ => None,
+        };
         if !hdc.is_null() {
             winapi::um::winuser::ReleaseDC(std::ptr::null_mut(), hdc);
         }
@@ -499,34 +505,55 @@ fn build_sprite(hcursor: isize) -> Option<CursorSprite> {
     }
 }
 
+/// 带完整调色板空间的 BITMAPINFO：GetDIBits 对 ≤8bpp 格式会回填 bmiColors
+/// 调色板（1bpp = 2 表项 8 字节）——传裸 BITMAPINFOHEADER 强转 *mut
+/// BITMAPINFO 会被越界写穿栈（2026-09-09 生产事故：光标精灵字段被调色板
+/// 数据 0x00FFFFFF00000000 踩坏，流内光标彻底不可见）。256 表项覆盖全部
+/// 调色板格式。
+#[repr(C)]
+struct BitmapInfo256 {
+    bmiHeader: winapi::um::wingdi::BITMAPINFOHEADER,
+    bmiColors: [winapi::um::wingdi::RGBQUAD; 256],
+}
+
+impl BitmapInfo256 {
+    fn new() -> Self {
+        // 全零初始化（POD 结构）；biSize 必填，其余由 GetDIBits 查询回填
+        let mut bi: Self = unsafe { std::mem::zeroed() };
+        bi.bmiHeader.biSize =
+            std::mem::size_of::<winapi::um::wingdi::BITMAPINFOHEADER>() as u32;
+        bi
+    }
+    fn as_info(&mut self) -> *mut winapi::um::wingdi::BITMAPINFO {
+        self as *mut _ as *mut winapi::um::wingdi::BITMAPINFO
+    }
+}
+
 /// 位图 → 32bpp top-down BGRA 像素（两次 GetDIBits：先查尺寸再取位）。
 unsafe fn dibits_32bpp(
     hdc: winapi::shared::windef::HDC,
     hbmp: winapi::shared::windef::HBITMAP,
 ) -> Option<(usize, usize, Vec<u8>)> {
-    let mut bi = winapi::um::wingdi::BITMAPINFOHEADER {
-        biSize: std::mem::size_of::<winapi::um::wingdi::BITMAPINFOHEADER>() as u32,
-        ..std::mem::zeroed()
-    };
+    let mut bi = BitmapInfo256::new();
     if winapi::um::wingdi::GetDIBits(
         hdc, hbmp, 0, 0, std::ptr::null_mut(),
-        &mut bi as *mut winapi::um::wingdi::BITMAPINFOHEADER as *mut winapi::um::wingdi::BITMAPINFO,
+        bi.as_info(),
         winapi::um::wingdi::DIB_RGB_COLORS,
     ) == 0 {
         return None;
     }
-    let w = bi.biWidth as usize;
-    let h = bi.biHeight.unsigned_abs() as usize;
+    let w = bi.bmiHeader.biWidth as usize;
+    let h = bi.bmiHeader.biHeight.unsigned_abs() as usize;
     if w == 0 || h == 0 || w > SPRITE_MAX_DIM || h > SPRITE_MAX_DIM {
         return None;
     }
-    bi.biHeight = -(h as i32); // top-down
-    bi.biBitCount = 32;
-    bi.biCompression = winapi::um::wingdi::BI_RGB;
+    bi.bmiHeader.biHeight = -(h as i32); // top-down
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = winapi::um::wingdi::BI_RGB;
     let mut buf = vec![0u8; w * h * 4];
     if winapi::um::wingdi::GetDIBits(
         hdc, hbmp, 0, h as u32, buf.as_mut_ptr() as *mut winapi::ctypes::c_void,
-        &mut bi as *mut winapi::um::wingdi::BITMAPINFOHEADER as *mut winapi::um::wingdi::BITMAPINFO,
+        bi.as_info(),
         winapi::um::wingdi::DIB_RGB_COLORS,
     ) == 0 {
         return None;
@@ -539,30 +566,27 @@ unsafe fn dibits_1bpp(
     hdc: winapi::shared::windef::HDC,
     hbmp: winapi::shared::windef::HBITMAP,
 ) -> Option<(usize, usize, Vec<u8>)> {
-    let mut bi = winapi::um::wingdi::BITMAPINFOHEADER {
-        biSize: std::mem::size_of::<winapi::um::wingdi::BITMAPINFOHEADER>() as u32,
-        ..std::mem::zeroed()
-    };
+    let mut bi = BitmapInfo256::new();
     if winapi::um::wingdi::GetDIBits(
         hdc, hbmp, 0, 0, std::ptr::null_mut(),
-        &mut bi as *mut winapi::um::wingdi::BITMAPINFOHEADER as *mut winapi::um::wingdi::BITMAPINFO,
+        bi.as_info(),
         winapi::um::wingdi::DIB_RGB_COLORS,
     ) == 0 {
         return None;
     }
-    let w = bi.biWidth as usize;
-    let h = bi.biHeight.unsigned_abs() as usize;
+    let w = bi.bmiHeader.biWidth as usize;
+    let h = bi.bmiHeader.biHeight.unsigned_abs() as usize;
     if w == 0 || h == 0 || w > SPRITE_MAX_DIM || h > SPRITE_MAX_DIM * 2 {
         return None;
     }
     let stride = ((w + 31) / 32) * 4;
-    bi.biHeight = -(h as i32); // top-down
-    bi.biBitCount = 1;
-    bi.biCompression = winapi::um::wingdi::BI_RGB;
+    bi.bmiHeader.biHeight = -(h as i32); // top-down
+    bi.bmiHeader.biBitCount = 1;
+    bi.bmiHeader.biCompression = winapi::um::wingdi::BI_RGB;
     let mut buf = vec![0u8; stride * h];
     if winapi::um::wingdi::GetDIBits(
         hdc, hbmp, 0, h as u32, buf.as_mut_ptr() as *mut winapi::ctypes::c_void,
-        &mut bi as *mut winapi::um::wingdi::BITMAPINFOHEADER as *mut winapi::um::wingdi::BITMAPINFO,
+        bi.as_info(),
         winapi::um::wingdi::DIB_RGB_COLORS,
     ) == 0 {
         return None;
@@ -588,7 +612,9 @@ unsafe fn build_color_sprite(
     let mask = dibits_1bpp(hdc, hbm_mask);
     if let Some((mw, mh, bits)) = &mask {
         let stride = ((*mw + 31) / 32) * 4;
-        let and_h = mh / 2; // 掩码高两倍：上半 AND
+        // 彩色光标的掩码是单倍高 AND 掩码（2026-09-09 本机探针证实：
+        // 标准 arrow 的 mask 32x32 == color 32x32；双倍高只属于单色光标）
+        let and_h = *mh;
         for y in 0..h.min(and_h) {
             for x in 0..w.min(*mw) {
                 let i = (y * w + x) * 4;
@@ -715,6 +741,85 @@ mod tests {
 
     fn sprite(w: usize, h: usize, data: Vec<u8>) -> CursorSprite {
         CursorSprite { w, h, hot_x: 0, hot_y: 0, data }
+    }
+
+    /// 本机交互会话诊断探针：真实 GetCursorInfo → GetIconInfo → 精灵转换，
+    /// 打印位图几何与 alpha 分布。仅在交互桌面可用（CI 无桌面，标 ignore）：
+    /// `cargo test -- --ignored --nocapture probe_cursor`
+    #[test]
+    #[ignore]
+    fn probe_cursor_sprite_conversion() {
+        let painter = CursorPainter::new();
+        let snap = painter.snapshot();
+        println!(
+            "snap: hcursor=0x{:x} pos=({},{}) visible={}",
+            snap.hcursor, snap.x, snap.y, snap.visible
+        );
+        // GetIconInfo 位图几何（验证掩码高度假设：彩色光标掩码应为单倍高）
+        unsafe {
+            let mut ii: winapi::um::winuser::ICONINFO = std::mem::zeroed();
+            if winapi::um::winuser::GetIconInfo(snap.hcursor as winapi::shared::windef::HCURSOR, &mut ii) != 0 {
+                let mut bm: winapi::um::wingdi::BITMAP = std::mem::zeroed();
+                if !ii.hbmMask.is_null()
+                    && winapi::um::wingdi::GetObjectW(
+                        ii.hbmMask as *mut _,
+                        std::mem::size_of::<winapi::um::wingdi::BITMAP>() as i32,
+                        &mut bm as *mut _ as *mut _,
+                    ) != 0
+                {
+                    println!("mask bitmap: {}x{} planes={} bpp={}", bm.bmWidth, bm.bmHeight, bm.bmPlanes, bm.bmBitsPixel);
+                }
+                if !ii.hbmColor.is_null()
+                    && winapi::um::wingdi::GetObjectW(
+                        ii.hbmColor as *mut _,
+                        std::mem::size_of::<winapi::um::wingdi::BITMAP>() as i32,
+                        &mut bm as *mut _ as *mut _,
+                    ) != 0
+                {
+                    println!("color bitmap: {}x{} planes={} bpp={}", bm.bmWidth, bm.bmHeight, bm.bmPlanes, bm.bmBitsPixel);
+                }
+                if !ii.hbmMask.is_null() {
+                    winapi::um::wingdi::DeleteObject(ii.hbmMask as *mut _);
+                }
+                if !ii.hbmColor.is_null() {
+                    winapi::um::wingdi::DeleteObject(ii.hbmColor as *mut _);
+                }
+            } else {
+                println!("GetIconInfo failed");
+            }
+        }
+        match build_sprite(snap.hcursor) {
+            Some(s) => {
+                let opaque = s.data.chunks(4).filter(|c| c[3] > 0).count();
+                println!(
+                    "sprite: {}x{} hot=({},{}) opaque={}/{} data_len={}",
+                    s.w,
+                    s.h,
+                    s.hot_x,
+                    s.hot_y,
+                    opaque,
+                    s.w * s.h,
+                    s.data.len()
+                );
+                // 12×12 网格采样 alpha，直观看形状
+                for gy in 0..12 {
+                    let mut row = String::new();
+                    for gx in 0..12 {
+                        let x = (gx * s.w).max(11) / 12;
+                        let y = (gy * s.h).max(11) / 12;
+                        let a = s.data[(y * s.w + x) * 4 + 3];
+                        row.push(match a {
+                            0 => '.',
+                            1..=63 => '·',
+                            64..=191 => '+',
+                            _ => '#',
+                        });
+                    }
+                    println!("  |{}|", row);
+                }
+            }
+            None => println!("build_sprite returned None"),
+        }
     }
 
     #[test]
