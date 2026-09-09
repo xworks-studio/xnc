@@ -3,6 +3,14 @@ import { Link, useParams } from "react-router-dom";
 import type { MouseEvent as ReactMouseEvent } from "react";
 import { api } from "../api";
 import type { DesktopCandidate } from "../types";
+import {
+  classifyKeyDown,
+  isPasteCombo,
+  isTextPathKey,
+  makeSetChunks,
+  truncateUtf8,
+  ClipAssembler,
+} from "../lib/rtvInput";
 
 /**
  * RTV desktop viewer (2026-09-08 rebuild): WebTransport 主路 + WebSocket
@@ -19,9 +27,15 @@ import type { DesktopCandidate } from "../types";
  *    config/frameStats/qosAdjust/hostOffline（host→viewer 方向）。
  * 4. 渲染：Worker 解码出 VideoFrame 转移主线程，队列≤3 迟到丢帧不追、
  *    延迟一帧释放、空转重绘（moonlight-qt Pacer 语义，worker.js 配套）。
- * 5. 输入：仅鼠标（键盘为后续 PATCH）；lease 授予方可开启；绝对坐标
- *    letterbox 映射，move 16ms 合并。canvas 坐标即编码分辨率空间，host
- *    侧换算回原生桌面像素（降采样场景）。
+ * 5. 输入：鼠标 + 键盘；lease 授予方可开启（inputAllowed = 本地开关 &&
+ *    controlSelf）。鼠标：绝对坐标 letterbox 映射，move 16ms 合并；canvas
+ *    坐标即编码分辨率空间，host 侧换算回原生桌面像素（降采样场景）。
+ *    键盘：无修饰键的可打印字符走 text 事件（KEYEVENTF_UNICODE，布局
+ *    无关），其余走 code 物理键位（快捷键在远端成立）；输入态全量
+ *    preventDefault（F5/Tab/空格不再撞本地；Ctrl+W/T 等浏览器保留键除外）。
+ *    剪贴板：Ctrl+V 拦下 → 本地 readText → 分块发 host 写远端剪贴板 →
+ *    收 set-ack 才补发合成 Ctrl+V（时序闭环）；远端剪贴板变化推送 →
+ *    通知栏 + 点击复制（writeText 需手势）。IME 中文经“粘贴”对话框。
  * 6. 恢复：hostOffline → hello 周期重发（host 回来 config 重下发，无感）；
  *    传输层断开 → 重建会话（epoch 递增 + 退避，最多 8 次）；8 次烧尽后
  *    不直接 fatal——≥10s 节流 re-POST 重建会话再试，最多 3 轮后才维持
@@ -118,6 +132,11 @@ export default function DesktopLive() {
   const [rttMs, setRttMs] = useState<number | null>(null);
   const [e2eMs, setE2eMs] = useState<number | null>(null);
   const [logLines, setLogLines] = useState<string[]>([]);
+  // 剪贴板：远端推送的最新文本 + 通知条 + 手动粘贴对话框
+  const [remoteClipLen, setRemoteClipLen] = useState(0);
+  const [clipNotice, setClipNotice] = useState<string | null>(null);
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [pasteText, setPasteText] = useState("");
 
   const rootRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -137,10 +156,26 @@ export default function DesktopLive() {
   const clockOffsetRef = useRef<number | null>(null);
   // e2e 高频原始值（renderLoop 每帧算，1s 才同步到 state 免整页重渲染）
   const e2eRawRef = useRef<number | null>(null);
+  // 剪贴板高频态（不经渲染路径）
+  const remoteClipRef = useRef("");
+  const clipAssemblerRef = useRef(new ClipAssembler());
+  const pasteSeqRef = useRef(0);
+  // 等待 set-ack 的粘贴序号（null = 无进行中的粘贴）
+  const pendingPasteRef = useRef<number | null>(null);
+  // 被 Ctrl+V 拦截的键（其 keyup 不再转发）
+  const suppressKeyUpRef = useRef<Set<string>>(new Set());
+  // inputAllowed 的 ref 镜像（F 全屏等 window 级常驻监听里读取）
+  const inputAllowedRef = useRef(false);
 
   useEffect(() => {
     inputOnRef.current = inputOn;
   }, [inputOn]);
+  // inputAllowed 的镜像（与下方 render 段同式）：F 全屏等 window 级常驻
+  // 监听里读取，避免远程打字触发本地全屏切换
+  useEffect(() => {
+    inputAllowedRef.current =
+      inputOn && control !== null && control.holder === selfSessionRef.current;
+  });
 
   // 全屏切换（F 键 / 按钮）
   const toggleFullscreen = () => {
@@ -154,6 +189,9 @@ export default function DesktopLive() {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+      // 输入态下按键发往远端，F 不再切本地全屏（注入监听会 preventDefault
+      // 但两个 window 监听都会执行，这里必须显式让路）
+      if (inputAllowedRef.current) return;
       if (e.key === "f" || e.key === "F") toggleFullscreen();
     };
     document.addEventListener("fullscreenchange", onFs);
@@ -259,6 +297,54 @@ export default function DesktopLive() {
     };
     sendCtrlRef.current = sendCtrl;
 
+    // 剪贴板消息（host→viewer 推送 / set-ack 回执）
+    function handleClipboardMsg(v: Record<string, unknown>) {
+      const ev = v.event;
+      if (ev === "text-chunk") {
+        const done = clipAssemblerRef.current.push({
+          seq: Number(v.seq),
+          index: Number(v.index),
+          total: Number(v.total),
+          text: typeof v.text === "string" ? v.text : "",
+        });
+        if (done) {
+          remoteClipRef.current = done.text;
+          setRemoteClipLen(done.text.length);
+          setClipNotice(`远程剪贴板已更新（${done.text.length} 字符）`);
+          // 机会性写本地剪贴板：无活跃手势时浏览器会拒（静默失败），通知
+          // 条上的“复制到本地”按钮（点击=手势）是稳定路径
+          navigator.clipboard?.writeText(done.text).catch(() => {});
+          log(`远程剪贴板更新：${done.text.length} 字符`);
+        }
+      } else if (ev === "text-end") {
+        if (v.truncated === true) {
+          setClipNotice("远程剪贴板已更新（超 256KiB 已截断）");
+        }
+      } else if (ev === "set-ack") {
+        const seq = Number(v.seq);
+        if (pendingPasteRef.current === seq) {
+          pendingPasteRef.current = null;
+          if (v.ok === true) {
+            // host 已写入远端剪贴板——补发完整 Ctrl+V 序列（物理 Ctrl down
+            // 可能已随松键转发，成对补发幂等）
+            const seq2 = [
+              ["ControlLeft", "down"],
+              ["KeyV", "down"],
+              ["KeyV", "up"],
+              ["ControlLeft", "up"],
+            ] as const;
+            for (const [code, kind] of seq2) {
+              sendCtrl({ type: "input", event: "keyboard", kind, code });
+            }
+            log("粘贴完成（远端剪贴板已写入并注入 Ctrl+V）");
+          } else {
+            setClipNotice("远端剪贴板写入失败，粘贴未执行");
+            log("clipboard set-ack: host write failed");
+          }
+        }
+      }
+    }
+
     const handleCtrl = (v: Record<string, unknown>) => {
       switch (v.type) {
         case "config":
@@ -307,6 +393,9 @@ export default function DesktopLive() {
           // 置空 config 恢复 hello 周期重发；host 回来后 config 重新下发。
           config = null;
           setPhase("hostOffline");
+          break;
+        case "clipboard":
+          handleClipboardMsg(v);
           break;
         case "heartbeat": {
           if (typeof v.tMs !== "number") break;
@@ -711,6 +800,119 @@ export default function DesktopLive() {
     sendCtrlRef.current?.({ type: "input", event: "mouse", kind, ...extra });
   };
 
+  // 键盘注入：window 级原生监听（wheel 同款模式）。输入态全量
+  // preventDefault（F5/Tab/空格不再撞本地；Ctrl+W/T、Alt+Tab 等浏览器/
+  // 系统保留键拦不住——平台固有限制）。IME 组合中的键跳过，中文文本走
+  // “粘贴到远程”对话框（剪贴板通道）。
+  useEffect(() => {
+    if (!inputAllowed) return;
+    // ref 绑定局部（cleanup 执行时 ref 可能已被替换——lint 要求）
+    const suppress = suppressKeyUpRef.current;
+    const editable = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      return t !== null && (t.tagName === "INPUT" || t.tagName === "TEXTAREA");
+    };
+    const onDown = (e: KeyboardEvent) => {
+      if (editable(e)) return; // 手动粘贴对话框内的输入不注入
+      e.preventDefault();
+      if (e.isComposing || e.key === "Process") return;
+      // Ctrl/Cmd+V：拦下物理键——读本地剪贴板 → 分块写远端 → set-ack 后
+      // 补发合成序列（见 handleClipboardMsg）
+      if (isPasteCombo(e)) {
+        suppress.add(e.code);
+        startPaste();
+        return;
+      }
+      const c = classifyKeyDown(e);
+      if (!c) return;
+      if (c.kind === "text") {
+        sendCtrlRef.current?.({
+          type: "input",
+          event: "keyboard",
+          kind: "text",
+          text: c.text,
+        });
+      } else {
+        sendCtrlRef.current?.({
+          type: "input",
+          event: "keyboard",
+          kind: "down",
+          code: c.code,
+        });
+      }
+    };
+    const onUp = (e: KeyboardEvent) => {
+      if (editable(e)) return;
+      e.preventDefault();
+      if (e.isComposing) return;
+      if (suppress.delete(e.code)) return; // 被拦截的 Ctrl+V
+      if (isTextPathKey(e)) return; // 文本路径不发 down/up
+      sendCtrlRef.current?.({
+        type: "input",
+        event: "keyboard",
+        kind: "up",
+        code: e.code,
+      });
+    };
+    window.addEventListener("keydown", onDown);
+    window.addEventListener("keyup", onUp);
+    return () => {
+      window.removeEventListener("keydown", onDown);
+      window.removeEventListener("keyup", onUp);
+      suppress.clear();
+    };
+  }, [inputAllowed, phase]);
+
+  // Ctrl+V 粘贴：读本地剪贴板 → 分块发 host（relay 租约门控内）→ 等
+  // set-ack。读剪贴板需用户激活（keydown 即手势）；被拒（Firefox 逐次
+  // 授权等）时引导手动对话框。
+  const startPaste = () => {
+    const clip = navigator.clipboard;
+    if (!clip?.readText) {
+      setClipNotice("浏览器不支持剪贴板读取——用工具栏“粘贴”手动输入");
+      setPasteOpen(true);
+      return;
+    }
+    clip
+      .readText()
+      .then((text) => {
+        sendPasteText(text);
+      })
+      .catch(() => {
+        setClipNotice("读取本地剪贴板被拒绝——用工具栏“粘贴”手动输入");
+        setPasteOpen(true);
+      });
+  };
+
+  const sendPasteText = (raw: string) => {
+    const { text } = truncateUtf8(raw);
+    if (!text) return;
+    const seq = ++pasteSeqRef.current;
+    pendingPasteRef.current = seq;
+    for (const c of makeSetChunks(text, seq)) {
+      sendCtrlRef.current?.({
+        type: "input",
+        event: "clipboard",
+        kind: "set-text",
+        ...c,
+      });
+    }
+    window.setTimeout(() => {
+      if (pendingPasteRef.current === seq) {
+        pendingPasteRef.current = null;
+        setClipNotice("粘贴未获远端确认（3 秒超时）");
+      }
+    }, 3000);
+  };
+
+  // 远端剪贴板 → 本地（点击=手势，writeText 稳定授权）
+  const copyRemote = () => {
+    navigator.clipboard
+      ?.writeText(remoteClipRef.current)
+      .then(() => setClipNotice("已复制到本地剪贴板"))
+      .catch(() => setClipNotice("复制被浏览器拒绝"));
+  };
+
   // 控制权按钮：自己持约=开始/停止控制（本地开关）；他人持约或空闲=接管
   // （takeControl——他人活约时为抢占，服务器 3s 防抖）。
   const onControlClick = () => {
@@ -810,6 +1012,26 @@ export default function DesktopLive() {
           </button>
           <button
             className="btn"
+            disabled={!inputAllowed}
+            onClick={() => setPasteOpen(true)}
+            title={
+              inputAllowed
+                ? "粘贴文本到远程剪贴板（中文/IME 输入的正规路径）"
+                : "需先接管控制"
+            }
+          >
+            粘贴
+          </button>
+          <button
+            className="btn"
+            disabled={remoteClipLen === 0}
+            onClick={copyRemote}
+            title="把远端剪贴板文本复制到本地"
+          >
+            复制
+          </button>
+          <button
+            className="btn"
             onClick={() => setStatsOpen((v) => !v)}
             title="统计面板"
           >
@@ -825,7 +1047,11 @@ export default function DesktopLive() {
         <div className="dt-stage">
           <canvas
             ref={canvasRef}
-            className={inputAllowed ? "dt-canvas dt-capture" : "dt-canvas"}
+            className={
+              inputAllowed || phase === "live"
+                ? "dt-canvas dt-capture"
+                : "dt-canvas"
+            }
             onMouseMove={onMouseMove}
             onMouseDown={(e) => {
               if (!inputAllowed) return;
@@ -861,6 +1087,37 @@ export default function DesktopLive() {
               <button className="btn" onClick={retryNow}>
                 重新连接
               </button>
+            </div>
+          )}
+          {pasteOpen && (
+            <div className="dt-overlay">
+              <div className="dt-pastebox">
+                <div>粘贴/输入文本发送到远端剪贴板（中文请在此输入）</div>
+                <textarea
+                  value={pasteText}
+                  onChange={(e) => setPasteText(e.target.value)}
+                  rows={6}
+                  autoFocus
+                  placeholder="在此粘贴或输入…"
+                />
+                <div className="dt-pastebox-actions">
+                  <button className="btn" onClick={() => setPasteOpen(false)}>
+                    取消
+                  </button>
+                  <button
+                    className="btn"
+                    disabled={!inputAllowed || !pasteText}
+                    title={inputAllowed ? undefined : "需先接管控制"}
+                    onClick={() => {
+                      sendPasteText(pasteText);
+                      setPasteOpen(false);
+                      setPasteText("");
+                    }}
+                  >
+                    发送并粘贴
+                  </button>
+                </div>
+              </div>
             </div>
           )}
         </div>
@@ -922,10 +1179,23 @@ export default function DesktopLive() {
         </aside>
       </div>
 
+      {clipNotice && (
+        <div className="dt-clipnote">
+          <span>{clipNotice}</span>
+          {remoteClipLen > 0 && (
+            <button className="btn" onClick={copyRemote}>
+              复制到本地
+            </button>
+          )}
+          <button className="btn" onClick={() => setClipNotice(null)}>
+            ×
+          </button>
+        </div>
+      )}
       {inputOn && (
         <footer className="dt-hint">
           {inputAllowed
-            ? "鼠标控制已开启，移动/点击/滚轮将注入远程桌面（键盘输入为后续版本）"
+            ? "键鼠控制已开启：移动/点击/滚轮/按键注入远程桌面；Ctrl+V 粘贴本地剪贴板"
             : "正在接管控制权…（他人持有时为抢占）"}
         </footer>
       )}
