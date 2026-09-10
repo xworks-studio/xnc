@@ -20,6 +20,15 @@ xnc register
 
 Dev 频道安装器在下载页选择，或 `curl -LO "https://xnc.app/installer?channel=dev"`。
 
+### 虚拟显示器（IDD，可选组件 "idd"）
+
+安装器可选组件 `idd` 安装 "XWorks XNC Virtual Display"（IDD 虚拟显示器，
+Win10 19041+）。默认不产生任何虚拟屏；仅当**远程桌面（RTV）会话接入且
+（笔记本合盖 ∨ 无物理输出）**时自动插入 1920×1080@60 虚拟屏（合盖的
+笔记本此时面板已熄灭，虚拟屏接管为唯一显示器），会话结束自动移除；
+agent 崩溃时设备随句柄关闭自动消失。`xnc display on|off|status` 为手动
+覆盖（on 保持到 off）。
+
 ## 快速上手
 
 ```bash
@@ -34,6 +43,7 @@ xnc shell <node>                     # 交互终端（~. 断开）
 xnc put <node> <local> <remote>      # 上传（sha256 校验）
 xnc get <node> <remote> <local>      # 下载
 xnc rdp <node>                       # 远程桌面（浏览器 RTV；screen 命令已退役）
+xnc display on|off|status            # 虚拟显示器手动控制/状态（IDD）
 xnc upgrade [--channel dev]          # 手动触发本机升级
 xnc logout                           # 退出用户会话（节点不受影响）
 ```
