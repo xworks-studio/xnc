@@ -221,14 +221,25 @@ func (m *Manager) unplugLocked() {
 }
 
 // teardownLocked 拆除屏幕与设备（仅 agent 退出路径）。调用方持 mu。幂等。
+// 拔屏设 3s 上界（驱动侧异常可能让 IOCTL 长阻塞，2026-09-10 停机挂起
+// 排查）——超时放弃拔屏继续拆设备；进程正在退出，滞留 goroutine 无碍。
 func (m *Manager) teardownLocked() {
 	if m.handle == 0 {
 		m.plugged = false
 		return
 	}
 	if m.plugged {
-		if err := m.be.unplugMonitor(m.handle); err != nil {
-			m.logger().Warn("display: unplug failed", "err", err)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			if err := m.be.unplugMonitor(m.handle); err != nil {
+				m.logger().Warn("display: unplug failed", "err", err)
+			}
+		}()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			m.logger().Warn("display: unplug timed out during teardown; proceeding with device removal")
 		}
 		m.plugged = false
 	}
