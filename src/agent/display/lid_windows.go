@@ -1,13 +1,28 @@
 //go:build windows
 
 // lid_windows.go — 盒盖状态监听：RegisterPowerSettingNotification
-// (GUID_LIDSWITCH_STATE_CHANGE) + 自建 message-only 窗口消息泵线程
-// （服务进程无 UI 线程；参考 src/native/core/wts_monitor.cpp 的
-// message-only 窗口先例）。状态以原子量暴露给 Manager 轮询。
+// (GUID_LIDSWITCH_STATE_CHANGE) + 顶层隐藏窗口消息泵（服务进程无 UI
+// 线程；参考 src/native/core/wts_monitor.cpp 的窗口先例）。
+//
+// 2026-09-10 XIAOXIN 实测踩过两个坑（都导致 lid 事件静默丢失）：
+//  1. message-only 窗口（HWND_MESSAGE）收不到电源广播——WM_POWERBROADCAST
+//     经 HWND_BROADCAST 投递，只达顶层窗口；改用不可见顶层窗口。
+//  2. **线程亲和**：窗口消息按"创建窗口的线程"入队，GetMessage 只取
+//     本线程队列。Go goroutine 不绑定 OS 线程——原实现窗口创建与消息泵
+//     分处两个线程，事件全部落进无泵线程的队列。现以
+//     runtime.LockOSThread 把注册类、建窗口、注册通知、消息泵全部锁在
+//     同一 goroutine/OS 线程内完成。
+//
+// 状态以原子量暴露给 Manager 轮询；启动失败/每个事件全程有日志。
 package display
 
 import (
+	"fmt"
+	"log/slog"
+	"runtime"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -38,10 +53,11 @@ const (
 	pbtPowerSettingChange    = 0x8013
 	wmClose                  = 0x0010
 	wmDestroy                = 0x0002
-	hwndMessage              = ^uintptr(3) // HWND_MESSAGE = -3
 	deviceNotifyWindowHandle = 0
 	csGblClass               = 0x0003
 	wsOverlappedWindow       = 0
+	// errorClassAlreadyExists：重试启动时类已在进程内注册（属正常）。
+	errorClassAlreadyExists = 1410
 )
 
 type wndClassExW struct {
@@ -74,14 +90,13 @@ type powerBroadcastSetting struct {
 	data         [1]byte
 }
 
-// lidMonitor 消息泵线程：lid 事件更新 closed/known 原子状态，并即时
-// 信号 events 通道（Manager 据此跳过轮询直接重评估——合盖过渡的关键）。
+// lidMonitor 消息泵线程（LockOSThread 固定）：lid 事件更新 closed/known
+// 原子状态，并即时信号 events 通道（Manager 据此跳过轮询直接重评估）。
 type lidMonitor struct {
 	closed atomic.Bool
 	known  atomic.Bool
 	events chan struct{}
 
-	class  [64]uint16
 	hwnd   uintptr
 	notify uintptr
 	done   chan struct{}
@@ -105,22 +120,25 @@ func lidNotifyChan() <-chan struct{} {
 	return nil
 }
 
-var lidSingleton atomic.Pointer[lidMonitor]
+var (
+	lidSingleton atomic.Pointer[lidMonitor]
+	lidStartMu   sync.Mutex
+)
 
-// lidMonitorSingleton 懒启动 monitor；失败（无窗口环境等极端情况）返回
-// nil——盒盖触发退化为仅靠无物理输出判定，功能不崩。
+// lidMonitorSingleton 懒启动 monitor（互斥守卫，单例）。启动全异步：
+// 失败经 run() 日志可见——盒盖触发退化为仅靠无物理输出判定，功能不崩。
 func lidMonitorSingleton() *lidMonitor {
 	if m := lidSingleton.Load(); m != nil {
 		return m
 	}
-	m := startLidMonitor()
-	if m != nil {
-		if lidSingleton.CompareAndSwap(nil, m) {
-			return m
-		}
-		m.stop()
+	lidStartMu.Lock()
+	defer lidStartMu.Unlock()
+	if m := lidSingleton.Load(); m != nil {
+		return m
 	}
-	return lidSingleton.Load()
+	m := startLidMonitor()
+	lidSingleton.Store(m)
+	return m
 }
 
 var lidWndProc = windows.NewCallback(func(hwnd, msg, wParam, lParam uintptr) uintptr {
@@ -131,19 +149,21 @@ var lidWndProc = windows.NewCallback(func(hwnd, msg, wParam, lParam uintptr) uin
 			// 直转 Pointer 会被 vet 拦，经 unsafe.Add 自类型化 nil 偏移）。
 			ps := (*powerBroadcastSetting)(unsafe.Add(
 				unsafe.Pointer((*powerBroadcastSetting)(nil)), lParam))
-				if ps.powerSetting == guidLidSwitchStateChange && ps.dataLength >= 1 {
-					m := lidSingleton.Load()
-					if m != nil {
-						// data[0]：0 = 合盖，1 = 开盖。
-						m.closed.Store(ps.data[0] == 0)
-						m.known.Store(true)
-						// 非阻塞信号：Manager 即时重评估（不等 3s 轮询）。
-						select {
-						case m.events <- struct{}{}:
-						default:
-						}
+			if ps.powerSetting == guidLidSwitchStateChange && ps.dataLength >= 1 {
+				m := lidSingleton.Load()
+				if m != nil {
+					// data[0]：0 = 合盖，1 = 开盖。
+					closed := ps.data[0] == 0
+					m.closed.Store(closed)
+					m.known.Store(true)
+					slog.Default().Info("display: lid event received", "closed", closed)
+					// 非阻塞信号：Manager 即时重评估（不等 3s 轮询）。
+					select {
+					case m.events <- struct{}{}:
+					default:
 					}
 				}
+			}
 		}
 	case wmClose:
 		procDestroyWindow.Call(hwnd)
@@ -156,7 +176,27 @@ var lidWndProc = windows.NewCallback(func(hwnd, msg, wParam, lParam uintptr) uin
 	return r1
 })
 
+// startLidMonitor 在专用 OS 线程上建窗口/注册通知并进入消息泵。全异步：
+// 不等待 setup 结果（调用方可能持有 Manager 锁，同步等待 = 潜在死锁，
+// 2026-09-10 停机挂起排查）；失败经 run() 内日志可见，lid 恒未知即症状。
 func startLidMonitor() *lidMonitor {
+	mon := &lidMonitor{events: make(chan struct{}, 1), done: make(chan struct{})}
+	go func() {
+		// 线程亲和：创建窗口、注册通知、GetMessage 泵必须同一 OS 线程
+		// （窗口消息按创建线程入队；goroutine 不绑定线程）。
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		if err := mon.run(); err != nil {
+			slog.Default().Warn("display: lid monitor start failed", "err", err)
+		}
+		close(mon.done)
+	}()
+	return mon
+}
+
+// run 在锁定的 OS 线程上执行：注册类 → 建顶层隐藏窗口 → 注册电源通知
+// → 消息泵（阻塞至 WM_QUIT）。setup 失败返回错误。
+func (m *lidMonitor) run() error {
 	className := windows.StringToUTF16("XncIddLidMonitor")
 
 	var cls wndClassExW
@@ -166,15 +206,18 @@ func startLidMonitor() *lidMonitor {
 	cls.hInstance, _, _ = procGetModuleHandleW.Call(0)
 	cls.lpszClassName = &className[0]
 
-	if r1, _, _ := procRegisterClassExW.Call(uintptr(unsafe.Pointer(&cls))); r1 == 0 {
-		return nil
+	r1, _, _ := procRegisterClassExW.Call(uintptr(unsafe.Pointer(&cls)))
+	if r1 == 0 && windows.GetLastError() != syscall.Errno(errorClassAlreadyExists) {
+		return fmt.Errorf("display: lid monitor RegisterClassExW: %v", windows.GetLastError())
 	}
 
+	// 顶层隐藏窗口（非 HWND_MESSAGE）：电源广播按 HWND_BROADCAST 投递，
+	// message-only 窗口不在广播名单（2026-09-10 实测事件静默丢失）。
 	hwnd, _, _ := procCreateWindowExW.Call(
 		0, uintptr(unsafe.Pointer(&className[0])), 0, wsOverlappedWindow,
-		0, 0, 0, 0, hwndMessage, 0, uintptr(cls.hInstance), 0)
+		0, 0, 0, 0, 0, 0, uintptr(cls.hInstance), 0)
 	if hwnd == 0 {
-		return nil
+		return fmt.Errorf("display: lid monitor CreateWindowExW: %v", windows.GetLastError())
 	}
 
 	notify, _, _ := procRegisterPowerSettingNotification.Call(
@@ -182,23 +225,22 @@ func startLidMonitor() *lidMonitor {
 		deviceNotifyWindowHandle)
 	if notify == 0 {
 		procDestroyWindow.Call(hwnd)
-		return nil
+		return fmt.Errorf("display: lid monitor RegisterPowerSettingNotification: %v", windows.GetLastError())
 	}
 
-	mon := &lidMonitor{hwnd: hwnd, notify: notify,
-		events: make(chan struct{}, 1), done: make(chan struct{})}
-	go func() {
-		var mq msg
-		for {
-			r1, _, _ := procGetMessageW.Call(uintptr(unsafe.Pointer(&mq)), 0, 0, 0)
-			if int32(r1) <= 0 { // 0 = WM_QUIT，-1 = 错误
-				break
-			}
-			procDispatchMessageW.Call(uintptr(unsafe.Pointer(&mq)))
+	m.hwnd = hwnd
+	m.notify = notify
+	slog.Default().Info("display: lid monitor started", "hwnd", hwnd)
+
+	var mq msg
+	for {
+		r1, _, _ := procGetMessageW.Call(uintptr(unsafe.Pointer(&mq)), 0, 0, 0)
+		if int32(r1) <= 0 { // 0 = WM_QUIT，-1 = 错误
+			break
 		}
-		close(mon.done)
-	}()
-	return mon
+		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&mq)))
+	}
+	return nil
 }
 
 // stop 收线：反注册通知 → 发 WM_CLOSE 让泵线程自毁窗口（跨线程
