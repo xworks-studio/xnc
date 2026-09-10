@@ -107,8 +107,9 @@ func TestSessionTriggerCreatesAndRemoves(t *testing.T) {
 	}
 
 	m.SessionEnded()
-	if f.closed != 1 || f.unplugged != 1 {
-		t.Fatalf("expected teardown on last session end, got closed=%d unplugged=%d", f.closed, f.unplugged)
+	// 设备常驻：会话结束只移除屏幕，设备保留（下一会话插屏即达）。
+	if f.unplugged != 1 || f.closed != 0 {
+		t.Fatalf("expected unplug-only on last session end, got closed=%d unplugged=%d", f.closed, f.unplugged)
 	}
 	st = m.Snapshot()
 	if st.AutoActive || st.VirtualActive {
@@ -122,13 +123,13 @@ func TestNoTriggerNoCreate(t *testing.T) {
 	defer m.Close()
 
 	m.SessionStarted()
-	// 预创建设备（无显示器）是会话期常态——不插屏即可。
+	// 常驻设备已存在（无显示器）、不插屏；会话结束设备保留。
 	if f.created != 1 || f.plugged != 0 {
-		t.Fatalf("expected pre-created device without plug, got created=%d plugged=%d", f.created, f.plugged)
+		t.Fatalf("expected resident device without plug, got created=%d plugged=%d", f.created, f.plugged)
 	}
 	m.SessionEnded()
-	if f.closed != 1 {
-		t.Fatalf("expected teardown of pre-created device, got closed=%d", f.closed)
+	if f.closed != 0 || f.plugged != 0 {
+		t.Fatalf("expected device kept after session, got closed=%d plugged=%d", f.closed, f.plugged)
 	}
 }
 
@@ -224,8 +225,8 @@ func TestManualOnSurvivesSessionEnd(t *testing.T) {
 		t.Fatalf("expected manualActive, got %+v", st)
 	}
 	m.SetOff()
-	if f.closed != 1 || f.unplugged != 1 {
-		t.Fatalf("SetOff must teardown, got closed=%d unplugged=%d", f.closed, f.unplugged)
+	if f.unplugged != 1 || f.closed != 0 {
+		t.Fatalf("SetOff must unplug but keep device, got closed=%d unplugged=%d", f.closed, f.unplugged)
 	}
 }
 
