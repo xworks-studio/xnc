@@ -31,9 +31,9 @@
 
 ### 1.1 现状（2026-09-08 RTV 重构后）
 
-- 媒体字节全部泵过 SRV 单机：`server/internal/rtv/relay.go` 的 Hub 按 nodeId 扇出，
+- 媒体字节全部泵过 SRV 单机：`src/server/internal/rtv/relay.go` 的 Hub 按 nodeId 扇出，
   server 出带宽 = Σ(会话 × 码率 × 观察者)。码率口径（运营估计，代码锚点）：host
-  默认码率 15000 kbps（`host/src/main.rs:55`）、QoS 下限 2000 kbps（`qos.rs`）、
+  默认码率 15000 kbps（`src/host/src/main.rs:55`）、QoS 下限 2000 kbps（`qos.rs`）、
   静止桌面因 `would_block_if_equal` 跳帧近零（`capture.rs`）——桌面流平均显著低于
   峰值，**P1 上线后以 RELAY_STATS 实测替代本估计**。量级判断：几十路并发活跃
   会话即可顶住国际区固定带宽机型，且境内用户吃跨境链路质量（2026-08-24 TURN
@@ -309,7 +309,7 @@ xnc-host（零改动 Phase 1）: token 即 RelayTicket（不透明字符串透�
 
 ## 4. 组件设计
 
-### 4.1 `rtv/`（新共享 Go 模块 xnc/rtv，自 internal/rtv 抽出）
+### 4.1 `src/rtv/`（新共享 Go 模块 xnc/rtv，自 internal/rtv 抽出）
 
 - 内容：Hub/relay（字节扇出、控制最小路由、迁移/IDR 合成、hello 重试门
   闩——逐字节搬用）、legquic/legwt/legws、ticket 验签（含墓碑）、传输级
@@ -325,7 +325,7 @@ type PlaneHost interface {
 }
 ```
 
-### 4.2 `xnc-relay`（新二进制，`relay/cmd/xnc-relay`）
+### 4.2 `xnc-relay`（新二进制，`src/relay/cmd/xnc-relay`）
 
 - 单静态二进制（distroless 或裸 systemd），身份/密钥文件 0600
   （`/var/lib/xnc-relay/identity.json`，无 argv 密钥）。
@@ -343,7 +343,7 @@ type PlaneHost interface {
   **纯 IP 模式**（UDP443 /wt 钉扎；降级 = re-POST 重建，§3.2）——对应
   owner 的免备案约束。
 
-### 4.3 `server/`（改动面）
+### 4.3 `src/server/`（改动面）
 
 - `internal/api/desktop_handlers.go`：分配器（**node-sticky 优先**；打分 =
   区域命中权重 + 归一化负载 `max(sessions/maxSessions, mbpsOut/maxMbpsOut)`，
@@ -356,7 +356,7 @@ type PlaneHost interface {
 - janitor 的 desktop idle 语义改由 relay RELAY_STATS/会话事件驱动
   （TouchActivity 节流 15s，< 租约 TTL 60s）。
 
-### 4.4 `agent/` 与 `host/`（Phase 1 零改动；Phase 2 各一处）
+### 4.4 `src/agent/` 与 `src/host/`（Phase 1 零改动；Phase 2 各一处）
 
 - Phase 1：**零改动**。DesktopParams.StreamEndpoint 换成 relay 的 host 腿
   endpoint，token 字段装 RelayTicket——两者对 agent/host 都是不透明透传；
@@ -367,7 +367,7 @@ type PlaneHost interface {
   Phase 3 加可选 `certSha256` 透传（纯 IP 模式 host 钉扎；rustls 自定义
   verifier 管线已有，AcceptAnyServer 的 debug 路径证明可插）。
 
-### 4.5 `web/`
+### 4.5 `src/web/`
 
 - Phase 1：读 candidates 做**顺序 fallback**（等价现 WT 失败转 WS 的推广）
   + **全候选烧尽后 re-POST 重建会话**（现状是 fatal 退出，`DesktopLive.tsx:
@@ -422,7 +422,7 @@ type PlaneHost interface {
 ## 7. 观测与运维闭环
 
 - 会话→relay 映射经对账常驻 server 内存 + Monitor 页 per-relay 视图。
-- **canary 流程**：relay 注册后置 draining（不参与分配）→ `tools/rtvload`
+- **canary 流程**：relay 注册后置 draining（不参与分配）→ `src/tools/rtvload`
   打该 relay 的 **/wt viewer 腿**（rtvload 现仅支持 WT 拨号，viewer 腿正好
   够用；打 host 腿属非必须的后续扩展）出 30s 报告 → 通过后翻 active。
   drain 反向。

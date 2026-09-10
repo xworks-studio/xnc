@@ -32,10 +32,10 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: web/package-lock.json
+          cache-dependency-path: src/web/package-lock.json
       - name: build web (dist 进入 docker 上下文；服务器不执行 npm)
         run: |
-          cd web
+          cd src/web
           npm ci
           npm run build
 

@@ -30,7 +30,7 @@ XNC = Windows 节点远程管理平台：Go server（xnc.app）+ Windows agent
 ```
 
 - **交付面**：agent/CLI 经 Inno Setup 安装器（**现行路径：本地
-  `installer/build.ps1` 签名构建 → 管理员 API `POST /api/admin/releases`
+  `src/installer/build.ps1` 签名构建 → 管理员 API `POST /api/admin/releases`
   直传生产 release store**；CI publish.yml 因 vcpkg 陈旧 ffmpeg 基线暂不可
   用，修复后恢复"tag+GitHub Release+installersync 拉回"的正规路径）；
   server 经 `deploy/build-server-local.ps1`（本地 docker build → save →
@@ -42,14 +42,18 @@ XNC = Windows 节点远程管理平台：Go server（xnc.app）+ Windows agent
   web/native/host-rust/installer-dryrun）→ main。实验机
   XIAOXIN/TB16G7（PS remoting），本机不装产品组件。
 
-模块地图（Go workspace，`go.work` 串联）：`proto`（协议）· `server`（控制面，
-chi + sqlc + 真 PG 测试）· `agent`（节点侧，Windows 服务）· `cli` · `shellhost`
-（ConPTY 宿主）· `mockagent`（负载/一致性测试用，**保留勿删**）· `shellsmoke` ·
-`tools/{desktopreport,rtvload,nalcheck}`（桌面报告/RTV 合成查看器/码流
-分析，均在职）。`native/` 为 C++（core=SYSTEM 管道服务、common=共享头；
-desktop 已随 RTV 重构删除）。`host/` 为 Rust crate `xnc-host`（桌面采集/
-编码/FEC/QUIC 发送），vendor 依赖在 `third_party/scrap`（rustdesk fork 裁剪）。
-`web/` 为 React+Vite（产物嵌入 server 二进制）。`installer/` 为 Inno Setup 打包。
+模块地图（2026-09-09 起全部代码模块在 `src/` 下；`deploy/` 运维、`docs/`
+文档、`scripts/` 脚本、`bin/` 产物池留在仓库根。Go workspace 由仓库根
+`go.work` 串联）：`src/proto`（协议）· `src/server`（控制面，
+chi + sqlc + 真 PG 测试）· `src/agent`（节点侧，Windows 服务）· `src/cli` · `src/shellhost`
+（ConPTY 宿主）· `src/mockagent`（负载/一致性测试用，**保留勿删**）· `src/shellsmoke` ·
+`src/rtv`（RTV 中继数据面库：Hub 扇出/票据/仲裁/三腿，server 内嵌与外置中继共用）·
+`src/relay`（外置中继二进制 xnc-relay）·
+`src/tools/{desktopreport,rtvload,nalcheck}`（桌面报告/RTV 合成查看器/码流
+分析，均在职）。`src/native/` 为 C++（core=SYSTEM 管道服务、common=共享头；
+desktop 已随 RTV 重构删除）。`src/host/` 为 Rust crate `xnc-host`（桌面采集/
+编码/FEC/QUIC 发送），vendor 依赖在 `src/third_party/scrap`（rustdesk fork 裁剪）。
+`src/web/` 为 React+Vite（产物嵌入 server 二进制）。`src/installer/` 为 Inno Setup 打包。
 
 ## 2. 硬性契约（违反即事故）
 
@@ -87,7 +91,7 @@ desktop 已随 RTV 重构删除）。`host/` 为 Rust crate `xnc-host`（桌面�
 - **实验机**：LABS-XIAOXIN（干净实验台）、LABS-TB16G7（用户机）经 PowerShell
   remoting（Invoke-Command，凭据在 deploy/.env 的 NODE_* 键）；**不要在开发
   机本机装 agent 做实验**。
-- 遗留坑：`agent/session` 存在预存在的 GOOS=linux 构建失败（非 Windows 路径），
+- 遗留坑：`src/agent/session` 存在预存在的 GOOS=linux 构建失败（非 Windows 路径），
   与新改动无关时勿"顺手修"。
 
 ## 4. 部署流程（server → xnc.app，本地构建直推）
@@ -185,10 +189,10 @@ vcpkg 无基线锁定，ffmpeg 头漂移（FF_PROFILE_* 枚举缺定义）编译
 
 - **背景**：未签名 exe 会被 Defender 随机隔离（实战发生过：xnc.exe 消失）。
 - **证书**：正式主体 `CN=XNC Code Signing, OU=Release Engineering,
-  O=XWorks Studio, C=CN`；`installer/codesign.cer`（公钥，入库）+
-  `installer/codesign.pfx`（私钥，gitignored，**勿外传**）；密码在
+  O=XWorks Studio, C=CN`；`src/installer/codesign.cer`（公钥，入库）+
+  `src/installer/codesign.pfx`（私钥，gitignored，**勿外传**）；密码在
   `deploy/.env` 的 `XNC_CODESIGN_PASSWORD`。3 年有效期，续期用
-  `installer/make-cert.ps1` 重建、重签并给存量机器重导信任。
+  `src/installer/make-cert.ps1` 重建、重签并给存量机器重导信任。
 - **构建**：`build.ps1` 自动签名（五 exe 在 ISCC 前签、setup 在其后、
   sha256 覆盖签名后产物）；设 `XNC_CODESIGN_PASSWORD` 环境变量。时间戳
   多服务器回退，全败则免时间戳签名+告警。指纹经 `/DCertThumb` 传给

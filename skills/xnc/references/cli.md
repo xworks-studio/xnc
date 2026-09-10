@@ -16,12 +16,12 @@
 | `xnc exec <node> [--timeout N] [--cwd PATH] -- <command...>` | 一次性命令 |
 | `xnc run <node> (--file x.ps1 \| -) [--timeout N]` | 脚本执行，`-` 表示 stdin |
 | `xnc shell <node> [--cols N] [--rows N]` | 交互式 PowerShell（需 TTY；行首 `~.` 断开（全角 `～．` 同样识别；裸 `~`+回车亦可）；提示符带 `[机器名]` 前缀；显式 cols/rows 禁用自动 resize） |
-| `xnc rdp <node> [--local-port N]` | 反向隧道 + mstsc |
+| `xnc rdp <node> [--local-port N]` | 浏览器 RTV 桌面（默认）；`--native` = 反向隧道 + mstsc |
 | `xnc upload <node> <local> <remote>` | 上传（sha256 校验） |
 | `xnc download <node> <remote> <local>` | 下载（sha256 校验） |
-| `xnc screen <node> [--snapshot out.jpg \| --open] [--fps N]` | 桌面快照/只读预览（operator+） |
+| `xnc screen <node> --snapshot out.jpg` | 桌面 JPEG 快照（operator+；`--open` 实时预览已退役——改开桌面会话） |
 | `xnc audit list [--node/--user/--action/--since]` | 审计日志查询 |
-| `xnc register` | 本机注册为节点：登录（无 JWT 时内联 login）→ 选 cluster（唯一 cluster 直接确认）→ 经 agentctl 管道注册 → 轮询至 online；已注册时提示当前绑定，`--force` 走 deregister+register。需先装 setup.exe（[xnc.app/setup.exe](https://xnc.app/setup.exe)） |
+| `xnc register` | 本机注册为节点：登录（无 JWT 时内联 login）→ 选 cluster（唯一 cluster 直接确认）→ 经 agentctl 管道注册 → 轮询至 online；已注册时提示当前绑定，`--force` 走 deregister+register。需先装安装器（[xnc.app/installer](https://xnc.app/installer)） |
 | `xnc deregister` | 反注册本机（断连、删 server 节点、弃机器绑定，保留身份私钥）；需 admin 控制台 |
 | `xnc upgrade [--channel stable\|dev]` | 经 agentctl 管道触发本机 agent 立即检查并静默应用更新（安装器编排，阻塞显示进度至新版本上线）；`--channel` 先原子改绑定频道再按新频道检查 |
 | `xnc version` | CLI 版本 |

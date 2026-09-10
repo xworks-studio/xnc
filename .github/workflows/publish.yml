@@ -94,7 +94,7 @@ jobs:
         shell: pwsh
         run: |
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-          powershell -NoProfile -ExecutionPolicy Bypass -File installer\build.ps1 `
+          powershell -NoProfile -ExecutionPolicy Bypass -File src\installer\build.ps1 `
             -Version $env:VERSION -Channel $env:CHANNEL -ISCC $iscc
           $name = "XNC-Installer$(if ($env:CHANNEL -eq 'dev') {'-dev'})-$env:VERSION.exe"
           "ARTIFACT=bin\$name" | Out-File $env:GITHUB_ENV -Append utf8

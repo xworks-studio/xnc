@@ -57,7 +57,7 @@ CloseApplications=no
 DisableProgramGroupPage=yes
 UninstallDisplayName=XNC
 VersionInfoVersion={#SetupVersion}
-OutputDir=..\bin
+OutputDir=..\..\bin
 OutputBaseFilename=XNC-Installer{#ChannelSuffix}-{#Version}
 Compression=lzma2/max
 SolidCompression=yes
@@ -75,11 +75,11 @@ Name: "shell"; Description: "XNC Shell (ConPTY shell sessions)"; Types: full cus
 [Files]
 ; Five binaries from bin\ (built by installer/build.ps1). Agent + CLI are a
 ; fixed component (spec G2); core+desktop and shell are croppable (spec 3.2).
-Source: "..\bin\xnc-agent.exe"; DestDir: "{app}"; Components: agent; Flags: ignoreversion
-Source: "..\bin\xnc.exe"; DestDir: "{app}"; Components: agent; Flags: ignoreversion restartreplace
-Source: "..\bin\xnc-core.exe"; DestDir: "{app}"; Components: desktop; Flags: ignoreversion
-Source: "..\bin\xnc-host.exe"; DestDir: "{app}"; Components: desktop; Flags: ignoreversion
-Source: "..\bin\xnc-shell.exe"; DestDir: "{app}"; Components: shell; Flags: ignoreversion
+Source: "..\..\bin\xnc-agent.exe"; DestDir: "{app}"; Components: agent; Flags: ignoreversion
+Source: "..\..\bin\xnc.exe"; DestDir: "{app}"; Components: agent; Flags: ignoreversion restartreplace
+Source: "..\..\bin\xnc-core.exe"; DestDir: "{app}"; Components: desktop; Flags: ignoreversion
+Source: "..\..\bin\xnc-host.exe"; DestDir: "{app}"; Components: desktop; Flags: ignoreversion
+Source: "..\..\bin\xnc-shell.exe"; DestDir: "{app}"; Components: shell; Flags: ignoreversion
 ; 签名公钥：安装时导入本机信任（自签过渡期的机群信任分发；正式 CA 后移除）
 Source: "codesign.cer"; DestDir: "{tmp}"; Flags: ignoreversion
 

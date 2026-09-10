@@ -18,10 +18,10 @@ $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 
 Write-Host "== build xnc-relay (linux/amd64 static) =="
-Push-Location "$repo\relay"
+Push-Location "$repo\src\relay"
 try {
     $env:CGO_ENABLED = "0"; $env:GOOS = "linux"; $env:GOARCH = "amd64"
-    go build -trimpath -ldflags "-s -w" -o "..\bin\xnc-relay-linux" ./cmd/xnc-relay
+    go build -trimpath -ldflags "-s -w" -o "..\..\bin\xnc-relay-linux" ./cmd/xnc-relay
     if ($LASTEXITCODE -ne 0) { throw "go build failed" }
 } finally {
     Remove-Item Env:CGO_ENABLED, Env:GOOS, Env:GOARCH -ErrorAction SilentlyContinue
