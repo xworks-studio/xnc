@@ -104,7 +104,7 @@ Exit codes:
 		newLoginCmd(), newLogoutCmd(), newRegisterCmd(), newDeregisterCmd(),
 		newWhoamiCmd(), newStatusCmd(), newVersionCmd(),
 		// Local machine control
-		newDisplayCmd(), newIddHoldCmd(),
+		newDisplayCmd(), newIddHoldCmd(), newIddProbeCmd(),
 		// Admin & maintenance
 		newAuditCmd(), newUpdateCmd(), newUpgradeCmd(),
 	)

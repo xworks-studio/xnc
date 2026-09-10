@@ -347,11 +347,15 @@ func (winBackend) unplugMonitor(h uintptr) error {
 }
 
 func (winBackend) physicalOutputActive() bool {
-	total, p, _ := enumDisplays()
-	if total == 0 {
-		// session 0 下枚举恒空 = "未知"，按有物理屏保守处理（不触发建屏）：
-		// 避免桌面机带屏时每次会话误建虚拟屏；盒盖场景由 lid 事件覆盖。
+	// 本进程（session 0）GDI 枚举恒空——真实物理输出状态经控制台会话
+	// 探针获取（probe_windows.go；盒盖不产生事件的机器靠它兜底"无物理
+	// 输出"触发）。探针不可用按"有物理输出"保守处理（不触发建屏）。
+	total, p, ok := probeConsoleDisplays()
+	if !ok {
 		return true
+	}
+	if total == 0 {
+		return false // 控制台无任何显示（headless 会话）：视为无物理输出
 	}
 	return p
 }
