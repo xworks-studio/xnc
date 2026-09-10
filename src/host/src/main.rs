@@ -291,7 +291,9 @@ fn main() -> Result<()> {
 
     // 采集 + 编码主循环（带重建：显示器/编码器异常恢复）
     let _rt = rt;
-    let mut backoff = Duration::from_millis(200);
+    // 重建退避 200ms→100ms 起步：盒盖过渡时第一次重建（面板消亡 → 重枚举
+    // 虚拟屏）尽早发生；封顶 3s 不变（防坏环境下的忙循环）。
+    let mut backoff = Duration::from_millis(100);
     loop {
         match run_pipeline(&shared, &cfg) {
             Ok(()) => unreachable!("pipeline only returns on error"),
