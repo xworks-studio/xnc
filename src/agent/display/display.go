@@ -3,8 +3,10 @@
 // src/third_party/xncidd，安装器 idd 组件 pnputil 入 store）。
 //
 // 策略（用户确认，比 2026-08-22 agent 重构 spec §13.3 更克制）：
-//   - **设备常驻后台**：SW 设备在 agent 生命周期内创建一次、不随会话
-//     拆建（Handle 生命周期——agent 崩溃/退出即自动移除）；
+//   - **设备常驻后台**：SW 设备经活动控制台会话里的持有进程创建一次
+//     （xnc idd-hold，见 holder_windows.go——会话 0 创建设备会把虚拟屏
+//     绑到不可见会话，2026-09-10 XIAOXIN 实测修复）、不随会话拆建；
+//     agent 退出/崩溃 → 持有进程 EOF 释放句柄 → 设备自动移除；
 //   - **屏幕仅在有控制请求接入后才创建**：desktop（RTV）会话活跃 且
 //     （盒盖 ∨ 无活动物理输出 ∨ XNC_IDD_FORCE_LID 调试旋钮）时插屏；
 //     会话全部结束即移除（仅自动创建的）；手动 `xnc display on` 保持
@@ -24,11 +26,14 @@ import (
 type backend interface {
 	// driverInstalled 驱动包是否在 store（DriverPackages 注册表键）。
 	driverInstalled() bool
-	// createDevice 经 SwDeviceCreate 创建软件设备（硬件 ID XncIdd），
-	// 返回设备句柄（Handle 生命周期）。
-	createDevice() (uintptr, error)
-	// closeDevice 关闭句柄；Handle 生命周期下设备即刻被 PnP 移除。
-	closeDevice(h uintptr)
+	// startDevice 在活动控制台会话拉起设备持有进程（xnc idd-hold，
+	// holder_windows.go），等设备接口就绪后返回持有进程句柄。无控制台
+	// 会话/就绪超时返回错误——可重试的延迟条件。会话亲和：会话 0 创建
+	// 设备会把虚拟屏绑到不可见会话（2026-09-10 实测）。
+	startDevice() (uintptr, error)
+	// stopDevice 结束持有进程（优雅 EOF → 超时强杀），设备随句柄释放
+	// 被 PnP 移除。
+	stopDevice(h uintptr)
 	// plugMonitor/unplugMonitor 经设备接口 IOCTL 热插拔 0 号显示器
 	// （EDID 0 = 1920×1080@60）。
 	plugMonitor(h uintptr) error
@@ -154,15 +159,15 @@ func (m *Manager) triggerLocked() bool {
 }
 
 // ensureDeviceLocked 设备常驻（用户策略：设备可常驻后台）：进程生命周期
-// 内创建一次、不随会话拆建（Handle 生命周期，agent 退出即自动移除）。
-// 驱动未装 = 静默 no-op（后续会话/触发/手动 on 时重试）。
+// 内创建一次、不随会话拆建（持有进程 EOF 生命周期，agent 退出即自动
+// 移除）。驱动未装 = 静默 no-op（后续会话/触发/手动 on 时重试）。
 func (m *Manager) ensureDeviceLocked() {
 	if m.handle != 0 || !m.be.driverInstalled() {
 		return
 	}
-	h, err := m.be.createDevice()
+	h, err := m.be.startDevice()
 	if err != nil {
-		m.logger().Warn("display: device create failed", "err", err)
+		m.logger().Warn("display: device start failed", "err", err)
 		return
 	}
 	m.handle = h
@@ -176,15 +181,16 @@ func (m *Manager) plugVirtualLocked() error {
 		return errNotInstalled
 	}
 	if m.handle == 0 {
-		h, err := m.be.createDevice()
+		h, err := m.be.startDevice()
 		if err != nil {
 			return err
 		}
 		m.handle = h
 	}
 	if err := m.be.plugMonitor(m.handle); err != nil {
-		// 常驻设备可能已失效（驱动重装/外部移除）：弃句柄，下次重建。
-		m.be.closeDevice(m.handle)
+		// 常驻设备可能已失效（驱动重装/外部移除/用户注销）：弃句柄，
+		// 下次重建。
+		m.be.stopDevice(m.handle)
 		m.handle = 0
 		return err
 	}
@@ -226,7 +232,7 @@ func (m *Manager) teardownLocked() {
 		}
 		m.plugged = false
 	}
-	m.be.closeDevice(m.handle)
+	m.be.stopDevice(m.handle)
 	m.handle = 0
 }
 

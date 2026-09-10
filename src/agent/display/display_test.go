@@ -31,14 +31,14 @@ func (f *fakeBackend) driverInstalled() bool {
 	return f.installed
 }
 
-func (f *fakeBackend) createDevice() (uintptr, error) {
+func (f *fakeBackend) startDevice() (uintptr, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.created++
 	return 1, nil
 }
 
-func (f *fakeBackend) closeDevice(uintptr) {
+func (f *fakeBackend) stopDevice(uintptr) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.closed++

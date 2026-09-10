@@ -1,7 +1,8 @@
 //go:build windows
 
-// idd_windows.go — Windows 后端：SwDeviceCreate 动态设备 + 设备接口
-// IOCTL 热插拔 + 显示器枚举 + 驱动包检测。协议逐字节镜像 vendored
+// idd_windows.go — Windows 后端：设备接口 IOCTL 热插拔 + 显示器枚举 +
+// 驱动包检测。软件设备创建经会话内持有进程（holder_windows.go——
+// 会话亲和修复，2026-09-10）；协议逐字节镜像 vendored
 // src/third_party/xncidd（Public.h / IddController.c，2026-09-10）。
 package display
 
@@ -22,15 +23,6 @@ import (
 var (
 	modSetupAPI = windows.NewLazySystemDLL("setupapi.dll")
 	modUser32   = windows.NewLazySystemDLL("user32.dll")
-	// SwDevice* 在现代 Windows 由 CFGMGR32 导出（System32 无实体
-	// swdevice.dll——SDK 的 swdevice.lib 也转发到 cfgmgr32，2026-09-10
-	// 实测 dumpbin）。老 Win10 上实体 swdevice.dll 仍导出同名函数：
-	// cfgMgr32 优先，缺则回落裸名 swdevice.dll（api-set 重定向）。
-	modCfgMgr32 = windows.NewLazySystemDLL("cfgmgr32.dll")
-	modSwDevice = windows.NewLazyDLL("swdevice.dll")
-
-	procSwDeviceCreate = findSwDeviceProc("SwDeviceCreate")
-	procSwDeviceClose  = findSwDeviceProc("SwDeviceClose")
 
 	procSetupDiGetClassDevsW             = modSetupAPI.NewProc("SetupDiGetClassDevsW")
 	procSetupDiEnumDeviceInterfaces      = modSetupAPI.NewProc("SetupDiEnumDeviceInterfaces")
@@ -38,15 +30,6 @@ var (
 	procSetupDiDestroyDeviceInfoList     = modSetupAPI.NewProc("SetupDiDestroyDeviceInfoList")
 	procEnumDisplayDevicesW              = modUser32.NewProc("EnumDisplayDevicesW")
 )
-
-// findSwDeviceProc 解析 SwDevice* 符号：cfgmgr32 → swdevice.dll 回落。
-// 两者都缺时返回的 proc 在 Call 时 panic——display 路径上层 recover 收敛。
-func findSwDeviceProc(name string) *windows.LazyProc {
-	if p := modCfgMgr32.NewProc(name); p.Find() == nil {
-		return p
-	}
-	return modSwDevice.NewProc(name)
-}
 
 // guidDevInterfaceXncIdd 设备接口 GUID（XNC 生成，见 XncIddDriver/Driver.cpp）。
 var guidDevInterfaceXncIdd = windows.GUID{
@@ -65,14 +48,6 @@ const (
 )
 
 const (
-	deviceDescription         = "XWorks XNC Virtual Display"
-	hwIDXncIdd                = "XncIdd"
-	// SWDeviceCapabilities（swdevicedef.h 真值：0x01/0x02/0x08；含未定义位
-	// 时 SwDeviceCreate 返回 E_INVALIDARG——2026-09-10 XIAOXIN 实测踩过）。
-	swDeviceCapRemovable      = 0x01
-	swDeviceCapSilentInstall  = 0x02
-	swDeviceCapDriverRequired = 0x08
-
 	digcfPresent            = 0x02
 	digcfDeviceInterface    = 0x10
 	errorInsufficientBuffer = syscall.Errno(122)
@@ -80,109 +55,14 @@ const (
 	displayDeviceActive    = 0x1
 	displayDeviceMirroring = 0x8
 
+	// virtualDisplayName 与驱动 EDID 的显示器名一致（镜像 CLI 侧
+	// swDeviceCreate 的 deviceDescription），用于 GDI 枚举识别虚拟屏。
+	virtualDisplayName = "XWorks XNC Virtual Display"
+
 	// 调试旋钮（契约 4 的 XNC_* 惯例）：注册表环境，值 open|closed。
 	forceLidValue = "XNC_IDD_FORCE_LID"
 	envRegKey     = `SYSTEM\CurrentControlSet\Control\Session Manager\Environment`
 )
-
-// ---- SwDeviceCreate（异步 + 回调，镜像 IddController.c DeviceCreate）----
-
-type swDeviceCreateInfo struct {
-	cbSize       uint32
-	_            uint32
-	instanceID   *uint16
-	hwIDs        *uint16
-	compIDs      *uint16
-	containerID  *windows.GUID // 恒 NULL；布局对齐 swdevicedef.h
-	capFlags     uint32        // ULONG（header 语义；字节版实测触 E_INVALIDARG）
-	description  *uint16
-	location     *uint16
-	securityDesc *windows.GUID // 恒 NULL；布局对齐 swdevicedef.h
-}
-
-type createCallbackCtx struct {
-	event     windows.Handle
-	hSwDevice uintptr
-	hr        uintptr
-}
-
-// createCtx 是 SwDeviceCreate 回调上下文（package 级单例：Manager 在
-// 互斥锁内串行调用，无并发使用——避免回调参数 uintptr→Pointer 转换）。
-var createCtx createCallbackCtx
-
-var createCallback = windows.NewCallback(func(hSwDevice, hr, _, _ uintptr) uintptr {
-	createCtx.hSwDevice = hSwDevice
-	createCtx.hr = hr
-	windows.SetEvent(createCtx.event)
-	return 0
-})
-
-// swDeviceCreate 创建软件设备（Handle 生命周期）。返回的句柄由调用方
-// 持至关闭；句柄关闭设备即被 PnP 移除。
-func swDeviceCreate() (uintptr, error) {
-	instanceID, err := windows.UTF16PtrFromString(hwIDXncIdd)
-	if err != nil {
-		return 0, err
-	}
-	// multi-sz（单条目 + 双 NUL）：UTF16PtrFromString 拒绝内嵌 NUL，
-	// 故从干净串构造后手动补终止符。
-	ids, err := windows.UTF16FromString(hwIDXncIdd)
-	if err != nil {
-		return 0, err
-	}
-	ids = append(ids, 0)
-	hwIDs := &ids[0]
-	desc, err := windows.UTF16PtrFromString(deviceDescription)
-	if err != nil {
-		return 0, err
-	}
-	enumName, _ := windows.UTF16PtrFromString(hwIDXncIdd)
-	parent, _ := windows.UTF16PtrFromString(`HTREE\ROOT\0`)
-
-	info := swDeviceCreateInfo{
-		cbSize:      uint32(unsafe.Sizeof(swDeviceCreateInfo{})),
-		instanceID:  instanceID,
-		hwIDs:       hwIDs,
-		compIDs:     hwIDs,
-		capFlags:    swDeviceCapRemovable | swDeviceCapSilentInstall | swDeviceCapDriverRequired,
-		description: desc,
-	}
-
-	event, err := windows.CreateEvent(nil, 0, 0, nil)
-	if err != nil {
-		return 0, err
-	}
-	defer windows.CloseHandle(event)
-	createCtx = createCallbackCtx{event: event}
-
-	var h uintptr
-	r1, _, e1 := procSwDeviceCreate.Call(
-		uintptr(unsafe.Pointer(enumName)),
-		uintptr(unsafe.Pointer(parent)),
-		uintptr(unsafe.Pointer(&info)),
-		0, 0,
-		createCallback,
-		// pContext：C 参考实现传非空上下文（cfgmgr32 实测对 NULL 报
-		// E_INVALIDARG）；回调侧忽略该值，传本 package 上下文地址即可。
-		uintptr(unsafe.Pointer(&createCtx)),
-		uintptr(unsafe.Pointer(&h)),
-	)
-	if r1 != 0 { // HRESULT != S_OK
-		return 0, fmt.Errorf("display: SwDeviceCreate failed 0x%x (%v)", uint32(r1), e1)
-	}
-	res, err := windows.WaitForSingleObject(event, 10000)
-	if err != nil || res != windows.WAIT_OBJECT_0 {
-		return 0, fmt.Errorf("display: SwDeviceCreate callback wait failed (res=%d err=%v)", res, err)
-	}
-	if createCtx.hr != 0 {
-		return 0, fmt.Errorf("display: SwDeviceCreate device creation failed 0x%x", uint32(createCtx.hr))
-	}
-	return createCtx.hSwDevice, nil
-}
-
-func swDeviceCloseHandle(h uintptr) {
-	procSwDeviceClose.Call(h)
-}
 
 // ---- 设备接口枚举 + CreateFile（镜像 IddController.c GetDevicePath2）----
 
@@ -356,7 +236,7 @@ func enumDisplays() (total int, physicalActive bool, virtualActive bool) {
 		if dd.flags&displayDeviceActive == 0 {
 			continue
 		}
-		if windows.UTF16ToString(dd.str[:]) == deviceDescription {
+		if windows.UTF16ToString(dd.str[:]) == virtualDisplayName {
 			virtualActive = true
 			continue
 		}
@@ -408,15 +288,33 @@ func forceLidFromRegistry() string {
 
 // ---- backend 装配 ----
 
-type winBackend struct{}
+// winBackend 持有设备持有进程的 stdin 管道写端（单设备：Manager 在
+// 互斥锁内串行调用，无并发访问）。
+type winBackend struct {
+	stdinWrite windows.Handle
+}
 
-func newBackend() backend { return winBackend{} }
+func newBackend() backend { return &winBackend{} }
 
-func (winBackend) driverInstalled() bool { return driverPackageInStore() }
+func (b *winBackend) driverInstalled() bool { return driverPackageInStore() }
 
-func (winBackend) createDevice() (uintptr, error) { return swDeviceCreate() }
+// startDevice 会话内创建软件设备（持有进程，见 holder_windows.go）：
+// 返回持有进程句柄；无控制台会话/超时返回错误（可重试）。
+func (b *winBackend) startDevice() (uintptr, error) {
+	proc, stdinW, err := startHolder()
+	if err != nil {
+		return 0, err
+	}
+	b.stdinWrite = stdinW
+	return uintptr(proc), nil
+}
 
-func (winBackend) closeDevice(h uintptr) { swDeviceCloseHandle(h) }
+func (b *winBackend) stopDevice(h uintptr) {
+	if b.stdinWrite != 0 {
+		stopHolder(windows.Handle(h), b.stdinWrite)
+		b.stdinWrite = 0
+	}
+}
 
 func (winBackend) plugMonitor(h uintptr) error {
 	// 接口就绪等待：200ms×10 快速重试 + 1s×5 兜底（会话已预创建设备，
