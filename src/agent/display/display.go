@@ -75,6 +75,10 @@ type Manager struct {
 }
 
 // NewManager 构造并启动轮询 goroutine。Close 停止轮询并移除设备。
+// lidNotify 盒盖电源事件即时信号源（平台实现：Windows = 电源通知窗口
+// 的单播通道；非 Windows = nil）。测试可注入假通道。
+var lidNotify = lidNotifyChan
+
 func NewManager(log *slog.Logger) *Manager {
 	m := &Manager{log: log, be: newBackend(), stop: make(chan struct{})}
 	go m.poll()
@@ -88,8 +92,9 @@ func (m *Manager) logger() *slog.Logger {
 	return slog.Default()
 }
 
-// poll 会话期间的触发变化兜底（会话接入后才可能盒盖/拔屏；创建只在
-// 会话活跃时发生，移除只发生在会话归零，见策略注释）。
+// poll 会话期间的触发变化（盒盖/拔屏）。双源：lid 电源事件即时信号
+// （合盖→建屏的主路径，不等轮询）+ 3s 轮询兜底（物理输出变化等）。
+// 创建只在会话活跃时发生，移除只发生在会话归零，见策略注释。
 func (m *Manager) poll() {
 	t := time.NewTicker(3 * time.Second)
 	defer t.Stop()
@@ -97,14 +102,24 @@ func (m *Manager) poll() {
 		select {
 		case <-m.stop:
 			return
+		case <-lidNotify():
+			m.reconcile()
 		case <-t.C:
-			m.mu.Lock()
-			if m.sessionRefs > 0 && !m.plugged && m.triggerLocked() {
-				if err := m.ensureVirtualLocked(); err == nil {
-					m.autoActive = true
-				}
-			}
-			m.mu.Unlock()
+			m.reconcile()
+		}
+	}
+}
+
+// reconcile 重评估触发条件（lid 事件/轮询共用）。
+func (m *Manager) reconcile() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sessionRefs > 0 && !m.plugged && m.triggerLocked() {
+		if err := m.ensureVirtualLocked(); err == nil {
+			m.autoActive = true
+			m.logger().Info("display: virtual display created for session")
+		} else if err != errNotInstalled {
+			m.logger().Warn("display: session-triggered create failed", "err", err)
 		}
 	}
 }
@@ -156,7 +171,7 @@ func (m *Manager) ensureVirtualLocked() error {
 		if m.be.virtualDisplayActive() {
 			return nil
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
 	// PLUG_IN 已成功但显示器尚未活动（慢机器/会话切换）：不视为失败，
 	// host 侧 1s 拓扑轮询会在其出现后自动采上。
@@ -180,12 +195,20 @@ func (m *Manager) teardownLocked() {
 	m.handle = 0
 }
 
-// SessionStarted desktop 会话接入：引用计数 +1；触发满足即建屏（先于
-// host spawn——host 枚举时虚拟屏须已在位）。
+// SessionStarted desktop 会话接入：引用计数 +1；**预创建设备**（无显示
+// 器——盒盖触发时只剩插屏 + OS 模式提交，省掉设备创建/接口就绪的秒级
+// 延迟，设备生命周期随会话）；触发满足即建屏（先于 host spawn——host
+// 枚举时虚拟屏须已在位）。
 func (m *Manager) SessionStarted() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.sessionRefs++
+	if m.handle == 0 && m.be.driverInstalled() {
+		if h, err := m.be.createDevice(); err == nil {
+			m.handle = h
+			m.logger().Info("display: device pre-created for session")
+		}
+	}
 	if !m.plugged && m.triggerLocked() {
 		if err := m.ensureVirtualLocked(); err == nil {
 			m.autoActive = true
@@ -196,17 +219,23 @@ func (m *Manager) SessionStarted() {
 	}
 }
 
-// SessionEnded 最后一个会话结束后移除自动创建的虚拟屏（手动 on 的保留）。
+// SessionEnded 最后一个会话结束后移除自动创建的虚拟屏（手动 on 的保留），
+// 并关闭仅预创建（未插屏）的设备。
 func (m *Manager) SessionEnded() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.sessionRefs > 0 {
 		m.sessionRefs--
 	}
-	if m.sessionRefs == 0 && m.autoActive && !m.manualActive {
-		m.teardownLocked()
-		m.autoActive = false
-		m.logger().Info("display: virtual display removed (last session closed)")
+	if m.sessionRefs == 0 && !m.manualActive {
+		if m.autoActive {
+			m.teardownLocked()
+			m.autoActive = false
+			m.logger().Info("display: virtual display removed (last session closed)")
+		} else if m.handle != 0 && !m.plugged {
+			// 仅预创建设备（无显示器）：随会话关闭。
+			m.teardownLocked()
+		}
 	}
 }
 

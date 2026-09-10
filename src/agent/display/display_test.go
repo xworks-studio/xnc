@@ -122,12 +122,13 @@ func TestNoTriggerNoCreate(t *testing.T) {
 	defer m.Close()
 
 	m.SessionStarted()
-	if f.created != 0 || f.plugged != 0 {
-		t.Fatalf("expected no create without trigger, got created=%d plugged=%d", f.created, f.plugged)
+	// 预创建设备（无显示器）是会话期常态——不插屏即可。
+	if f.created != 1 || f.plugged != 0 {
+		t.Fatalf("expected pre-created device without plug, got created=%d plugged=%d", f.created, f.plugged)
 	}
 	m.SessionEnded()
-	if f.closed != 0 {
-		t.Fatalf("expected no teardown, got closed=%d", f.closed)
+	if f.closed != 1 {
+		t.Fatalf("expected teardown of pre-created device, got closed=%d", f.closed)
 	}
 }
 
@@ -151,8 +152,8 @@ func TestForceKnobOpenSuppressesLid(t *testing.T) {
 	defer m.Close()
 
 	m.SessionStarted()
-	if f.created != 0 {
-		t.Fatalf("expected no create with force=open, got created=%d", f.created)
+	if f.plugged != 0 {
+		t.Fatalf("expected no plug with force=open, got plugged=%d", f.plugged)
 	}
 }
 
@@ -166,6 +167,43 @@ func TestForceKnobClosedTriggers(t *testing.T) {
 	if f.plugged != 1 {
 		t.Fatalf("expected plug with force=closed, got plugged=%d", f.plugged)
 	}
+}
+
+func TestLidEventTriggersImmediately(t *testing.T) {
+	f := newFakeBackend()
+	ch := make(chan struct{}, 1)
+	orig := lidNotify
+	lidNotify = func() <-chan struct{} { return ch }
+	defer func() { lidNotify = orig }()
+
+	m := newTestManager(f)
+	defer m.Close()
+	m.SessionStarted() // 预创建设备，不插屏
+	if f.plugged != 0 {
+		t.Fatalf("expected no plug yet, got plugged=%d", f.plugged)
+	}
+
+	// 会话中途合盖：lid 事件 → 即时建屏（不等 3s 轮询）。
+	f.mu.Lock()
+	f.lidClosedV, f.lidKnownV = true, true
+	f.mu.Unlock()
+	ch <- struct{}{}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		m.mu.Lock()
+		plugged := m.plugged
+		m.mu.Unlock()
+		if plugged {
+			st := m.Snapshot()
+			if !st.AutoActive {
+				t.Fatalf("expected autoActive after lid event, got %+v", st)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("lid event did not trigger virtual display within 2s")
 }
 
 func TestManualOnSurvivesSessionEnd(t *testing.T) {
@@ -211,9 +249,9 @@ func TestPollerTriggersMidSession(t *testing.T) {
 	m := newTestManager(f)
 	defer m.Close()
 
-	m.SessionStarted() // 无触发：不建
-	if f.created != 0 {
-		t.Fatalf("expected no create, got created=%d", f.created)
+	m.SessionStarted() // 无触发：只预创建设备，不插屏
+	if f.created != 1 || f.plugged != 0 {
+		t.Fatalf("expected pre-created device without plug, got created=%d plugged=%d", f.created, f.plugged)
 	}
 	f.mu.Lock()
 	f.lidClosedV, f.lidKnownV = true, true // 会话中途盒盖

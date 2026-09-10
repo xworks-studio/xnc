@@ -74,10 +74,12 @@ type powerBroadcastSetting struct {
 	data         [1]byte
 }
 
-// lidMonitor 消息泵线程：lid 事件更新 closed/known 原子状态。
+// lidMonitor 消息泵线程：lid 事件更新 closed/known 原子状态，并即时
+// 信号 events 通道（Manager 据此跳过轮询直接重评估——合盖过渡的关键）。
 type lidMonitor struct {
 	closed atomic.Bool
 	known  atomic.Bool
+	events chan struct{}
 
 	class  [64]uint16
 	hwnd   uintptr
@@ -92,6 +94,15 @@ func lidClosedState() (closed, known bool) {
 		return false, false
 	}
 	return m.closed.Load(), m.known.Load()
+}
+
+// lidNotifyChan 供 Manager 订阅 lid 事件（monitor 未启动 = nil，select
+// 天然禁用该分支）。
+func lidNotifyChan() <-chan struct{} {
+	if m := lidSingleton.Load(); m != nil {
+		return m.events
+	}
+	return nil
 }
 
 var lidSingleton atomic.Pointer[lidMonitor]
@@ -120,14 +131,19 @@ var lidWndProc = windows.NewCallback(func(hwnd, msg, wParam, lParam uintptr) uin
 			// 直转 Pointer 会被 vet 拦，经 unsafe.Add 自类型化 nil 偏移）。
 			ps := (*powerBroadcastSetting)(unsafe.Add(
 				unsafe.Pointer((*powerBroadcastSetting)(nil)), lParam))
-			if ps.powerSetting == guidLidSwitchStateChange && ps.dataLength >= 1 {
-				m := lidSingleton.Load()
-				if m != nil {
-					// data[0]：0 = 合盖，1 = 开盖。
-					m.closed.Store(ps.data[0] == 0)
-					m.known.Store(true)
+				if ps.powerSetting == guidLidSwitchStateChange && ps.dataLength >= 1 {
+					m := lidSingleton.Load()
+					if m != nil {
+						// data[0]：0 = 合盖，1 = 开盖。
+						m.closed.Store(ps.data[0] == 0)
+						m.known.Store(true)
+						// 非阻塞信号：Manager 即时重评估（不等 3s 轮询）。
+						select {
+						case m.events <- struct{}{}:
+						default:
+						}
+					}
 				}
-			}
 		}
 	case wmClose:
 		procDestroyWindow.Call(hwnd)
@@ -169,7 +185,8 @@ func startLidMonitor() *lidMonitor {
 		return nil
 	}
 
-	mon := &lidMonitor{hwnd: hwnd, notify: notify, done: make(chan struct{})}
+	mon := &lidMonitor{hwnd: hwnd, notify: notify,
+		events: make(chan struct{}, 1), done: make(chan struct{})}
 	go func() {
 		var mq msg
 		for {

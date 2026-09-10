@@ -17,3 +17,6 @@ func (stubBackend) physicalOutputActive() bool     { return true }
 func (stubBackend) virtualDisplayActive() bool     { return false }
 func (stubBackend) lidClosed() (bool, bool)        { return false, false }
 func (stubBackend) forceLid() string               { return "" }
+
+// lidNotifyChan 非 Windows：无 lid 事件源（Manager 只走轮询）。
+func lidNotifyChan() <-chan struct{} { return nil }

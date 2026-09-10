@@ -419,21 +419,22 @@ func (winBackend) createDevice() (uintptr, error) { return swDeviceCreate() }
 func (winBackend) closeDevice(h uintptr) { swDeviceCloseHandle(h) }
 
 func (winBackend) plugMonitor(h uintptr) error {
-	// 设备接口可能在设备创建后数十秒才就绪（新驱动包首次加载镜像 +
-	// IddCx 适配器初始化）；镜像上游 25 次重试（1s 间隔）。
+	// 接口就绪等待：200ms×10 快速重试 + 1s×5 兜底（会话已预创建设备，
+	// 触发插屏时设备通常已就绪，接口在 1s 内可达；新驱动包首次加载的
+	// 慢路径由兜底覆盖）。
 	var lastErr error
-	for i := 0; i < 25; i++ {
+	for i := 0; i < 15; i++ {
 		dev, err := openDeviceInterface()
-		if err != nil {
-			lastErr = err
-			if i < 24 {
-				time.Sleep(time.Second)
-				continue
-			}
-			return lastErr
+		if err == nil {
+			defer windows.CloseHandle(dev)
+			return ioctlPlugInMonitor(uintptr(dev))
 		}
-		defer windows.CloseHandle(dev)
-		return ioctlPlugInMonitor(uintptr(dev))
+		lastErr = err
+		if i < 10 {
+			time.Sleep(200 * time.Millisecond)
+		} else {
+			time.Sleep(time.Second)
+		}
 	}
 	return lastErr
 }
