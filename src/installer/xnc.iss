@@ -71,6 +71,9 @@ Name: "custom"; Description: "Custom installation"; Flags: iscustom
 Name: "agent"; Description: "XNC Agent + CLI (required)"; Types: full custom; Flags: fixed
 Name: "desktop"; Description: "XNC Core + Desktop (remote desktop sessions)"; Types: full custom
 Name: "shell"; Description: "XNC Shell (ConPTY shell sessions)"; Types: full custom
+; IDD 虚拟显示器（可选；驱动本身惰性——显示器由 agent 在桌面会话触发时动态
+; 创建，默认不产生任何虚拟屏）。IddCx 需 Win10 19041+。
+Name: "idd"; Description: "XWorks XNC Virtual Display (IDD 虚拟显示器)"; Types: full custom; MinVersion: 10.0.19041
 
 [Files]
 ; Five binaries from bin\ (built by installer/build.ps1). Agent + CLI are a
@@ -82,6 +85,12 @@ Source: "..\..\bin\xnc-host.exe"; DestDir: "{app}"; Components: desktop; Flags: 
 Source: "..\..\bin\xnc-shell.exe"; DestDir: "{app}"; Components: shell; Flags: ignoreversion
 ; 签名公钥：安装时导入本机信任（自签过渡期的机群信任分发；正式 CA 后移除）
 Source: "codesign.cer"; DestDir: "{tmp}"; Flags: ignoreversion
+; IDD 虚拟显示器驱动包（组件 idd；built by installer/build.ps1 的
+; Build-IddDriver 步骤，dll+cat 用同一自签证书签名——信任装卸与 exe 共用
+; InstallSignTrust 流程）
+Source: "..\..\bin\driver\xncidd\XncIdd.dll"; DestDir: "{app}\driver\xncidd"; Components: idd; Flags: ignoreversion
+Source: "..\..\bin\driver\xncidd\XncIdd.inf"; DestDir: "{app}\driver\xncidd"; Components: idd; Flags: ignoreversion
+Source: "..\..\bin\driver\xncidd\XncIdd.cat"; DestDir: "{app}\driver\xncidd"; Components: idd; Flags: ignoreversion
 
 [UninstallDelete]
 ; Runtime-generated files under {app} that setup never copied and hence is
@@ -492,6 +501,22 @@ begin
     InstallerLog('WARN: certutil addstore TrustedPublisher rc=' + IntToStr(rc));
 end;
 
+// IDD 驱动包入 store（组件 idd；2026-09-10 引入）。包验证走同一自签信任
+// （须在 InstallSignTrust 之后调用）；无设备在场，agent 会话触发时经
+// SwDeviceCreate 动态创建设备。幂等：重装/升级重复 add-driver 无害。
+// 失败仅告警不中断——驱动装不上不应阻断 agent/CLI 主流程，状态经
+// `xnc display status` 可见。
+procedure InstallIddDriver();
+var
+  rc: Integer;
+begin
+  if not Exec(ExpandConstant('{sys}\pnputil.exe'),
+      '/add-driver "' + ExpandConstant('{app}') + '\driver\xncidd\XncIdd.inf"', '',
+      SW_HIDE, ewWaitUntilTerminated, rc) or (rc <> 0) then
+    InstallerLog('WARN: pnputil add-driver XncIdd.inf rc=' + IntToStr(rc) +
+      ' (virtual display will not be available)');
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   script, withCore: String;
@@ -500,6 +525,8 @@ begin
   if CurStep <> ssPostInstall then
     Exit;
   InstallSignTrust();
+  if WizardIsComponentSelected('idd') then
+    InstallIddDriver();
   if WizardIsComponentSelected('desktop') then
     withCore := '1'
   else
@@ -528,6 +555,24 @@ begin
 end;
 
 // ---- uninstall flow (spec 8) ----
+
+// IDD 驱动出 store（卸载，组件 idd）。顺序敏感：须在 prep 脚本停掉
+// XNCAgent 之后（agent 以 Handle 生命周期持有软件设备，停服即自动移除
+// 设备）、且在 Inno 删除 {app} 文件之前（delete-driver 用原 INF 路径匹配
+// store 里的包）。/remove-device 是测试残留（ParentPresent 设备）的兜底。
+// 全部 best-effort：驱动包残留无害（惰性、无设备），不阻塞卸载。
+procedure UninstallIddDriver();
+var
+  rc: Integer;
+begin
+  Exec(ExpandConstant('{sys}\pnputil.exe'),
+    '/remove-device "SWD\XncIdd\XncIdd"', '', SW_HIDE,
+    ewWaitUntilTerminated, rc);
+  Exec(ExpandConstant('{sys}\pnputil.exe'),
+    '/delete-driver "' + ExpandConstant('{app}') + '\driver\xncidd\XncIdd.inf" /uninstall /force', '',
+    SW_HIDE, ewWaitUntilTerminated, rc);
+  InstallerLog('idd driver removed (pnputil rc=' + IntToStr(rc) + ')');
+end;
 
 // /PURGEDATA[=true|1] forces data deletion in silent uninstalls (spec 8
 // step 6); =false/=0 disables.
@@ -679,6 +724,9 @@ begin
       end;
       DeleteFile(script);
     end;
+    // IDD 驱动包清理（仅当组件曾安装；见 UninstallIddDriver 顺序说明）。
+    if FileExists(ExpandConstant('{app}') + '\driver\xncidd\XncIdd.inf') then
+      UninstallIddDriver();
     // Step 4: {app} files and the uninstall registry entry are removed by
     // Inno itself right after this step.
   end;
