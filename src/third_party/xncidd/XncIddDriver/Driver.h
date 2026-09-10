@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #define NOMINMAX
 #include <windows.h>
@@ -111,6 +111,9 @@ namespace Microsoft
 
             NTSTATUS UpdateMonitorModes(PCtlMonitorModes Param);
 
+            // XNC 增补：各连接器插拔/激活状态（激活 = OS 已分配 swapchain）。
+            NTSTATUS GetMonitorStatus(PCtlMonitorStatus Status);
+
             NTSTATUS CheckIndex(UINT index);
 
             static UINT GetMaxMonitorCount()
@@ -119,7 +122,7 @@ namespace Microsoft
             }
 
         protected:
-            static constexpr UINT m_sMaxMonitorCount = 10;
+            static constexpr UINT m_sMaxMonitorCount = IDD_MAX_MONITOR_COUNT;
             IDDCX_MONITOR m_Monitors[m_sMaxMonitorCount];
 
             NTSTATUS m_AdapterInitStatus;
@@ -136,6 +139,9 @@ namespace Microsoft
 
             void AssignSwapChain(IDDCX_SWAPCHAIN SwapChain, LUID RenderAdapter, HANDLE NewFrameEvent);
             void UnassignSwapChain();
+
+            // XNC 增补：OS 已分配 swapchain（显示器点亮中）。
+            bool IsActive() const { return m_ProcessingThread != nullptr; }
 
         private:
             IDDCX_MONITOR m_Monitor;

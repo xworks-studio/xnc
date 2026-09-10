@@ -1,4 +1,4 @@
-/*++
+﻿/*++
 
 Copyright (c) Microsoft Corporation
 
@@ -989,6 +989,27 @@ IndirectMonitorContext::IndirectMonitorContext(_In_ IDDCX_MONITOR Monitor) :
 {
 }
 
+// XNC 增补：连接器插拔/激活状态（激活 = OS 已分配 swapchain，即显示器被
+// 点亮；session 0 的 agent 无法经 GDI/DXGI 枚举获知，此 IOCTL 是权威信号）。
+NTSTATUS IndirectDeviceContext::GetMonitorStatus(PCtlMonitorStatus Status)
+{
+    Status->ConnectorCount = m_sMaxMonitorCount;
+    for (UINT i = 0; i < m_sMaxMonitorCount; i++)
+    {
+        Status->Connectors[i].Plugged = (m_Monitors[i] != NULL);
+        Status->Connectors[i].Active = FALSE;
+        if (m_Monitors[i] != NULL)
+        {
+            auto* pMonitorWrapper = WdfObjectGet_IndirectMonitorContextWrapper(m_Monitors[i]);
+            if (pMonitorWrapper && pMonitorWrapper->pContext)
+            {
+                Status->Connectors[i].Active = pMonitorWrapper->pContext->IsActive();
+            }
+        }
+    }
+    return STATUS_SUCCESS;
+}
+
 IndirectMonitorContext::~IndirectMonitorContext()
 {
     m_ProcessingThread.reset();
@@ -1092,6 +1113,24 @@ IddRustDeskIoDeviceControl(WDFDEVICE Device, WDFREQUEST Request, size_t OutputBu
         }
         pMonitorModes = (PCtlMonitorModes)Buffer;
         Status = pContext->pContext->UpdateMonitorModes(pMonitorModes);
+        break;
+    case IOCTL_CHANGER_IDD_GET_STATUS:
+        PCtlMonitorStatus pMonitorStatus;
+        Status = WdfRequestRetrieveOutputBuffer(Request, sizeof(CtlMonitorStatus), &Buffer, &BufSize);
+        if (!NT_SUCCESS(Status))
+        {
+            TraceEvents(TRACE_LEVEL_ERROR,
+                TRACE_DEVICE,
+                "%!FUNC! cannot retrieve output buffer %!STATUS!",
+                Status);
+            break;
+        }
+        pMonitorStatus = (PCtlMonitorStatus)Buffer;
+        Status = pContext->pContext->GetMonitorStatus(pMonitorStatus);
+        if (NT_SUCCESS(Status))
+        {
+            WdfRequestSetInformation(Request, sizeof(CtlMonitorStatus));
+        }
         break;
     default:
         TraceEvents(TRACE_LEVEL_ERROR,

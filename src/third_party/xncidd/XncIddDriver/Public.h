@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <minwindef.h>
 #include <winioctl.h>
@@ -16,6 +16,16 @@
                                                        0x1003, \
                                                        METHOD_BUFFERED, \
                                                        FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+// XNC 增补（上游无此接口）：查询各连接器插拔/激活状态。激活 = OS 已分配
+// swapchain（显示器被点亮）——agent 运行于 session 0，GDI/DXGI 枚举均不可
+// 用（2026-09-10 XIAOXIN 实测），此接口是会话无关的唯一权威信号。
+#define IOCTL_CHANGER_IDD_GET_STATUS           CTL_CODE(IOCTL_CHANGER_BASE, \
+                                                       0x1004, \
+                                                       METHOD_BUFFERED, \
+                                                       FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+
+// 连接器上限（Driver.h m_sMaxMonitorCount 同源；保持小值即可）。
+#define IDD_MAX_MONITOR_COUNT 10
 
 
 #define STATUS_ERROR_ADAPTER_NOT_INIT      (3 << 30) + 11
@@ -48,6 +58,14 @@ typedef struct _CtlMonitorModes {
         DWORD Sync;
     } Modes[1];
 } CtlMonitorModes, *PCtlMonitorModes;
+
+typedef struct _CtlMonitorStatus {
+    UINT ConnectorCount;
+    struct {
+        BOOL Plugged;
+        BOOL Active;
+    } Connectors[IDD_MAX_MONITOR_COUNT];
+} CtlMonitorStatus, *PCtlMonitorStatus;
 
 
 #define SYMBOLIC_LINK_NAME L"\\Device\\XncIdd"

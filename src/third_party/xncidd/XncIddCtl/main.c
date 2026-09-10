@@ -1,4 +1,4 @@
-/* main.c - non-interactive controller for XncIdd (XWorks XNC Virtual Display).
+﻿/* main.c - non-interactive controller for XncIdd (XWorks XNC Virtual Display).
    Dev/test tooling mirroring upstream RustDeskIddApp; the production agent
    (Go, src/agent/display) issues the same IOCTLs in-process.
 
