@@ -8,6 +8,8 @@ package display
 import (
 	"crypto/rand"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -19,17 +21,32 @@ import (
 
 var (
 	modSetupAPI = windows.NewLazySystemDLL("setupapi.dll")
-	modSwDevice = windows.NewLazySystemDLL("swdevice.dll")
 	modUser32   = windows.NewLazySystemDLL("user32.dll")
+	// SwDevice* 在现代 Windows 由 CFGMGR32 导出（System32 无实体
+	// swdevice.dll——SDK 的 swdevice.lib 也转发到 cfgmgr32，2026-09-10
+	// 实测 dumpbin）。老 Win10 上实体 swdevice.dll 仍导出同名函数：
+	// cfgMgr32 优先，缺则回落裸名 swdevice.dll（api-set 重定向）。
+	modCfgMgr32 = windows.NewLazySystemDLL("cfgmgr32.dll")
+	modSwDevice = windows.NewLazyDLL("swdevice.dll")
+
+	procSwDeviceCreate = findSwDeviceProc("SwDeviceCreate")
+	procSwDeviceClose  = findSwDeviceProc("SwDeviceClose")
 
 	procSetupDiGetClassDevsW             = modSetupAPI.NewProc("SetupDiGetClassDevsW")
 	procSetupDiEnumDeviceInterfaces      = modSetupAPI.NewProc("SetupDiEnumDeviceInterfaces")
 	procSetupDiGetDeviceInterfaceDetailW = modSetupAPI.NewProc("SetupDiGetDeviceInterfaceDetailW")
 	procSetupDiDestroyDeviceInfoList     = modSetupAPI.NewProc("SetupDiDestroyDeviceInfoList")
-	procSwDeviceCreate                   = modSwDevice.NewProc("SwDeviceCreate")
-	procSwDeviceClose                    = modSwDevice.NewProc("SwDeviceClose")
 	procEnumDisplayDevicesW              = modUser32.NewProc("EnumDisplayDevicesW")
 )
+
+// findSwDeviceProc 解析 SwDevice* 符号：cfgmgr32 → swdevice.dll 回落。
+// 两者都缺时返回的 proc 在 Call 时 panic——display 路径上层 recover 收敛。
+func findSwDeviceProc(name string) *windows.LazyProc {
+	if p := modCfgMgr32.NewProc(name); p.Find() == nil {
+		return p
+	}
+	return modSwDevice.NewProc(name)
+}
 
 // guidDevInterfaceXncIdd 设备接口 GUID（XNC 生成，见 XncIddDriver/Driver.cpp）。
 var guidDevInterfaceXncIdd = windows.GUID{
@@ -38,18 +55,22 @@ var guidDevInterfaceXncIdd = windows.GUID{
 }
 
 // IOCTL 码 = CTL_CODE(IOCTL_CHANGER_BASE=0x30, fn, METHOD_BUFFERED,
-// FILE_READ_ACCESS|FILE_WRITE_ACCESS)，与上游 Public.h 逐字节一致。
+// FILE_READ_ACCESS|FILE_WRITE_ACCESS)。注：SDK 的 CTL_CODE 把 Function
+// 截断到 12 位（0x1001→1）——实测驱动接收码为 0x0030C004/0x0030C008
+// （C 探针编译 Public.h 打印验证，2026-09-10）。
 const (
-	ioctlPlugIn  = 0x0030C404 // 0x1001
-	ioctlPlugOut = 0x0030C408 // 0x1002
+	ioctlPlugIn  = 0x0030C004
+	ioctlPlugOut = 0x0030C008
 )
 
 const (
 	deviceDescription         = "XWorks XNC Virtual Display"
 	hwIDXncIdd                = "XncIdd"
-	swDeviceCapRemovable      = 0x10
-	swDeviceCapSilentInstall  = 0x04
-	swDeviceCapDriverRequired = 0x02
+	// SWDeviceCapabilities（swdevicedef.h 真值：0x01/0x02/0x08；含未定义位
+	// 时 SwDeviceCreate 返回 E_INVALIDARG——2026-09-10 XIAOXIN 实测踩过）。
+	swDeviceCapRemovable      = 0x01
+	swDeviceCapSilentInstall  = 0x02
+	swDeviceCapDriverRequired = 0x08
 
 	digcfPresent            = 0x02
 	digcfDeviceInterface    = 0x10
@@ -58,8 +79,6 @@ const (
 	displayDeviceActive    = 0x1
 	displayDeviceMirroring = 0x8
 
-	// 驱动包 store 注册表（pnputil 入包后存在；键名 <inf>_<arch>_<hash>）。
-	driverPackagesKey = `SYSTEM\DriverDatabase\DriverPackages`
 	// 调试旋钮（契约 4 的 XNC_* 惯例）：注册表环境，值 open|closed。
 	forceLidValue = "XNC_IDD_FORCE_LID"
 	envRegKey     = `SYSTEM\CurrentControlSet\Control\Session Manager\Environment`
@@ -73,12 +92,11 @@ type swDeviceCreateInfo struct {
 	instanceID   *uint16
 	hwIDs        *uint16
 	compIDs      *uint16
-	containerID  *windows.DEVPROPKEY
-	capFlags     byte // BOOLEAN
-	_            [7]byte
+	containerID  *windows.GUID // 恒 NULL；布局对齐 swdevicedef.h
+	capFlags     uint32        // ULONG（header 语义；字节版实测触 E_INVALIDARG）
 	description  *uint16
 	location     *uint16
-	securityDesc *windows.DEVPROPKEY
+	securityDesc *windows.GUID // 恒 NULL；布局对齐 swdevicedef.h
 }
 
 type createCallbackCtx struct {
@@ -105,10 +123,14 @@ func swDeviceCreate() (uintptr, error) {
 	if err != nil {
 		return 0, err
 	}
-	hwIDs, err := windows.UTF16PtrFromString(hwIDXncIdd + "\x00\x00")
+	// multi-sz（单条目 + 双 NUL）：UTF16PtrFromString 拒绝内嵌 NUL，
+	// 故从干净串构造后手动补终止符。
+	ids, err := windows.UTF16FromString(hwIDXncIdd)
 	if err != nil {
 		return 0, err
 	}
+	ids = append(ids, 0)
+	hwIDs := &ids[0]
 	desc, err := windows.UTF16PtrFromString(deviceDescription)
 	if err != nil {
 		return 0, err
@@ -139,7 +161,9 @@ func swDeviceCreate() (uintptr, error) {
 		uintptr(unsafe.Pointer(&info)),
 		0, 0,
 		createCallback,
-		0,
+		// pContext：C 参考实现传非空上下文（cfgmgr32 实测对 NULL 报
+		// E_INVALIDARG）；回调侧忽略该值，传本 package 上下文地址即可。
+		uintptr(unsafe.Pointer(&createCtx)),
 		uintptr(unsafe.Pointer(&h)),
 	)
 	if r1 != 0 { // HRESULT != S_OK
@@ -308,22 +332,19 @@ func enumDisplays() (physicalActive bool, virtualActive bool) {
 	}
 }
 
-// ---- 驱动包 store 检测（DriverPackages 注册表）----
+// ---- 驱动包 store 检测 ----
 
-// driverPackageInStore 驱动包是否已入 store（键名 xncidd.inf_<arch>_<hash>，
-// pnputil 小写化原始 INF 名）。
+// driverPackageInStore 驱动包是否已入 store。pnputil 将包落于
+// DriverStore\FileRepository，目录名 <inf>_<arch>_<hash>（实测不进
+// DriverPackages 注册表键；文件系统判据语言无关、跨版本稳定）。
 func driverPackageInStore() bool {
-	k, err := registry.OpenKey(registry.LOCAL_MACHINE, driverPackagesKey, registry.ENUMERATE_SUB_KEYS)
+	repo := filepath.Join(os.Getenv("SystemRoot"), "System32", "DriverStore", "FileRepository")
+	entries, err := os.ReadDir(repo)
 	if err != nil {
 		return false
 	}
-	defer k.Close()
-	names, err := k.ReadSubKeyNames(0)
-	if err != nil {
-		return false
-	}
-	for _, n := range names {
-		if strings.HasPrefix(strings.ToLower(n), "xncidd") {
+	for _, e := range entries {
+		if strings.HasPrefix(strings.ToLower(e.Name()), "xncidd") {
 			return true
 		}
 	}

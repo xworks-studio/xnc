@@ -401,7 +401,16 @@ func (a *Agent) closeDisplay() {
 // Display 实现 agentctl.Deps（虚拟显示器本地控制）：on = 手动开并保持；
 // off = 移除；status = 只读快照。驱动未装（idd 组件未装/装失败）时 on
 // 返回 not_installed（status 恒成功——诊断入口不受影响）。
-func (a *Agent) Display(_ context.Context, action string) (*agentctl.DisplayInfo, error) {
+// defer/recover：display 路径含底层 syscall（LazyProc 缺 DLL 会 panic），
+// 任何 panic 收敛为错误应答——绝不让一条本地显示操作杀死 agent 进程
+// （2026-09-10 XIAOXIN 实测：swdevice.dll 硬路径加载 panic 曾致服务崩）。
+func (a *Agent) Display(_ context.Context, action string) (info *agentctl.DisplayInfo, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("display: panic recovered", "action", action, "panic", r)
+			info, err = nil, fmt.Errorf("internal: display operation panicked: %v", r)
+		}
+	}()
 	m := a.displayMgr()
 	switch action {
 	case agentctl.DisplayActionOn:
