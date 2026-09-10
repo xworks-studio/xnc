@@ -24,8 +24,12 @@ import (
 // 不认 \"，DIR 值带着字面引号进来 → "Folder names cannot include \""
 // → 安装中止退出码 3。单个 argv 元素 + 外层引号（Go 自动）即可让空格
 // 路径原样到达——等价于 cmd 语法 `/DIR="C:\Program Files\XNC"`。
+//
+// /ALLOWDOWNGRADE：本路径兼用于回滚（installer-cache 上一版安装器即
+// 降级）——安装器的降级守卫（InitializeSetup）放行此旁路；升级场景下
+// 该参数无害。
 func installerArgs(installDir string) []string {
-	return []string{"/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=" + installDir}
+	return []string{"/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/ALLOWDOWNGRADE", "/DIR=" + installDir}
 }
 
 // platform 装配平台缝（New 已调用；直接构造 Updater 的测试再保险调用，

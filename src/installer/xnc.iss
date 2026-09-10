@@ -52,10 +52,15 @@ MinVersion=10.0
 SetupMutex=XNC-Installer
 ; Same-dir re-runs are the upgrade/repair path, not an accident.
 DirExistsWarning=no
+; 已安装时跳过目录页（升级直接走）；卸载/更改经"安装的应用"条目发起。
+DisableDirPage=auto
 ; In-use xnc.exe is handled by the prep rename step, not Restart Manager.
 CloseApplications=no
 DisableProgramGroupPage=yes
 UninstallDisplayName=XNC
+; "安装的应用"（Settings→Apps）图标：指向安装目录的 CLI（无 .ico 资源时
+; 显示系统默认 exe 图标，仍比空白好；后续可给 exe 嵌图标资源）。
+UninstallDisplayIcon={app}\xnc.exe
 VersionInfoVersion={#SetupVersion}
 OutputDir=..\..\bin
 OutputBaseFilename=XNC-Installer{#ChannelSuffix}-{#Version}
@@ -450,6 +455,62 @@ end;
 
 // ---- install flow ----
 
+// ---- version-aware upgrade（2026-09-10）----
+
+// AllowDowngradeRequested：命令行 /ALLOWDOWNGRADE 旁路降级守卫。唯一合法
+// 使用者是回滚看门狗（执行 installer-cache 里的上一版安装器——硬性契约 5
+// 的回滚路径本身就是降级）；普通降级一律拒绝。
+function AllowDowngradeRequested(): Boolean;
+begin
+  Result := Pos('/ALLOWDOWNGRADE', Uppercase(GetCmdTail())) > 0;
+end;
+
+// InstalledDisplayVersion：卸载注册表键里的已装版本（空 = 首次安装）。
+function InstalledDisplayVersion(): String;
+begin
+  Result := '';
+  if not RegQueryStringValue(HKEY_LOCAL_MACHINE, UninstallKey,
+      'DisplayVersion', Result) then
+    Result := '';
+end;
+
+// NumericVersion 剥掉 -dev/-tag 后缀（"0.11.0-dev" → "0.11.0"），供
+// ComparePackedVersion 做数值比较。
+function NumericVersion(v: String): String;
+var
+  p: Integer;
+begin
+  p := Pos('-', v);
+  if p > 0 then
+    Result := Copy(v, 1, p - 1)
+  else
+    Result := v;
+end;
+
+// InitializeSetup：版本门卫。已装版本更新 → 拒绝降级（除
+// /ALLOWDOWNGRADE）；新版本 → 放行（直接更新）；同版本 → 放行（修复）。
+function InitializeSetup(): Boolean;
+var
+  installed: String;
+begin
+  Result := True;
+  installed := InstalledDisplayVersion();
+  if (installed = '') or AllowDowngradeRequested() then
+    Exit;
+  if ComparePackedVersion(NumericVersion(installed),
+      NumericVersion('{#Version}')) > 0 then
+  begin
+    InstallerLog('REFUSED: downgrade ' + installed + ' -> {#Version} ' +
+      '(rerun with /ALLOWDOWNGRADE to override)');
+    if not WizardSilent() then
+      MsgBox('A newer XNC version (' + installed + ') is already installed.' + #13#10#13#10 +
+        'Downgrading is refused to protect the update ' +
+        'pipeline. Keep the newer version, or uninstall it first.',
+        mbError, MB_OK);
+    Result := False;
+  end;
+end;
+
 // Spec 9.3 step 2: runs for first install and upgrades alike (services are
 // disposable; there is deliberately no "already installed?" branch).
 function PrepareToInstall(var NeedsRestart: Boolean): String;
@@ -517,6 +578,40 @@ begin
       ' (virtual display will not be available)');
 end;
 
+// RemoveIddDriver：驱动包出 store + 动态设备移除（安装侧升级取消勾选与
+// 卸载共用）。delete-driver 依次尝试原始 INF 名（升级取消勾选时 {app}
+// 下无文件）与 {app} 完整路径（卸载时文件仍在）；全部 best-effort——
+// 驱动包残留无害（惰性、无设备），不阻塞主流程。顺序敏感：须在 prep
+// 停掉 XNCAgent 之后（agent 以 Handle 生命周期持有软件设备，停服即自动
+// 移除设备；/remove-device 是测试残留的兜底）、且在 Inno 删除 {app}
+// 文件之前。
+procedure RemoveIddDriver();
+var
+  rc: Integer;
+begin
+  Exec(ExpandConstant('{sys}\pnputil.exe'),
+    '/remove-device "SWD\XncIdd\XncIdd"', '', SW_HIDE,
+    ewWaitUntilTerminated, rc);
+  Exec(ExpandConstant('{sys}\pnputil.exe'),
+    '/delete-driver xncidd.inf /uninstall /force', '', SW_HIDE,
+    ewWaitUntilTerminated, rc);
+  InstallerLog('idd: delete-driver (original name) rc=' + IntToStr(rc));
+  Exec(ExpandConstant('{sys}\pnputil.exe'),
+    '/delete-driver "' + ExpandConstant('{app}') + '\driver\xncidd\XncIdd.inf" /uninstall /force', '',
+    SW_HIDE, ewWaitUntilTerminated, rc);
+  InstallerLog('idd: delete-driver (app path) rc=' + IntToStr(rc));
+end;
+
+// IddInstalledMarker：卸载键里的 idd 装态标记（升级决策用；卸载时整个
+// 键随卸载删除，无残留）。
+function IddInstalledMarker(): Boolean;
+var
+  v: Cardinal;
+begin
+  Result := RegQueryDWordValue(HKEY_LOCAL_MACHINE, UninstallKey,
+    'IddInstalled', v) and (v <> 0);
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   script, withCore: String;
@@ -526,7 +621,18 @@ begin
     Exit;
   InstallSignTrust();
   if WizardIsComponentSelected('idd') then
+  begin
     InstallIddDriver();
+    // 装态标记（卸载键，随卸载自动清除）：升级取消勾选时据此移除驱动包。
+    RegWriteDWordValue(HKEY_LOCAL_MACHINE, UninstallKey, 'IddInstalled', 1);
+  end
+  else
+  begin
+    // 升级时取消勾选 idd：文件由 Inno 随组件删除，驱动包在此显式出 store。
+    if IddInstalledMarker() then
+      RemoveIddDriver();
+    RegWriteDWordValue(HKEY_LOCAL_MACHINE, UninstallKey, 'IddInstalled', 0);
+  end;
   if WizardIsComponentSelected('desktop') then
     withCore := '1'
   else
@@ -555,24 +661,6 @@ begin
 end;
 
 // ---- uninstall flow (spec 8) ----
-
-// IDD 驱动出 store（卸载，组件 idd）。顺序敏感：须在 prep 脚本停掉
-// XNCAgent 之后（agent 以 Handle 生命周期持有软件设备，停服即自动移除
-// 设备）、且在 Inno 删除 {app} 文件之前（delete-driver 用原 INF 路径匹配
-// store 里的包）。/remove-device 是测试残留（ParentPresent 设备）的兜底。
-// 全部 best-effort：驱动包残留无害（惰性、无设备），不阻塞卸载。
-procedure UninstallIddDriver();
-var
-  rc: Integer;
-begin
-  Exec(ExpandConstant('{sys}\pnputil.exe'),
-    '/remove-device "SWD\XncIdd\XncIdd"', '', SW_HIDE,
-    ewWaitUntilTerminated, rc);
-  Exec(ExpandConstant('{sys}\pnputil.exe'),
-    '/delete-driver "' + ExpandConstant('{app}') + '\driver\xncidd\XncIdd.inf" /uninstall /force', '',
-    SW_HIDE, ewWaitUntilTerminated, rc);
-  InstallerLog('idd driver removed (pnputil rc=' + IntToStr(rc) + ')');
-end;
 
 // /PURGEDATA[=true|1] forces data deletion in silent uninstalls (spec 8
 // step 6); =false/=0 disables.
@@ -724,9 +812,9 @@ begin
       end;
       DeleteFile(script);
     end;
-    // IDD 驱动包清理（仅当组件曾安装；见 UninstallIddDriver 顺序说明）。
+    // IDD 驱动包清理（仅当组件曾安装；见 RemoveIddDriver 顺序说明）。
     if FileExists(ExpandConstant('{app}') + '\driver\xncidd\XncIdd.inf') then
-      UninstallIddDriver();
+      RemoveIddDriver();
     // Step 4: {app} files and the uninstall registry entry are removed by
     // Inno itself right after this step.
   end;
