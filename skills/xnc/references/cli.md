@@ -19,7 +19,7 @@
 | `xnc rdp <node> [--local-port N]` | 浏览器 RTV 桌面（默认）；`--native` = 反向隧道 + mstsc |
 | `xnc upload <node> <local> <remote>` | 上传（sha256 校验） |
 | `xnc download <node> <remote> <local>` | 下载（sha256 校验） |
-| `xnc screen <node> --snapshot out.jpg` | 桌面 JPEG 快照（operator+；`--open` 实时预览已退役——改开桌面会话） |
+| `xnc screen <node>` | **已退役**（RTV 重构）：任何调用报退役提示 exit 2——实时观看用桌面会话（web /desktop 或 `xnc rdp`）；快照恢复列后续 PATCH |
 | `xnc audit list [--node/--user/--action/--since]` | 审计日志查询 |
 | `xnc register` | 本机注册为节点：登录（无 JWT 时内联 login）→ 选 cluster（唯一 cluster 直接确认）→ 经 agentctl 管道注册 → 轮询至 online；已注册时提示当前绑定，`--force` 走 deregister+register。需先装安装器（[xnc.app/installer](https://xnc.app/installer)） |
 | `xnc deregister` | 反注册本机（断连、删 server 节点、弃机器绑定，保留身份私钥）；需 admin 控制台 |

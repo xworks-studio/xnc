@@ -38,7 +38,7 @@ func (h *handlers) Close() error {
 }
 
 // App 生产入口的应用句柄：内嵌 http.Handler（router），并携带停止后台 worker
-// （TURN 池健康探测）的 Close。main.go 停机时先调用 Close（停探测 goroutine）
+// （relay 池健康探测）的 Close。main.go 停机时先调用 Close（停探测 goroutine）
 // 再排空 HTTP 连接。
 type App struct {
 	http.Handler
@@ -54,7 +54,7 @@ func (a *App) Close() error {
 }
 
 // NewApp 生产入口：与 NewRouter（sess=nil 自建）等价，但返回 *App 携带 Close，
-// 优雅停机时先停 TURN 池探测 goroutine 再等 HTTP 排空。
+// 优雅停机时先停 relay 池探测 goroutine 再等 HTTP 排空。
 func NewApp(st *db.Store, cfg config.Config, reg *registry.Registry) *App {
 	r, closeFn := newRouterWithSession(st, cfg, reg, nil)
 	return &App{Handler: r, close: closeFn}
@@ -232,10 +232,11 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		cr.Get("/download", h.cliDownload)
 	})
 
-	// 安装器分发（设计 §4，无认证——产品首次下载入口）：频道最新 setup.exe
-	// 直流 + 动态版本清单 setup.json（供 xnc upgrade --check / CI 消费）。
-	// 安装器是唯一安装入口（未上线直采终态，设计 §14）：历史的一行流
-	// （/a/* /c* /install/*.ps1）已在上线前整体移除。
+	// 安装器分发（设计 §4，无认证——产品首次下载入口）：/installer 直流
+	// 频道最新安装器（release 内制品名 setup.exe）+ /installer.json 动态版本
+	// 清单（xnc upgrade --check / CI 消费；历史端点名 /setup.exe /setup.json
+	// 已换轨）。安装器是唯一安装入口：历史的一行流（/a/* /c* /install/*.ps1）
+	// 已在上线前整体移除。
 	r.Get("/installer", h.setupDownload)
 	r.Get("/installer.json", h.setupManifest)
 
@@ -252,8 +253,8 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		nr.Post("/{id}/files/download", h.fileDownload)
 		// tunnel：RDP 等端口隧道，kind=tunnel，白名单 target 解析 host/port
 		nr.Post("/{id}/tunnel", h.tunnelStart)
-		// screen：桌面流会话，kind=screen（Phase 6，DXGI+H.264），startSession 路径
-		nr.Post("/{id}/screen", h.screenStart)
+		// screen 会话已随 RTV 重构退役（2026-09-08）：旧 CLI 报退役提示，
+		// 端点不再提供——流式观看走 /desktop，快照恢复列后续 PATCH。
 		// desktop：实时桌面会话（RTV 中继），startSession 路径；
 		// XNC_RTV_ENDPOINT 未配置 → 503 RTV_UNCONFIGURED，每节点并发上限 + idle 治理
 		nr.Post("/{id}/desktop", h.desktopStart)

@@ -46,16 +46,15 @@ xnc download web-01 C:\logs\app.log ./app.log
 
 sha256 自动校验，不匹配返回 HASH_MISMATCH。单文件上限 256 MB。
 
-## 桌面预览（只读）
+## 桌面观看（只读）
 
 ```bash
-xnc screen web-01 --snapshot desktop.jpg --json
+# screen 命令已退役（RTV 重构）；观看走桌面会话（浏览器 /desktop 或 xnc rdp）
 ```
 
 - 用于无扰动判断桌面状态：弹窗是否卡住、安装器是否等输入、谁登录着
-- 只读、无键鼠注入、低频 JPEG（默认 1 fps）；实时流用 Web 预览面板
+- 只读观看 = 不开控制（不点"接管控制"），无键鼠注入
 - 不要用 RDP 去"看一眼"——RDP 会锁定 console 或新建会话，扰动被观察状态
-- 状态字段：capturing / locked / no_session
 
 ## 交互式 Shell / 远程桌面（仅人类交互场景）
 

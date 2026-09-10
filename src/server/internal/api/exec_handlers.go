@@ -114,11 +114,11 @@ func (h *handlers) requireSystemRole(w http.ResponseWriter, r *http.Request) boo
 	return ok
 }
 
-// startSession 是 exec/shell/file/tunnel/screen/desktop 共享的会话创建路径：
+// startSession 是 exec/shell/file/tunnel/desktop 共享的会话创建路径：
 // RBAC（requireMinRole "operator"）→ Create（双侧 token）→ 装配 finish/notify
 // 钩子 → 经控制连接下发 SESSION_OPEN → 审计 openAction → 202。
-// extra（可 nil）并入 202 响应体（desktop 的 turn 配置等 kind 特有字段；
-// 绝不入审计——TURN 凭据不得落审计行）。auditExtra（可 nil）并入 open
+// extra（可 nil）并入 202 响应体（desktop 的 relay 端点/票据等 kind 特有
+// 字段；绝不入审计——票据不得落审计行）。auditExtra（可 nil）并入 open
 // 审计 metadata（exec/shell 的 system=true 标记）。
 // extraFn（可 nil，M2-Slice3 Task 4）：Create 之后按结果追加响应字段
 // （desktop 的 lease 判定 {granted,leaseId}——授予与否只有 Create 后可知）。

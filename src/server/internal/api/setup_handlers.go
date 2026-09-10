@@ -1,11 +1,12 @@
-// setup_handlers.go — 安装器分发端点：/setup.exe + /setup.json（设计 §4）。
+// setup_handlers.go — 安装器分发端点：/installer + /installer.json（设计 §4；
+// 历史端点名 /setup.exe /setup.json 已换轨，handler 文件名保留）。
 //
-// Inno Setup 安装器存于 release store（与 cli 制品同库同表，固定名
-// setup.exe）。/setup.exe 直流最新安装器（200 流式 + X-Xnc-Sha256 完整性
-// 头，交付风格与 cli 制品一致）；/setup.json 动态生成版本清单
+// Inno Setup 安装器存于 release store（与 cli 制品同库同表，固定制品名
+// setup.exe）。/installer 直流最新安装器（200 流式 + X-Xnc-Sha256 完整性
+// 头，交付风格与 cli 制品一致）；/installer.json 动态生成版本清单
 // {version, url, sha256, size, releasedAt}（无需入库），供 xnc upgrade
 // --check、CI 与编排工具消费。两端点均无认证——安装器是产品首次下载入口
-// （官网/README 统一 https://xnc.app/setup.exe）。
+// （官网/README 统一 https://xnc.app/installer）。
 package api
 
 import (

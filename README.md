@@ -33,8 +33,7 @@ xnc exec <node> --file deploy.ps1    # 脚本文件
 xnc shell <node>                     # 交互终端（~. 断开）
 xnc put <node> <local> <remote>      # 上传（sha256 校验）
 xnc get <node> <remote> <local>      # 下载
-xnc screen <node> --snap out.jpg     # 屏幕截图
-xnc rdp <node>                       # 远程桌面（浏览器 RTV）
+xnc rdp <node>                       # 远程桌面（浏览器 RTV；screen 命令已退役）
 xnc upgrade [--channel dev]          # 手动触发本机升级
 xnc logout                           # 退出用户会话（节点不受影响）
 ```

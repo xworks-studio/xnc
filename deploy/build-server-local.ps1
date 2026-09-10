@@ -2,7 +2,7 @@
 # 用法: powershell -File deploy\build-server-local.ps1 -ServerVersion 0.10.9
 # 注意参数名不能用 -Version：powershell.exe -File 会把它吞作引擎参数
 # （脚本收到空值，tar 名缺版本即此症状）。
-# 前提: web/dist 已构建（npm run build）；SRV 凭据在 deploy/.env 的 SRV_*
+# 前提: src/web/dist 已构建（npm run build）；SRV 凭据在 deploy/.env 的 SRV_*
 # （远端步骤经 deploy/push_server_image.py 走 paramiko 密码认证——OpenSSH
 # CLI 无法非交互输密码）。
 # 流程: docker build（deploy/Dockerfile，仓库根上下文）→ docker save →

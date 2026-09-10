@@ -487,61 +487,6 @@ h2 {
   padding: 24px 4px;
 }
 
-/* Screen preview */
-.screen-preview {
-  display: flex;
-  flex-direction: column;
-  height: 100vh;
-  overflow: hidden;
-}
-
-.screen-bar {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 8px 16px;
-  background: #16213e;
-  border-bottom: 1px solid #0f3460;
-  flex-shrink: 0;
-  flex-wrap: wrap;
-}
-
-/* 状态栏三组（会话信息｜媒体统计｜操作）：flex 分组 + 左分隔线。 */
-.screen-bar-group {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-}
-.screen-bar-group + .screen-bar-group {
-  border-left: 1px solid var(--border, #333);
-  padding-left: 10px;
-  margin-left: 2px;
-}
-
-.screen-canvas {
-  flex: 1;
-  min-height: 0;
-  width: 100%;
-  object-fit: contain;
-  background: #000;
-}
-
-.screen-state {
-  padding: 2px 8px;
-  border-radius: 4px;
-  font-size: 12px;
-  font-weight: 600;
-}
-.screen-state-capturing { background: #2d6a4f; color: #b7e4c7; }
-.screen-state-locked { background: #7f4f24; color: #ffe6a7; }
-.screen-state-no_session { background: #6c757d; color: #dee2e6; }
-.screen-state-error { background: #8b0000; color: #ffcccc; }
-.screen-state-disconnected { background: #495057; color: #ced4da; }
-.screen-state-signaling { background: #0f3460; color: #cfe2ff; }
-.screen-state-streaming { background: #2d6a4f; color: #b7e4c7; }
-.screen-state-opening { background: #0f3460; color: #cfe2ff; }
-
 /* Desktop live — RTV 沉浸式查看器（2026-09-08 重构，独立全屏路由） */
 
 .dt-root {

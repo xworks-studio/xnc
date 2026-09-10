@@ -2,7 +2,7 @@
 // 单镜像分发控制面 UI。嵌入路径相对本文件：server/web/dist。仓库内提交了
 // 占位 index.html + .gitkeep（见 .gitignore 的豁免规则），保证未构建前端时
 // go build 仍可通过；真实产物由构建链覆盖——Dockerfile 在 go build 前把
-// Node 阶段产物拷入 server/web/dist，本地验证走 scripts/e2e_phase7.sh 的
+// Node 阶段产物拷入 server/web/dist，本地验证 = npm run build + docker 构建
 // 同步步骤。开发态不嵌入：npm run dev（Vite dev server 代理 /api 到 :8080）。
 
 package server

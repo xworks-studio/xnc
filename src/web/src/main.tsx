@@ -40,7 +40,8 @@ createRoot(document.getElementById("root")!).render(
             <Route path="/profile" element={<Profile />} />
             <Route path="/monitor" element={<Monitor />} />
           </Route>
-          {/* 远程桌面：沉浸式独立布局（无侧栏，占满视口），LoginGuard 保护 */}
+          {/* 远程桌面：沉浸式独立布局（无侧栏，占满视口），LoginGuard 保护。
+              /screen/:nodeId 是 RTV 重构前的旧 URL，保留作书签兼容（同一组件） */}
           <Route
             path="/screen/:nodeId"
             element={

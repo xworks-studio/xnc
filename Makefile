@@ -17,9 +17,9 @@ build-agent:
 build-server:
 	cd src/server && go build -ldflags "$(SERVER_LDFLAGS)" -o ../../bin/xnc-server$(EXE) ./cmd/xnc-server
 
-# 安装器频道（设计 §3.1）：stable 产 xnc-setup-<ver>.exe，dev 产 -dev- 变体。
+# 安装器频道（设计 §3.1）：stable 产 XNC-Installer-<ver>.exe，dev 产 -dev- 变体。
 CHANNEL ?= stable
-# 安装器（设计 §3/§12）：五二进制 → ISCC 打包 bin/xnc-setup[-dev]-<ver>.exe，
+# 安装器（设计 §3/§12）：五二进制 → ISCC 打包 bin/XNC-Installer[-dev]-<ver>.exe，
 # sha256 输出到 stdout + sidecar。build.ps1 内含各二进制的既有构建路径
 # （build-agent 旗标 / cli、shellhost go build / native build.bat）。
 .PHONY: installer
