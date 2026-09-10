@@ -87,9 +87,9 @@ func (h *handlers) adminUploadRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// setup.exe 是安装/更新的唯一制品面：maybeOfferUpdate 仅按它推送
-	// UPDATE_AVAILABLE，/setup.exe 与 /setup.json 由 setup_handlers 动态
-	// 服务该制品。
+	// setup.exe（release 内制品名）是安装/更新的唯一制品面：maybeOfferUpdate
+	// 仅按它推送 UPDATE_AVAILABLE；端点 /installer 与 /installer.json 由
+	// setup_handlers 动态服务该制品。
 	ssum := sha256.Sum256(setupBytes)
 	if err := h.st.Q().PutArtifact(ctx, sqlc.PutArtifactParams{
 		ReleaseID: rel.ID, Name: setupArtifactName,

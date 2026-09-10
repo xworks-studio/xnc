@@ -49,7 +49,7 @@ func NewTestEnv(t *testing.T) *TestEnv {
 	})
 }
 
-// newTestEnvWithCfg 构造可变异 config 的 TestEnv（desktop TURN 未配置路径等）。
+// newTestEnvWithCfg 构造可变异 config 的 TestEnv（desktop RTV 未配置路径等）。
 func newTestEnvWithCfg(t *testing.T, mutate func(*config.Config)) *TestEnv {
 	t.Helper()
 	st := db.OpenTestStore(t)

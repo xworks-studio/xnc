@@ -26,7 +26,7 @@ func desktopPost(t *testing.T, env *TestEnv, nodeID, body string) *http.Response
 	return resp
 }
 
-// desktopOpenResp 是 REST 响应形态（RTV：wtUrl/wsUrl + lease；无 turn）。
+// desktopOpenResp 是 REST 响应形态（RTV：wtUrl/wsUrl + lease；无 TURN 遗留字段）。
 type desktopOpenResp struct {
 	SessionID string `json:"sessionId"`
 	Token     string `json:"token"`

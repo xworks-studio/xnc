@@ -17,11 +17,12 @@ const KindFile = "file"
 // KindTunnel 端口隧道会话（RDP 等，Phase 4）。
 const KindTunnel = "tunnel"
 
-// KindScreen 单帧快照会话（M2-Slice3 Task 3 换轨）：流式 H.264 管线已
-// 退役（流式观看走 KindDesktop 实时桌面会话）；kind 名与 REST/CLI 语法
-// 保留，snapshot=true 时经 xnc-core 0x0111 一次性 spawn
-// xnc-desktop --jpeg-single 回传 JPEG（0x03 子帧），流式请求由 agent 以
-// 稳定码 SCREEN_STREAM_RETIRED 拒绝。
+// KindScreen screen 会话（LEGACY：2026-09-08 RTV 重构后整体退役）。
+// 流式与快照通道（xnc-core 0x0111 --jpeg-single）均已删除；server 端点
+// 已移除，CLI 报退役提示，agent 侧 handler 保留为防御面（旧客户端仍会
+// 发该 kind），恒回 SCREEN_STREAM_RETIRED / SCREEN_SNAPSHOT_UNSUPPORTED。
+// 常量与下方 Screen* 类型保留作文档锚点与旧二进制兼容面；快照恢复列
+// RTV 设计文档后续 PATCH 清单。
 const KindScreen = "screen"
 
 // KindDesktop 实时桌面会话（RTV 重构，2026-09-08）：agent 收到 SESSION_OPEN
@@ -166,36 +167,33 @@ type TunnelParams struct {
 	Target string `json:"target"` // "rdp"
 }
 
-// ScreenParams SESSION_OPEN params（M2-Slice3：快照专用；fps/quality 字段
-// 仅为兼容保留，流式已退役）。maxWidth 默认 1920（核心侧 box-filter 降
-// 采样上限）；0 值由 server 端补默认后再下发。
+// ScreenParams SESSION_OPEN params —— LEGACY：screen 会话整体退役（见
+// KindScreen 注释），本组类型仅为旧二进制兼容面保留，生产链路不再使用。
 type ScreenParams struct {
-	Fps      int  `json:"fps,omitempty"`      // 兼容保留（流式退役，忽略）
-	Quality  int  `json:"quality,omitempty"`  // 兼容保留（JPEG 质量由桌面侧固定 0.85）
-	MaxWidth int  `json:"maxWidth,omitempty"` // 默认 1920（降采样上限）
-	Snapshot bool `json:"snapshot,omitempty"` // 单帧 JPEG 模式（唯一支持的模式）
+	Fps      int  `json:"fps,omitempty"`      // legacy：流式退役，忽略
+	Quality  int  `json:"quality,omitempty"`  // legacy：快照通道已删，忽略
+	MaxWidth int  `json:"maxWidth,omitempty"` // legacy
+	Snapshot bool `json:"snapshot,omitempty"` // legacy：唯一曾支持的模式，现已拒绝
 }
 
-// ScreenBegin agent → client：流开始（SCREEN_BEGIN text 帧）。
+// ScreenBegin agent → client：流开始（SCREEN_BEGIN text 帧）—— legacy 词表。
 type ScreenBegin struct {
 	Width  int    `json:"width"`
 	Height int    `json:"height"`
 	State  string `json:"state"` // capturing / locked / no_session
-	Codec  string `json:"codec"` // 快照 "jpeg"（"h264" 为退役流式词汇）
+	Codec  string `json:"codec"` // legacy："jpeg"/"h264" 词汇均已退役
 }
 
-// ScreenState agent → client：捕获状态变化（SCREEN_STATE text 帧）。
+// ScreenState agent → client：捕获状态变化（SCREEN_STATE text 帧）—— legacy。
 type ScreenState struct {
 	State string `json:"state"` // capturing / locked / no_session
 }
 
-// Screen 会话 WS 二进制帧子头：帧类型显式随帧走（第 1 字节），消费端免
-// NALU 嗅探判定 key/delta——历史上三处独立嗅探实现各自漂移，是 WebCodecs
-// 拒帧类问题的温床。
+// Screen 会话 WS 二进制帧子头（legacy 词表，流式与快照通道均已退役）。
 const (
-	ScreenBinKey   byte = 0x01 // H.264 关键帧（Annex-B AU，首 NALU 必为 SPS）
-	ScreenBinDelta byte = 0x02 // H.264 增量帧（Annex-B AU）
-	ScreenBinJPEG  byte = 0x03 // JPEG 单帧（快照模式）
+	ScreenBinKey   byte = 0x01 // legacy：H.264 关键帧
+	ScreenBinDelta byte = 0x02 // legacy：H.264 增量帧
+	ScreenBinJPEG  byte = 0x03 // legacy：JPEG 单帧（快照模式）
 )
 
 // MaxSessionFrameBytes 会话 WS 单帧上限（server/agent/CLI 三处共用同一
