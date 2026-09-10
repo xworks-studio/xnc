@@ -9,7 +9,7 @@
 > rt-pipe/C++ 采集栈）。本文涉及桌面媒体/TURN/rt-pipe/IDR/QoS 的章节按
 > 历史存档理解；现行权威设计见
 > `docs/superpowers/specs/2026-09-08-desktop-rtv-rewrite-design.md` 与
-> `server/internal/rtv`、`host/` 源码。JPEG 快照/键盘输入/多显示器切换/
+> `src/server/internal/rtv`、`src/host/` 源码。JPEG 快照/键盘输入/多显示器切换/
 > SAS 为已确认的后续 PATCH 项。
 
 XNC 是小团队和 AI Agent 的 Windows 节点统一运维入口：节点只需**出站 443 长连接**，即获得状态观测、命令执行、交互终端、脚本/文件分发和远程桌面。不是穿透工具，是合规友好的反向连接平面。
@@ -224,7 +224,7 @@ deploy/ Docker Compose 栈（caddy + xnc-server + postgres 三容器）
 
 ## 5.2 Windows Agent
 
-Agent 与 Server / CLI 同为 Go，协议定义共享仓库根 `proto/` 包（唯一定义点），协议漂移在结构上不可能发生。
+Agent 与 Server / CLI 同为 Go，协议定义共享仓库根 `src/proto/` 包（唯一定义点），协议漂移在结构上不可能发生。
 
 选型：
 
@@ -1434,7 +1434,7 @@ xnc shell production/web-01
 
 # 30. Agent 内部结构
 
-Agent 为单一 Go 模块，按包划分职责（协议定义 import 自仓库根 `proto/` 共享包，与 server / cli / mockagent 共用唯一定义点）：
+Agent 为单一 Go 模块，按包划分职责（协议定义 import 自仓库根 `src/proto/` 共享包，与 server / cli / mockagent 共用唯一定义点）：
 
 ```text
 agent/
@@ -2835,7 +2835,7 @@ E2E                docker-compose：server + PostgreSQL + mockagent×N + cli（�
 CLI                golden 测试：--json envelope 快照、退出码表逐条、选择器歧义
 ```
 
-MockAgent 不再是第三份协议实现——就是 agent 核心包 + 内存虚拟传输；协议定义 import 自仓库根 `proto/` 共享包。
+MockAgent 不再是第三份协议实现——就是 agent 核心包 + 内存虚拟传输；协议定义 import 自仓库根 `src/proto/` 共享包。
 
 ## 测试设备矩阵
 

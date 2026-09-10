@@ -94,10 +94,10 @@ jobs:
 ### 2.3 规则
 
 - 各 job 缓存：`actions/setup-go` 自带模块缓存 + `actions/cache` 缓存
-  `bin\`（native 编译产物按 key: hashFiles(native/**) 复用）。
+  `bin\`（native 编译产物按 key: hashFiles(src/native/**) 复用）。
 - 失败输出：`if: failure()` 上传失败日志（go test 输出、build.log）。
 - 禁止 CI 里出现任何凭据（测试全用 testcontainers/临时凭据）。
-- 已知环境债：`agent/session` 的 GOOS=linux 构建失败是预存在问题，
+- 已知环境债：`src/agent/session` 的 GOOS=linux 构建失败是预存在问题，
   CI 的 linux job 对该包 `//` 排除并在 job 内注释引用问题编号（不修
   不挡——避免 CI 一上线就红）。
 
@@ -155,7 +155,7 @@ jobs:
 
 ### 3.4 生产侧拉取（installersync，server 内置）
 
-`server/internal/installersync`：GitHub Releases → 本地 release store
+`src/server/internal/installersync`：GitHub Releases → 本地 release store
 的定时拉取，/installer 与 /installer.json 服务路径与 agent 更新契约
 零改动。
 
@@ -179,7 +179,7 @@ CI publish.yml 修复前的实际路径（与正规路径的节点升级语义�
 仅缺 tag 锚定——版本不可变改靠发布纪律）：
 
 ```
-1. powershell installer/build.ps1 -Version <v> -Channel stable|dev
+1. powershell src/installer/build.ps1 -Version <v> -Channel stable|dev
    （本地签名：XNC_CODESIGN_PASSWORD 环境变量；产 bin/XNC-Installer-<v>.exe + .sha256）
 2. POST /api/admin/releases （multipart：file + sha256 边车 + channel/version
    字段；生产 admin JWT）→ 直写生产 release store

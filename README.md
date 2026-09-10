@@ -34,8 +34,7 @@ xnc shell <node>                     # 交互终端（~. 断开）
 xnc put <node> <local> <remote>      # 上传（sha256 校验）
 xnc get <node> <remote> <local>      # 下载
 xnc screen <node> --snap out.jpg     # 屏幕截图
-xnc screen <node> --open             # 实时画面（浏览器）
-xnc rdp <node>                       # 远程桌面
+xnc rdp <node>                       # 远程桌面（浏览器 RTV）
 xnc upgrade [--channel dev]          # 手动触发本机升级
 xnc logout                           # 退出用户会话（节点不受影响）
 ```
@@ -63,33 +62,33 @@ xnc exec node1 --cwd C:\xnc --env DEBUG=1 "tool"   # env + cwd
 
 ```
 Browser ──── Web UI / WebCodecs / 下载页
-    │
-Server (Go, xnc.app) ─── REST + WS 信令 + release store + 安装器分发
-    │ (agent 主动出站 443；媒体经 TURN 中继)
+    │  TCP443 REST/WS + UDP443 WebTransport（媒体主路，H3）
+Server (Go, xnc.app) ─── REST + WS 信令 + release store + 安装器分发 + RTV 中继
+    │ (agent 主动出站 wss 443；xnc-host 直连 UDP4433 媒体面)
 Agent (Windows 服务, SYSTEM)
     ├─ exec engine (bash/pwsh/powershell/cmd)
     ├─ shell (ConPTY)
-    ├─ screen (DXGI Desktop Duplication → H.264, 经 XNCCore)
+    ├─ desktop (xnc-host：DXGI 采集 → H.264 → RS FEC → QUIC，浏览器 WebCodecs 硬解)
     ├─ agentctl 管道（register/deregister/status/upgrade 本地控制面）
     └─ self-updater (installer-orchestrated + rollback)
 ```
 
 ## 开发与交付
 
-> Agent/工程师操作规范（硬性契约、部署、发布、签名）见 [AGENTS.md](AGENTS.md)；CI/版本/发布/部署设计见 [docs/ci-release-and-deploy.md](docs/ci-release-and-deploy.md)。
+> Agent/工程师操作规范（硬性契约、部署、发布、签名）见 [AGENTS.md](AGENTS.md)；CI/版本/发布/部署设计见 [docs/ci-release-and-deploy.md](docs/ci-release-and-deploy.md)。代码模块统一在 `src/` 下；`deploy/`（运维）与 `bin/`（产物）留在仓库根。
 
-- **测试门禁**：PR/push main → `ci.yml` 五矩阵（Linux Go + PG、Windows agent/shellhost、web、native、安装器试构建）。
-- **安装器发版**：手动触发 `release` workflow 输入版本号 → CI 在 main HEAD 打 tag → 签名构建 → GitHub Release（发布终点）；生产 server 由 installersync 定时拉取，在线节点自动升级。
-- **server 发版**：手动触发 `build-server` workflow 输入版本号 → GHCR `v<版本>+latest` → Watchtower 轮询 `:latest` 自动换版（5–10 分钟）。
+- **测试门禁**：PR/push main → `ci.yml` 六矩阵（go-linux、go-windows、web、native、host-rust、installer-dryrun）。
+- **安装器发版（现行）**：本地 `powershell src/installer/build.ps1 -Version <v> -Channel stable|dev` 签名构建 → 管理员 API `POST /api/admin/releases` 直传生产 release store；在线节点经 WS 推送秒级升级。（CI `publish` workflow 因 vcpkg ffmpeg 基线漂移暂不可用，修复后恢复 tag + GitHub Release 正规路径。）
+- **server 发版（现行）**：本地 `powershell deploy/build-server-local.ps1 -ServerVersion <v>`（docker build → SFTP 直推 SRV；watchtower 已停用）。（CI `build-server` workflow → GHCR 保留为备用通道。）
 - **本地开发栈**：
 
 ```bash
 cd deploy && docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
-(cd cli && go build -o ../bin/xnc.exe .)
-(cd agent && go build -o ../bin/xnc-agent.exe ./cmd/xnc-agent)
+(cd src/cli && go build -o ../../bin/xnc.exe .)
+(cd src/agent && go build -o ../../bin/xnc-agent.exe ./cmd/xnc-agent)
 ```
 
-- **版本号**：`MAJOR.MINOR.PATCH[-dev]`，段 ≤4 位，发版 = 手动触发 `release` workflow（CI 在 main HEAD 打 tag 锚定；版本单一来源：tag → 构建注入 == installer.json == /api/health）。
+- **版本号**：`MAJOR.MINOR.PATCH[-dev]`，段 ≤4 位；版本单一来源：构建注入 == installer.json == /api/health。
 
 ## 测试设备凭据
 

@@ -113,12 +113,12 @@ coturn：退役（desktop 是其唯一用户，合并前审计确认）
 
 ## 3. 组件设计
 
-### 3.1 `host/`（Rust crate `xnc-host`，二进制 xnc-host.exe）
+### 3.1 `src/host/`（Rust crate `xnc-host`，二进制 xnc-host.exe）
 
 模块自 `mvp/host/src` 忠实迁移：capture/encoder/framing/rs/transport/qos/
 stats/shared/input/main。集成缝（仅此清单，见 §4）：
 
-- `Cargo.toml`：scrap 指向 `third_party/scrap`（vendored rustdesk fork，锁 rev）；
+- `Cargo.toml`：scrap 指向 `src/third_party/scrap`（vendored rustdesk fork，锁 rev）；
   crate/binary 更名 xnc-host。
 - `main.rs`：配置源从 CLI 默认值改为 stdin JSON（`{endpoint, token, nodeId, fps,
   bitrateKbps, fec, display, sendKbps, logFile}`）；argv 只允许非密钥覆盖项。
@@ -126,7 +126,7 @@ stats/shared/input/main。集成缝（仅此清单，见 §4）：
   （server 证书为 CA 签发）；ALPN 不变。
 - 日志：`--log-file` 落 `C:\ProgramData\XNC\logs\xnc-host.log`（core spawn 传参）。
 
-### 3.2 `server/internal/rtv/`（Go，自 mvp/server 移植）
+### 3.2 `src/server/internal/rtv/`（Go，自 mvp/server 移植）
 
 - `relay.go`：Hub 键改为 nodeId；HostToken 签发/校验（会话创建时生成，经
   SESSION_OPEN→agent→core→host stdin 下发；host 重连凭同 token 再注册=合法
@@ -140,7 +140,7 @@ stats/shared/input/main。集成缝（仅此清单，见 §4）：
 - 会话接线：desktop kind 不再走 pump；首个 viewer 触发 SESSION_OPEN，无 viewer
   经 janitor 收线（复用现有 idle sweep + lease TTL 语义）。
 
-### 3.3 `native/core/`（C++，裁剪保留）
+### 3.3 `src/native/core/`（C++，裁剪保留）
 
 - 白名单 `spawn.h`：`xnc-desktop.exe` → `xnc-host.exe`。
 - StartCapture RPC：请求扩展携带 stdin 配置 blob（endpoint/token/参数 JSON）；
@@ -150,18 +150,18 @@ stats/shared/input/main。集成缝（仅此清单，见 §4）：
 - 删除：rt-pipe 相关回调/等待逻辑、快照 spawn 路径（--jpeg-single 随 C++ 栈
   退役，agent 侧以明确错误码兜底）。
 
-### 3.4 `agent/`（Go，瘦身）
+### 3.4 `src/agent/`（Go，瘦身）
 
-- `agent/desktop` 重写为 thin handler：SESSION_OPEN → StartCapture（参数透传）；
+- `src/agent/desktop` 重写为 thin handler：SESSION_OPEN → StartCapture（参数透传）；
   SESSION_CLOSE → intent 引用计数归零 → StopCapture。intent.go 的源监督模式
   保留（崩溃退避重拉由 core DesktopSupervisor 承担，agent 不再自己监督）。
 - 删除：transport/viewer_sender/qos_controller/input/keyframe_coordinator/frames/
-  source/frame_meta（Pion 栈）、`agent/desktoppipe/` 全部。
-- `agent/coreclient`：StartCapture 请求加 stdin blob；删 rt-pipe 辅助。
+  source/frame_meta（Pion 栈）、`src/agent/desktoppipe/` 全部。
+- `src/agent/coreclient`：StartCapture 请求加 stdin blob；删 rt-pipe 辅助。
 
-### 3.5 `web/`（React/Vite）
+### 3.5 `src/web/`（React/Vite）
 
-- `web/src/lib/rtv/`：proto/rs（逐字节）、worker（Vite `new URL(...,
+- `src/web/src/lib/rtv/`：proto/rs（逐字节）、worker（Vite `new URL(...,
   import.meta.url)` 形态）、transport（框架无关，WT 主路 + WS 兜底 + 证书直连
   Web PKI）、input（鼠标采集与 letterbox 映射）。
 - `DesktopLive.tsx` 重写：React 壳（会话创建/lease UI/HUD/framediag 等价物）+
@@ -177,14 +177,14 @@ canary 机制。REST `POST /desktop` 响应：`{sessionId, token, wtUrl, wsUrl}`
 
 ## 4. 允许的改动缝（忠实搬用契约的边界）
 
-1. `host/Cargo.toml` 依赖路径与 crate 命名；`.cargo/config.toml` 不变。
+1. `src/host/Cargo.toml` 依赖路径与 crate 命名；`.cargo/config.toml` 不变。
 2. `main.rs` 配置装载（stdin JSON + argv 非密钥覆盖）。
 3. `transport.rs` hello 字段与 TLS verifier。
 4. 日志文件路径参数化。
 5. server 侧 Hub 键/鉴权/门控/证书来源/observability 收权。
 6. web 侧模块导入路径与 Worker 构建形态、React 渲染壳。
 7. 其余（rs/framing/worker 逻辑/pacer/QoS 决策/恢复语义）逐字节搬用；
-   `proto/fixture-rs.json` 不动。
+   `src/proto/fixture-rs.json` 不动。
 
 ## 5. 证书与部署
 
@@ -199,13 +199,13 @@ canary 机制。REST `POST /desktop` 响应：`{sessionId, token, wtUrl, wsUrl}`
 
 ## 6. 构建与 CI
 
-- `installer/build.ps1`：新增 cargo 构建步骤（xnc-host.exe 替换 xnc-desktop.exe，
+- `src/installer/build.ps1`：新增 cargo 构建步骤（xnc-host.exe 替换 xnc-desktop.exe，
   五 exe 数不变）；签名链不变（codesign 指纹/装卸信任复用）。
 - `ci.yml`：新增 Rust job（rust-toolchain.toml 锁版本 + vcpkg 二进制缓存 +
-  cargo test/build）；node RS 对拍（`tools/rtvload` 测试）入 CI。
+  cargo test/build）；node RS 对拍（`src/tools/rtvload` 测试）入 CI。
 - `release.yml`：windows runner 加 Rust 工具链 + VCPKG_ROOT/LIBCLANG_PATH 环境
-  （二进制缓存预热）；`tools/rtvload` 随矩阵编译。
-- `tools/`：新增 `rtvload/`（自 mvp loadclient，加 token 鉴权）；删除
+  （二进制缓存预热）；`src/tools/rtvload` 随矩阵编译。
+- `src/tools/`：新增 `rtvload/`（自 mvp loadclient，加 token 鉴权）；删除
   `e2eviewer/`；`nalcheck` 保留；`desktopreport` 瘦身适配（frameStats 为新遥测
   源）或退役并留终版报告。
 
@@ -232,7 +232,7 @@ canary 机制。REST `POST /desktop` 响应：`{sessionId, token, wtUrl, wsUrl}`
 
 - RS 黄金向量：`proto-fixtures/fixture-rs.json` + Rust `golden_fixture` + node
   `rs.test.js`（双端对拍，CI 门禁）。
-- `tools/rtvload`：合成 WT viewer（鉴权版），30s 报告 + Annex-B 落盘。
+- `src/tools/rtvload`：合成 WT viewer（鉴权版），30s 报告 + Annex-B 落盘。
 - nalcheck：IDR ratio / SPS+PPS 前置不变量。
 - 真机矩阵：LABS-XIAOXIN（干净实验台）→ LABS-TB16G7（用户机）。
 
@@ -253,9 +253,9 @@ canary 机制。REST `POST /desktop` 响应：`{sessionId, token, wtUrl, wsUrl}`
 | host→viewer | `{type:"clipboard",event:"set-ack",seq,ok,bytes}` | 写入回执；web 收 ack 才补发合成 Ctrl+V（时序闭环） |
 | host→viewer | `{type:"clipboard",event:"text-chunk"\|"text-end",seq,index,total,text,truncated}` | 远端剪贴板变化推送（同分块限制，总量 256KiB 截断） |
 
-分块尺寸依据：WS 兜底腿（`rtv/legws.go`）未 `SetReadLimit`，coder/websocket
+分块尺寸依据：WS 兜底腿（`src/rtv/legws.go`）未 `SetReadLimit`，coder/websocket
 默认 32KiB 读上限——超限直接断连；WT/host 腿为显式 256KiB。16KiB 留 JSON
-开销余量，双端（`host/src/clipboard.rs` 与 `web/src/lib/rtvInput.ts`）码点
+开销余量，双端（`src/host/src/clipboard.rs` 与 `src/web/src/lib/rtvInput.ts`）码点
 边界切块、乱序组装、新 seq 丢半截。
 
 ### 10.2 剪贴板机制
