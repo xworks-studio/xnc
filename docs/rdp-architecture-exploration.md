@@ -3,6 +3,11 @@
 > 目标：评估并实验验证 XNC 远程桌面（`xnc rdp`）技术架构的改造方向。
 > 本文是**活文档**：实验一边做一边把关键发现写进来。
 > 实验工具：`xnc` CLI 本身（`bin/xnc.exe`，用法见 `xnc --help`）+ 少量自制探针程序。
+>
+> **状态（2026-09 标注）**：本文为 RTV 重构前的探索记录，现按历史存档理解。
+> 其中引用的 screen-helper/C++ 采集栈、`tools/screendiag`、TURN 架构均已随
+> 2026-09-08 RTV 重构删除或退役（现行媒体面：xnc-host Rust + QUIC 中继 +
+> WebCodecs，见 `docs/superpowers/specs/2026-09-08-*`）；文中路径未逐一更新。
 
 ## 0. 基线：当前架构（v2 现状）
 

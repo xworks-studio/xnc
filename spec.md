@@ -809,7 +809,7 @@ v1 的自定义二进制帧头（1 字节类型 + 16 字节会话 ID）删除—
 
 说明：
 
-* `kind ∈ {exec, shell, file, screen, tunnel}`。
+* `kind ∈ {exec, shell, file, screen, tunnel}`（screen 已随 RTV 重构退役，仅保留为旧客户端兼容面）。
 * `SESSION_OPEN` / `SESSION_REFUSED` / `SESSION_CLOSE` 为会话管理消息，**Phase 2 起随第一个会话 kind（exec）启用**；Phase 1 只有前 5 个消息 + ERROR。
 * 会话面 text 帧词汇按 kind 定义：exec 1 个 / shell 3 个（SHELL_BEGIN / SHELL_RESIZE / 通用 ERROR，见第 15 节）/ file 3 个 / screen 2 个 / tunnel 0 个，合计 9 个，且每个只在所属通道出现。
 
@@ -1324,7 +1324,7 @@ POST /api/nodes/{id}/exec           {command|script, timeoutSec?, cwd?}
 POST /api/nodes/{id}/shell          {cols?, rows?, shell?}
 POST /api/nodes/{id}/files/upload   {path, size, sha256}
 POST /api/nodes/{id}/files/download {path}
-POST /api/nodes/{id}/screen         {fps?, quality?, maxWidth?}
+POST /api/nodes/{id}/screen         {fps?, quality?, maxWidth?}（端点已移除，2026-09-08 RTV 重构退役）
 POST /api/nodes/{id}/tunnel         {target}
 ```
 
@@ -2648,7 +2648,7 @@ xnc run <node> (- | --file <f>)                  # exec --stdin 的别名（兼�
 xnc shell <node> [--cols N] [--rows N] [--system]  # 交互终端（~. 断开；--system 同上，M2 起）
 xnc upload <node> <local> <remote>               # 别名: put
 xnc download <node> <remote> <local>             # 别名: get
-xnc screen <node> --snap out.jpg | --open        # 截图 | 实时预览
+xnc screen <node> --snap out.jpg | --open        # 已退役（RTV 重构）：报提示，改 xnc rdp
 xnc rdp <node> [--local-port N] [--native]       # 默认浏览器 desktop；--native = mstsc tunnel（M2 起）
 
 # 节点与管理
@@ -2991,7 +2991,13 @@ Linux 无 RDP 概念，Remote Desktop 仅作为 Windows 节点能力。
 
 ---
 
-# 64. 桌面预览（Screen Preview，Phase 6+）
+# 64. 桌面预览（Screen Preview，Phase 6+）—— 本章已退役（历史存档）
+
+> **状态（2026-09-08 RTV 重构）**：本章描述的 screen 会话（DXGI + C DLL +
+> H.264 流式与 JPEG 快照）整体退役：流式由 kind=desktop 实时桌面会话取代，
+> 快照通道已删（恢复列后续 PATCH）。CLI `xnc screen` 现为退役桩（报提示），
+> server 端点已移除，agent 侧以 SCREEN_STREAM_RETIRED /
+> SCREEN_SNAPSHOT_UNSUPPORTED 拒绝。以下内容按历史存档理解。
 
 ## 动机
 
