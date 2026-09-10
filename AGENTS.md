@@ -38,8 +38,9 @@ XNC = Windows 节点远程管理平台：Go server（xnc.app）+ Windows agent
   build-server.yml → GHCR 保留为备用通道）。
 - **信任**：自签 Authenticode（安装器内置信任装卸）；更新 sha256 强校验 +
   回滚看门狗；凭据唯一源 `deploy/.env`。
-- **开发流**：worktree 分支 → PR（ci.yml 六矩阵门禁：go-linux/go-windows/
-  web/native/host-rust/installer-dryrun）→ main。实验机
+- **开发流**：feature 分支直接开发（2026-09-10 起弃用 worktree：`git switch
+  -c feature/<name>` 从 main 切出）→ PR（ci.yml 六矩阵门禁：go-linux/
+  go-windows/web/native/host-rust/installer-dryrun）→ merge 回 main。实验机
   XIAOXIN/TB16G7（PS remoting），本机不装产品组件。
 
 模块地图（2026-09-09 起全部代码模块在 `src/` 下；`deploy/` 运维、`docs/`
@@ -80,8 +81,9 @@ desktop 已随 RTV 重构删除）。`src/host/` 为 Rust crate `xnc-host`（桌
 
 ## 3. 开发流程
 
-- **分支隔离**：任何实施在 `.worktrees/<name>`（gitignored）+ feature 分支上
-  做，完成后合并回 main；不在 main 上直接开发。
+- **分支隔离**：任何实施在 feature 分支上做（`git switch -c feature/<name>`，
+  不再使用 worktree——同一工作区切换分支），完成后合并回 main；不在 main
+  上直接开发。
 - **构建/测试**：`go build ./...` 逐模块（根目录不是模块）；server 测试需真
   PG（testcontainers 自动拉起）；agent Windows 测试直接本机 `go test`。
   `make build/test/fmt` 覆盖 MODULES。
