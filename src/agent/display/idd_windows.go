@@ -56,11 +56,12 @@ var guidDevInterfaceXncIdd = windows.GUID{
 
 // IOCTL 码 = CTL_CODE(IOCTL_CHANGER_BASE=0x30, fn, METHOD_BUFFERED,
 // FILE_READ_ACCESS|FILE_WRITE_ACCESS)。注：SDK 的 CTL_CODE 把 Function
-// 截断到 12 位（0x1001→1）——实测驱动接收码为 0x0030C004/0x0030C008
-// （C 探针编译 Public.h 打印验证，2026-09-10）。
+// 截断到 12 位（0x1001→1）——实测驱动接收码如下（C 探针编译 Public.h
+// 打印验证，2026-09-10）。
 const (
-	ioctlPlugIn  = 0x0030C004
-	ioctlPlugOut = 0x0030C008
+	ioctlPlugIn    = 0x0030C004
+	ioctlPlugOut   = 0x0030C008
+	ioctlGetStatus = 0x0030C010 // 0x1004（XNC 增补）
 )
 
 const (
@@ -260,6 +261,16 @@ type ctlPlugOut struct {
 	connectorIndex uint32
 }
 
+// ctlMonitorStatus 镜像 Public.h CtlMonitorStatus（C BOOL = 4 字节；
+// C sizeof=84，逐字节对齐）。
+type ctlMonitorStatus struct {
+	count uint32
+	conns [10]struct {
+		plugged uint32
+		active  uint32
+	}
+}
+
 func randomGUID() windows.GUID {
 	var g windows.GUID
 	b := make([]byte, 16)
@@ -298,6 +309,27 @@ func ioctlPlugOutMonitor(h uintptr) error {
 	return nil
 }
 
+// ioctlGetMonitorStatus 查询驱动状态（session 0 唯一权威信号：GDI/DXGI
+// 枚举在服务会话均不可用）。返回 0 号连接器的插拔/激活状态。
+func ioctlGetMonitorStatus() (plugged, active bool, err error) {
+	dev, err := openDeviceInterface()
+	if err != nil {
+		return false, false, err
+	}
+	defer windows.CloseHandle(dev)
+	out := ctlMonitorStatus{}
+	var junk uint32
+	if err := windows.DeviceIoControl(dev, ioctlGetStatus,
+		nil, 0, (*byte)(unsafe.Pointer(&out)), uint32(unsafe.Sizeof(out)),
+		&junk, nil); err != nil {
+		return false, false, fmt.Errorf("display: GET_STATUS ioctl: %w", err)
+	}
+	if out.count == 0 || out.count > 10 {
+		return false, false, fmt.Errorf("display: GET_STATUS bad count %d", out.count)
+	}
+	return out.conns[0].plugged != 0, out.conns[0].active != 0, nil
+}
+
 // ---- 显示器枚举（EnumDisplayDevicesW）----
 
 type displayDevice struct {
@@ -309,8 +341,10 @@ type displayDevice struct {
 	key   [128]uint16
 }
 
-// enumDisplays 枚举全部显示设备；返回活动物理屏数量与虚拟屏活动标志。
-func enumDisplays() (physicalActive bool, virtualActive bool) {
+// enumDisplays 枚举显示设备（GDI）。注意：session 0（服务）下该 API 恒
+// 返回空（2026-09-10 XIAOXIN 实测）——仅在交互上下文（dev-console/控制台
+// 会话）有真实语义；调用方须按"空 = 未知"处理。
+func enumDisplays() (total int, physicalActive bool, virtualActive bool) {
 	for i := uint32(0); ; i++ {
 		dd := displayDevice{cb: uint32(unsafe.Sizeof(displayDevice{}))}
 		r1, _, _ := procEnumDisplayDevicesW.Call(0, uintptr(i),
@@ -318,6 +352,7 @@ func enumDisplays() (physicalActive bool, virtualActive bool) {
 		if r1 == 0 {
 			return
 		}
+		total++
 		if dd.flags&displayDeviceActive == 0 {
 			continue
 		}
@@ -384,13 +419,14 @@ func (winBackend) createDevice() (uintptr, error) { return swDeviceCreate() }
 func (winBackend) closeDevice(h uintptr) { swDeviceCloseHandle(h) }
 
 func (winBackend) plugMonitor(h uintptr) error {
-	// 设备接口可能在设备创建后瞬间未就绪：镜像上游 10 次重试（1s 间隔）。
+	// 设备接口可能在设备创建后数十秒才就绪（新驱动包首次加载镜像 +
+	// IddCx 适配器初始化）；镜像上游 25 次重试（1s 间隔）。
 	var lastErr error
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 25; i++ {
 		dev, err := openDeviceInterface()
 		if err != nil {
 			lastErr = err
-			if i < 9 {
+			if i < 24 {
 				time.Sleep(time.Second)
 				continue
 			}
@@ -412,13 +448,24 @@ func (winBackend) unplugMonitor(h uintptr) error {
 }
 
 func (winBackend) physicalOutputActive() bool {
-	p, _ := enumDisplays()
+	total, p, _ := enumDisplays()
+	if total == 0 {
+		// session 0 下枚举恒空 = "未知"，按有物理屏保守处理（不触发建屏）：
+		// 避免桌面机带屏时每次会话误建虚拟屏；盒盖场景由 lid 事件覆盖。
+		return true
+	}
 	return p
 }
 
 func (winBackend) virtualDisplayActive() bool {
-	_, v := enumDisplays()
-	return v
+	plugged, active, err := ioctlGetMonitorStatus()
+	if err != nil {
+		// 设备未创建或驱动为旧版（无 GET_STATUS）：回落 GDI（仅交互
+		// 上下文有意义；session 0 下返回 false 即"未激活"）。
+		_, _, v := enumDisplays()
+		return v
+	}
+	return plugged && active
 }
 
 func (winBackend) lidClosed() (bool, bool) { return lidClosedState() }
