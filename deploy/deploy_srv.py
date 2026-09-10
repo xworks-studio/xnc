@@ -274,13 +274,13 @@ def cmd_docker():
 def cmd_push():
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        for name in ("proto", "server", "deploy"):
-            tf.add(ROOT / name, arcname=name,
+        for name in ("src/proto", "src/server", "deploy"):
+            tf.add(ROOT / name, arcname=name.split("/")[-1],
                    filter=lambda ti: None if ti.name.endswith(".env") else ti)
         # Web UI 产物随包上传（Docker 内不再构建：服务器 npm registry 网络
         # 不可靠，2026-08-25 部署事故根因——本地构建 dist 后 push）。排除
         # node_modules；dist 必须包含（Dockerfile web 阶段直接 COPY）。
-        tf.add(ROOT / "web", arcname="web",
+        tf.add(ROOT / "src/web", arcname="web",
                filter=lambda ti: None if "node_modules" in ti.name
                or ti.name.endswith(".env") else ti)
     buf.seek(0)

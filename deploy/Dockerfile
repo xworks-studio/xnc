@@ -6,7 +6,7 @@
 # 3) distroless static 运行（CGO_ENABLED=0，纯静态）
 FROM alpine:3.20 AS web
 WORKDIR /web
-COPY web/dist ./dist
+COPY src/web/dist ./dist
 
 FROM golang:1.26-alpine AS build
 WORKDIR /src
@@ -14,9 +14,9 @@ WORKDIR /src
 # 版本一致；缺省回落 0.0.0-dev）。deploy_srv.py up 前在 .env 设 XNC_VERSION
 # 即可让 compose build 透传。
 ARG XNC_VERSION=0.0.0-dev
-COPY proto ./proto
-COPY rtv ./rtv
-COPY server ./server
+COPY src/proto ./proto
+COPY src/rtv ./rtv
+COPY src/server ./server
 # 覆盖仓库占位（server/web/dist/index.html），embed 命中真实产物
 COPY --from=web /web/dist ./server/web/dist
 RUN cd server && CGO_ENABLED=0 go build -trimpath \

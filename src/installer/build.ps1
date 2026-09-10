@@ -21,7 +21,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$root = Split-Path -Parent $PSScriptRoot
+# 脚本位于 <repo>/src/installer：$src = <repo>/src（各模块目录），
+# $root = 仓库根（bin/ 产物池在此）。
+$src = Split-Path -Parent $PSScriptRoot
+$root = Split-Path -Parent $src
 $bin = Join-Path $root "bin"
 New-Item -ItemType Directory -Force -Path $bin | Out-Null
 
@@ -33,17 +36,17 @@ function Invoke-Step([string]$name, [scriptblock]$body) {
 
 # 1) five binaries (version injected into the agent; see Makefile AGENT_LDFLAGS).
 Invoke-Step "build xnc-agent.exe" {
-    Push-Location (Join-Path $root "agent")
+    Push-Location (Join-Path $src "agent")
     try { go build -ldflags "-X xnc/agent/machineinfo.Version=$Version" -o (Join-Path $bin "xnc-agent.exe") ./cmd/xnc-agent }
     finally { Pop-Location }
 }
 Invoke-Step "build xnc.exe (cli)" {
-    Push-Location (Join-Path $root "cli")
+    Push-Location (Join-Path $src "cli")
     try { go build -o (Join-Path $bin "xnc.exe") . }
     finally { Pop-Location }
 }
 Invoke-Step "build xnc-shell.exe (shellhost)" {
-    Push-Location (Join-Path $root "shellhost")
+    Push-Location (Join-Path $src "shellhost")
     try { go build -o (Join-Path $bin "xnc-shell.exe") . }
     finally { Pop-Location }
 }
@@ -54,7 +57,7 @@ Invoke-Step "build xnc-shell.exe (shellhost)" {
 # 永远全量重建。
 if (-not ($ReuseNative -and (Test-Path (Join-Path $bin "xnc-core.exe")))) {
     Invoke-Step "build xnc-core.exe" {
-        $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c build.bat" -WorkingDirectory (Join-Path $root "native\core") -NoNewWindow -Wait -PassThru
+        $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c build.bat" -WorkingDirectory (Join-Path $src "native\core") -NoNewWindow -Wait -PassThru
         $global:LASTEXITCODE = $p.ExitCode
     }
 } else { Write-Output "build.ps1: reuse cached xnc-core.exe" }
@@ -68,7 +71,7 @@ if (-not ($ReuseNative -and (Test-Path (Join-Path $bin "xnc-host.exe")))) {
     if (-not $env:VCPKG_ROOT) { throw "xnc-host build needs VCPKG_ROOT (x64-windows-static with ffmpeg[amf,nvcodec,qsv] + libyuv)" }
     if (-not $env:LIBCLANG_PATH) { throw "xnc-host build needs LIBCLANG_PATH (bindgen)" }
     Invoke-Step "build xnc-host.exe (cargo release)" {
-        Push-Location (Join-Path $root "host")
+        Push-Location (Join-Path $src "host")
         try {
             cargo build --release
             if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }

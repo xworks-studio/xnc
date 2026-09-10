@@ -11,12 +11,12 @@ dist/
 target/
 node_modules/
 
-# go:embed 编译期占位：server/web/dist 需入库（web_embed.go 引用），
+# go:embed 编译期占位：src/server/web/dist 需入库（web_embed.go 引用），
 # 但只跟踪占位文件；真实 Vite 产物（assets/* 等）仍忽略。
-!server/web/dist/
-server/web/dist/*
-!server/web/dist/index.html
-!server/web/dist/.gitkeep
+!src/server/web/dist/
+src/server/web/dist/*
+!src/server/web/dist/index.html
+!src/server/web/dist/.gitkeep
 
 # IDE / 系统
 .idea/
@@ -34,11 +34,11 @@ __pycache__/
 artifacts/
 
 # 代码签名私钥（仅本地，勿入库）
-installer/codesign.pfx
+src/installer/codesign.pfx
 
 # Rust（xnc-host / vendored scrap）
-host/target/
-third_party/scrap/src/generated/
+src/host/target/
+src/third_party/scrap/src/generated/
 
 # RTV 研究期 MVP 源（已迁移进 host/server/web；原品保留于 desktop-reserch）
 mvp/
