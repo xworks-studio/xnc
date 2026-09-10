@@ -23,6 +23,10 @@ src/server/web/dist/*
 .vscode/
 *.log
 
+# 会话工作区产物（ZCode 计划文件 / superpowers 任务报告——本机留存，不入库）
+.zcode/
+.superpowers/
+
 .worktrees/
 
 /bin/
