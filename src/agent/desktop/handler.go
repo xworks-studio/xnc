@@ -25,6 +25,7 @@ import (
 	"golang.org/x/sys/windows"
 
 	"xnc/agent/coreclient"
+	"xnc/agent/display"
 	"xnc/proto"
 )
 
@@ -50,6 +51,12 @@ type Handler struct {
 	secret []byte
 	nodeID string
 
+	// display 虚拟显示器管理器（nil = 功能未启用，零行为变化；测试/非
+	// Windows 传 nil）。会话开始触发建屏（盒盖/无物理输出），会话结束
+	// 自动移除——顺序：先建屏后 StartCapture（host 枚举时屏须在位）、
+	// 先 StopCapture 后拆屏（避免 host 采集正在消失的显示器）。
+	display *display.Manager
+
 	mu       sync.Mutex
 	client   *coreclient.Client
 	sessions map[string]bool // sessionID → 活跃（引用计数）
@@ -58,7 +65,7 @@ type Handler struct {
 // NewHandler 生产入口：凭据 = env（优先，dev-console 保持既有语义）→
 // 生产缺省（XNCCore 服务约定，core-secret.hex）。拿不到凭据返回 nil
 // （desktop kind 不注册，零行为变化）。
-func NewHandler(stateDir, nodeID string, log *slog.Logger) *Handler {
+func NewHandler(stateDir, nodeID string, log *slog.Logger, dsp *display.Manager) *Handler {
 	pipe, secret, err := coreclient.ResolveCoreEndpoint(stateDir)
 	if err != nil {
 		if log == nil {
@@ -71,7 +78,7 @@ func NewHandler(stateDir, nodeID string, log *slog.Logger) *Handler {
 		log = slog.Default()
 	}
 	return &Handler{Log: log, pipe: pipe, secret: secret, nodeID: nodeID,
-		sessions: map[string]bool{}}
+		display: dsp, sessions: map[string]bool{}}
 }
 
 // ensureClientLocked 返回活的 core 连接（探活失败即重拨）。调用方持 mu。
@@ -109,6 +116,12 @@ func (h *Handler) SessionStart(ctx context.Context, sessionID string, params jso
 	wts := p.WTSSession
 	if wts == 0 {
 		wts = windows.WTSGetActiveConsoleSessionId()
+	}
+
+	// 虚拟显示器：先于 StartCapture 触发（host spawn 后枚举显示器时虚拟屏
+	// 须已在位；触发条件 = 盒盖/无物理输出/调试旋钮，见 display 包）。
+	if h.display != nil {
+		h.display.SessionStarted()
 	}
 
 	h.mu.Lock()
@@ -155,6 +168,10 @@ func (h *Handler) release(sessionID string) {
 	}
 	if err := c.StopCapture(); err != nil {
 		h.log().Warn("desktop: stop_capture failed", "err", err)
+	}
+	// 拆虚拟屏在 host 停止之后（host 已不在采集，移除显示器无影响）。
+	if h.display != nil {
+		h.display.SessionEnded()
 	}
 	h.log().Info("desktop host stopped (last session closed)")
 }

@@ -21,6 +21,7 @@ import (
 	"xnc/agent/binding"
 	"xnc/agent/connect"
 	"xnc/agent/desktop"
+	"xnc/agent/display"
 	"xnc/agent/enroll"
 	"xnc/agent/identity"
 	"xnc/agent/machineinfo"
@@ -54,6 +55,11 @@ type Agent struct {
 	// op 的在途判据（§9.3 串行化）。
 	upgradeMu sync.Mutex
 	upgrading bool
+
+	// display：虚拟显示器管理器（懒初始化；display op / desktop 会话钩子
+	// 共用；agent 退出时 Close 拆除设备——Handle 生命周期兜底）。
+	displayMu sync.Mutex
+	display   *display.Manager
 }
 
 // rebindCh 返回（必要时创建）唤醒通道。
@@ -222,6 +228,9 @@ func (a *Agent) idleAwaitRegistration(ctx context.Context) (*binding.Binding, er
 }
 
 func (a *Agent) Run(ctx context.Context) error {
+	// 虚拟显示器管理器（懒初始化；Close 收线时拆除设备——Handle 生命周期
+	// 兜底保证 agent 崩溃也不残留虚拟屏）。
+	defer a.closeDisplay()
 	// 控制管道（spec §6.3）：空转期等待注册指令 / 运行期处理 deregister 与
 	// status。失败仅记日志（agent 主功能不因此阻断）。
 	a.startCtlPipe(ctx)
@@ -324,7 +333,8 @@ func (a *Agent) runConnected(ctx context.Context, b *binding.Binding) error {
 		// desktop(RTV thin):凭据 = env(dev)→ 生产缺省(XNCCore 服务的
 		// \\.\pipe\xnc-core + <StateDir>\core-secret.hex)；nodeId 取注册
 		// 身份(host 向 relay 注册用)。缺省零行为变化(refused 路径不变)。
-		if dh := desktop.NewHandler(a.StateDir, k.NodeID, slog.Default()); dh != nil {
+		// display 管理器供会话钩子触发/移除虚拟显示器（IDD）。
+		if dh := desktop.NewHandler(a.StateDir, k.NodeID, slog.Default(), a.displayMgr()); dh != nil {
 			engine.Register(proto.KindDesktop, dh)
 		}
 		c.Handler = engine
@@ -366,6 +376,57 @@ func (a *Agent) runConnected(ctx context.Context, b *binding.Binding) error {
 }
 
 // ---- agentctl 控制管道操作（spec §6.2/§6.3/§7；agentctl.Deps 实现）----
+
+// displayMgr 懒初始化虚拟显示器管理器（进程级单例；display op 与 desktop
+// 会话钩子共用同一状态机）。
+func (a *Agent) displayMgr() *display.Manager {
+	a.displayMu.Lock()
+	defer a.displayMu.Unlock()
+	if a.display == nil {
+		a.display = display.NewManager(slog.Default())
+	}
+	return a.display
+}
+
+// closeDisplay agent 退出收线：拆除设备（Handle 生命周期兜底由 OS 保证，
+// 此处显式收线让退出路径干净可测）。
+func (a *Agent) closeDisplay() {
+	a.displayMu.Lock()
+	defer a.displayMu.Unlock()
+	if a.display != nil {
+		a.display.Close()
+	}
+}
+
+// Display 实现 agentctl.Deps（虚拟显示器本地控制）：on = 手动开并保持；
+// off = 移除；status = 只读快照。驱动未装（idd 组件未装/装失败）时 on
+// 返回 not_installed（status 恒成功——诊断入口不受影响）。
+func (a *Agent) Display(_ context.Context, action string) (*agentctl.DisplayInfo, error) {
+	m := a.displayMgr()
+	switch action {
+	case agentctl.DisplayActionOn:
+		if err := m.SetOn(); err != nil {
+			return nil, err
+		}
+	case agentctl.DisplayActionOff:
+		m.SetOff()
+	case agentctl.DisplayActionStatus:
+	default:
+		return nil, fmt.Errorf("bad_request: action must be on, off or status")
+	}
+	st := m.Snapshot()
+	return &agentctl.DisplayInfo{
+		DriverInstalled: st.DriverInstalled,
+		DevicePresent:   st.DevicePresent,
+		VirtualActive:   st.VirtualActive,
+		PhysicalActive:  st.PhysicalActive,
+		LidClosed:       st.LidClosed,
+		LidKnown:        st.LidKnown,
+		ForceLid:        st.ForceLid,
+		AutoActive:      st.AutoActive,
+		ManualActive:    st.ManualActive,
+	}, nil
+}
 
 // loadOrCreateIdentity 加载本机身份，不存在则生成（NodeID 空，注册成功后
 // 回写）。身份生成必须在 agent 进程内（SYSTEM 上下文的 DPAPI 保护；CLI 永不

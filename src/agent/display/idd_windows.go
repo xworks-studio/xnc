@@ -1,0 +1,405 @@
+//go:build windows
+
+// idd_windows.go — Windows 后端：SwDeviceCreate 动态设备 + 设备接口
+// IOCTL 热插拔 + 显示器枚举 + 驱动包检测。协议逐字节镜像 vendored
+// src/third_party/xncidd（Public.h / IddController.c，2026-09-10）。
+package display
+
+import (
+	"crypto/rand"
+	"fmt"
+	"strings"
+	"syscall"
+	"time"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
+)
+
+var (
+	modSetupAPI = windows.NewLazySystemDLL("setupapi.dll")
+	modSwDevice = windows.NewLazySystemDLL("swdevice.dll")
+	modUser32   = windows.NewLazySystemDLL("user32.dll")
+
+	procSetupDiGetClassDevsW             = modSetupAPI.NewProc("SetupDiGetClassDevsW")
+	procSetupDiEnumDeviceInterfaces      = modSetupAPI.NewProc("SetupDiEnumDeviceInterfaces")
+	procSetupDiGetDeviceInterfaceDetailW = modSetupAPI.NewProc("SetupDiGetDeviceInterfaceDetailW")
+	procSetupDiDestroyDeviceInfoList     = modSetupAPI.NewProc("SetupDiDestroyDeviceInfoList")
+	procSwDeviceCreate                   = modSwDevice.NewProc("SwDeviceCreate")
+	procSwDeviceClose                    = modSwDevice.NewProc("SwDeviceClose")
+	procEnumDisplayDevicesW              = modUser32.NewProc("EnumDisplayDevicesW")
+)
+
+// guidDevInterfaceXncIdd 设备接口 GUID（XNC 生成，见 XncIddDriver/Driver.cpp）。
+var guidDevInterfaceXncIdd = windows.GUID{
+	Data1: 0x0b6910e4, Data2: 0xb09f, Data3: 0x48a9,
+	Data4: [8]byte{0x85, 0x13, 0x66, 0x28, 0x41, 0x5e, 0x1b, 0x45},
+}
+
+// IOCTL 码 = CTL_CODE(IOCTL_CHANGER_BASE=0x30, fn, METHOD_BUFFERED,
+// FILE_READ_ACCESS|FILE_WRITE_ACCESS)，与上游 Public.h 逐字节一致。
+const (
+	ioctlPlugIn  = 0x0030C404 // 0x1001
+	ioctlPlugOut = 0x0030C408 // 0x1002
+)
+
+const (
+	deviceDescription         = "XWorks XNC Virtual Display"
+	hwIDXncIdd                = "XncIdd"
+	swDeviceCapRemovable      = 0x10
+	swDeviceCapSilentInstall  = 0x04
+	swDeviceCapDriverRequired = 0x02
+
+	digcfPresent            = 0x02
+	digcfDeviceInterface    = 0x10
+	errorInsufficientBuffer = syscall.Errno(122)
+
+	displayDeviceActive    = 0x1
+	displayDeviceMirroring = 0x8
+
+	// 驱动包 store 注册表（pnputil 入包后存在；键名 <inf>_<arch>_<hash>）。
+	driverPackagesKey = `SYSTEM\DriverDatabase\DriverPackages`
+	// 调试旋钮（契约 4 的 XNC_* 惯例）：注册表环境，值 open|closed。
+	forceLidValue = "XNC_IDD_FORCE_LID"
+	envRegKey     = `SYSTEM\CurrentControlSet\Control\Session Manager\Environment`
+)
+
+// ---- SwDeviceCreate（异步 + 回调，镜像 IddController.c DeviceCreate）----
+
+type swDeviceCreateInfo struct {
+	cbSize       uint32
+	_            uint32
+	instanceID   *uint16
+	hwIDs        *uint16
+	compIDs      *uint16
+	containerID  *windows.DEVPROPKEY
+	capFlags     byte // BOOLEAN
+	_            [7]byte
+	description  *uint16
+	location     *uint16
+	securityDesc *windows.DEVPROPKEY
+}
+
+type createCallbackCtx struct {
+	event     windows.Handle
+	hSwDevice uintptr
+	hr        uintptr
+}
+
+// createCtx 是 SwDeviceCreate 回调上下文（package 级单例：Manager 在
+// 互斥锁内串行调用，无并发使用——避免回调参数 uintptr→Pointer 转换）。
+var createCtx createCallbackCtx
+
+var createCallback = windows.NewCallback(func(hSwDevice, hr, _, _ uintptr) uintptr {
+	createCtx.hSwDevice = hSwDevice
+	createCtx.hr = hr
+	windows.SetEvent(createCtx.event)
+	return 0
+})
+
+// swDeviceCreate 创建软件设备（Handle 生命周期）。返回的句柄由调用方
+// 持至关闭；句柄关闭设备即被 PnP 移除。
+func swDeviceCreate() (uintptr, error) {
+	instanceID, err := windows.UTF16PtrFromString(hwIDXncIdd)
+	if err != nil {
+		return 0, err
+	}
+	hwIDs, err := windows.UTF16PtrFromString(hwIDXncIdd + "\x00\x00")
+	if err != nil {
+		return 0, err
+	}
+	desc, err := windows.UTF16PtrFromString(deviceDescription)
+	if err != nil {
+		return 0, err
+	}
+	enumName, _ := windows.UTF16PtrFromString(hwIDXncIdd)
+	parent, _ := windows.UTF16PtrFromString(`HTREE\ROOT\0`)
+
+	info := swDeviceCreateInfo{
+		cbSize:      uint32(unsafe.Sizeof(swDeviceCreateInfo{})),
+		instanceID:  instanceID,
+		hwIDs:       hwIDs,
+		compIDs:     hwIDs,
+		capFlags:    swDeviceCapRemovable | swDeviceCapSilentInstall | swDeviceCapDriverRequired,
+		description: desc,
+	}
+
+	event, err := windows.CreateEvent(nil, 0, 0, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer windows.CloseHandle(event)
+	createCtx = createCallbackCtx{event: event}
+
+	var h uintptr
+	r1, _, e1 := procSwDeviceCreate.Call(
+		uintptr(unsafe.Pointer(enumName)),
+		uintptr(unsafe.Pointer(parent)),
+		uintptr(unsafe.Pointer(&info)),
+		0, 0,
+		createCallback,
+		0,
+		uintptr(unsafe.Pointer(&h)),
+	)
+	if r1 != 0 { // HRESULT != S_OK
+		return 0, fmt.Errorf("display: SwDeviceCreate failed 0x%x (%v)", uint32(r1), e1)
+	}
+	res, err := windows.WaitForSingleObject(event, 10000)
+	if err != nil || res != windows.WAIT_OBJECT_0 {
+		return 0, fmt.Errorf("display: SwDeviceCreate callback wait failed (res=%d err=%v)", res, err)
+	}
+	if createCtx.hr != 0 {
+		return 0, fmt.Errorf("display: SwDeviceCreate device creation failed 0x%x", uint32(createCtx.hr))
+	}
+	return createCtx.hSwDevice, nil
+}
+
+func swDeviceCloseHandle(h uintptr) {
+	procSwDeviceClose.Call(h)
+}
+
+// ---- 设备接口枚举 + CreateFile（镜像 IddController.c GetDevicePath2）----
+
+type spDeviceInterfaceData struct {
+	cbSize             uint32
+	interfaceClassGUID windows.GUID
+	flags              uint32
+	reserved           uintptr
+}
+
+type spDeviceInterfaceDetailData struct {
+	cbSize     uint32
+	devicePath [1]uint16
+}
+
+// openDeviceInterface 枚举 GUID 设备接口并打开（share=0）。
+func openDeviceInterface() (windows.Handle, error) {
+	info, _, e1 := procSetupDiGetClassDevsW.Call(
+		uintptr(unsafe.Pointer(&guidDevInterfaceXncIdd)),
+		0, 0,
+		digcfPresent|digcfDeviceInterface,
+	)
+	if info == 0 || info == ^uintptr(0) {
+		return 0, fmt.Errorf("display: SetupDiGetClassDevs failed (%v)", e1)
+	}
+	defer procSetupDiDestroyDeviceInfoList.Call(info)
+
+	data := spDeviceInterfaceData{cbSize: uint32(unsafe.Sizeof(spDeviceInterfaceData{}))}
+	r1, _, e1 := procSetupDiEnumDeviceInterfaces.Call(
+		info, 0, uintptr(unsafe.Pointer(&guidDevInterfaceXncIdd)), 0,
+		uintptr(unsafe.Pointer(&data)),
+	)
+	if r1 == 0 {
+		return 0, fmt.Errorf("display: no XncIdd device interface present (%v)", e1)
+	}
+
+	var req uint32
+	r1, _, e1 = procSetupDiGetDeviceInterfaceDetailW.Call(
+		info, uintptr(unsafe.Pointer(&data)), 0, 0,
+		uintptr(unsafe.Pointer(&req)), 0,
+	)
+	if r1 != 0 || req == 0 || e1 != errorInsufficientBuffer {
+		return 0, fmt.Errorf("display: SetupDiGetDeviceInterfaceDetail probe failed (r=%d err=%v)", r1, e1)
+	}
+
+	buf := make([]byte, req)
+	detail := (*spDeviceInterfaceDetailData)(unsafe.Pointer(&buf[0]))
+	detail.cbSize = uint32(unsafe.Sizeof(spDeviceInterfaceDetailData{}))
+	r1, _, e1 = procSetupDiGetDeviceInterfaceDetailW.Call(
+		info, uintptr(unsafe.Pointer(&data)),
+		uintptr(unsafe.Pointer(&buf[0])), uintptr(req),
+		uintptr(unsafe.Pointer(&req)), 0,
+	)
+	if r1 == 0 {
+		return 0, fmt.Errorf("display: SetupDiGetDeviceInterfaceDetail failed (%v)", e1)
+	}
+	path := windows.UTF16ToString(unsafe.Slice((*uint16)(unsafe.Pointer(&buf[unsafe.Offsetof(spDeviceInterfaceDetailData{}.devicePath)])), (int(req)-int(unsafe.Offsetof(spDeviceInterfaceDetailData{}.devicePath)))/2))
+	h, err := windows.CreateFile(windows.StringToUTF16Ptr(path),
+		windows.GENERIC_READ|windows.GENERIC_WRITE, 0, nil,
+		windows.OPEN_EXISTING, 0, 0)
+	if err != nil {
+		return 0, fmt.Errorf("display: open device interface: %w", err)
+	}
+	return h, nil
+}
+
+// ---- IOCTL 热插拔（payload 镜像 Public.h CtlPlugIn/CtlPlugOut）----
+
+type ctlPlugIn struct {
+	connectorIndex uint32
+	monitorEDID    uint32
+	containerID    windows.GUID
+}
+
+type ctlPlugOut struct {
+	connectorIndex uint32
+}
+
+func randomGUID() windows.GUID {
+	var g windows.GUID
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err == nil {
+		copy(g.Data4[:], b[8:])
+		g.Data1 = uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
+		g.Data2 = uint16(b[4]) | uint16(b[5])<<8
+		g.Data3 = uint16(b[6]) | uint16(b[7])<<8
+		g.Data3 = (g.Data3 & 0x0FFF) | 0x4000 // v4
+		g.Data4[0] = (g.Data4[0] & 0x3F) | 0x80
+	}
+	return g
+}
+
+func ioctlPlugInMonitor(h uintptr) error {
+	in := ctlPlugIn{connectorIndex: 0, monitorEDID: 0, containerID: randomGUID()}
+	var junk uint32
+	err := windows.DeviceIoControl(windows.Handle(h), ioctlPlugIn,
+		(*byte)(unsafe.Pointer(&in)), uint32(unsafe.Sizeof(in)),
+		nil, 0, &junk, nil)
+	if err != nil {
+		return fmt.Errorf("display: PLUG_IN ioctl: %w", err)
+	}
+	return nil
+}
+
+func ioctlPlugOutMonitor(h uintptr) error {
+	in := ctlPlugOut{connectorIndex: 0}
+	var junk uint32
+	err := windows.DeviceIoControl(windows.Handle(h), ioctlPlugOut,
+		(*byte)(unsafe.Pointer(&in)), uint32(unsafe.Sizeof(in)),
+		nil, 0, &junk, nil)
+	if err != nil {
+		return fmt.Errorf("display: PLUG_OUT ioctl: %w", err)
+	}
+	return nil
+}
+
+// ---- 显示器枚举（EnumDisplayDevicesW）----
+
+type displayDevice struct {
+	cb    uint32
+	name  [32]uint16
+	str   [128]uint16
+	flags uint32
+	id    [128]uint16
+	key   [128]uint16
+}
+
+// enumDisplays 枚举全部显示设备；返回活动物理屏数量与虚拟屏活动标志。
+func enumDisplays() (physicalActive bool, virtualActive bool) {
+	for i := uint32(0); ; i++ {
+		dd := displayDevice{cb: uint32(unsafe.Sizeof(displayDevice{}))}
+		r1, _, _ := procEnumDisplayDevicesW.Call(0, uintptr(i),
+			uintptr(unsafe.Pointer(&dd)), 0)
+		if r1 == 0 {
+			return
+		}
+		if dd.flags&displayDeviceActive == 0 {
+			continue
+		}
+		if windows.UTF16ToString(dd.str[:]) == deviceDescription {
+			virtualActive = true
+			continue
+		}
+		if dd.flags&displayDeviceMirroring != 0 {
+			continue
+		}
+		physicalActive = true
+	}
+}
+
+// ---- 驱动包 store 检测（DriverPackages 注册表）----
+
+// driverPackageInStore 驱动包是否已入 store（键名 xncidd.inf_<arch>_<hash>，
+// pnputil 小写化原始 INF 名）。
+func driverPackageInStore() bool {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, driverPackagesKey, registry.ENUMERATE_SUB_KEYS)
+	if err != nil {
+		return false
+	}
+	defer k.Close()
+	names, err := k.ReadSubKeyNames(0)
+	if err != nil {
+		return false
+	}
+	for _, n := range names {
+		if strings.HasPrefix(strings.ToLower(n), "xncidd") {
+			return true
+		}
+	}
+	return false
+}
+
+// forceLidFromRegistry 读调试旋钮（直接读注册表环境，不经进程环境缓存）。
+func forceLidFromRegistry() string {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, envRegKey, registry.QUERY_VALUE)
+	if err != nil {
+		return ""
+	}
+	defer k.Close()
+	v, _, err := k.GetStringValue(forceLidValue)
+	if err != nil {
+		return ""
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "open":
+		return "open"
+	case "closed":
+		return "closed"
+	}
+	return ""
+}
+
+// ---- backend 装配 ----
+
+type winBackend struct{}
+
+func newBackend() backend { return winBackend{} }
+
+func (winBackend) driverInstalled() bool { return driverPackageInStore() }
+
+func (winBackend) createDevice() (uintptr, error) { return swDeviceCreate() }
+
+func (winBackend) closeDevice(h uintptr) { swDeviceCloseHandle(h) }
+
+func (winBackend) plugMonitor(h uintptr) error {
+	// 设备接口可能在设备创建后瞬间未就绪：镜像上游 10 次重试（1s 间隔）。
+	var lastErr error
+	for i := 0; i < 10; i++ {
+		dev, err := openDeviceInterface()
+		if err != nil {
+			lastErr = err
+			if i < 9 {
+				time.Sleep(time.Second)
+				continue
+			}
+			return lastErr
+		}
+		defer windows.CloseHandle(dev)
+		return ioctlPlugInMonitor(uintptr(dev))
+	}
+	return lastErr
+}
+
+func (winBackend) unplugMonitor(h uintptr) error {
+	dev, err := openDeviceInterface()
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(dev)
+	return ioctlPlugOutMonitor(uintptr(dev))
+}
+
+func (winBackend) physicalOutputActive() bool {
+	p, _ := enumDisplays()
+	return p
+}
+
+func (winBackend) virtualDisplayActive() bool {
+	_, v := enumDisplays()
+	return v
+}
+
+func (winBackend) lidClosed() (bool, bool) { return lidClosedState() }
+
+func (winBackend) forceLid() string { return forceLidFromRegistry() }
