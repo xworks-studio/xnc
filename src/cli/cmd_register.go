@@ -49,6 +49,7 @@ type agentctlReq struct {
 	ClusterID string `json:"clusterId,omitempty"`
 	JWT       string `json:"jwt,omitempty"`
 	Channel   string `json:"channel,omitempty"` // upgrade：目标频道 stable|dev
+	Action    string `json:"action,omitempty"`  // display：on | off | status
 }
 
 // agentctlUpdate 镜像 agent/agentctl.UpdateInfo（status 的在途更新进度，
@@ -59,18 +60,32 @@ type agentctlUpdate struct {
 	To    string `json:"to,omitempty"`
 }
 
+// agentctlDisplay 镜像 agent/agentctl.DisplayInfo（display op 状态载荷）。
+type agentctlDisplay struct {
+	DriverInstalled bool   `json:"driverInstalled"`
+	DevicePresent   bool   `json:"devicePresent"`
+	VirtualActive   bool   `json:"virtualActive"`
+	PhysicalActive  bool   `json:"physicalActive"`
+	LidClosed       bool   `json:"lidClosed"`
+	LidKnown        bool   `json:"lidKnown"`
+	ForceLid        string `json:"forceLid,omitempty"`
+	AutoActive      bool   `json:"autoActive"`
+	ManualActive    bool   `json:"manualActive"`
+}
+
 type agentctlResp struct {
-	OK        bool            `json:"ok"`
-	NodeID    string          `json:"nodeId,omitempty"`
-	State     string          `json:"state,omitempty"`
-	Server    string          `json:"server,omitempty"`
-	ClusterID string          `json:"clusterId,omitempty"`
-	Channel   string          `json:"channel,omitempty"`
-	Version   string          `json:"version,omitempty"`
-	Triggered bool            `json:"triggered"`        // upgrade：false = 已在途（非错误，见 note）
-	Note      string          `json:"note,omitempty"`   // upgrade 在途说明
-	Update    *agentctlUpdate `json:"update,omitempty"` // status：在途更新进度
-	Error     string          `json:"error,omitempty"`
+	OK        bool             `json:"ok"`
+	NodeID    string           `json:"nodeId,omitempty"`
+	State     string           `json:"state,omitempty"`
+	Server    string           `json:"server,omitempty"`
+	ClusterID string           `json:"clusterId,omitempty"`
+	Channel   string           `json:"channel,omitempty"`
+	Version   string           `json:"version,omitempty"`
+	Triggered bool             `json:"triggered"`         // upgrade：false = 已在途（非错误，见 note）
+	Note      string           `json:"note,omitempty"`    // upgrade 在途说明
+	Update    *agentctlUpdate  `json:"update,omitempty"`  // status：在途更新进度
+	Display   *agentctlDisplay `json:"display,omitempty"` // display：状态载荷
+	Error     string           `json:"error,omitempty"`
 }
 
 // agentctlDial 是拨号缝隙（测试换 net.Pipe 假服务端；生产 = winio）。
