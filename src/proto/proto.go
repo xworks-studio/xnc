@@ -47,6 +47,10 @@ const (
 	// relay 在本地 Arbiter 执行 Grant，使外部会话与内嵌 relay-0 的
 	// "首个 viewer 免显式 takeControl" UX 一致，2026-09-11 Stage A）。
 	TypeRelaySessionGrant = "RELAY_SESSION_GRANT"
+	// RELAY_SESSION_CLOSED：relay → server，会话数据腿终局（Stage B 的
+	// session router 双腿断开/对端掉线即报）——server 据此 NotifyClose
+	// 走既有清理路径（等价主站泵的 peer-disconnect 语义）。
+	TypeRelaySessionClosed = "RELAY_SESSION_CLOSED"
 	// RELAY_CONFIG：server → relay，下行票据验签公钥集合（双窗口轮换：
 	// 新旧并存；relay 收到即重建 Verifier）。认证通过后立即下发一次。
 	TypeRelayConfig = "RELAY_CONFIG"
@@ -234,4 +238,13 @@ type RelaySessionGrant struct {
 	SessionID string `json:"sid,omitempty"`
 	NodeID    string `json:"nid,omitempty"`
 	Holder    string `json:"holder,omitempty"`
+}
+
+// RelaySessionClosed 会话数据腿终局（relay → server，Stage B）：session
+// router 的粘合会话任一侧断开即上报（reason 对齐主站泵语义，如
+// peer-disconnect/kill）。server 侧等价 NotifyClose 的触发源。
+type RelaySessionClosed struct {
+	SessionID string `json:"sid,omitempty"`
+	NodeID    string `json:"nid,omitempty"`
+	Reason    string `json:"reason,omitempty"`
 }

@@ -83,6 +83,9 @@ type Manager struct {
 	// touch 活跃会话代触碰（stats 的 ActiveSids → session manager：外部
 	// relay 的 viewer 触碰不出进程，粘合/idle 治理经此旁路）。
 	touch func(sessionID string)
+	// notifyClose 会话数据腿终局（Stage B：RELAY_SESSION_CLOSED → session
+	// manager NotifyClose，等价主站泵的 peer-disconnect）。
+	notifyClose func(sessionID, reason string)
 
 	mu     sync.Mutex
 	conns  map[string]*relayConn // relayID → conn
@@ -95,15 +98,16 @@ type Manager struct {
 // New 构造池管理器；signingPubkey 为 server 票据签名公钥（hex），经
 // RELAY_CONFIG 下发给已认证 relay。
 func New(st *db.Store, cfg config.Config, log *slog.Logger, signingPubkey string,
-	touch func(sessionID string)) *Manager {
+	touch func(sessionID string), notifyClose func(sessionID, reason string)) *Manager {
 	allow := map[string]bool{}
 	for _, k := range cfg.RTVRelayAllowlist {
 		allow[normalizeHex(k)] = true
 	}
 	return &Manager{
-		st: st, cfg: cfg, log: log, allow: allow, pubkey: signingPubkey, touch: touch,
+		st: st, cfg: cfg, log: log, allow: allow, pubkey: signingPubkey,
+		touch: touch, notifyClose: notifyClose,
 		conns: map[string]*relayConn{}, sticky: map[string]string{},
-		stop: make(chan struct{}),
+		stop:  make(chan struct{}),
 	}
 }
 
@@ -255,10 +259,31 @@ func (m *Manager) serveRelay(c *websocket.Conn) {
 				conn.lastBeat = time.Now()
 				conn.sendMu.Unlock()
 			}
+		case proto.TypeRelaySessionClosed:
+			// 会话数据腿终局（Stage B）：relay 泵的 peer-disconnect 等价
+			// 信号 → session manager NotifyClose（幂等；rid 校验由票据/
+			// conn 归属天然保证——只有持有该会话的 relay 会报）。
+			var cl proto.RelaySessionClosed
+			if msg.Decode(&cl) == nil && cl.SessionID != "" {
+				conn.sendMu.Lock()
+				conn.lastBeat = time.Now()
+				conn.sendMu.Unlock()
+				if m.notifyClose != nil {
+					m.notifyClose(cl.SessionID, orDefault(cl.Reason, "peer-disconnect"))
+				}
+			}
 		default:
 			m.log.Debug("rtvpool: unknown relay msg", "type", msg.Type)
 		}
 	}
+}
+
+// orDefault 空串回退（闭环 reason 透传，空 = 对齐主站泵语义）。
+func orDefault(s, d string) string {
+	if s == "" {
+		return d
+	}
+	return s
 }
 
 // register 处理首帧 RELAY_REGISTER：校验 pubkey、幂等入库（新 relay 分配

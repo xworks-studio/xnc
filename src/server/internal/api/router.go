@@ -154,7 +154,7 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 	// relay 池管理器（外部中继）。控制连接挂公开路由（身份 = 注册公钥的
 	// 挑战-应答）；健康探测随 router 生命周期。relay-only 形态这是唯一
 	// 媒体路径的来源。
-	h.pool = rtvpool.New(st, cfg, slog.Default(), rtvSign.PublicKeyHex(), sess.TouchActivity)
+	h.pool = rtvpool.New(st, cfg, slog.Default(), rtvSign.PublicKeyHex(), sess.TouchActivity, sess.NotifyClose)
 	h.pool.Start()
 	r := chi.NewRouter()
 

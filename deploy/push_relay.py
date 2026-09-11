@@ -41,6 +41,9 @@ def main():
     ap.add_argument("--max-sessions", default="100")
     ap.add_argument("--max-mbps-out", default="500")
     ap.add_argument("--unit", default=str(HERE / "xnc-relay.service"))
+    # 会话数据面（Stage B）：对外域名（caddy 前置 + CA）；空 = 不宣告。
+    ap.add_argument("--session-host", default="")
+    ap.add_argument("--session-port", default="443")
     # 多 relay 凭据键前缀（deploy/.env 的 RELAY1_/RELAY2_…；2026-09-11）。
     ap.add_argument("--env-prefix", default="RELAY1_")
     args = ap.parse_args()
@@ -73,7 +76,9 @@ def main():
                 .replace("{{REGION}}", args.region)
                 .replace("{{ALLOW_ORIGIN}}", args.allow_origin)
                 .replace("{{MAX_SESSIONS}}", args.max_sessions)
-                .replace("{{MAX_MBPS_OUT}}", args.max_mbps_out))
+                .replace("{{MAX_MBPS_OUT}}", args.max_mbps_out)
+                .replace("{{SESSION_HOST}}", args.session_host)
+                .replace("{{SESSION_PORT}}", args.session_port))
     sftp = cli.open_sftp()
     with sftp.open("/etc/systemd/system/xnc-relay.service", "w") as f:
         f.write(unit)
