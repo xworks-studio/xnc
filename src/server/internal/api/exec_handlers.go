@@ -43,8 +43,8 @@ func (h *handlers) relaySessionEndpoint(nodeID string) (ep, relayID string, ok b
 	if h.pool == nil {
 		return "", "", false
 	}
-	a, assigned := h.pool.Assign(nodeID)
-	if !assigned {
+	a, ok := h.pool.AssignData(nodeID) // 仅含宣告 sdata 的 relay（粘性独立于媒体）
+	if !ok {
 		return "", "", false
 	}
 	for _, e := range a.Endpoints {

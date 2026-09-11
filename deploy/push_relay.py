@@ -77,8 +77,14 @@ def main():
                 .replace("{{ALLOW_ORIGIN}}", args.allow_origin)
                 .replace("{{MAX_SESSIONS}}", args.max_sessions)
                 .replace("{{MAX_MBPS_OUT}}", args.max_mbps_out)
-                .replace("{{SESSION_HOST}}", args.session_host)
                 .replace("{{SESSION_PORT}}", args.session_port))
+    # 空 session-host 时整行移除（空值会让 Go flag 吞掉下一个旗标——
+    # RELAY2 曾宣告垃圾端点 "--session-port:443"，2026-09-11 踩过）。
+    if not args.session_host:
+        unit = unit.replace("  --session-host {{SESSION_HOST}} \
+", "")
+    else:
+        unit = unit.replace("{{SESSION_HOST}}", args.session_host)
     sftp = cli.open_sftp()
     with sftp.open("/etc/systemd/system/xnc-relay.service", "w") as f:
         f.write(unit)

@@ -87,9 +87,11 @@ type Manager struct {
 	// manager NotifyClose，等价主站泵的 peer-disconnect）。
 	notifyClose func(sessionID, reason string)
 
-	mu     sync.Mutex
-	conns  map[string]*relayConn // relayID → conn
-	sticky map[string]string     // nodeID → relayID（分配粘性）
+	mu         sync.Mutex
+	conns      map[string]*relayConn // relayID → conn
+	sticky     map[string]string     // nodeID → relayID（媒体分配粘性）
+	dataSticky map[string]string     // nodeID → relayID（会话数据面粘性，
+	                                  // 仅含宣告 sdata 的 relay，独立于媒体）
 
 	stop chan struct{}
 	once sync.Once
@@ -106,8 +108,9 @@ func New(st *db.Store, cfg config.Config, log *slog.Logger, signingPubkey string
 	return &Manager{
 		st: st, cfg: cfg, log: log, allow: allow, pubkey: signingPubkey,
 		touch: touch, notifyClose: notifyClose,
-		conns: map[string]*relayConn{}, sticky: map[string]string{},
-		stop:  make(chan struct{}),
+		conns:      map[string]*relayConn{}, sticky: map[string]string{},
+		dataSticky: map[string]string{},
+		stop:       make(chan struct{}),
 	}
 }
 
@@ -474,6 +477,51 @@ func (m *Manager) Assign(nodeID string) (Assignment, bool) {
 	}
 	m.sticky[nodeID] = best.id
 	return best.assignmentLocked(), true
+}
+
+// AssignData 为节点的会话数据面（exec/shell/file/tunnel，Stage B）选
+// relay：仅考虑宣告了 sdata 端点的合格 relay；粘性独立于媒体分配（媒体
+// 可用任意 relay，数据面必须有域名端点——两类可用集不同，混用会把 exec
+// 锁死在无 sdata 的 sticky 上）。空 = 无可用（主站旧路径）。
+func (m *Manager) AssignData(nodeID string) (Assignment, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	eligible := make([]*relayConn, 0, len(m.conns))
+	for _, c := range m.conns {
+		if c.eligibleLocked(now) && hasSdata(c.endpoints) {
+			eligible = append(eligible, c)
+		}
+	}
+	if len(eligible) == 0 {
+		return Assignment{}, false
+	}
+	if rid, ok := m.dataSticky[nodeID]; ok {
+		for _, c := range eligible {
+			if c.id == rid {
+				return c.assignmentLocked(), true
+			}
+		}
+	}
+	best := eligible[0]
+	bestLoad := best.loadNormLocked()
+	for _, c := range eligible[1:] {
+		if l := c.loadNormLocked(); l < bestLoad {
+			best, bestLoad = c, l
+		}
+	}
+	m.dataSticky[nodeID] = best.id
+	return best.assignmentLocked(), true
+}
+
+// hasSdata 端点表含可用的会话数据端点。
+func hasSdata(eps []proto.EndpointDesc) bool {
+	for _, e := range eps {
+		if e.Transport == "sdata" && e.Host != "" && e.Port > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *relayConn) assignmentLocked() Assignment {
