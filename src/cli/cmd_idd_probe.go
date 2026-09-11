@@ -51,25 +51,39 @@ func newIddProbeCmd() *cobra.Command {
 	}
 }
 
+// probeDisplays 两级枚举：NULL 级 = 适配器视图（合盖时其标志不变，
+// 2026-09-11 YOGA9 70 样本实测恒 true——面板 EDID 掉线不反映到这一层）；
+// 监视器级（lpDevice = \\.\DISPLAYn）才反映面板在位——合盖时监视器条目
+// 从枚举消失（用户 watch-display.ps1 实证 = 这类无 lid 事件机器上的
+// 合盖信号）。total/physicalActive/virtualActive 均按监视器计。
 func probeDisplays() (total int, physicalActive, virtualActive bool) {
 	procEnum := windows.NewLazySystemDLL("user32.dll").NewProc("EnumDisplayDevicesW")
 	for i := uint32(0); ; i++ {
-		dd := iddDisplayDevice{cb: uint32(unsafe.Sizeof(iddDisplayDevice{}))}
-		r1, _, _ := procEnum.Call(0, uintptr(i), uintptr(unsafe.Pointer(&dd)), 0)
+		dev := iddDisplayDevice{cb: uint32(unsafe.Sizeof(iddDisplayDevice{}))}
+		r1, _, _ := procEnum.Call(0, uintptr(i), uintptr(unsafe.Pointer(&dev)), 0)
 		if r1 == 0 {
 			return
 		}
-		total++
-		if dd.flags&iddDisplayDeviceActive == 0 {
-			continue
+		// lpDevice 指向本适配器的 \\.\DISPLAYn 名（本地数组，调用期间有效）。
+		for j := uint32(0); ; j++ {
+			mon := iddDisplayDevice{cb: uint32(unsafe.Sizeof(iddDisplayDevice{}))}
+			r2, _, _ := procEnum.Call(uintptr(unsafe.Pointer(&dev.name[0])), uintptr(j),
+				uintptr(unsafe.Pointer(&mon)), 0)
+			if r2 == 0 {
+				break
+			}
+			total++
+			if mon.flags&iddDisplayDeviceActive == 0 {
+				continue
+			}
+			if windows.UTF16ToString(mon.str[:]) == virtualDisplayName {
+				virtualActive = true
+				continue
+			}
+			if mon.flags&iddDisplayDeviceMirroring != 0 {
+				continue
+			}
+			physicalActive = true
 		}
-		if windows.UTF16ToString(dd.str[:]) == virtualDisplayName {
-			virtualActive = true
-			continue
-		}
-		if dd.flags&iddDisplayDeviceMirroring != 0 {
-			continue
-		}
-		physicalActive = true
 	}
 }
