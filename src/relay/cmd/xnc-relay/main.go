@@ -311,12 +311,26 @@ func controlSession(ctx context.Context, serverURL, relayID, pubHex string, priv
 		_ = send(proto.Message{Type: proto.TypeRelayStats, Payload: mustJSON(st)})
 	})
 	defer stats.stop()
-	heartbeat := time.NewTicker(30 * time.Second)
-	defer heartbeat.Stop()
+	// 心跳独立 goroutine（2026-09-11 修）：原实现把 ticker 检查挂在读循环
+	// 尾部——server 不主动发消息时读阻塞、心跳永不发出，控制连接每 90s
+	// 读超时断连重连（journal 周期性 flap 的根因，分配资格随之振荡）。
+	hbStop := make(chan struct{})
+	defer close(hbStop)
+	go func() {
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-hbStop:
+				return
+			case <-t.C:
+				_ = send(proto.Message{Type: proto.TypeRelayHeartbeat,
+					Payload: mustJSON(proto.RelayHeartbeat{ClockUnix: time.Now().Unix()})})
+			}
+		}
+	}()
 	for {
-		readCtx, readCancel := context.WithTimeout(ctx, 90*time.Second)
-		typ, data, err := c.Read(readCtx)
-		readCancel()
+		typ, data, err := c.Read(ctx)
 		if err != nil {
 			return err
 		}
@@ -355,12 +369,6 @@ func controlSession(ctx context.Context, serverURL, relayID, pubHex string, priv
 			// 无载荷。
 		case proto.TypeError:
 			log.Warn("server error frame", "payload", string(msg.Payload))
-		}
-		select {
-		case <-heartbeat.C:
-			_ = send(proto.Message{Type: proto.TypeRelayHeartbeat,
-				Payload: mustJSON(proto.RelayHeartbeat{ClockUnix: time.Now().Unix()})})
-		default:
 		}
 	}
 }

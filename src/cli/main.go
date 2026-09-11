@@ -17,7 +17,7 @@ import (
 	"xnc/proto"
 )
 
-const cliVersion = "0.3.0"
+const cliVersion = "0.3.1"
 
 // defaultServerURL 是 CLI 的固定生产控制面（设计 §3.4）：register/login
 // 不再询问 server；--server 与 XNC_SERVER 仅为开发/测试保留（MarkHidden，
