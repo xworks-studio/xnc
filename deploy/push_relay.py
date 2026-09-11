@@ -41,11 +41,13 @@ def main():
     ap.add_argument("--max-sessions", default="100")
     ap.add_argument("--max-mbps-out", default="500")
     ap.add_argument("--unit", default=str(HERE / "xnc-relay.service"))
+    # 多 relay 凭据键前缀（deploy/.env 的 RELAY1_/RELAY2_…；2026-09-11）。
+    ap.add_argument("--env-prefix", default="RELAY1_")
     args = ap.parse_args()
 
-    env = load_env()
+    env = load_env(args.env_prefix)
     if not env.get("ssh_host"):
-        sys.exit("deploy/.env missing RELAY1_SSH_HOST")
+        sys.exit(f"deploy/.env missing {args.env_prefix}SSH_HOST")
     host = env["ssh_host"]
     user = env.get("ssh_user", "root")
     password = env.get("ssh_password", "")
