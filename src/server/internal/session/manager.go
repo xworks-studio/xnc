@@ -92,6 +92,10 @@ type session struct {
 	glued    bool
 	ttl      *time.Timer
 
+	// relayRouted（Stage B）：会话数据双腿经外置 relay（MarkRelayRouted
+	// 置位）；主站不泵、不期待 attach，活跃/终局信号来自 relay 控制连接。
+	relayRouted bool
+
 	finish      func(reason string)
 	notifyAgent func(sc proto.SessionClose) error
 	closeOnce   sync.Once
@@ -483,6 +487,24 @@ func (m *Manager) TouchActivity(sessionID string) {
 	m.mu.Unlock()
 	if s != nil {
 		s.lastActivity.Store(time.Now().UnixNano())
+	}
+}
+
+// MarkRelayRouted 标记 relay 数据面会话（2026-09-11 Stage B）：会话双腿
+// 不回主站（经外置 relay 的 session router 粘合），Opening TTL 停臂——
+// 活跃信号 = relay STATS ActiveSids 代 Touch，终局 = RELAY_SESSION_CLOSED
+// → NotifyClose（等价主站泵的 peer-disconnect）。desktop 不适用（RTV 专腿）。
+func (m *Manager) MarkRelayRouted(sessionID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.sessions[sessionID]
+	if s == nil {
+		return
+	}
+	s.relayRouted = true
+	s.glued = true // 双腿在外粘合：主站不再期待 attach
+	if s.ttl != nil {
+		s.ttl.Stop()
 	}
 }
 

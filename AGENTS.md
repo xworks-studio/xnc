@@ -28,6 +28,9 @@ XNC = Windows 节点远程管理平台：Go server（xnc.app）+ Windows agent
        server rtvpool 注册/审批/健康探测/节点粘性+负载评分分配；无可用
        relay → desktop 503 RTV_NO_RELAY；内嵌 relay-0 仅 dev/过渡
        （XNC_RTV_EMBEDDED=true）
+     会话数据面（Stage B，2026-09-11）：exec/shell/file/tunnel 的 WS 双腿
+       走 relay session router（sdata 票据；域名+caddy 前置为激活前置，
+       未宣告时回落主站旧路径——存量端零改动）
      状态：ProgramData\XNC（binding/identity/回滚缓存）；用户会话：~/.xnc
      用户流：装安装器（零凭据）→ xnc register（登录→选 cluster→秒级上线）
 ```

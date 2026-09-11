@@ -307,4 +307,32 @@ XNC_RTV_RELAY_ALLOWLIST=<hex> # 可选（免审批）
 # XNC_RTV_ENDPOINT/HOST_ADDR/WT_ADDR/CERT_FILE/KEY_FILE/WT_PORT 均仅
 # 内嵌模式生效，relay-only 下忽略（配置了会告警提示）
 ```
+
+## 7. 会话数据面走 relay（2026-09-11 Stage B）
+
+exec/shell/file/tunnel 的会话 WS 双腿也迁到 xnc-relay（主站彻底只剩
+web/认证/编排信令）：
+
+- **协议**：relay HTTP 腿新增 `/api/agent/session?token=`（agent 腿）与
+  `/api/session/{sid}?token=`（客户端腿），路径与主站同形——agent 引擎、
+  CLI、web（toWsUrl 透传绝对地址）对 URL 形态零假设，**存量端零改动**。
+  准入 = sdata 票据（ed25519，sid 粒度，sub=agent/client 区分腿）；
+  粘合后帧不透明双向泵（复刻主站 pump 语义：8MiB 读限、任一腿断即终局）。
+- **活跃/终局**：relay STATS 的 ActiveSids 并入会话数据 sid → server 代
+  Touch（idle 治理）；泵终局上报 RELAY_SESSION_CLOSED → server
+  NotifyClose（peer-disconnect 等价）；server 撤销（SessionKill）同步关
+  relay 侧双腿 + 墓碑。
+- **server 双路径**：startSession 对非 desktop kind 经 pool.Assign 找
+  sdata 端点——有则签发双腿票据、SESSION_OPEN.WsURL 与 202 websocketUrl
+  改指 relay（MarkRelayRouted：Opening TTL 停臂，双腿不回主站）；无
+  （relay 未宣告/池空）= 主站旧路径，行为不变。节点粘性与桌面媒体共享
+  （同 node 全 kind 同 relay）。
+- **激活前置（硬性）**：浏览器/CLI 的 WS 腿无法钉扎自签证书——relay 需
+  **域名 + caddy（或 --http-cert CA 证书对）**。DNS（如 r1.xnc.app →
+  relay IP）就绪后在 relay 主机装 caddy 反代 TCP443 → 127.0.0.1:8080，
+  再以 `--session-host r1.xnc.app` 重推 relay（push_relay.py 参数）。
+  未宣告 sdata 前一切会话走主站旧路径——**合并/部署零风险，DNS 就绪即
+  接通**。
+- **票据 TTL**：sdata 1h（只在双侧拨号窗口消费）；撤销墓碑复用
+  RELAY_SESSION_KILL 通道。
 ```

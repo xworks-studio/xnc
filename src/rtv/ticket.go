@@ -29,9 +29,13 @@ import (
 const (
 	ticketV1 = 1
 
-	// TicketHost / TicketViewer 票据角色。
+	// TicketHost / TicketViewer / TicketSessionData 票据角色。
 	TicketHost   = "host"
 	TicketViewer = "viewer"
+	// TicketSessionData 会话数据腿票据（2026-09-11 Stage B）：exec/shell/
+	// file/tunnel 的会话 WS 走 relay 时的双腿凭证——agent 腿 sub="agent"、
+	// 客户端腿 sub="client"（sub 编码于 Name 字段复用线格式）。
+	TicketSessionData = "sdata"
 
 	// ticketLeeway 时钟偏差容忍（spec §3.1）：relay 以本地时钟验 exp，
 	// 廉价 VPS 漂移不误拒；漂移观测（心跳携带时钟）由控制连接承担。
@@ -142,6 +146,18 @@ func (s *Signer) ViewerTicket(sessionID, nodeID, relayID, name string, control, 
 	return mint(&ticketClaims{
 		V: ticketV1, Typ: TicketViewer, NID: nodeID, SID: sessionID, RID: relayID,
 		Gen: 1, Cap: &ticketCap{Control: control, Input: input}, NM: name,
+		Iat: now.Unix(), Exp: now.Add(ttl).Unix(),
+	}, s.priv)
+}
+
+// SessionDataTicket 铸造会话数据腿票据（Stage B）：sid 粒度、sub 区分
+// agent/client 两条腿。一次性消费由 relay session router 的粘合状态机保证
+// （每侧只许 attach 一次）；撤销走既有墓碑（SessionKill）。
+func (s *Signer) SessionDataTicket(sessionID, nodeID, relayID, sub string, ttl time.Duration) (string, error) {
+	now := time.Now()
+	return mint(&ticketClaims{
+		V: ticketV1, Typ: TicketSessionData, NID: nodeID, SID: sessionID, RID: relayID,
+		Gen: 1, NM: sub,
 		Iat: now.Unix(), Exp: now.Add(ttl).Unix(),
 	}, s.priv)
 }

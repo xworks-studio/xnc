@@ -3,7 +3,11 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"log/slog"
+	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -27,7 +31,29 @@ const (
 	// exec.start 写入发生在 SESSION_OPEN 已下发之后——客户端此刻断连即取消
 	// r.Context()，start 行会丢；exec.finish 更是在 POST 返回很久之后才触发。
 	auditInsertTimeout = 5 * time.Second
+	// sessionTicketTTL（Stage B）：会话数据腿 sdata 票据有效期——只在双侧
+	// 拨号窗口消费（会话建立后票据不再校验），1h 覆盖重试/晚拨余量。
+	sessionTicketTTL = time.Hour
 )
+
+// relaySessionEndpoint 为节点选 relay 数据腿端点（sdata 传输候选）。同一
+// pool.Assign 的节点粘性语义与桌面媒体一致（node→relay 全 kind 统一）。
+// 无 = 主站旧路径。
+func (h *handlers) relaySessionEndpoint(nodeID string) (ep, relayID string, ok bool) {
+	if h.pool == nil {
+		return "", "", false
+	}
+	a, assigned := h.pool.Assign(nodeID)
+	if !assigned {
+		return "", "", false
+	}
+	for _, e := range a.Endpoints {
+		if e.Transport == "sdata" && e.Host != "" && e.Port > 0 {
+			return net.JoinHostPort(e.Host, strconv.Itoa(e.Port)), a.RelayID, true
+		}
+	}
+	return "", "", false
+}
 
 // execReq 的 TimeoutSec 为指针：缺省（nil）→ 默认 300；显式给出则必须
 // 落在 [1, 86400]——显式 0 视为非法（客户端想用默认值应省略字段）。
@@ -147,6 +173,32 @@ func (h *handlers) startSession(w http.ResponseWriter, r *http.Request,
 		return nil, false
 	}
 
+	// relay 数据面（2026-09-11 Stage B）：exec/shell/file/tunnel 的会话
+	// 双腿改经外置 relay 的 session router（sdata 票据即凭证，路径与主站
+	// 同形——agent/CLI 对 URL 无假设，web toWsUrl 透传绝对地址，存量端
+	// 零改动）。desktop 除外（RTV 专腿）。无可用的 sdata 端点（relay 未
+	// 宣告域名数据面/池空）= 主站旧路径，行为不变。
+	var relayFinish func()
+	agentWSURL := wsBaseURL(r) + "/api/agent/session?token=" + res.AgentToken
+	clientWSURL := "/api/session/" + res.Session.ID + "?token=" + res.ClientToken
+	if kind != proto.KindDesktop {
+		if ep, rid, ok := h.relaySessionEndpoint(nodeID.String()); ok {
+			atok, aerr := h.rtvSign.SessionDataTicket(res.Session.ID, nodeID.String(), rid, "agent", sessionTicketTTL)
+			ctok, cerr := h.rtvSign.SessionDataTicket(res.Session.ID, nodeID.String(), rid, "client", sessionTicketTTL)
+			if aerr == nil && cerr == nil {
+				agentWSURL = "wss://" + ep + "/api/agent/session?token=" + atok
+				clientWSURL = "wss://" + ep + "/api/session/" + res.Session.ID + "?token=" + ctok
+				h.sess.MarkRelayRouted(res.Session.ID)
+				relayFinish = func() { // 终局撤销：relay 关腿 + 墓碑（票据不可复活）
+					h.pool.SessionKill(rid, nodeID.String(), res.Session.ID, "session-end")
+				}
+				slog.Info("session routed via relay", "kind", kind, "session", res.Session.ID, "relay", rid)
+			} else {
+				slog.Error("relay: session ticket mint failed; falling back to main-site legs", "err", errors.Join(aerr, cerr))
+			}
+		}
+	}
+
 	// 钩子在 Create 后立即装配（早于任何可触发 NotifyClose 的路径）：
 	// Opening 超时（60s）、pump 断连、SESSION_REFUSED 都可能在 handler
 	// 返回后异步关闭会话，届时 finish/notify 必须已就位。
@@ -160,6 +212,9 @@ func (h *handlers) startSession(w http.ResponseWriter, r *http.Request,
 				"reason": reason, "kind": kind, "sessionId": res.Session.ID,
 			}),
 		})
+		if relayFinish != nil {
+			relayFinish()
+		}
 		if finishExtra != nil {
 			finishExtra(res.Session.ID, reason)
 		}
@@ -185,11 +240,12 @@ func (h *handlers) startSession(w http.ResponseWriter, r *http.Request,
 		return nil, false
 	}
 	// SESSION_OPEN 用 manager 侧 params（desktop 授予时 leaseId 已嵌入；
-	// 与 REST 响应/agent 看到的同一份）。
+	// 与 REST 响应/agent 看到的同一份）。WsURL = relay 数据腿（Stage B）
+	// 或主站旧路径。
 	openMsg, err := proto.NewMsg(proto.TypeSessionOpen, proto.SessionOpen{
 		SessionID: res.Session.ID, Kind: kind, Params: res.Session.Params,
 		AgentToken: res.AgentToken,
-		WsURL:      wsBaseURL(r) + "/api/agent/session?token=" + res.AgentToken,
+		WsURL:      agentWSURL,
 		ExpiresAt:  res.ExpiresAt,
 	})
 	if err != nil {
@@ -215,12 +271,14 @@ func (h *handlers) startSession(w http.ResponseWriter, r *http.Request,
 		UserID: pgUUID(u.ID), NodeID: pgUUID(nodeID), Action: openAction,
 		Metadata: mustJSON(meta),
 	})
-	// AgentToken 绝不进 REST 响应；client 拿到的 token 是一次性 ClientToken。
+	// AgentToken 绝不进 REST 响应；client 拿到的 token 是一次性 ClientToken
+	// （relay 路径下改随 URL 的 sdata 张票，token 字段保留主站旧值仅为
+	// 兼容旧客户端解析——它不会被消费）。
 	body := map[string]any{
 		"sessionId":    res.Session.ID,
 		"token":        res.ClientToken,
 		"expiresAt":    res.ExpiresAt,
-		"websocketUrl": "/api/session/" + res.Session.ID + "?token=" + res.ClientToken,
+		"websocketUrl": clientWSURL,
 	}
 	for k, v := range extra {
 		body[k] = v

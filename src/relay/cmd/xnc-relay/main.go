@@ -70,10 +70,16 @@ func main() {
 		// 生产形态 = 本地明文 + 主机 caddy 前置（ACME/HTTPS，同主站模式）；
 		// 无 caddy 部署可用 --http-cert/--http-key 直启 TLS（需 CA 证书——
 		// 浏览器 WS 无法钉扎自签证书）。空串关闭 HTTP 腿。
-		httpAddr = flag.String("http-addr", "127.0.0.1:8080", "HTTP 腿监听地址（/ws + /healthz；空 = 关闭）")
+		httpAddr = flag.String("http-addr", "127.0.0.1:8080", "HTTP 腿监听地址（/ws + /healthz + 会话数据腿；空 = 关闭）")
 		wsPort   = flag.Int("ws-port", 443, "注册端点：WS 兜底腿对外端口（caddy 前置 = 443）")
 		httpCert = flag.String("http-cert", "", "HTTP 腿直启 TLS 证书（PEM；空 = 明文，由 caddy 前置终结 TLS）")
 		httpKey  = flag.String("http-key", "", "HTTP 腿直启 TLS 私钥（PEM）")
+		// 会话数据面（2026-09-11 Stage B）：exec/shell/file/tunnel 的会话
+		// WS 腿挂本 relay。sessionHost = 浏览器/agent 可达的对外域名（经
+		// caddy CA 证书）——非空才宣告 sdata 端点（server 见到才会把会话
+		// 数据路由到本 relay）；纯 IP 未配域名时不宣告，会话走主站旧路径。
+		sessionHost = flag.String("session-host", "", "会话数据腿对外域名（如 r1.xnc.app；空 = 不宣告会话数据面）")
+		sessionPort = flag.Int("session-port", 443, "注册端点：会话数据腿对外端口（caddy 前置 = 443）")
 	)
 	flag.Parse()
 	if *serverURL == "" || *publicHost == "" {
@@ -122,34 +128,51 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 会话数据路由器（Stage B）：sdata 票据验签 + 双腿粘合泵。rid 经
+	// 闭包取（控制连接回填后才可用；空 = 拒绝接入）。
+	sessRouter := newSessionRouter(verifier, func() string { return srv.RelayID })
+
 	endpoints := []proto.EndpointDesc{
 		{Transport: "wt", Host: *publicHost, Port: *wtPort, Path: "/wt", CertSHA256: certSHA},
 		{Transport: "quic", Host: *publicHost, Port: *hostPort, ALPN: rtv.HostALPN},
 	}
-	// HTTP 腿（/ws 浏览器兜底）：开启即注册 ws 候选（browser 按 wt→ws
-	// 顺序尝试；无 CA 证书的部署 ws 握手必败，viewer 自然回落，无害）。
+	// HTTP 腿（/ws 浏览器兜底 + 会话数据腿 + /healthz）：开启即注册 ws
+	// 候选（browser 按 wt→ws 顺序尝试；无 CA 证书的部署 ws 握手必败，
+	// viewer 自然回落，无害）。会话数据端点（sdata）仅在 --session-host
+	// 给出对外域名时宣告（浏览器/agent WS 均无法钉扎自签——域名 + caddy
+	// CA 是数据腿的硬前置）。
 	if *httpAddr != "" {
-		startHTTPLeg(*httpAddr, *httpCert, *httpKey, srv)
+		startHTTPLeg(*httpAddr, *httpCert, *httpKey, srv, sessRouter)
 		endpoints = append(endpoints, proto.EndpointDesc{
 			Transport: "ws", Host: *publicHost, Port: *wsPort, Path: "/ws",
 		})
+		if *sessionHost != "" {
+			endpoints = append(endpoints, proto.EndpointDesc{
+				Transport: "sdata", Host: *sessionHost, Port: *sessionPort,
+			})
+			log.Info("session data plane advertised", "host", *sessionHost, "port", *sessionPort)
+		}
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	go controlLoop(ctx, *serverURL, relayID, pubHex, priv, endpoints,
-		*region, *maxSessions, *maxMbpsOut, srv, verifier, *dataDir)
+		*region, *maxSessions, *maxMbpsOut, srv, verifier, *dataDir, sessRouter)
 
 	<-ctx.Done()
 	log.Info("xnc-relay shutting down")
 }
 
-// startHTTPLeg 起 HTTP 腿（/ws 兜底 + /healthz）：默认明文本地口（生产由
-// caddy 前置终结 TLS）；--http-cert/--http-key 给出则直启 TLS。
-func startHTTPLeg(addr, certFile, keyFile string, srv *rtv.Server) {
+// startHTTPLeg 起 HTTP 腿（/ws 兜底 + 会话数据腿 + /healthz）：默认明文
+// 本地口（生产由 caddy 前置终结 TLS）；--http-cert/--http-key 给出则直启
+// TLS。会话数据腿挂 /api/agent/session 与 /api/session/{sid}（sdata 票据
+// 即凭证，路径与主站同形——agent/CLI 对 URL 形态无假设）。
+func startHTTPLeg(addr, certFile, keyFile string, srv *rtv.Server, sessRouter *sessionRouter) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", srv.WSHandler())
+	mux.HandleFunc("/api/agent/session", sessRouter.AgentLegHandler())
+	mux.HandleFunc("/api/session/{sid}", sessRouter.ClientLegHandler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -174,7 +197,7 @@ func startHTTPLeg(addr, certFile, keyFile string, srv *rtv.Server) {
 // 断线指数退避重连（2s → 30s），server 重启即重连重注册（软状态重建）。
 func controlLoop(ctx context.Context, serverURL, relayID, pubHex string, priv ed25519.PrivateKey,
 	endpoints []proto.EndpointDesc, region string, maxSessions, maxMbpsOut int,
-	srv *rtv.Server, verifier *rtv.Verifier, dataDir string,
+	srv *rtv.Server, verifier *rtv.Verifier, dataDir string, sessRouter *sessionRouter,
 ) {
 	backoff := 2 * time.Second
 	for {
@@ -182,7 +205,7 @@ func controlLoop(ctx context.Context, serverURL, relayID, pubHex string, priv ed
 			return
 		}
 		if err := controlSession(ctx, serverURL, relayID, pubHex, priv, endpoints,
-			region, maxSessions, maxMbpsOut, srv, verifier, dataDir); err != nil {
+			region, maxSessions, maxMbpsOut, srv, verifier, dataDir, sessRouter); err != nil {
 			log.Warn("control session ended", "err", err)
 		}
 		select {
@@ -199,7 +222,7 @@ func controlLoop(ctx context.Context, serverURL, relayID, pubHex string, priv ed
 
 func controlSession(ctx context.Context, serverURL, relayID, pubHex string, priv ed25519.PrivateKey,
 	endpoints []proto.EndpointDesc, region string, maxSessions, maxMbpsOut int,
-	srv *rtv.Server, verifier *rtv.Verifier, dataDir string,
+	srv *rtv.Server, verifier *rtv.Verifier, dataDir string, sessRouter *sessionRouter,
 ) error {
 	dialCtx, dialCancel := context.WithTimeout(ctx, 15*time.Second)
 	c, _, err := websocket.Dial(dialCtx, serverURL, nil)
@@ -277,8 +300,14 @@ func controlSession(ctx context.Context, serverURL, relayID, pubHex string, priv
 	_ = send(proto.Message{Type: proto.TypeRelayReconcile,
 		Payload: mustJSON(proto.RelayReconcile{Live: rl})})
 
-	// ③ 服务循环 + 心跳/统计上报。
-	stats := newStatsReporter(srv, func(st proto.RelayStats) {
+	// ③ 服务循环 + 心跳/统计上报。会话数据腿的终局上报（Stage B）与
+	// 活跃 sid 集均经本连接；断线即摘回调（控制连接是终局上报的唯一
+	// 通道，断线期终局丢弃——server 的 Opening/idle 兜底收）。
+	sessRouter.closed = func(cl proto.RelaySessionClosed) {
+		_ = send(proto.Message{Type: proto.TypeRelaySessionClosed, Payload: mustJSON(cl)})
+	}
+	defer func() { sessRouter.closed = nil }()
+	stats := newStatsReporter(srv, sessRouter, func(st proto.RelayStats) {
 		_ = send(proto.Message{Type: proto.TypeRelayStats, Payload: mustJSON(st)})
 	})
 	defer stats.stop()
@@ -312,6 +341,7 @@ func controlSession(ctx context.Context, serverURL, relayID, pubHex string, priv
 			var k proto.RelaySessionKill
 			if msg.Decode(&k) == nil {
 				srv.KillSession(k.NodeID, k.SessionID, k.Reason)
+				sessRouter.Kill(k.SessionID, k.Reason) // 会话数据腿同步终局（Stage B）
 				log.Info("session killed", "node", k.NodeID, "reason", k.Reason)
 			}
 		case proto.TypeRelaySessionGrant:
@@ -338,14 +368,15 @@ func controlSession(ctx context.Context, serverURL, relayID, pubHex string, priv
 // ---------------- 统计上报（10s 差分） ----------------
 
 type statsReporter struct {
-	srv   *rtv.Server
-	send  func(proto.RelayStats)
-	stopF chan struct{}
-	once  sync.Once
+	srv         *rtv.Server
+	sessRouter  *sessionRouter
+	send        func(proto.RelayStats)
+	stopF       chan struct{}
+	once        sync.Once
 }
 
-func newStatsReporter(srv *rtv.Server, send func(proto.RelayStats)) *statsReporter {
-	r := &statsReporter{srv: srv, send: send, stopF: make(chan struct{})}
+func newStatsReporter(srv *rtv.Server, sessRouter *sessionRouter, send func(proto.RelayStats)) *statsReporter {
+	r := &statsReporter{srv: srv, sessRouter: sessRouter, send: send, stopF: make(chan struct{})}
 	go r.loop()
 	return r
 }
@@ -376,10 +407,14 @@ func (r *statsReporter) loop() {
 			if secs <= 0 {
 				secs = 10
 			}
-			// 活跃 sid 集：server 侧代触碰（粘合/idle 旁路，见 pool 注释）。
+			// 活跃 sid 集：RTV viewer 会话 + 会话数据腿（Stage B）——
+			// server 侧统一代 Touch（粘合/idle 旁路，见 pool 注释）。
 			active := make([]string, 0)
 			for sid := range r.srv.Hub.ActiveSessions() {
 				active = append(active, sid)
+			}
+			if r.sessRouter != nil {
+				active = append(active, r.sessRouter.ActiveSids()...)
 			}
 			r.send(proto.RelayStats{
 				Sessions: sessions, Viewers: viewers,
