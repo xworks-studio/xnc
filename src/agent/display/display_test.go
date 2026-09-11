@@ -167,6 +167,74 @@ func TestPhysicalHysteresisNeedsTwoSamples(t *testing.T) {
 	}
 }
 
+// waitPlugged 轮询等待插屏完成（1s 轮询 + 2 采样滞回）。
+func waitPlugged(t *testing.T, m *Manager, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		m.mu.Lock()
+		plugged := m.plugged
+		m.mu.Unlock()
+		if plugged {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("virtual display was not plugged in time")
+}
+
+func TestPhysicalReturnUnplugsMidSession(t *testing.T) {
+	f := newFakeBackend()
+	f.physicalActive = false
+	m := newTestManager(f)
+	defer m.Close()
+
+	m.SessionStarted()
+	waitPlugged(t, m, 5*time.Second)
+
+	// 物理屏回归：滞回 2 采样后自动拆屏（会话保持活跃）。
+	f.mu.Lock()
+	f.physicalActive = true
+	f.mu.Unlock()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		m.mu.Lock()
+		plugged := m.plugged
+		m.mu.Unlock()
+		if !plugged {
+			if f.unplugged == 0 {
+				t.Fatal("unplug not invoked on physical return")
+			}
+			st := m.Snapshot()
+			if st.AutoActive {
+				t.Fatalf("autoActive must clear after mid-session release, got %+v", st)
+			}
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("physical return did not unplug within 5s")
+}
+
+func TestLidClosedHoldsDespitePhysicalPresent(t *testing.T) {
+	f := newFakeBackend()
+	f.lidClosedV, f.lidKnownV = true, true // 盒盖触发（物理屏仍在场 = do-nothing 机器）
+	m := newTestManager(f)
+	defer m.Close()
+
+	m.SessionStarted()
+	waitPlugged(t, m, 3*time.Second)
+
+	// 物理维度不能拆掉 lid 触发建立的屏（物理屏始终在场）。
+	time.Sleep(2500 * time.Millisecond)
+	m.mu.Lock()
+	plugged := m.plugged
+	m.mu.Unlock()
+	if !plugged {
+		t.Fatal("lid trigger must hold the display despite physical present")
+	}
+}
+
 func TestForceKnobOpenSuppressesLid(t *testing.T) {
 	f := newFakeBackend()
 	f.lidClosedV, f.lidKnownV = true, true

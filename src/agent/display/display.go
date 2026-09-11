@@ -74,10 +74,11 @@ type Manager struct {
 	autoActive   bool // 会话触发创建的（会话归零即移除）
 	manualActive bool // 手动 on（保持到 off / agent 退出）
 
-	// physicalAbsentStreak 连续"无物理输出"采样数（触发滞回：物理屏
-	// EDID 抖动的机器上避免随拓扑振荡反复建拆——2026-09-11 YOGA9 外接
-	// 屏 4-8s 周期抖动实测，需连续 2 次确认才触发）。
-	physicalAbsentStreak int
+	// physicalAbsentStreak/physicalPresentStreak 连续"无/有物理输出"采样数
+	// （双向触发滞回：物理屏 EDID 抖动的机器上避免随拓扑振荡反复建拆
+	// ——2026-09-11 YOGA9 外接屏 4-8s 周期抖动实测）。
+	physicalAbsentStreak  int
+	physicalPresentStreak int
 
 	stop     chan struct{}
 	stopOnce sync.Once
@@ -106,10 +107,11 @@ func (m *Manager) logger() *slog.Logger {
 }
 
 // poll 会话期间的触发变化（盒盖/拔屏）。双源：lid 电源事件即时信号
-// （合盖→建屏的主路径，不等轮询）+ 3s 轮询兜底（物理输出变化等）。
-// 创建只在会话活跃时发生，移除只发生在会话归零，见策略注释。
+// （合盖→建屏的主路径，不等轮询）+ 1s 轮询兜底（物理输出变化；双向
+// 跟随的切换延迟目标"立刻"，2026-09-11 从 3s 收紧）。
+// 创建只在会话活跃时发生，移除只在触发解除时发生，见策略注释。
 func (m *Manager) poll() {
-	t := time.NewTicker(3 * time.Second)
+	t := time.NewTicker(1 * time.Second)
 	defer t.Stop()
 	for {
 		select {
@@ -123,18 +125,39 @@ func (m *Manager) poll() {
 	}
 }
 
-// reconcile 重评估触发条件（lid 事件/轮询共用）。屏幕只在会话活跃时
-// 创建（用户策略：设备可常驻后台，屏幕仅控制请求接入后才新建）。
+// physicalHysteresis 物理输出采样的滞回门槛（连续 N 次同向才动作）：
+// 物理屏 EDID 抖动的机器上避免拓扑振荡下反复建拆（2026-09-11 YOGA9
+// 外接屏 4-8s 周期抖动实测；1s 轮询下 2 次 ≈ 2s 切换延迟）。
+const physicalHysteresis = 2
+
+// reconcile 重评估触发条件（lid 事件/轮询共用）。双向（2026-09-11）：
+//   - 建屏：会话活跃 + 触发满足（盒盖/无物理输出，滞回后）；
+//   - 拆屏：会话活跃 + 自动建的屏 + 触发解除（开盖事件即时 / 物理屏
+//     回归滞回后）——视频流随 host 采集源立即切回物理屏。
 func (m *Manager) reconcile() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.sessionRefs > 0 && !m.plugged && m.triggerLocked() {
+	if m.sessionRefs == 0 {
+		return
+	}
+
+	// 单次采样物理输出（探针进程 spawn 有开销，两个方向共用一次结果）。
+	physicalActive := m.be.physicalOutputActive()
+	m.updatePhysicalStreaksLocked(physicalActive)
+
+	if !m.plugged && m.triggerWithPhysicalLocked(physicalActive) {
 		if err := m.plugVirtualLocked(); err == nil {
 			m.autoActive = true
 			m.logger().Info("display: virtual display created for session")
 		} else if err != errNotInstalled {
 			m.logger().Warn("display: session-triggered create failed", "err", err)
 		}
+		return
+	}
+	if m.plugged && m.autoActive && !m.manualActive && m.releaseWithPhysicalLocked(physicalActive) {
+		m.unplugLocked()
+		m.autoActive = false
+		m.logger().Info("display: virtual display removed (trigger released mid-session)")
 	}
 }
 
@@ -147,28 +170,68 @@ func (m *Manager) Close() {
 	m.teardownLocked()
 }
 
-// triggerLocked 判定本次是否应创建虚拟屏。调用方持 mu。
-// 无物理输出分支带滞回（连续 2 次采样确认）——物理屏抖动机器上
-// 拓扑反复振荡，单次采样会误触发（2026-09-11 YOGA9 实测）。
-func (m *Manager) triggerLocked() bool {
-	physicalActive := m.be.physicalOutputActive()
+// updatePhysicalStreaksLocked 更新双向滞回计数（连续 physicalHysteresis
+// 次同向采样才动作）。
+func (m *Manager) updatePhysicalStreaksLocked(physicalActive bool) {
 	if physicalActive {
 		m.physicalAbsentStreak = 0
+		m.physicalPresentStreak++
 	} else {
 		m.physicalAbsentStreak++
+		m.physicalPresentStreak = 0
 	}
-	trigger := !physicalActive && m.physicalAbsentStreak >= 2
+}
+
+// physicalTriggerFromLocked 物理维度建屏判定（无物理输出且滞回满足）。
+func (m *Manager) physicalTriggerFromLocked(physicalActive bool) bool {
+	return !physicalActive && m.physicalAbsentStreak >= physicalHysteresis
+}
+
+// physicalReleaseFromLocked 物理维度拆屏判定（物理输出回归且滞回满足）。
+func (m *Manager) physicalReleaseFromLocked(physicalActive bool) bool {
+	return physicalActive && m.physicalPresentStreak >= physicalHysteresis
+}
+
+// triggerWithPhysicalLocked 建屏判定（物理状态已采样；lid/旋钮/物理 OR）。
+func (m *Manager) triggerWithPhysicalLocked(physicalActive bool) bool {
+	trigger := m.physicalTriggerFromLocked(physicalActive)
 	switch m.be.forceLid() {
 	case "closed":
 		trigger = true
 	case "open":
-		// 仅无物理输出触发（headless 机仍可用；盒盖信号被旋钮压制）
+		// 仅物理维度（headless 机仍可用；盒盖信号被旋钮压制）
 	default:
 		if closed, known := m.be.lidClosed(); known && closed {
 			trigger = true
 		}
 	}
 	return trigger
+}
+
+// releaseWithPhysicalLocked 拆屏判定（物理状态已采样）：
+//   - 真实 lid 已知：开盖即时拆、合盖保持（事件即事实，无滞回）；
+//   - lid 未知（无 lid 事件的机器）：物理输出回归且滞回满足才拆；
+//   - 旋钮 closed 强制保持，open 仅按物理维度。
+func (m *Manager) releaseWithPhysicalLocked(physicalActive bool) bool {
+	switch m.be.forceLid() {
+	case "closed":
+		return false // 旋钮强制合盖：保持插屏
+	case "open":
+		// 仅物理维度（headless 机仍可用；盒盖信号被旋钮压制）
+	default:
+		if closed, known := m.be.lidClosed(); known {
+			return !closed // 真实 lid：开盖即拆、合盖保持
+		}
+	}
+	return m.physicalReleaseFromLocked(physicalActive)
+}
+
+// triggerLocked SessionStarted 路径的建屏判定：自行采样一次物理输出
+// （调用方持 mu）。
+func (m *Manager) triggerLocked() bool {
+	physicalActive := m.be.physicalOutputActive()
+	m.updatePhysicalStreaksLocked(physicalActive)
+	return m.triggerWithPhysicalLocked(physicalActive)
 }
 
 // ensureDeviceLocked 设备常驻（用户策略：设备可常驻后台）：进程生命周期

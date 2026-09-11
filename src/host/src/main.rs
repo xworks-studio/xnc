@@ -59,8 +59,10 @@ struct Args {
     /// FEC 百分比（初始值，QoS 可动态调节）
     #[arg(long, default_value_t = 20)]
     fec: u8,
-    /// 显示器序号（0 = 主屏）
-    #[arg(long, default_value_t = 0)]
+    /// 显示器序号（usize::MAX = 跟随主屏）。默认跟随主屏：拓扑切换时
+    /// Windows 把当前激活屏标记为 primary，采集源随重建自动跟随——
+    /// 盒盖建虚拟屏/开盖回归物理屏的双向切换都靠它（2026-09-11）。
+    #[arg(long, default_value_t = usize::MAX)]
     display: usize,
     /// 编码宽度上限（等比降采样；0 = 原生分辨率）。默认 1920：原生 2K/4K
     /// 源的 IDR 数百 KB 会冲垮浏览器新 QUIC 连接的初始拥塞窗口（首帧
