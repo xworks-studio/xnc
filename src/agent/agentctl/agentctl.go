@@ -105,6 +105,7 @@ type DisplayInfo struct {
 	ForceLid        string `json:"forceLid,omitempty"`
 	AutoActive      bool   `json:"autoActive"`
 	ManualActive    bool   `json:"manualActive"`
+	Enabled         bool   `json:"enabled"`
 }
 
 // UpdateInfo status op 的在途更新进度（CLI upgrade 轮询信号，尽力而为：

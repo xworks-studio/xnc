@@ -61,7 +61,9 @@ const (
 
 	// 调试旋钮（契约 4 的 XNC_* 惯例）：注册表环境，值 open|closed。
 	forceLidValue = "XNC_IDD_FORCE_LID"
-	envRegKey     = `SYSTEM\CurrentControlSet\Control\Session Manager\Environment`
+	// 功能总开关（2026-09-11 用户决策：缺省停用）：值 1|true|yes 启用。
+	iddEnabledValue = "XNC_IDD_ENABLED"
+	envRegKey       = `SYSTEM\CurrentControlSet\Control\Session Manager\Environment`
 )
 
 // ---- 设备接口枚举 + CreateFile（镜像 IddController.c GetDevicePath2）----
@@ -387,3 +389,22 @@ func (winBackend) virtualDisplayActive() bool {
 func (winBackend) lidClosed() (bool, bool) { return lidClosedState() }
 
 func (winBackend) forceLid() string { return forceLidFromRegistry() }
+
+// featureEnabled IDD 功能总开关：XNC_IDD_ENABLED ∈ {1,true,yes} 才开，
+// 其余（含键不存在/拼写噪声）一律 false——缺省停用语义。
+func (winBackend) featureEnabled() bool {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, envRegKey, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	defer k.Close()
+	v, _, err := k.GetStringValue(iddEnabledValue)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes":
+		return true
+	}
+	return false
+}

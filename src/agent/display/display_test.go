@@ -17,12 +17,15 @@ type fakeBackend struct {
 	lidClosedV     bool
 	lidKnownV      bool
 	forceV         string
+	enabledV       bool
 
 	created, closed, plugged, unplugged int
 }
 
 func newFakeBackend() *fakeBackend {
-	return &fakeBackend{installed: true, physicalActive: true}
+	// enabled 缺省 true：以下用例测的是"开关打开时"的策略语义；
+	// 停用语义见 TestFeatureDisabledNeverCreates。
+	return &fakeBackend{installed: true, physicalActive: true, enabledV: true}
 }
 
 func (f *fakeBackend) driverInstalled() bool {
@@ -82,6 +85,50 @@ func (f *fakeBackend) forceLid() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.forceV
+}
+
+func (f *fakeBackend) featureEnabled() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.enabledV
+}
+
+// TestFeatureDisabledNeverCreates 总开关关（2026-09-11 用户决策的缺省
+// 态）：任何触发条件（盒盖/无物理输出/旋钮）都不得建设备/插屏。
+func TestFeatureDisabledNeverCreates(t *testing.T) {
+	f := newFakeBackend()
+	f.enabledV = false
+	f.lidClosedV, f.lidKnownV = true, true
+	f.physicalActive = false // 双触发条件同时满足
+	f.forceV = "closed"
+	m := newTestManager(f)
+	defer m.Close()
+
+	m.SessionStarted()
+	deadline := time.Now().Add(2500 * time.Millisecond) // 覆盖 1s 轮询 + 2 采样滞回窗口
+	for time.Now().Before(deadline) {
+		f.mu.Lock()
+		created, plugged := f.created, f.plugged
+		f.mu.Unlock()
+		if created != 0 || plugged != 0 {
+			t.Fatalf("disabled feature must never create/plug, got created=%d plugged=%d", created, plugged)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func TestFeatureDisabledSetOn(t *testing.T) {
+	f := newFakeBackend()
+	f.enabledV = false
+	m := newTestManager(f)
+	defer m.Close()
+
+	if err := m.SetOn(); err == nil {
+		t.Fatal("SetOn must fail when feature disabled")
+	}
+	if f.created != 0 {
+		t.Fatalf("disabled feature must not create device, got created=%d", f.created)
+	}
 }
 
 // newTestManager 构造 Manager 并注入假后端。

@@ -13,9 +13,14 @@
 //     到 off。无会话时盒盖不产生任何屏幕。
 //
 // 驱动未安装时全部操作退化为 no-op（状态经 agentctl display op 可见）。
+//
+// **2026-09-11 用户决策：功能停用**——组件（驱动/安装器组件/agent 编排/
+// CLI）全部保留，但缺省任何条件下都不创建显示器（会话/lid/无物理输出/
+// 手动 on 一并被门禁，XNC_IDD_ENABLED=1 经注册表环境显式重新启用）。
 package display
 
 import (
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -46,6 +51,11 @@ type backend interface {
 	lidClosed() (closed, known bool)
 	// forceLid 调试旋钮 XNC_IDD_FORCE_LID（"" | "open" | "closed"）。
 	forceLid() string
+	// featureEnabled IDD 功能总开关（2026-09-11 用户决策：放弃启用，
+	// 组件全保留）。注册表环境 XNC_IDD_ENABLED=1 显式启用；缺省恒 false
+	// ——任何条件下不创建显示器（会话/lid/无物理输出/手动 on 全部
+	// 被门禁）。Windows 实现读注册表环境，非 Windows 恒 false。
+	featureEnabled() bool
 }
 
 // Status 是 agentctl display op 的应答载荷（展示/诊断用）。
@@ -59,6 +69,8 @@ type Status struct {
 	ForceLid        string `json:"forceLid,omitempty"`
 	AutoActive      bool   `json:"autoActive"`
 	ManualActive    bool   `json:"manualActive"`
+	// Enabled 功能总开关（缺省 false：组件在、永不建屏）。
+	Enabled bool `json:"enabled"`
 }
 
 // Manager 虚拟显示器生命周期编排（会话引用计数 + 手动覆盖 + 3s 轮询
@@ -137,6 +149,11 @@ const physicalHysteresis = 2
 func (m *Manager) reconcile() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// 总开关（2026-09-11 用户决策：缺省停用）：任何条件下不建屏——
+	// 早退也避免每秒空跑探针进程。
+	if !m.be.featureEnabled() {
+		return
+	}
 	if m.sessionRefs == 0 {
 		return
 	}
@@ -238,6 +255,9 @@ func (m *Manager) triggerLocked() bool {
 // 内创建一次、不随会话拆建（持有进程 EOF 生命周期，agent 退出即自动
 // 移除）。驱动未装 = 静默 no-op（后续会话/触发/手动 on 时重试）。
 func (m *Manager) ensureDeviceLocked() {
+	if !m.be.featureEnabled() {
+		return // 总开关关：不创建常驻设备（更不会插屏）
+	}
 	if m.handle != 0 || !m.be.driverInstalled() {
 		return
 	}
@@ -253,6 +273,9 @@ func (m *Manager) ensureDeviceLocked() {
 // plugVirtualLocked 设备就绪 → 插屏 → 等 ≤5s 显示器活动。调用方持 mu。
 // 驱动未安装是常态（组件未选/装失败），返回错误不视为故障。
 func (m *Manager) plugVirtualLocked() error {
+	if !m.be.featureEnabled() {
+		return errDisabled
+	}
 	if !m.be.driverInstalled() {
 		return errNotInstalled
 	}
@@ -357,7 +380,11 @@ func (m *Manager) SessionEnded() {
 }
 
 // SetOn 手动开（agentctl display on）：无视触发条件，保持到 off/退出。
+// 总开关关时同样被门禁（任何条件下不建屏）。
 func (m *Manager) SetOn() error {
+	if !m.be.featureEnabled() {
+		return errDisabled
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.plugged {
@@ -398,6 +425,7 @@ func (m *Manager) Snapshot() Status {
 		AutoActive:      m.autoActive,
 		ManualActive:    m.manualActive,
 		ForceLid:        m.be.forceLid(),
+		Enabled:         m.be.featureEnabled(),
 	}
 	st.LidClosed, st.LidKnown = m.be.lidClosed()
 	return st
@@ -405,6 +433,10 @@ func (m *Manager) Snapshot() Status {
 
 // errNotInstalled 驱动未入 store（idd 组件未装/装失败）——状态而非故障。
 var errNotInstalled = &notInstalledError{}
+
+// errDisabled 功能总开关关闭（2026-09-11 用户决策：组件保留、缺省
+// 停用；XNC_IDD_ENABLED=1 显式重新启用）。
+var errDisabled = errors.New("idd feature disabled (set XNC_IDD_ENABLED=1 to enable)")
 
 type notInstalledError struct{}
 

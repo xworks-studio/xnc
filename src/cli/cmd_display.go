@@ -73,6 +73,7 @@ func printDisplayStatus(d *agentctlDisplay) {
 	}
 	pairs := [][2]string{
 		{"driver installed", yesNo(d.DriverInstalled)},
+		{"enabled", yesNo(d.Enabled)},
 		{"virtual active", yesNo(d.VirtualActive)},
 		{"physical active", yesNo(d.PhysicalActive)},
 		{"lid", lid},

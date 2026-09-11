@@ -434,6 +434,7 @@ func (a *Agent) Display(_ context.Context, action string) (info *agentctl.Displa
 		ForceLid:        st.ForceLid,
 		AutoActive:      st.AutoActive,
 		ManualActive:    st.ManualActive,
+		Enabled:         st.Enabled,
 	}, nil
 }
 

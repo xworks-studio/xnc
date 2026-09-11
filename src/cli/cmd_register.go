@@ -71,6 +71,7 @@ type agentctlDisplay struct {
 	ForceLid        string `json:"forceLid,omitempty"`
 	AutoActive      bool   `json:"autoActive"`
 	ManualActive    bool   `json:"manualActive"`
+	Enabled         bool   `json:"enabled"`
 }
 
 type agentctlResp struct {
