@@ -40,6 +40,9 @@ func (c *Client) Do(method, path string, body, out any) *proto.APIError {
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// UA 携带 CLI 版本（Stage B 起 server 据此判定会话数据面路由：旧 CLI
+	// 无 UA = 绝对 wss URL 兼容性缺口，回落主站旧路径）。
+	req.Header.Set("User-Agent", "xnc-cli/"+cliVersion)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return proto.Err(0, "NETWORK", err.Error())

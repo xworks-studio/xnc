@@ -13,11 +13,15 @@ import (
 // chunk，screen 大 I 帧需 MiB 级余量；统一取 proto.MaxSessionFrameBytes。
 const wsReadLimit = proto.MaxSessionFrameBytes
 
-// dialSession connects to a session WS. wsPath is the relative websocketUrl
-// from the exec 202 response (includes ?token=); https servers need wss.
+// dialSession connects to a session WS. wsPath is the websocketUrl from the
+// exec 202 response：相对路径（主站旧路径）按 server 补全（https → wss）；
+// 绝对 wss://（relay 数据面，Stage B）直接使用——不经 server 拼接。
 func dialSession(server, wsPath string) (*websocket.Conn, error) {
-	url := strings.Replace(strings.Replace(server, "https://", "wss://", 1),
-		"http://", "ws://", 1) + wsPath
+	url := wsPath
+	if !strings.HasPrefix(wsPath, "wss://") && !strings.HasPrefix(wsPath, "ws://") {
+		url = strings.Replace(strings.Replace(server, "https://", "wss://", 1),
+			"http://", "ws://", 1) + wsPath
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	c, _, err := websocket.Dial(ctx, url, nil)

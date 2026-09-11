@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -35,6 +36,43 @@ const (
 	// 拨号窗口消费（会话建立后票据不再校验），1h 覆盖重试/晚拨余量。
 	sessionTicketTTL = time.Hour
 )
+
+// clientSupportsRelayWS 判定请求方能否消费绝对 wss:// 会话 URL（relay
+// 数据面，Stage B）。已知缺口：旧 xnc-cli 把 websocketUrl 当相对路径与
+// server 拼接（绝对 URL 必坏）——旧 CLI 无自定义 UA（Go 默认 UA）。
+// 判定：xnc-cli/<0.3.1 或 Go 默认 UA → 旧路径；其余（≥0.3.1 的 CLI、
+// 浏览器等）→ relay。
+func clientSupportsRelayWS(r *http.Request) bool {
+	ua := r.Header.Get("User-Agent")
+	if strings.HasPrefix(ua, "xnc-cli/") {
+		ver := strings.TrimPrefix(ua, "xnc-cli/")
+		return compareSemver(ver, "0.3.1") >= 0
+	}
+	return ua != "" && !strings.HasPrefix(ua, "Go-http-client/")
+}
+
+// compareSemver 粗粒度语义版本比较（点分数字段逐段；解析失败按相等
+// 处理——门禁偏保守侧由调用方兜底）。
+func compareSemver(a, b string) int {
+	pa := strings.Split(a, ".")
+	pb := strings.Split(b, ".")
+	for i := 0; i < len(pa) || i < len(pb); i++ {
+		var va, vb int
+		if i < len(pa) {
+			va, _ = strconv.Atoi(pa[i])
+		}
+		if i < len(pb) {
+			vb, _ = strconv.Atoi(pb[i])
+		}
+		if va != vb {
+			if va < vb {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
+}
 
 // relaySessionEndpoint 为节点选 relay 数据腿端点（sdata 传输候选）。同一
 // pool.Assign 的节点粘性语义与桌面媒体一致（node→relay 全 kind 统一）。
@@ -181,7 +219,7 @@ func (h *handlers) startSession(w http.ResponseWriter, r *http.Request,
 	var relayFinish func()
 	agentWSURL := wsBaseURL(r) + "/api/agent/session?token=" + res.AgentToken
 	clientWSURL := "/api/session/" + res.Session.ID + "?token=" + res.ClientToken
-	if kind != proto.KindDesktop {
+	if kind != proto.KindDesktop && clientSupportsRelayWS(r) {
 		if ep, rid, ok := h.relaySessionEndpoint(nodeID.String()); ok {
 			atok, aerr := h.rtvSign.SessionDataTicket(res.Session.ID, nodeID.String(), rid, "agent", sessionTicketTTL)
 			ctok, cerr := h.rtvSign.SessionDataTicket(res.Session.ID, nodeID.String(), rid, "client", sessionTicketTTL)

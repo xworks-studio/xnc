@@ -57,6 +57,7 @@ func TestExecRoutedViaRelay(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPost, env.srv.URL+"/api/nodes/"+nodeID+"/exec", body)
 	req.Header.Set("Authorization", "Bearer "+env.AdminToken(t))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "xnc-cli/0.3.1")
 	resp, err := env.srv.Client().Do(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
