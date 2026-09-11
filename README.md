@@ -20,9 +20,11 @@ xnc register
 
 Dev 频道安装器在下载页选择，或 `curl -LO "https://xnc.app/installer?channel=dev"`。
 
-### 虚拟显示器（IDD，可选组件 "idd"）
+### 虚拟显示器（IDD，默认停用；可选组件 "idd"）
 
-安装器可选组件 `idd` 安装 "XWorks XNC Virtual Display"（IDD 虚拟显示器，
+2026-09-11 起功能默认停用（用户决策；组件保留，任何条件下不建屏）——
+`XNC_IDD_ENABLED=1`（注册表环境）为重启用运维通道。安装器可选组件 `idd`
+安装 "XWorks XNC Virtual Display"（IDD 虚拟显示器，
 Win10 19041+）。默认不产生任何虚拟屏；仅当**远程桌面（RTV）会话接入且
 （笔记本合盖 ∨ 无物理输出）**时自动插入 1920×1080@60 虚拟屏（合盖的
 笔记本此时面板已熄灭，虚拟屏接管为唯一显示器），会话结束自动移除；
@@ -69,15 +71,22 @@ xnc exec node1 --cwd C:\xnc --env DEBUG=1 "tool"   # env + cwd
 
 ## 架构
 
+主站只做 web/认证/编排（零数据流，`XNC_RTV_EMBEDDED` 默认 false）；媒体与会话数据
+全部经外置 relay（多 relay 负载均衡：节点粘性 + 负载评分 + 健康探测）：
+
 ```
 Browser ──── Web UI / WebCodecs / 下载页
-    │  TCP443 REST/WS + UDP443 WebTransport（媒体主路，H3）
-Server (Go, xnc.app) ─── REST + WS 信令 + release store + 安装器分发 + RTV 中继
-    │ (agent 主动出站 wss 443；xnc-host 直连 UDP4433 媒体面)
+    │
+Server (Go, xnc.app) ─── REST/WS 信令 + 认证 + release store + 票据签发（ed25519）
+    │  agent 主动出站 wss 443（控制信令）
+    │
+Relay 池 (xnc-relay, r1/r2.xnc.app) ── 媒体: UDP443 WT / UDP4433 host QUIC / TCP443 WS 兜底
+    │                                 ── 数据: 会话 WS 双腿（exec/shell/file/tunnel, sdata 票据）
+    │
 Agent (Windows 服务, SYSTEM)
     ├─ exec engine (bash/pwsh/powershell/cmd)
     ├─ shell (ConPTY)
-    ├─ desktop (xnc-host：DXGI 采集 → H.264 → RS FEC → QUIC，浏览器 WebCodecs 硬解)
+    ├─ desktop (xnc-host：DXGI 采集 → H.264 → RS FEC → QUIC 直连 relay，浏览器 WebCodecs 硬解)
     ├─ agentctl 管道（register/deregister/status/upgrade 本地控制面）
     └─ self-updater (installer-orchestrated + rollback)
 ```
@@ -101,7 +110,7 @@ cd deploy && docker compose -f docker-compose.yml -f docker-compose.dev.yml up -
 
 ## 测试设备凭据
 
-`deploy/.env`（gitignored）：`cp .env.example .env` 后填入。server 只部署在 xnc.app（阿里云 SRV，镜像化交付），本机禁止运行 server 栈。
+`deploy/.env`（gitignored）：`cp .env.example .env` 后填入。server 只部署在 xnc.app（阿里云 SRV，镜像化交付）；外置 relay 经 `deploy/build-relay.ps1` + `push_relay.py` 部署（RELAY1_/RELAY2_ 凭据键）。本机禁止运行 server 栈。
 
 ## 负载 smoke
 

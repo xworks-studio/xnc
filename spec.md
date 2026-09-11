@@ -4,18 +4,31 @@
 
 ### 1.1 一句话定位
 
+> **架构基线（2026-09-11 主站缩减 relay-only，最高优先级注记）**：主站
+> （xnc.app）缩减为 web/认证/编排/票据签发——`XNC_RTV_EMBEDDED` 默认
+> false，主站不跑媒体面/不挂 /ws/不启 ACME，无可用 relay 时 desktop
+> 503 `RTV_NO_RELAY`。**媒体与会话数据（exec/shell/file/tunnel 的 WS
+> 双腿）全部经外置 xnc-relay**（多 relay 负载均衡：节点粘性 + 会话数
+> 评分 + 健康探测 + admin 审批/drain；票据三类 host/viewer/sdata，
+> ed25519 + 墓碑撤销）。存量客户端零断代：旧 CLI 经 UA 门禁回落主站
+> 旧路径。本文描述"数据经 Control Server 中转/粘合"的章节按该基线
+> 重新理解（server 侧粘合 = 回落路径；默认路径在 relay session router）。
+> 部署/运维细节见 `docs/ci-release-and-deploy.md` §6/§7 与
+> `deploy/PORTS.md`（含 relay 主机端口表）。
+>
 > **桌面管线章节状态（2026-09-08 RTV 重构）**：远程桌面媒体面已整体重构为
 > Rust host + QUIC/WT/WS 三腿中继 + WebCodecs 渲染（替换 WebRTC/TURN/
-> rt-pipe/C++ 采集栈）。本文涉及桌面媒体/TURN/rt-pipe/IDR/QoS 的章节按
-> 历史存档理解；现行权威设计见
-> `docs/superpowers/specs/2026-09-08-desktop-rtv-rewrite-design.md` 与
-> `src/server/internal/rtv`、`src/host/` 源码。JPEG 快照/键盘输入/多显示器切换/
+> rt-pipe/C++ 采集栈；2026-09-11 起中继 = 外置 xnc-relay，见顶部基线）。
+> 本文涉及桌面媒体/TURN/rt-pipe/IDR/QoS 的章节按历史存档理解；现行权威
+> 设计见 `docs/superpowers/specs/2026-09-08-desktop-rtv-rewrite-design.md`、
+> `src/rtv`、`src/relay`、`src/host/` 源码。JPEG 快照/键盘输入/多显示器切换/
 > SAS 为已确认的后续 PATCH 项。
 >
-> **IDD 虚拟显示器（2026-09-10 落地，M3 项提前）**：§65 路线图 M3 规划的
-> IDD/headless 支持已以"会话触发版"提前实现（策略比 2026-08-22 agent 重构
-> spec §13.3 更克制：仅 RTV 会话接入且盒盖/无物理输出时自动建屏，会话结束
-> 移除）。实施记录与验收见
+> **IDD 虚拟显示器（2026-09-10 落地，2026-09-11 默认停用）**：§65 路线图
+> M3 规划的 IDD/headless 支持已实现（会话触发版：仅 RTV 会话接入且
+> 盒盖/无物理输出时自动建屏，会话结束移除）——**当前默认停用**（用户
+> 决策：组件保留，任何条件下不建屏；`XNC_IDD_ENABLED=1` 注册表环境为
+> 重启用运维通道）。实施记录见
 > `docs/superpowers/plans/2026-09-10-idd-virtual-display-plan.md`。
 
 XNC 是小团队和 AI Agent 的 Windows 节点统一运维入口：节点只需**出站 443 长连接**，即获得状态观测、命令执行、交互终端、脚本/文件分发和远程桌面。不是穿透工具，是合规友好的反向连接平面。
@@ -79,7 +92,8 @@ AI Agent（第一公民）   主要操作者：xnc --json + 退出码契约 + sk
 ```text
 仅允许出站长连接
 禁入站暴露 / frp 式穿透 / VPN 拨入
-Server 中转会话数据属于允许范围 → Control Server 可部署公网云（现有架构不变）
+Server 中转会话数据属于允许范围 → Control Server 可部署公网云（2026-09-11 起
+数据面在外置 xnc-relay 主机中转，Control Server 仍可公网——合规结论不变）
 ```
 
 系统由一个中心服务器、若干 Windows 节点 Agent 以及客户端组成。用户可以自行创建节点集群、注册 Windows 节点，并通过中心服务器执行远程 PowerShell、交互式终端以及远程桌面。

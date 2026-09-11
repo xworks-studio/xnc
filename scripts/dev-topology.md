@@ -1,4 +1,11 @@
-# Dev topology (M1-Slice2): dev server + coturn on LABS-DEV, console-run dev agent on XIAOXIN
+# Dev topology: dev server (embedded RTV) on LABS-DEV, console-run dev agent on XIAOXIN
+
+> **2026-09-11 更新**：TURN/WebRTC 面已退役（2026-09-08），本文 turn-dev
+> overlay 段仅存档。dev RTV 走 docker-compose.dev.yml 的内嵌形态：
+> **`XNC_RTV_EMBEDDED: "true"`（显式开启——生产默认 false 的 relay-only
+> 形态不适用于 dev 单机栈）** + `XNC_RTV_ENDPOINT=127.0.0.1:14433` +
+> `XNC_RTV_INSECURE_TLS=true`（dev 无 ACME，进程内自签）。生产端口清单
+> 移至 `deploy/PORTS.md`（含 relay 主机条目）。
 
 One page, copy-paste ready. Fully isolated from production: the dev agent never
 touches the XNCAgent service, its state lives only in `%TEMP%\xnc-dev-agent-<pid>`
@@ -136,17 +143,7 @@ Notes:
   503 `TURN_UNCONFIGURED`. One desktop session per node; idle (no signaling
   frames) for 5 min auto-closes (viewer may simply re-POST).
 
-## 生产端口清单(xnc.app / SRV,2026-08-24 retro P2#11 文档化)
+## 生产端口清单
 
-安全组需开以下全部,否则对应功能失效(本次事故:3478 未开 → STUN/TURN
-全盲;coturn 配置见 deploy/turnserver.conf,模板由 deploy_srv.py `up` 渲染):
-
-| 端口 | 协议 | 用途 |
-|---|---|---|
-| 443 | TCP | HTTPS/WSS — Caddy 反代 xnc-server(web + /api) |
-| 3478 | TCP+UDP | coturn STUN/TURN 监听(lt-cred 静态凭据,relay-only,无 TLS) |
-| 49160-49200 | UDP | coturn TURN relay 分配段(min-port/max-port;不开则 relay 候选不可达) |
-
-自检:`py deploy/deploy_srv.py verify` 含 STUN binding 探测(UDP+TCP
-127.0.0.1:3478,期望 0x0101 应答)——本机端口通不代表安全组通,公网侧用
-`curl https://<domain>/api/health`(verify 已含)。
+已迁移至 `deploy/PORTS.md`（2026-09-11 relay-only 基线：主站仅 TCP443；
+relay 主机 TCP443/UDP443/UDP4433；coturn 3478/49160-49200 已退役可收回）。
