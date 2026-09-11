@@ -42,6 +42,8 @@ type fakeDeps struct {
 	upgChannels  []string
 	upgTriggered bool
 	upgErr       error
+	dspActions   []string
+	dspErr       error
 }
 
 func (f *fakeDeps) Register(_ context.Context, server, clusterID, jwt string) (string, error) {
@@ -69,6 +71,13 @@ func (f *fakeDeps) Upgrade(_ context.Context, channel string) (bool, error) {
 	defer f.mu.Unlock()
 	f.upgChannels = append(f.upgChannels, channel)
 	return f.upgTriggered, f.upgErr
+}
+
+func (f *fakeDeps) Display(_ context.Context, action string) (*DisplayInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dspActions = append(f.dspActions, action)
+	return &DisplayInfo{DriverInstalled: true, VirtualActive: action == "on"}, f.dspErr
 }
 
 func (f *fakeDeps) upgradeCalls() int {

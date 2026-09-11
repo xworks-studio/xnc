@@ -17,7 +17,8 @@ param(
     [string]$Version = "0.0.0-dev",
     [ValidateSet("stable", "dev")][string]$Channel = "stable",
     [string]$ISCC = "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
-    [switch]$ReuseNative
+    [switch]$ReuseNative,
+    [switch]$SkipIdd
 )
 
 $ErrorActionPreference = "Stop"
@@ -79,6 +80,49 @@ if (-not ($ReuseNative -and (Test-Path (Join-Path $bin "xnc-host.exe")))) {
         } finally { Pop-Location }
     }
 } else { Write-Output "build.ps1: reuse cached xnc-host.exe" }
+
+# IDD 虚拟显示器驱动（安装器可选组件 idd，src/third_party/xncidd，vendored
+# RustDeskIddDriver + 微软 IddSample 基底）：WDK 工具集 msbuild（自定位
+# vcvars64，同 native build.bat 模式），SignMode=off 后手工签名 dll（内嵌）
+# + cat（目录）。UMDF 为用户态驱动，自签 + 安装器信任分发即可加载（无
+# testmode，XIAOXIN 真机验证过）。WDK 构建目标缺失（CI dryrun / 无 WDK
+# 机器）时告警跳过，绝不阻塞 exe/installer 构建；-SkipIdd 显式跳过。
+$iddBuilt = $false
+if (-not $SkipIdd) {
+    $iddOut = Join-Path $bin "driver\xncidd"
+    if (-not ($ReuseNative -and (Test-Path (Join-Path $iddOut "XncIdd.dll")))) {
+        $iddSrc = Join-Path $src "third_party\xncidd"
+        $wdkBuild = "${env:ProgramFiles(x86)}\Windows Kits\10\build"
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        $vcvars = ""
+        if (Test-Path $vswhere) {
+            $vcvars = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null | Out-String).Trim()
+        }
+        if (-not $vcvars -and (Test-Path "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat")) {
+            $vcvars = "C:\Program Files\Microsoft Visual Studio\2022\Community"
+        }
+        if (-not (Test-Path $wdkBuild)) {
+            Write-Warning "build.ps1: WDK build targets not found - skipping idd driver build (release builds need WDK)"
+        } elseif (-not $vcvars -or -not (Test-Path (Join-Path $vcvars "VC\Auxiliary\Build\vcvars64.bat"))) {
+            Write-Warning "build.ps1: VS2022 vcvars64 not found - skipping idd driver build"
+        } else {
+            Invoke-Step "build xncidd driver (msbuild+WDK)" {
+                $sln = Join-Path $iddSrc "XncIdd.sln"
+                $cmd = "call `"$(Join-Path $vcvars 'VC\Auxiliary\Build\vcvars64.bat')`" >nul 2>&1 && msbuild `"$sln`" /p:Configuration=Release /p:Platform=x64 /p:TargetVersion=Windows10 /p:SignMode=off /p:SpectreMitigation=false /m /v:minimal /nologo"
+                & cmd.exe /c $cmd
+                if ($LASTEXITCODE -ne 0) { throw "msbuild XncIdd.sln failed (exit $LASTEXITCODE)" }
+            }
+            # 驱动包 = 打过戳的 INF + dll + cat（同目录、INF CatalogFile 同名单）
+            New-Item -ItemType Directory -Force -Path $iddOut | Out-Null
+            $iddRel = Join-Path $iddSrc "x64\Release"
+            Copy-Item (Join-Path $iddRel "XncIdd.dll") (Join-Path $iddOut "XncIdd.dll") -Force
+            Copy-Item (Join-Path $iddRel "XncIddDriver.inf") (Join-Path $iddOut "XncIdd.inf") -Force
+            Copy-Item (Join-Path $iddRel "XncIddDriver\xncidd.cat") (Join-Path $iddOut "XncIdd.cat") -Force
+            $iddBuilt = $true
+            Write-Output "build.ps1: idd driver staged to bin\driver\xncidd"
+        }
+    } else { Write-Output "build.ps1: reuse cached idd driver"; $iddBuilt = $true }
+}
 
 # Version single-source check: the agent's self-reported version must equal
 # the version being packaged.
@@ -145,6 +189,24 @@ function Sign-Artifact([string]$file) {
 }
 foreach ($exe in @("xnc-agent.exe", "xnc.exe", "xnc-shell.exe", "xnc-core.exe", "xnc-host.exe")) {
     Sign-Artifact (Join-Path $bin $exe)
+}
+# 驱动签名走 signtool（Set-AuthenticodeSignature 不产目录签名所需的
+# 完整 cat 语义）：dll 内嵌签名 + cat 目录签名，同一 pfx/时间戳策略。
+if ($iddBuilt) {
+    function Sign-DriverArtifact([string]$file) {
+        if (-not $signCert) { return }
+        $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter "signtool.exe" -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1
+        if (-not $signtool) { throw "signtool.exe not found in Windows Kits (cannot sign driver)" }
+        $args = @("sign", "/fd", "SHA256", "/f", $pfxPath, "/p", $env:XNC_CODESIGN_PASSWORD)
+        if ($tsaUrl) { $args += @("/tr", $tsaUrl, "/td", "SHA256") }
+        $args += $file
+        & $signtool.FullName $args
+        if ($LASTEXITCODE -ne 0) { throw "signtool signing $file failed (exit $LASTEXITCODE)" }
+        Write-Output "build.ps1: signed $(Split-Path -Leaf $file) (driver)"
+    }
+    Sign-DriverArtifact (Join-Path $iddOut "XncIdd.dll")
+    Sign-DriverArtifact (Join-Path $iddOut "XncIdd.cat")
 }
 
 # VersionInfoVersion must be strictly numeric w.x.y.z ("0.6.1" -> "0.6.1.0",

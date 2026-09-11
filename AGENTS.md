@@ -46,7 +46,8 @@ XNC = Windows 节点远程管理平台：Go server（xnc.app）+ Windows agent
 模块地图（2026-09-09 起全部代码模块在 `src/` 下；`deploy/` 运维、`docs/`
 文档、`scripts/` 脚本、`bin/` 产物池留在仓库根。Go workspace 由仓库根
 `go.work` 串联）：`src/proto`（协议）· `src/server`（控制面，
-chi + sqlc + 真 PG 测试）· `src/agent`（节点侧，Windows 服务）· `src/cli` · `src/shellhost`
+chi + sqlc + 真 PG 测试）· `src/agent`（节点侧，Windows 服务；`display` 子包
+= IDD 虚拟显示器控制编排）· `src/cli` · `src/shellhost`
 （ConPTY 宿主）· `src/mockagent`（负载/一致性测试用，**保留勿删**）· `src/shellsmoke` ·
 `src/rtv`（RTV 中继数据面库：Hub 扇出/票据/仲裁/三腿，server 内嵌与外置中继共用）·
 `src/relay`（外置中继二进制 xnc-relay）·
@@ -54,6 +55,9 @@ chi + sqlc + 真 PG 测试）· `src/agent`（节点侧，Windows 服务）· `s
 分析，均在职）。`src/native/` 为 C++（core=SYSTEM 管道服务、common=共享头；
 desktop 已随 RTV 重构删除）。`src/host/` 为 Rust crate `xnc-host`（桌面采集/
 编码/FEC/QUIC 发送），vendor 依赖在 `src/third_party/scrap`（rustdesk fork 裁剪）。
+`src/third_party/xncidd/` 为 IDD 虚拟显示器驱动（UMDF/IddCx 1.4，C++，
+vendored RustDeskIddDriver + 微软 IddSample 基底，MS-PL；控制侧在
+`src/agent/display`，详见其 VENDOR.md）。
 `src/web/` 为 React+Vite（产物嵌入 server 二进制）。`src/installer/` 为 Inno Setup 打包。
 
 ## 2. 硬性契约（违反即事故）
@@ -171,6 +175,10 @@ vcpkg 无基线锁定，ffmpeg 头漂移（FF_PROFILE_* 枚举缺定义）编译
 - **反注册**：`xnc deregister`（需管理员终端；删服务端记录+本地绑定，
   保留身份）。WS 通道不通时改用服务端管理删除。
 - **升级**：`xnc upgrade [--channel stable|dev]`。
+- **虚拟显示器**：`xnc display on|off|status`（IDD 可选组件，Win10 19041+；
+  策略 = RTV 会话接入且盒盖/无物理输出时自动建屏、会话结束移除、agent
+  崩溃自动消失；实现见 `src/agent/display` + `src/third_party/xncidd`，
+  验收记录 `docs/superpowers/plans/2026-09-10-idd-virtual-display-plan.md`）。
 - **卸载**：图形向导（数据默认保留，重装续用身份）或
   `unins000.exe /VERYSILENT /PURGEDATA=true`（彻底清零）。卸载不反注册。
 

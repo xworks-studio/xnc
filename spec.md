@@ -11,6 +11,12 @@
 > `docs/superpowers/specs/2026-09-08-desktop-rtv-rewrite-design.md` 与
 > `src/server/internal/rtv`、`src/host/` 源码。JPEG 快照/键盘输入/多显示器切换/
 > SAS 为已确认的后续 PATCH 项。
+>
+> **IDD 虚拟显示器（2026-09-10 落地，M3 项提前）**：§65 路线图 M3 规划的
+> IDD/headless 支持已以"会话触发版"提前实现（策略比 2026-08-22 agent 重构
+> spec §13.3 更克制：仅 RTV 会话接入且盒盖/无物理输出时自动建屏，会话结束
+> 移除）。实施记录与验收见
+> `docs/superpowers/plans/2026-09-10-idd-virtual-display-plan.md`。
 
 XNC 是小团队和 AI Agent 的 Windows 节点统一运维入口：节点只需**出站 443 长连接**，即获得状态观测、命令执行、交互终端、脚本/文件分发和远程桌面。不是穿透工具，是合规友好的反向连接平面。
 

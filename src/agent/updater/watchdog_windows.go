@@ -115,7 +115,9 @@ func writeWatchdogScript(stateDir, installDir string) error {
 	// from==to 死循环）。
 	b.WriteString("Remove-Item -Path $pending -Force\r\n")
 	b.WriteString("Log \"watchdog: executing rollback installer in place: $exe\"\r\n")
-	b.WriteString("$proc = Start-Process -FilePath $exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',('/DIR=\"' + $InstallDir + '\"') -WindowStyle Hidden -Wait -PassThru\r\n")
+	// /ALLOWDOWNGRADE：回滚执行的是上一版安装器（即降级），须旁路安装器
+	// 的降级守卫（2026-09-10 引入）。
+	b.WriteString("$proc = Start-Process -FilePath $exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/ALLOWDOWNGRADE',('/DIR=\"' + $InstallDir + '\"') -WindowStyle Hidden -Wait -PassThru\r\n")
 	b.WriteString("Log ('watchdog: rollback installer exit code ' + $proc.ExitCode)\r\n")
 	b.WriteString("exit $proc.ExitCode\r\n")
 	return os.WriteFile(watchdogScriptPath(stateDir), []byte(b.String()), 0o755)

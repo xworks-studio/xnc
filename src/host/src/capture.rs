@@ -131,8 +131,9 @@ impl ScreenCapturer {
 
     /// 拉取一帧。timeout 为 DXGI AcquireNextFrame 等待时长。
     pub fn next(&mut self, timeout: Duration) -> IoResult<CaptureOutcome<'_>> {
-        // 显示器拓扑巡检（每 1s，rustdesk try_broadcast_display_changed 思路）
-        if self.display_check_at.elapsed() >= Duration::from_secs(1) {
+        // 显示器拓扑巡检（每 500ms，rustdesk try_broadcast_display_changed 思路；
+        // 1s → 500ms：盒盖过渡时虚拟屏上线的识别延迟减半）
+        if self.display_check_at.elapsed() >= Duration::from_millis(500) {
             self.display_check_at = Instant::now();
             if let Ok(displays) = Display::all() {
                 let geometry: Vec<(i32, i32, usize, usize)> = displays
@@ -168,6 +169,16 @@ impl ScreenCapturer {
                     }
                 }
                 return self.cursor_only_or_none();
+            }
+            // 显示器消失/会话断开（盒盖面板消亡的典型错误）：GDI 同样救
+            // 不了——跳过 GDI 掩盖直接上抛，pipeline 立即重建并重枚举
+            // （新出现的 IDD 虚拟屏会被采上，缩短合盖过渡黑屏窗口）。
+            Err(e)
+                if e.kind() == ErrorKind::ConnectionReset
+                    || e.kind() == ErrorKind::ConnectionAborted =>
+            {
+                tracing::warn!(?e, "capture lost, reinit immediately");
+                return Err(e);
             }
             Err(e) => {
                 // 运行中出错 → 尝试切 GDI 再抛给上层重建（rustdesk: "dxgi error, fall back to gdi"）

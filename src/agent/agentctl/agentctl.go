@@ -30,10 +30,19 @@ const (
 	OpDeregister = "deregister"
 	OpStatus     = "status"
 	OpUpgrade    = "upgrade"
+	OpDisplay    = "display"
 
 	StateUnregistered = "unregistered"
 	StateRegistered   = "registered"
 	StateOnline       = "online"
+)
+
+// display op 的 action 取值（on = 手动开虚拟显示器并保持；off = 移除；
+// status = 只读状态）。
+const (
+	DisplayActionOn     = "on"
+	DisplayActionOff    = "off"
+	DisplayActionStatus = "status"
 )
 
 // 更新频道（§9.5 跨频道切换仅经 upgrade op；白名单外的值 → bad_request）。
@@ -49,8 +58,8 @@ func ValidChannel(ch string) bool {
 
 // update op 应答里 status.update.phase 的取值。
 const (
-	UpdatePhaseChecking = "checking"  // 触发后拉清单/下载中（agent 侧进程内标记）
-	UpdatePhaseApplying = "applying"  // pending 存在 = 安装器执行中/新 agent 自检中
+	UpdatePhaseChecking = "checking" // 触发后拉清单/下载中（agent 侧进程内标记）
+	UpdatePhaseApplying = "applying" // pending 存在 = 安装器执行中/新 agent 自检中
 )
 
 // Request 单行 JSON 请求（多余字段忽略，前向兼容）。
@@ -60,6 +69,7 @@ type Request struct {
 	ClusterID string `json:"clusterId,omitempty"` // register：目标 cluster
 	JWT       string `json:"jwt,omitempty"`       // register：用户 JWT（内存传递，用后即弃）
 	Channel   string `json:"channel,omitempty"`   // upgrade：目标频道 stable|dev（空 = 当前频道）
+	Action    string `json:"action,omitempty"`    // display：on | off | status
 }
 
 // Response 单行 JSON 应答。失败：{"ok":false,"error":"<code>: <message>"}；
@@ -69,17 +79,33 @@ type Request struct {
 // Triggered 仅 upgrade op 有意义（恒输出，false = 更新已在途而非错误，配
 // note 说明）；Update 仅 status op 在更新在途时输出（进度信号，可缺省）。
 type Response struct {
-	OK        bool        `json:"ok"`
-	NodeID    string      `json:"nodeId,omitempty"`
-	State     string      `json:"state,omitempty"`
-	Server    string      `json:"server,omitempty"`
-	ClusterID string      `json:"clusterId,omitempty"`
-	Channel   string      `json:"channel,omitempty"`
-	Version   string      `json:"version,omitempty"`
-	Triggered bool        `json:"triggered"`
-	Note      string      `json:"note,omitempty"`
-	Update    *UpdateInfo `json:"update,omitempty"`
-	Error     string      `json:"error,omitempty"`
+	OK        bool         `json:"ok"`
+	NodeID    string       `json:"nodeId,omitempty"`
+	State     string       `json:"state,omitempty"`
+	Server    string       `json:"server,omitempty"`
+	ClusterID string       `json:"clusterId,omitempty"`
+	Channel   string       `json:"channel,omitempty"`
+	Version   string       `json:"version,omitempty"`
+	Triggered bool         `json:"triggered"`
+	Note      string       `json:"note,omitempty"`
+	Update    *UpdateInfo  `json:"update,omitempty"`
+	Display   *DisplayInfo `json:"display,omitempty"`
+	Error     string       `json:"error,omitempty"`
+}
+
+// DisplayInfo display op 的状态载荷（display.Manager.Snapshot 的镜像，
+// agentctl 不 import 业务包，保持协议数据面独立）。
+type DisplayInfo struct {
+	DriverInstalled bool   `json:"driverInstalled"`
+	DevicePresent   bool   `json:"devicePresent"`
+	VirtualActive   bool   `json:"virtualActive"`
+	PhysicalActive  bool   `json:"physicalActive"`
+	LidClosed       bool   `json:"lidClosed"`
+	LidKnown        bool   `json:"lidKnown"`
+	ForceLid        string `json:"forceLid,omitempty"`
+	AutoActive      bool   `json:"autoActive"`
+	ManualActive    bool   `json:"manualActive"`
+	Enabled         bool   `json:"enabled"`
 }
 
 // UpdateInfo status op 的在途更新进度（CLI upgrade 轮询信号，尽力而为：
@@ -122,6 +148,9 @@ type Deps interface {
 	// 后台执行），本调用快速返回：triggered=false 表示已有更新在途（非
 	// 错误，dispatch 配 note 应答）；错误（如未注册/绑定写失败）同步返回。
 	Upgrade(ctx context.Context, channel string) (triggered bool, err error)
+	// Display 虚拟显示器本地控制（on/off/status）；status 恒成功，on 在
+	// 驱动未装时返回 not_installed 错误码。
+	Display(ctx context.Context, action string) (*DisplayInfo, error)
 }
 
 // Server 控制管道服务端。Name 空 = PipeName；IsAdminConn 空 = 平台实现
@@ -214,6 +243,17 @@ func (s *Server) dispatch(ctx context.Context, conn net.Conn, req Request) Respo
 			return Response{OK: true, Triggered: false, Note: "update already in progress"}
 		}
 		return Response{OK: true, Triggered: true}
+	case OpDisplay:
+		switch req.Action {
+		case DisplayActionOn, DisplayActionOff, DisplayActionStatus:
+		default:
+			return Errorf("bad_request: action must be on, off or status")
+		}
+		info, err := s.Deps.Display(ctx, req.Action)
+		if err != nil {
+			return Errorf("%s", err.Error())
+		}
+		return Response{OK: true, Display: info}
 	default:
 		return Errorf("bad_request: unknown op %q", req.Op)
 	}

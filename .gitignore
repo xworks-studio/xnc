@@ -46,3 +46,6 @@ src/third_party/scrap/src/generated/
 
 # RTV 研究期 MVP 源（已迁移进 host/server/web；原品保留于 desktop-reserch）
 mvp/
+
+# IDD 驱动（vendored xncidd）的 MSBuild 产物
+src/third_party/xncidd/**/x64/
