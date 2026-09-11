@@ -250,4 +250,61 @@ SFTP 上 SRV → docker load + tag ghcr.io/...:latest → docker compose up -d
       `XNC_SERVER_URL`、`XNC_ADMIN_EMAIL`、`XNC_ADMIN_PASSWORD`、
       `SRV_HOST`、`SRV_SSH_USER`、`SRV_SSH_KEY`
 - [x] AGENTS.md §3/§4/§5 增补：CI 门禁与发版/部署的触发方式
+
+## 6. xnc-relay 外置中继部署（2026-09-11 Stage A：媒体面 relay-only）
+
+主站默认 `XNC_RTV_EMBEDDED=false`（compose 同步默认）：主站不跑任何媒体
+流量——不创建内嵌 rtv.Server、不挂 `/ws`、不启 ACME。桌面媒体只经外置
+xnc-relay；relay 池无可用者时 desktop 直接 `503 RTV_NO_RELAY`（不做内嵌
+兜底）。过渡期（首台 relay 就位前）可在 SRV 的 compose 临时
+`XNC_RTV_EMBEDDED=true` 保内嵌运行。
+
+### 6.1 relay 主机要求与端口
+
+- 二进制：`deploy/build-relay.ps1`（linux/amd64 交叉构建）+ `push_relay.py`
+  推送（凭据 `deploy/.env` 的 `RELAY1_*` 键）；systemd 单元
+  `deploy/xnc-relay.service`（参数模板渲染）。
+- 端口：UDP 443（viewer WT 主路，自签证书 + 浏览器 serverCertificateHashes
+  钉扎）、UDP 4433（host 腿 QUIC，自签证书 + server 下发 certSha256 钉扎）、
+  TCP 443（可选：caddy 前置 → relay `127.0.0.1:8080` HTTP 腿 `/ws` 浏览器
+  兜底 + `/healthz`）。
+- **浏览器 WS 兜底腿的域名前置**：WS 无法钉扎自签证书——`/ws` 兜底要
+  caddy（或 `--http-cert/--http-key` CA 证书）直启 TLS；纯 IP relay 的
+  浏览器路径只有 WT（钉扎），`/ws` 候选握手必败后 viewer 自然回落，无害。
+
+### 6.2 首次接入与审批
+
+1. SRV 配 `XNC_RTV_SIGNING_KEY`（ed25519 64B hex，持久；空 = 进程内临时
+   生成，server 重启后全部 relay 票据作废需重连重同步）。
+2. relay 启动后自动经 `wss://xnc.app/api/relay/connect` 注册（ed25519
+   挑战-应答）。首注册落 `pending`；`GET/PATCH /api/admin/relays` 审批为
+   `active`，或预先在 `XNC_RTV_RELAY_ALLOWLIST` 放公钥（hex，逗号分隔）
+   注册即 active。
+3. relay 认证通过即上报 `RELAY_RECONCILE`（在服会话集）；心跳 30s、统计
+   10s（含 ActiveSids → server 代 Touch 活跃会话）；server 下发
+   `RELAY_CONFIG`（票据签名公钥）、`RELAY_SESSION_KILL`（撤销）与
+   `RELAY_SESSION_GRANT`（被动首约，外部会话与内嵌 UX 一致）。
+
+### 6.3 多 relay 负载均衡（现行设计）
+
+- **分配**（`rtvpool.Assign`）：**节点粘性**——节点首个会话选中后沿用
+  （host 张票 (node,relay) 字节等值、core 幂等复用 host 的前提）；粘性
+  失效（relay 不合格）时在合格集内选 **负载评分最低** 者
+  （loadNorm = sessions/maxSessions）。
+- **合格性**：status=active + 90s 内有心跳 + host 腿健康探测（30s 一探，
+  连续 2 败出局）+ 时钟漂移 <5min。
+- **摘除/缩容**：admin `PATCH /api/admin/relays` 置非 active 状态即停止
+  新分配（存量会话自然收敛；drain 编排列后续）。
+- 观测：`GET /api/rtv/stats`（JWT）的 `relays` 数组 + web Monitor 页
+  relay 池表格。
+
+### 6.4 主站侧配置速查（relay-only 生产形态）
+
+```
+XNC_RTV_EMBEDDED=false        # 默认；主站不跑媒体
+XNC_RTV_SIGNING_KEY=<hex64>   # 必须（持久票据签名）
+XNC_RTV_RELAY_ALLOWLIST=<hex> # 可选（免审批）
+# XNC_RTV_ENDPOINT/HOST_ADDR/WT_ADDR/CERT_FILE/KEY_FILE/WT_PORT 均仅
+# 内嵌模式生效，relay-only 下忽略（配置了会告警提示）
+```
 ```

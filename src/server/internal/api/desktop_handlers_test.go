@@ -194,10 +194,11 @@ func TestDesktopPerNodeLimit(t *testing.T) {
 	}, 3*time.Second, 100*time.Millisecond)
 }
 
-// TestDesktopRtvUnconfigured：无 RTV endpoint 配置的服务器 → 503
-// RTV_UNCONFIGURED（拒绝开会话优于开一个必死的会话）。
+// TestDesktopRtvUnconfigured：内嵌模式（XNC_RTV_EMBEDDED=true）且无 RTV
+// endpoint 配置 → 503 RTV_UNCONFIGURED（拒绝开会话优于开一个必死的会话）。
 func TestDesktopRtvUnconfigured(t *testing.T) {
 	env := newTestEnvWithCfg(t, func(c *config.Config) {
+		c.RTVEmbedded = true
 		c.RTVStreamEndpoint = ""
 	})
 	nodeID := env.EnrollNode(t, "WEB-DT4", "mid-dt4")
@@ -211,6 +212,27 @@ func TestDesktopRtvUnconfigured(t *testing.T) {
 	require.Equal(t, 503, resp.StatusCode)
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&e))
 	assert.Equal(t, proto.CodeRtvUnconfigured, e.Error.Code)
+}
+
+// TestDesktopRelayOnlyNoRelay：relay-only 形态（XNC_RTV_EMBEDDED=false，
+// 2026-09-11 生产默认）且 relay 池空 → 503 RTV_NO_RELAY（主站不跑媒体，
+// 不做内嵌兜底）。
+func TestDesktopRelayOnlyNoRelay(t *testing.T) {
+	env := newTestEnvWithCfg(t, func(c *config.Config) {
+		c.RTVEmbedded = false
+		c.RTVStreamEndpoint = "" // 不得被用作兜底
+	})
+	nodeID := env.EnrollNode(t, "WEB-DT5", "mid-dt5")
+	_ = dialControl(t, env, nodeID)
+
+	resp := desktopPost(t, env, nodeID, `{}`)
+	defer resp.Body.Close()
+	var e struct {
+		Error proto.APIError `json:"error"`
+	}
+	require.Equal(t, 503, resp.StatusCode)
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&e))
+	assert.Equal(t, proto.CodeRtvNoRelay, e.Error.Code)
 }
 
 // TestDesktopRBAC：Scenario F——owner/operator → 202；viewer → 403 FORBIDDEN；

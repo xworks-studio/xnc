@@ -42,7 +42,10 @@ func NewTestEnv(t *testing.T) *TestEnv {
 	return newTestEnvWithCfg(t, func(c *config.Config) {
 		// desktop 会话需要 RTV endpoint（生产读 XNC_RTV_ENDPOINT；测试注入
 		// 固定值，未配置 → 503 路径经 newTestEnvWithCfg 显式清空）。UDP 腿
-		// 绑 :0（ephemeral）避免并行测试端口冲突。
+		// 绑 :0（ephemeral）避免并行测试端口冲突。内嵌 relay 显式开
+		//（XNC_RTV_EMBEDDED 生产默认 false，2026-09-11；测试装置沿用全内嵌
+		// 形态——relay-only 的 503 路径由专用用例覆盖）。
+		c.RTVEmbedded = true
 		c.RTVStreamEndpoint = "test-rtv:4433"
 		c.RTVHostAddr = ":0"
 		c.RTVWTAddr = ":0"

@@ -33,6 +33,12 @@ services:
       XNC_INSTALLER_SYNC_INTERVAL: ${XNC_INSTALLER_SYNC_INTERVAL:-5m}
       XNC_GITHUB_TOKEN: ${XNC_GITHUB_TOKEN:-}
       # —— RTV 桌面中继（2026-09-08 重构，替代 TURN/WebRTC 面）——
+      # 2026-09-11 主站缩减（relay-only 默认）：XNC_RTV_EMBEDDED=false 时主站
+      # 不跑媒体面——不创建内嵌 rtv.Server/不挂 /ws/不启 ACME，桌面只经
+      # 外置 xnc-relay（rtvpool 分配；无可用 → 503 RTV_NO_RELAY）。以下
+      # XNC_RTV_ENDPOINT/HOST_ADDR/WT_ADDR/CERT/WT_PORT 仅内嵌模式生效；
+      # 过渡期（relay 就位前）可临时置 true 保内嵌运行。
+      XNC_RTV_EMBEDDED: ${XNC_RTV_EMBEDDED:-false}
       # host 腿 QUIC 地址（agent 经 SESSION_OPEN 收到；生产 = 域名:4433）。
       XNC_RTV_ENDPOINT: ${XNC_RTV_ENDPOINT:-xnc.app:4433}
       # 容器内监听（host 腿 UDP4433 / WT 腿 UDP443；均需 compose 端口映射）。

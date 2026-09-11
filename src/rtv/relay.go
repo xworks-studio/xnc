@@ -438,6 +438,40 @@ func (g *Hub) ActiveSessions() map[string]int {
 	return out
 }
 
+// LiveSession 对账条目（RELAY_RECONCILE 的 relay → server 载荷元素；
+// 独立小结构避免 rtv 模块耦合 proto——控制连接层负责转换）。
+type LiveSession struct {
+	SessionID string
+	NodeID    string
+	Viewers   int
+}
+
+// LiveSessions 在服会话清单（sid → 归属节点聚合）：relay 重连控制连接时
+// 上报，server 重建 sticky/最小会话记录（孤儿收敛对账的 relay 侧事实源）。
+func (g *Hub) LiveSessions() []LiveSession {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	counts := map[string]*LiveSession{}
+	for _, h := range g.hosts {
+		h.mu.Lock()
+		for _, w := range h.viewers {
+			if e, ok := counts[w.Session()]; ok {
+				e.Viewers++
+			} else {
+				counts[w.Session()] = &LiveSession{
+					SessionID: w.Session(), NodeID: h.NodeID, Viewers: 1,
+				}
+			}
+		}
+		h.mu.Unlock()
+	}
+	out := make([]LiveSession, 0, len(counts))
+	for _, e := range counts {
+		out = append(out, *e)
+	}
+	return out
+}
+
 // Snapshot statsz 输出（管理端挂载）。
 func (g *Hub) Snapshot() map[string]any {
 	g.mu.Lock()

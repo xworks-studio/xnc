@@ -43,6 +43,10 @@ const (
 	TypeRelayStats             = "RELAY_STATS"
 	TypeRelayReconcile         = "RELAY_RECONCILE"
 	TypeRelaySessionKill       = "RELAY_SESSION_KILL"
+	// RELAY_SESSION_GRANT：server → relay，被动首约下发（与会话创建同拍；
+	// relay 在本地 Arbiter 执行 Grant，使外部会话与内嵌 relay-0 的
+	// "首个 viewer 免显式 takeControl" UX 一致，2026-09-11 Stage A）。
+	TypeRelaySessionGrant = "RELAY_SESSION_GRANT"
 	// RELAY_CONFIG：server → relay，下行票据验签公钥集合（双窗口轮换：
 	// 新旧并存；relay 收到即重建 Verifier）。认证通过后立即下发一次。
 	TypeRelayConfig = "RELAY_CONFIG"
@@ -221,4 +225,13 @@ type RelaySessionKill struct {
 	SessionID string `json:"sid,omitempty"`
 	NodeID    string `json:"nid,omitempty"`
 	Reason    string `json:"reason,omitempty"`
+}
+
+// RelaySessionGrant 被动首约下发（server → relay，与桌面会话创建同拍）：
+// relay 在本地 Arbiter 执行 Grant(node, session, holder)——空闲时授予首约，
+// 外部会话与内嵌 relay-0 的 UX 对齐（首个 viewer 免显式 takeControl）。
+type RelaySessionGrant struct {
+	SessionID string `json:"sid,omitempty"`
+	NodeID    string `json:"nid,omitempty"`
+	Holder    string `json:"holder,omitempty"`
 }

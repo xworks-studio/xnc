@@ -400,6 +400,21 @@ func (m *Manager) SessionKill(relayID, node, sessionID, reason string) {
 		Payload: mustJSON(proto.RelaySessionKill{SessionID: sessionID, NodeID: node, Reason: reason})})
 }
 
+// SessionGrant 被动首约下发（server → relay，2026-09-11 Stage A）：relay
+// 在本地 Arbiter 执行 Grant（空闲时授予首约——外部会话与内嵌 relay-0 的
+// "首个 viewer 免显式 takeControl" UX 对齐）。尽力而为：下发失败 viewer
+// 仍可显式 takeControl。
+func (m *Manager) SessionGrant(relayID, node, sessionID, holder string) {
+	m.mu.Lock()
+	conn := m.conns[relayID]
+	m.mu.Unlock()
+	if conn == nil {
+		return
+	}
+	_ = conn.sendRaw(proto.Message{Type: proto.TypeRelaySessionGrant,
+		Payload: mustJSON(proto.RelaySessionGrant{SessionID: sessionID, NodeID: node, Holder: holder})})
+}
+
 // ---------------- 分配（node-sticky + 负载打分） ----------------
 
 // Assign 为节点选择中继：sticky 命中且仍合格 → 沿用（host 张票字节等值、
