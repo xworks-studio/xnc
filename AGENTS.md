@@ -1,5 +1,11 @@
 # AGENTS.md — XNC 仓库操作规范
 
+> 2026-09-11 架构基线：主站（xnc.app）= web/认证/编排/票据签发，**零数据流**
+> （XNC_RTV_EMBEDDED 默认 false）；媒体 + 会话数据（exec/shell/file/tunnel）
+> 全部经外置 xnc-relay（r1/r2.xnc.app，节点粘性 + 负载评分 + 健康探测）。
+> 存量客户端零断代（旧 CLI 经 UA 门禁回落主站旧路径）。详见
+> docs/ci-release-and-deploy.md §6/§7。
+
 面向在本仓库工作的 AI agent 与工程师。读完应能：正确开发、部署 server、发布安装器、
 管理节点与用户安装流程，且不违反下述硬性契约。历史背景与完整设计见文末索引；
 本文与 spec 冲突时以 spec 为准，但**硬性契约**一节优先于一切。
@@ -14,7 +20,7 @@ XNC = Windows 节点远程管理平台：Go server（xnc.app）+ Windows agent
 
 ```
                  ┌─ SRV（阿里云，xnc.app）docker：caddy(TLS) ─ xnc-server ─ postgres
-                 │                                    cert-sync(LE 证书同步)  watchtower(已停用)
+                 │                                    cert-sync(仅内嵌过渡)  watchtower(已停用)
    浏览器 ───────┤  TCP443(caddy)：Web UI / REST / 会话编排（认证+控制面；
                  │    XNC_RTV_EMBEDDED=false 默认 → 主站不跑媒体面/不挂 /ws）
                  │  分发：/installer + /installer.json + /download 页（无认证）
@@ -181,7 +187,7 @@ vcpkg 无基线锁定，ffmpeg 头漂移（FF_PROFILE_* 枚举缺定义）编译
 - **反注册**：`xnc deregister`（需管理员终端；删服务端记录+本地绑定，
   保留身份）。WS 通道不通时改用服务端管理删除。
 - **升级**：`xnc upgrade [--channel stable|dev]`。
-- **虚拟显示器**：`xnc display on|off|status`（IDD 可选组件，Win10 19041+；
+- **虚拟显示器（默认停用，2026-09-11）**：`xnc display on|off|status`（IDD 可选组件，Win10 19041+；
   策略 = RTV 会话接入且盒盖/无物理输出时自动建屏、会话结束移除、agent
   崩溃自动消失；实现见 `src/agent/display` + `src/third_party/xncidd`，
   验收记录 `docs/superpowers/plans/2026-09-10-idd-virtual-display-plan.md`）。
@@ -229,8 +235,9 @@ vcpkg 无基线锁定，ffmpeg 头漂移（FF_PROFILE_* 枚举缺定义）编译
   同一 Dockerfile，构建前临时清掉即可；CI 远端构建不受影响）。
 - CI publish.yml 的 vcpkg 无基线锁定：ffmpeg 头漂移（FF_PROFILE_* 枚举
   缺失）致 host 编译失败——安装器发布暂走本地构建直传。
-- 阿里云安全组未放行 UDP443：RTV WT 主路暂用 14433/udp 过渡（compose
-  `XNC_RTV_WT_PORT`）；放行后清空该变量回规范 URL。
+- 阿里云安全组（主站）未放行 UDP443：仅影响内嵌/开发形态的 WT 腿
+  （compose `XNC_RTV_WT_PORT` 过渡 14433/udp）；relay-only 生产形态主站
+  不跑媒体腿，媒体在 relay 主机（r1/r2 已放行 UDP443/4433）。
 - web HUD 码率/收包显示累计值（未做每秒差分）；e2e 显示跨时钟偏差。
 
 ## 9. 索引
