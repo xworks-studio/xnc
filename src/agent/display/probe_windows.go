@@ -80,6 +80,16 @@ func probeConsoleDisplays() (total int, physicalActive bool, ok bool) {
 	si.Flags = windows.STARTF_USESTDHANDLES
 	si.StdOutput = outW
 	si.StdErr = outW
+	// 交互桌面（会话 1 的 winsta0\default）：GDI 枚举的 attached/active
+	// 标志随调用进程所在桌面变化——服务窗口站上的探针读到的是与用户
+	// 桌面不同的（陈旧）视图（2026-09-11 YOGA9 实测：交互探针 physical
+	// false 而服务站探针仍 true）。探针只读不改，指定桌面无副作用
+	// （与持有者的创建路径不同——那里指定桌面会破坏监视器模式查询）。
+	si.Desktop, err = windows.UTF16PtrFromString(`winsta0\default`)
+	if err != nil {
+		windows.CloseHandle(outW)
+		return 0, false, false
+	}
 
 	var pi windows.ProcessInformation
 	if err := windows.CreateProcessAsUser(token, exePtr, cmdLine, nil, nil, true,

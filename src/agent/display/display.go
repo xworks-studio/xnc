@@ -74,6 +74,11 @@ type Manager struct {
 	autoActive   bool // 会话触发创建的（会话归零即移除）
 	manualActive bool // 手动 on（保持到 off / agent 退出）
 
+	// physicalAbsentStreak 连续"无物理输出"采样数（触发滞回：物理屏
+	// EDID 抖动的机器上避免随拓扑振荡反复建拆——2026-09-11 YOGA9 外接
+	// 屏 4-8s 周期抖动实测，需连续 2 次确认才触发）。
+	physicalAbsentStreak int
+
 	stop     chan struct{}
 	stopOnce sync.Once
 }
@@ -143,8 +148,16 @@ func (m *Manager) Close() {
 }
 
 // triggerLocked 判定本次是否应创建虚拟屏。调用方持 mu。
+// 无物理输出分支带滞回（连续 2 次采样确认）——物理屏抖动机器上
+// 拓扑反复振荡，单次采样会误触发（2026-09-11 YOGA9 实测）。
 func (m *Manager) triggerLocked() bool {
-	trigger := !m.be.physicalOutputActive()
+	physicalActive := m.be.physicalOutputActive()
+	if physicalActive {
+		m.physicalAbsentStreak = 0
+	} else {
+		m.physicalAbsentStreak++
+	}
+	trigger := !physicalActive && m.physicalAbsentStreak >= 2
 	switch m.be.forceLid() {
 	case "closed":
 		trigger = true

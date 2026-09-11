@@ -140,8 +140,30 @@ func TestNoPhysicalOutputTriggers(t *testing.T) {
 	defer m.Close()
 
 	m.SessionStarted()
-	if f.plugged != 1 {
-		t.Fatalf("expected plug on headless trigger, got plugged=%d", f.plugged)
+	// 滞回：单次采样不触发，轮询（3s）第二次采样确认后触发。
+	deadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(deadline) {
+		m.mu.Lock()
+		plugged := m.plugged
+		m.mu.Unlock()
+		if plugged {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("headless trigger did not fire after hysteresis window")
+}
+
+func TestPhysicalHysteresisNeedsTwoSamples(t *testing.T) {
+	f := newFakeBackend()
+	f.physicalActive = false
+	m := newTestManager(f)
+	defer m.Close()
+
+	m.SessionStarted()
+	// 第一次采样（SessionStarted 内）：滞回未满足，不得插屏。
+	if f.plugged != 0 {
+		t.Fatalf("hysteresis must not trigger on first sample, got plugged=%d", f.plugged)
 	}
 }
 
