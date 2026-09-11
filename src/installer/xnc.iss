@@ -475,7 +475,7 @@ begin
 end;
 
 // NumericVersion 剥掉 -dev/-tag 后缀（"0.11.0-dev" → "0.11.0"），供
-// ComparePackedVersion 做数值比较。
+// 版本比较。
 function NumericVersion(v: String): String;
 var
   p: Integer;
@@ -485,6 +485,60 @@ begin
     Result := Copy(v, 1, p - 1)
   else
     Result := v;
+end;
+
+// VersionPartNum：版本串按 '.' 取第 idx 段（0 基）的数值；越界/非数字
+// 段按 0（"0.10.13" 第 4 段 = 0——3 段与 4 段版本可直接比较）。
+function VersionPartNum(v: String; idx: Integer): Integer;
+var
+  parts: TArrayOfString;
+  i, n: Integer;
+  seg: String;
+begin
+  Result := 0;
+  if v = '' then
+    Exit;
+  SetArrayLength(parts, 1);
+  parts[0] := v;
+  // 逐段切分（无内建 split：循环剥首段）。
+  while Pos('.', parts[Length(parts) - 1]) > 0 do
+  begin
+    seg := parts[Length(parts) - 1];
+    i := Pos('.', seg);
+    n := Length(parts);
+    SetArrayLength(parts, n + 1);
+    parts[n] := Copy(seg, i + 1, Length(seg) - i);
+    parts[n - 1] := Copy(seg, 1, i - 1);
+  end;
+  if idx < Length(parts) then
+    Result := StrToIntDef(parts[idx], 0);
+end;
+
+// CompareVersions 自实现数值版本比较（a>b → 1；a<b → -1；相等 → 0），
+// 容忍 3/4 段混比。不用 Inno 内建 ComparePackedVersion——真机实测它对
+// 3 段版本（"0.10.13"）抛 Type Mismatch（26200/28020 均崩，2026-09-11
+// 0.10.15 fleet 更新事故根因：0.10.13 agent 不带 /ALLOWDOWNGRADE，
+// 门卫首次被真实执行即崩，exit 1 → 回滚 → 0.10.15 被拉黑）。
+function CompareVersions(a, b: String): Integer;
+var
+  i, pa, pb: Integer;
+begin
+  for i := 0 to 3 do
+  begin
+    pa := VersionPartNum(a, i);
+    pb := VersionPartNum(b, i);
+    if pa > pb then
+    begin
+      Result := 1;
+      Exit;
+    end;
+    if pa < pb then
+    begin
+      Result := -1;
+      Exit;
+    end;
+  end;
+  Result := 0;
 end;
 
 // InitializeSetup：版本门卫。已装版本更新 → 拒绝降级（除
@@ -497,7 +551,7 @@ begin
   installed := InstalledDisplayVersion();
   if (installed = '') or AllowDowngradeRequested() then
     Exit;
-  if ComparePackedVersion(NumericVersion(installed),
+  if CompareVersions(NumericVersion(installed),
       NumericVersion('{#Version}')) > 0 then
   begin
     InstallerLog('REFUSED: downgrade ' + installed + ' -> {#Version} ' +
@@ -509,6 +563,8 @@ begin
         mbError, MB_OK);
     Result := False;
   end;
+  InstallerLog('GATE: installed=' + installed + ' incoming={#Version} -> ' +
+    IntToStr(Integer(Result)));
 end;
 
 // Spec 9.3 step 2: runs for first install and upgrades alike (services are
