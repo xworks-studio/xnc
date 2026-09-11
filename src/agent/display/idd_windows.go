@@ -316,16 +316,19 @@ func (b *winBackend) stopDevice(h uintptr) {
 	}
 }
 
-func (winBackend) plugMonitor(h uintptr) error {
+func (b *winBackend) plugMonitor(h uintptr) error {
 	// 接口就绪等待：200ms×10 快速重试 + 1s×5 兜底（会话已预创建设备，
 	// 触发插屏时设备通常已就绪，接口在 1s 内可达；新驱动包首次加载的
-	// 慢路径由兜底覆盖）。
+	// 慢路径由兜底覆盖）。就绪后经 stdin 管道命令持有者（会话 1）执行
+	// PLUG_IN——IOCTL 调用者的会话决定 IddCx 的监视器路由（2026-09-11
+	// YOGA9 驱动追踪定位：会话 0 直达 = CommitModes ACTIVE 但无 DWM 接管
+	// = swapchain 永不分配、虚拟屏永不上用户桌面）。
 	var lastErr error
 	for i := 0; i < 15; i++ {
 		dev, err := openDeviceInterface()
 		if err == nil {
-			defer windows.CloseHandle(dev)
-			return ioctlPlugInMonitor(uintptr(dev))
+			windows.CloseHandle(dev)
+			return b.holderCommand("plug\n")
 		}
 		lastErr = err
 		if i < 10 {
@@ -337,13 +340,23 @@ func (winBackend) plugMonitor(h uintptr) error {
 	return lastErr
 }
 
-func (winBackend) unplugMonitor(h uintptr) error {
+func (b *winBackend) unplugMonitor(h uintptr) error {
+	// 拔屏同样经会话 1 持有者（PLUG_OUT 的路由同 PLUG_IN）。
 	dev, err := openDeviceInterface()
 	if err != nil {
 		return err
 	}
-	defer windows.CloseHandle(dev)
-	return ioctlPlugOutMonitor(uintptr(dev))
+	windows.CloseHandle(dev)
+	return b.holderCommand("unplug\n")
+}
+
+// holderCommand 经 stdin 管道向持有者进程发一行命令（持有者在会话 1
+// 执行对应 IOCTL，见 src/cli/cmd_idd_hold.go）。
+func (b *winBackend) holderCommand(cmd string) error {
+	if b.stdinWrite == 0 {
+		return fmt.Errorf("display: idd holder not running")
+	}
+	return windows.WriteFile(b.stdinWrite, []byte(cmd), nil, nil)
 }
 
 func (winBackend) physicalOutputActive() bool {

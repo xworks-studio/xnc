@@ -112,6 +112,10 @@ func startHolder() (proc, stdinW windows.Handle, err error) {
 	si.StdInput = stdinR
 	si.StdOutput = logFile
 	si.StdErr = logFile
+	// 注意（2026-09-11 YOGA9 实测回退）：不要指定 lpDesktop=winsta0\default——
+	// 交互桌面创建会导致 OS 不查询模式回调（CommitModes 空模式、永不分配
+	// swapchain）；服务窗口站 + 会话 1 token 的持有者（继承 agent 窗口站）
+	// 才是已验证可分配 swapchain 的形态（20:50 实测）。
 
 	var pi windows.ProcessInformation
 	if err := windows.CreateProcessAsUser(token, exePtr, cmdLine, nil, nil, true,
