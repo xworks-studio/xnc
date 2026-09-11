@@ -24,6 +24,36 @@ Environment:
 #include "Public.h"
 
 //
+// 2026-09-11 XNC 诊断插桩（虚拟屏不上用户桌面排查）：文件日志
+// C:\Windows\Temp\xncidd_trace.log。UMDF 为用户态驱动，可直接文件 I/O；
+// 排查完删除本段。
+//
+#include <stdio.h>
+#include <stdarg.h>
+#include <process.h>
+
+void XncIddTraceLog(const char* fmt, ...)
+{
+    FILE* f = nullptr;
+    if (fopen_s(&f, "C:\\Windows\\Temp\\xncidd_trace.log", "a") != 0 || f == nullptr)
+    {
+        return;
+    }
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    DWORD sid = 0xFFFFFFFF;
+    ProcessIdToSessionId(GetCurrentProcessId(), &sid);
+    fprintf(f, "%02u:%02u:%02u.%03u pid=%lu sess=%lu ",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, GetCurrentProcessId(), sid);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fprintf(f, "\n");
+    fclose(f);
+}
+
+//
 // Define an Interface Guid for XncIdd device class.
 // This GUID is used to register (IoRegisterDeviceInterface)
 // an instance of an interface so that user application
@@ -52,7 +82,10 @@ static const struct IndirectSampleMonitor::SampleMonitorMode s_XncDefaultModes[]
     { 1024,  768, 75 },
 };
 
-// XNC virtual monitor: 1920x1080@60 EDID (name "XNC Virtual"), checksum 0xD5.
+// 插屏序列号种子（进程内 LCG；唯一身份只需本进程内不重复即可）。
+static unsigned long long s_EdidSerialSeed = 0;
+
+// XNC virtual monitor: 1920x1080@60 EDID (name "XNC Virtual"), checksum 0xC0（DTD 同步区 2026-09-11 修正为标准 1080p60）.
 static const struct IndirectSampleMonitor s_XncMonitors[] =
 {
     {
@@ -61,10 +94,10 @@ static const struct IndirectSampleMonitor s_XncMonitors[] =
             0x10,0x23,0x01,0x04,0x80,0x30,0x1B,0x78,0x0E,0x64,0x50,0x96,0xA0,0x28,0x40,0xD0,
             0x44,0xE8,0xD0,0x00,0x00,0x00,0xD1,0xC0,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,
             0x01,0x01,0x01,0x01,0x01,0x01,0x02,0x3A,0x80,0x18,0x71,0x38,0x2D,0x40,0x58,0x2C,
-            0x50,0x40,0xE0,0x0E,0x11,0x00,0x00,0x00,0x00,0x00,0x00,0xFC,0x00,0x58,0x4E,0x43,
+            0x45,0x00,0x13,0x2B,0x21,0x00,0x00,0x00,0x00,0x00,0x00,0xFC,0x00,0x58,0x4E,0x43,
             0x20,0x56,0x69,0x72,0x74,0x75,0x61,0x6C,0x0A,0x20,0x00,0x00,0x00,0xFD,0x00,0x3C,
-            0x3C,0x44,0x0F,0x00,0x0A,0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x00,0x00,0x00,0x00,
-            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xD5,
+            0x3C,0x44,0x0F,0x00,0x0A,0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x00,0x00,0x00,0xFF,
+            0x00,0x58,0x4E,0x43,0x2D,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xAB,
         },
         {
             { 1920, 1080, 60 },
@@ -719,6 +752,7 @@ void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
     // Create a monitor object with the specified monitor descriptor
     IDARG_OUT_MONITORCREATE MonitorCreateOut;
     NTSTATUS Status = IddCxMonitorCreate(m_Adapter, &MonitorCreate, &MonitorCreateOut);
+    XncIddTraceLog("FinishInit(conn=%u): IddCxMonitorCreate -> 0x%08X", ConnectorIndex, (unsigned)Status);
     if (NT_SUCCESS(Status))
     {
         TraceEvents(TRACE_LEVEL_INFORMATION,
@@ -732,6 +766,7 @@ void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
         // Tell the OS that the monitor has been plugged in
         IDARG_OUT_MONITORARRIVAL ArrivalOut;
         Status = IddCxMonitorArrival(MonitorCreateOut.MonitorObject, &ArrivalOut);
+        XncIddTraceLog("FinishInit(conn=%u): IddCxMonitorArrival -> 0x%08X", ConnectorIndex, (unsigned)Status);
         if (NT_SUCCESS(Status))
         {
             TraceEvents(TRACE_LEVEL_INFORMATION,
@@ -816,8 +851,25 @@ NTSTATUS IndirectDeviceContext::PlugInMonitor(PCtlPlugIn Param)
     }
     else
     {
+        // 每次插屏写入唯一序列号（EDID FF 描述符 8 字节随机化 + 重算校验
+        // 和）：OS 以 EDID 派生 UID 标识监视器，同身份的新到达会被当成
+        // 幽灵监视器子设备的重复而移除（CHANGED 提交，2026-09-11 YOGA9
+        // 驱动追踪定位）——唯一身份让每次插屏都是全新监视器。
+        memcpy(m_PlugEdidBuf, s_XncMonitors[MonitorEDID].pEdidBlock, IndirectSampleMonitor::szEdidBlock);
+        for (UINT i = 0; i < 8; i++)
+        {
+            s_EdidSerialSeed = s_EdidSerialSeed * 6364136223846793005ULL + 1442695040888963407ULL;
+            m_PlugEdidBuf[116 + i] = (BYTE)(s_EdidSerialSeed >> 32);
+        }
+        UINT EdidSum = 0;
+        for (UINT i = 0; i < IndirectSampleMonitor::szEdidBlock - 1; i++)
+        {
+            EdidSum += m_PlugEdidBuf[i];
+        }
+        m_PlugEdidBuf[IndirectSampleMonitor::szEdidBlock - 1] = (BYTE)((256 - (EdidSum & 0xFF)) & 0xFF);
+
         MonitorInfo.MonitorDescription.DataSize = IndirectSampleMonitor::szEdidBlock;
-        MonitorInfo.MonitorDescription.pData = const_cast<BYTE*>(s_XncMonitors[MonitorEDID].pEdidBlock);
+        MonitorInfo.MonitorDescription.pData = m_PlugEdidBuf;
     }
 
     MonitorInfo.MonitorContainerId = ContainerID;
@@ -1071,6 +1123,8 @@ IddRustDeskIoDeviceControl(WDFDEVICE Device, WDFREQUEST Request, size_t OutputBu
     size_t BufSize;
     auto* pContext = WdfObjectGet_IndirectDeviceContextWrapper(Device);
 
+    XncIddTraceLog("IoDeviceControl code=0x%08X inlen=%u", (unsigned)IoControlCode, (unsigned)InputBufferLength);
+
     switch (IoControlCode)
     {
     case IOCTL_CHANGER_IDD_PLUG_IN:
@@ -1085,6 +1139,7 @@ IddRustDeskIoDeviceControl(WDFDEVICE Device, WDFREQUEST Request, size_t OutputBu
         }
         pCtlPlugIn = (PCtlPlugIn)Buffer;
         Status = pContext->pContext->PlugInMonitor(pCtlPlugIn);
+        XncIddTraceLog("PLUG_IN conn=%u edid=%u -> 0x%08X", pCtlPlugIn->ConnectorIndex, pCtlPlugIn->MonitorEDID, (unsigned)Status);
         break;
     case IOCTL_CHANGER_IDD_PLUG_OUT:
         PCtlPlugOut pCtlPlugOut;
@@ -1160,6 +1215,7 @@ NTSTATUS IddRustDeskAdapterInitFinished(IDDCX_ADAPTER AdapterObject, const IDARG
 
     auto* pDeviceContextWrapper = WdfObjectGet_IndirectDeviceContextWrapper(AdapterObject);
     auto Status = pInArgs->AdapterInitStatus;
+    XncIddTraceLog("AdapterInitFinished status=0x%08X", (unsigned)Status);
     if (NT_SUCCESS(Status))
     {
         TraceEvents(TRACE_LEVEL_INFORMATION,
@@ -1188,6 +1244,19 @@ NTSTATUS IddRustDeskAdapterCommitModes(IDDCX_ADAPTER AdapterObject, const IDARG_
 {
     TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_DEVICE, "%!FUNC! called");
 
+    XncIddTraceLog("AdapterCommitModes paths=%u", pInArgs->PathCount);
+    for (UINT i = 0; i < pInArgs->PathCount; i++)
+    {
+        XncIddTraceLog("  path[%u] flags=0x%08X mode=%ux%u@%u/%u pixelRate=%llu scanline=%u",
+            i, (unsigned)pInArgs->pPaths[i].Flags,
+            pInArgs->pPaths[i].TargetVideoSignalInfo.activeSize.cx,
+            pInArgs->pPaths[i].TargetVideoSignalInfo.activeSize.cy,
+            pInArgs->pPaths[i].TargetVideoSignalInfo.vSyncFreq.Numerator,
+            pInArgs->pPaths[i].TargetVideoSignalInfo.vSyncFreq.Denominator,
+            (unsigned long long)pInArgs->pPaths[i].TargetVideoSignalInfo.pixelRate,
+            (unsigned)pInArgs->pPaths[i].TargetVideoSignalInfo.scanLineOrdering);
+    }
+
     UNREFERENCED_PARAMETER(AdapterObject);
     UNREFERENCED_PARAMETER(pInArgs);
 
@@ -1206,6 +1275,8 @@ _Use_decl_annotations_
 NTSTATUS IddRustDeskParseMonitorDescription(const IDARG_IN_PARSEMONITORDESCRIPTION* pInArgs, IDARG_OUT_PARSEMONITORDESCRIPTION* pOutArgs)
 {
     TraceEvents(TRACE_LEVEL_VERBOSE, TRACE_DEVICE, "%!FUNC! called");
+    XncIddTraceLog("ParseMonitorDescription in=%u descSize=%u",
+        pInArgs->MonitorModeBufferInputCount, pInArgs->MonitorDescription.DataSize);
 
     // ==============================
     // TODO: In a real driver, this function would be called to generate monitor modes for an EDID by parsing it. In
@@ -1221,17 +1292,14 @@ NTSTATUS IddRustDeskParseMonitorDescription(const IDARG_IN_PARSEMONITORDESCRIPTI
     }
     else
     {
-        // In the sample driver, we have reported some static information about connected monitors
-        // Check which of the reported monitors this call is for by comparing it to the pointer of
-        // our known EDID blocks.
-
+        // 2026-09-11：宽松匹配——每次插屏的 EDID 序列号随机化后，与静态
+        // 块逐字节比对必然失败（OS 也只在无法自行解析时才走这里）。凡
+        // 128 字节 EDID 一律返回已知模式（本驱动只有一种监视器）。
         if (pInArgs->MonitorDescription.DataSize != IndirectSampleMonitor::szEdidBlock)
             return STATUS_INVALID_PARAMETER;
 
         DWORD SampleMonitorIdx = 0;
-        for(; SampleMonitorIdx < ARRAYSIZE(s_XncMonitors); SampleMonitorIdx++)
         {
-            if (memcmp(pInArgs->MonitorDescription.pData, s_XncMonitors[SampleMonitorIdx].pEdidBlock, IndirectSampleMonitor::szEdidBlock) == 0)
             {
                 // Copy the known modes to the output buffer
                 for (DWORD ModeIndex = 0; ModeIndex < IndirectSampleMonitor::szModeList; ModeIndex++)
@@ -1246,16 +1314,13 @@ NTSTATUS IddRustDeskParseMonitorDescription(const IDARG_IN_PARSEMONITORDESCRIPTI
 
                 // Set the preferred mode as represented in the EDID
                 pOutArgs->PreferredMonitorModeIdx = s_XncMonitors[SampleMonitorIdx].ulPreferredModeIdx;
+
+                XncIddTraceLog("ParseMonitorDescription MATCH idx=%u out=%u preferred=%u",
+                    SampleMonitorIdx, pOutArgs->MonitorModeBufferOutputCount, pOutArgs->PreferredMonitorModeIdx);
         
                 return STATUS_SUCCESS;
             }
         }
-
-        TraceEvents(TRACE_LEVEL_ERROR,
-            TRACE_DEVICE,
-            "%!FUNC! invalid parameter");
-        // This EDID block does not belong to the monitors we reported earlier
-        return STATUS_INVALID_PARAMETER;
     }
 }
 
@@ -1336,6 +1401,7 @@ _Use_decl_annotations_
 NTSTATUS IddRustDeskMonitorAssignSwapChain(IDDCX_MONITOR MonitorObject, const IDARG_IN_SETSWAPCHAIN* pInArgs)
 {
     TraceEvents(TRACE_LEVEL_RESERVED7, TRACE_DEVICE, "%!FUNC! called");
+    XncIddTraceLog("MonitorAssignSwapChain (OS attached monitor to a session)");
 
     auto* pMonitorContextWrapper = WdfObjectGet_IndirectMonitorContextWrapper(MonitorObject);
     pMonitorContextWrapper->pContext->AssignSwapChain(pInArgs->hSwapChain, pInArgs->RenderAdapterLuid, pInArgs->hNextSurfaceAvailable);

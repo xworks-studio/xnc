@@ -129,6 +129,12 @@ namespace Microsoft
 
             WDFDEVICE m_WdfDevice;
             IDDCX_ADAPTER m_Adapter;
+
+            // 每次插屏写入唯一序列号的 EDID 副本（FF 描述符 8 字节随机化 +
+            // 重算校验和）：监视器身份随插屏变化，避免与幽灵监视器子设备
+            // 身份碰撞导致 OS 拒绝到达（2026-09-11 YOGA9 追踪定位）。单监视
+            // 器场景一次一份即可；指针在监视器存续期内有效。
+            BYTE m_PlugEdidBuf[IndirectSampleMonitor::szEdidBlock];
         };
 
         class IndirectMonitorContext

@@ -10,7 +10,7 @@ Class = Display
 ClassVer = 2.0
 Provider=%ManufacturerName%
 CatalogFile=XncIdd.cat
-DriverVer= ; TODO: set DriverVer in stampinf property pages
+DriverVer=09/11/2026,0.10.15.0
 
 [Manufacturer]
 %ManufacturerName%=Standard,NT$ARCH$
