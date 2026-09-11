@@ -21,8 +21,14 @@ type Config struct {
 	ShellMaxLifetime time.Duration // XNC_SHELL_MAX，默认 8h，0 = 不限
 
 	// —— RTV 桌面中继（2026-09-08 重构，替代 TURN/WebRTC 面）。
-	// RTVStreamEndpoint 缺省为空 = desktop 会话 503 RTV_UNCONFIGURED；
-	// 形态 host:port（host 腿 QUIC，生产 xnc.app:4433）。凭据绝不入日志。
+	// RTVEmbedded（XNC_RTV_EMBEDDED，默认 false，2026-09-11 主站缩减决策）：
+	// false = 主站不跑媒体面——不创建内嵌 rtv.Server、不挂 /ws，桌面会话只
+	// 经外置 relay（rtvpool），无可用 relay 时 503 RTV_NO_RELAY。true = 旧单机
+	// 全内嵌模式（dev-compose/CI/测试装置显式开启），此时 RTVStreamEndpoint
+	// 恢复旧语义（host:port，空 = desktop 503 RTV_UNCONFIGURED）。
+	RTVEmbedded bool // XNC_RTV_EMBEDDED
+	// RTVStreamEndpoint 仅内嵌模式的 host 腿公告地址（host:port，生产
+	// xnc.app:4433）。embedded=false 时忽略（告警提示）。凭据绝不入日志。
 	RTVStreamEndpoint string // XNC_RTV_ENDPOINT
 	// RTVHostAddr/RTVWTAddr 是两条 UDP 腿的容器内监听地址（空 = 不启对应
 	// 腿；compose 映射 4433/udp 与 443/udp）。
@@ -81,6 +87,7 @@ func Load() (Config, error) {
 		ShellPerNode:          envInt("XNC_SHELL_PER_NODE", 10),
 		ShellIdleTimeout:      envDur("XNC_SHELL_IDLE", 30*time.Minute),
 		ShellMaxLifetime:      envDur("XNC_SHELL_MAX", 8*time.Hour),
+		RTVEmbedded:           envBool("XNC_RTV_EMBEDDED", false),
 		RTVStreamEndpoint:     env("XNC_RTV_ENDPOINT", ""),
 		RTVHostAddr:           env("XNC_RTV_HOST_ADDR", ":4433"),
 		RTVWTPublicPort:       os.Getenv("XNC_RTV_WT_PORT"),

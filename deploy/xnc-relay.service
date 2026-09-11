@@ -5,7 +5,10 @@ Wants=network-online.target
 
 [Service]
 # 参数由 deploy/push_relay.py 渲染（{{SERVER_URL}}/{{PUBLIC_HOST}}/
-# {{REGION}}/{{MAX_SESSIONS}}/{{MAX_MBPS_OUT}}）。
+# {{REGION}}/{{MAX_SESSIONS}}/{{MAX_MBPS_OUT}}/{{ALLOW_ORIGIN}}）。
+# HTTP 腿（/ws 浏览器兜底 + /healthz，默认 127.0.0.1:8080）：生产由主机
+# caddy 前置终结 TLS（TCP443 → 127.0.0.1:8080，需域名 + CA 证书——浏览器
+# WS 无法钉扎自签）；--ws-port 443 为注册的对外端口。
 ExecStart=/usr/local/bin/xnc-relay \
   --server {{SERVER_URL}} \
   --public-host {{PUBLIC_HOST}} \
@@ -13,7 +16,9 @@ ExecStart=/usr/local/bin/xnc-relay \
   --region {{REGION}} \
   --allow-origin {{ALLOW_ORIGIN}} \
   --max-sessions {{MAX_SESSIONS}} \
-  --max-mbps-out {{MAX_MBPS_OUT}}
+  --max-mbps-out {{MAX_MBPS_OUT}} \
+  --http-addr 127.0.0.1:8080 \
+  --ws-port 443
 Restart=always
 RestartSec=2
 

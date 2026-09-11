@@ -15,16 +15,19 @@ XNC = Windows 节点远程管理平台：Go server（xnc.app）+ Windows agent
 ```
                  ┌─ SRV（阿里云，xnc.app）docker：caddy(TLS) ─ xnc-server ─ postgres
                  │                                    cert-sync(LE 证书同步)  watchtower(已停用)
-   浏览器 ───────┤  TCP443(caddy)：Web UI / REST / RTV WS 兜底腿（/ws）
-                 │  UDP443：RTV WebTransport 主路（H3，LE 真实 CA 证书；
-                 │    过渡期安全组未放行 443/udp，浏览器暂走 14433/udp）
+   浏览器 ───────┤  TCP443(caddy)：Web UI / REST / 会话编排（认证+控制面；
+                 │    XNC_RTV_EMBEDDED=false 默认 → 主站不跑媒体面/不挂 /ws）
                  │  分发：/installer + /installer.json + /download 页（无认证）
                  │
-   Windows 节点 ─┘  纯出站 wss 控制连接（agent 自报版本，server 推送更新）
+   Windows 节点 ─┤  纯出站 wss 控制连接（agent 自报版本，server 推送更新）
      XNCAgent(SYSTEM) + XNCCore(spawn 桥) + xnc-host.exe(Rust 采集/编码/
-       RS FEC/QUIC 直连 UDP4433，HostToken 经 stdin 下发) + agentctl 管道
-     媒体面（RTV，2026-09-08 重构）：host→server 字节扇出→浏览器 WebCodecs
-       硬解；TURN/WebRTC/rt-pipe/C++ desktop 栈已退役
+       RS FEC/QUIC 直连 relay UDP4433，HostToken/certSha256 经 stdin 下发)
+     媒体面（RTV，2026-09-11 起 relay-only 默认）：host→xnc-relay 字节扇出
+       →浏览器 WebCodecs 硬解。relay = 外置 systemd 二进制（UDP443 WT 自签
+       钉扎 + UDP4433 host 腿 + HTTP /ws 兜底经 relay 主机 caddy 前置）；
+       server rtvpool 注册/审批/健康探测/节点粘性+负载评分分配；无可用
+       relay → desktop 503 RTV_NO_RELAY；内嵌 relay-0 仅 dev/过渡
+       （XNC_RTV_EMBEDDED=true）
      状态：ProgramData\XNC（binding/identity/回滚缓存）；用户会话：~/.xnc
      用户流：装安装器（零凭据）→ xnc register（登录→选 cluster→秒级上线）
 ```

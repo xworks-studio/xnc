@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
 
-/** GET /api/rtv/stats 响应（原 MVP /statsz 的收权版本；RTV 重构后的
- * 监控面——TURN 池视图随栈退役）。 */
+/** GET /api/rtv/stats 响应。relay-only 形态（XNC_RTV_EMBEDDED=false，
+ * 2026-09-11 主站缩减默认）：{enabled:false, relays}——主站不跑媒体，只有
+ * 外置 relay 池视图；内嵌形态补 hosts（本地 relay-0 的在服采集端）。 */
 interface RtvStats {
-  uptimeSec: number;
-  hosts: {
+  enabled?: boolean;
+  uptimeSec?: number;
+  hosts?: {
     node: string;
     connectedSince: string;
     viewers: number;
@@ -16,6 +18,25 @@ interface RtvStats {
     framesSeen: number;
     hostLegLatencyMs: number;
   }[];
+  relays?: RelayInfo[];
+}
+
+/** 外置 relay（rtvpool 快照元素）。 */
+interface RelayInfo {
+  id: string;
+  region: string;
+  status: string;
+  online: boolean;
+  probeFails: number;
+  clockDriftMs: number;
+  stats: {
+    sessions: number;
+    viewers: number;
+    mbpsIn: number;
+    mbpsOut: number;
+  };
+  liveSessions: number;
+  lastBeat: string;
 }
 
 const REFRESH_MS = 10_000;
@@ -56,49 +77,53 @@ export default function Monitor() {
     );
   }
 
+  const relays = stats.relays ?? [];
+  const hosts = stats.hosts ?? [];
+
   return (
     <div className="page">
       <h1>Monitor</h1>
 
       <section className="card">
         <div className="download-card-head">
-          <h2>RTV relay hosts</h2>
-          <span className="dim mono">uptime {stats.uptimeSec}s</span>
+          <h2>Relay pool</h2>
+          <span className="dim mono">
+            {stats.enabled === false ? "embedded relay off (relay-only)" : `uptime ${stats.uptimeSec ?? 0}s`}
+          </span>
         </div>
-        {stats.hosts.length === 0 ? (
-          <div className="empty">No desktop hosts are connected.</div>
+        {relays.length === 0 ? (
+          <div className="empty">
+            No external relays registered. Desktop sessions require at least
+            one approved xnc-relay.
+          </div>
         ) : (
           <table>
             <thead>
               <tr>
-                <th>Node</th>
-                <th>Since</th>
+                <th>Relay</th>
+                <th>Region</th>
+                <th>Status</th>
+                <th>Sessions</th>
                 <th>Viewers</th>
-                <th>Rx</th>
-                <th>Tx</th>
-                <th>Frames</th>
-                <th>Host leg</th>
+                <th>Out</th>
+                <th>Probe fails</th>
+                <th>Last beat</th>
               </tr>
             </thead>
             <tbody>
-              {stats.hosts.map((h) => (
-                <tr key={h.node}>
-                  <td className="mono">{h.node.slice(0, 8)}</td>
+              {relays.map((r) => (
+                <tr key={r.id}>
+                  <td className="mono">{r.id}</td>
+                  <td className="dim">{r.region || "—"}</td>
+                  <td className="mono">{r.status}</td>
+                  <td className="mono">{r.stats?.sessions ?? 0}</td>
+                  <td className="mono">{r.stats?.viewers ?? 0}</td>
                   <td className="dim mono">
-                    {new Date(h.connectedSince).toLocaleTimeString()}
+                    {(r.stats?.mbpsOut ?? 0).toFixed(1)} Mbps
                   </td>
-                  <td className="mono">{h.viewers}</td>
+                  <td className="mono">{r.probeFails}</td>
                   <td className="dim mono">
-                    {(h.rxBytes / 1e6).toFixed(1)} MB / {h.rxPkgs} pkts
-                  </td>
-                  <td className="dim mono">
-                    {(h.txBytes / 1e6).toFixed(1)} MB / {h.txPkgs} pkts
-                  </td>
-                  <td className="mono">{h.framesSeen}</td>
-                  <td className="mono">
-                    {h.hostLegLatencyMs < 0
-                      ? "—"
-                      : `${h.hostLegLatencyMs.toFixed(1)} ms`}
+                    {new Date(r.lastBeat).toLocaleTimeString()}
                   </td>
                 </tr>
               ))}
@@ -107,12 +132,64 @@ export default function Monitor() {
         )}
       </section>
 
+      {stats.enabled !== false && (
+        <section className="card">
+          <div className="download-card-head">
+            <h2>Embedded relay hosts (relay-0)</h2>
+            <span className="dim mono">uptime {stats.uptimeSec ?? 0}s</span>
+          </div>
+          {hosts.length === 0 ? (
+            <div className="empty">No desktop hosts are connected.</div>
+          ) : (
+            <table>
+              <thead>
+                <tr>
+                  <th>Node</th>
+                  <th>Since</th>
+                  <th>Viewers</th>
+                  <th>Rx</th>
+                  <th>Tx</th>
+                  <th>Frames</th>
+                  <th>Host leg</th>
+                </tr>
+              </thead>
+              <tbody>
+                {hosts.map((h) => (
+                  <tr key={h.node}>
+                    <td className="mono">{h.node.slice(0, 8)}</td>
+                    <td className="dim mono">
+                      {new Date(h.connectedSince).toLocaleTimeString()}
+                    </td>
+                    <td className="mono">{h.viewers}</td>
+                    <td className="dim mono">
+                      {(h.rxBytes / 1e6).toFixed(1)} MB / {h.rxPkgs} pkts
+                    </td>
+                    <td className="dim mono">
+                      {(h.txBytes / 1e6).toFixed(1)} MB / {h.txPkgs} pkts
+                    </td>
+                    <td className="mono">{h.framesSeen}</td>
+                    <td className="mono">
+                      {h.hostLegLatencyMs < 0
+                        ? "—"
+                        : `${h.hostLegLatencyMs.toFixed(1)} ms`}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </section>
+      )}
+
       <section className="card">
         <h2>Notes</h2>
         <p className="dim">
-          Desktop media relays through xnc-server&apos;s QUIC/WT/WS legs (RTV);
-          the host leg latency includes clock skew and is trend-only. TURN was
-          retired with the 2026-09-08 rewrite.
+          Desktop media relays through xnc-relay servers; this server runs{" "}
+          {stats.enabled === false
+            ? "relay-only (embedded relay disabled)"
+            : "the embedded relay-0"
+          }
+          . Host leg latency includes clock skew and is trend-only.
         </p>
       </section>
     </div>

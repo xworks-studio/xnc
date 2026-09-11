@@ -22,6 +22,9 @@ services:
       # RTV（dev）：endpoint = 本机 LAN IP 的 host 腿映射端口；dev 无 ACME
       # （进程内自签证书 → XNC_RTV_INSECURE_TLS 让 host 跳过校验；浏览器
       # WT 不可用，走 WS 兜底——8443 的自签只服务 rtvload -insecure）。
+      # 内嵌 relay 显式开（生产默认 false 的 relay-only 形态不适用 dev
+      # 单机栈）。
+      XNC_RTV_EMBEDDED: "true"
       XNC_RTV_ENDPOINT: ${XNC_RTV_ENDPOINT:-127.0.0.1:14433}
       XNC_RTV_INSECURE_TLS: "true"
       XNC_ACME_DOMAIN: ""

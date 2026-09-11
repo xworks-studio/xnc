@@ -47,7 +47,15 @@ type desktopReq struct {
 // lease 判定 + 被动首约；会话终局经 finishExtra 触发 relay 撤销（墓碑+
 // 断连，spec §3.4）。
 func (h *handlers) desktopStart(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.RTVStreamEndpoint == "" || h.rtv == nil || h.rtvSign == nil {
+	if h.rtvSign == nil {
+		respondError(w, proto.Err(503, proto.CodeRtvUnconfigured,
+			"desktop sessions require RTV; ticket signer unavailable"))
+		return
+	}
+	if !h.cfg.RTVEmbedded {
+		// relay-only（2026-09-11 主站缩减默认形态）：媒体只经外置 relay，
+		// 主站不跑 relay-0。签发器与 pool 在 router 恒装配，此处无需再检。
+	} else if h.cfg.RTVStreamEndpoint == "" || h.rtv == nil {
 		respondError(w, proto.Err(503, proto.CodeRtvUnconfigured,
 			"desktop sessions require RTV; server has no XNC_RTV_ENDPOINT configuration"))
 		return
@@ -66,8 +74,9 @@ func (h *handlers) desktopStart(w http.ResponseWriter, r *http.Request) {
 
 	nodeID := chi.URLParam(r, "id")
 
-	// relay-plane 分配：node-sticky + 负载打分选外部中继；池空/全不合格
-	// 回落 relay-0（内嵌，现行为）。rid 决定两张票的归属与 StreamEndpoint。
+	// relay-plane 分配：node-sticky + 负载打分选外部中继。内嵌模式下池空/
+	// 全不合格回落 relay-0（旧行为）；relay-only 模式池空 = 503（主站不跑
+	// 媒体，无 relay 即无桌面）。rid 决定两张票的归属与 StreamEndpoint。
 	rid := rtv.EmbeddedRelayID
 	assignRelayID := rtv.EmbeddedRelayID
 	assignRegion := "embedded"
@@ -78,7 +87,14 @@ func (h *handlers) desktopStart(w http.ResponseWriter, r *http.Request) {
 			assignRelayID = a.RelayID
 			assignRegion = a.Region
 			candidates = a.Endpoints
+		} else if !h.cfg.RTVEmbedded {
+			respondError(w, proto.Err(503, proto.CodeRtvNoRelay,
+				"no relay available: register/approve an xnc-relay (server runs relay-only, XNC_RTV_EMBEDDED=false)"))
+			return
 		}
+	} else if !h.cfg.RTVEmbedded {
+		respondError(w, proto.Err(503, proto.CodeRtvNoRelay, "no relay pool available"))
+		return
 	}
 	hostLeg := h.cfg.RTVStreamEndpoint
 	if rid != rtv.EmbeddedRelayID {
@@ -88,13 +104,19 @@ func (h *handlers) desktopStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hostToken := h.rtvSign.HostTicketFor(nodeID, rid)
+	// host leg 证书校验：外置 relay = 从其注册端点取 wt 候选的 certSha256
+	// 钉扎（自签证书 + 指纹，host 侧 rustls PinnedCertVerifier 按指纹校验，
+	// 2026-09-11 收紧——此前对外置 relay 恒 TLSInsecure 属过渡态）；域名
+	// +CA 证书的 relay 不带 certSha256，host 走系统根校验。内嵌 relay-0
+	// 按 server 证书形态（ACME/文件对 = Web PKI；dev 自签 = 显式
+	// XNC_RTV_INSECURE_TLS）。
+	certSHA := candidateCertSHA(candidates)
 	params, err := json.Marshal(proto.DesktopParams{
 		StreamEndpoint: hostLeg,   // relay-0 = server config；外部 = 归属 relay 的 host 腿
 		HostToken:      hostToken, // 签发器 (node,relay) 表；绝不回显给客户端
 		WTSSession:     req.WTSSession,
-		// 纯 IP relay 自签证书的过渡态：P1 暂以 insecure 联调（T7 换
-		// certSha256 钉扎后收紧）；relay-0 仍按 server config。
-		TLSInsecure: h.cfg.RTVInsecureTLS || rid != rtv.EmbeddedRelayID,
+		TLSInsecure:    h.cfg.RTVInsecureTLS,
+		CertSHA256:     certSHA,
 	})
 	if err != nil {
 		respondError(w, proto.Err(500, proto.CodeInternal, "encode params"))
@@ -172,10 +194,14 @@ func (h *handlers) desktopStart(w http.ResponseWriter, r *http.Request) {
 			}
 			out["token"] = vtok
 			// 被动首约（manager 先到先得语义的 relay 侧等价物）：仅空闲时
-			// 授予。外部 relay 的仲裁机在远端，P1 无下发通道——外部会话以
-			// 显式 takeControl 为准（P2 经控制连接补 Grant 下发）。
+			// 授予。内嵌直调本地仲裁机；外置 relay 经控制连接下发
+			// RELAY_SESSION_GRANT（2026-09-11 起，UX 对齐）。
 			if rid == rtv.EmbeddedRelayID {
-				h.rtv.Hub.Arbiter().Grant(nodeID, res.Session.ID, name)
+				if h.rtv != nil {
+					h.rtv.Hub.Arbiter().Grant(nodeID, res.Session.ID, name)
+				}
+			} else if h.pool != nil {
+				h.pool.SessionGrant(rid, nodeID, res.Session.ID, name)
 			}
 			out["candidates"] = candidates
 			return out
@@ -209,6 +235,18 @@ func relayHostLeg(eps []proto.EndpointDesc) string {
 	for _, e := range eps {
 		if e.Transport == "quic" && e.Host != "" {
 			return net.JoinHostPort(e.Host, strconv.Itoa(e.Port))
+		}
+	}
+	return ""
+}
+
+// candidateCertSHA 取 relay 注册端点里 wt 候选携带的自签证书指纹（host 腿
+// 与 wt 腿共用同一证书，指纹一致）。空 = relay 用域名+CA 证书（host 走
+// 系统 Web PKI 校验，无需钉扎）。
+func candidateCertSHA(eps []proto.EndpointDesc) string {
+	for _, e := range eps {
+		if e.Transport == "wt" && e.CertSHA256 != "" {
+			return e.CertSHA256
 		}
 	}
 	return ""
@@ -250,9 +288,14 @@ func hostOnly(host string) string {
 }
 
 // rtvStats 管理端观测面（原 MVP /statsz 收权版本：JWT admin 组内挂载）。
+// relay-only 形态（内嵌关）只报 pool；embedded=false 显式标注。
 func (h *handlers) rtvStats(w http.ResponseWriter, _ *http.Request) {
 	if h.rtv == nil {
-		respondJSON(w, http.StatusOK, map[string]any{"enabled": false})
+		out := map[string]any{"enabled": false}
+		if h.pool != nil {
+			out["relays"] = h.pool.Snapshot()
+		}
+		respondJSON(w, http.StatusOK, out)
 		return
 	}
 	snap := h.rtv.Hub.Snapshot()

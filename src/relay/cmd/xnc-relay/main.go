@@ -1,15 +1,19 @@
-// xnc-relay — RTV 外部中继（relay-plane P1，spec 2026-09-08 §4.2）。
+// xnc-relay — RTV 外部中继（relay-plane，spec 2026-09-08 §4.2；2026-09-11
+// Stage A 转正为唯一媒体路径——主站 XNC_RTV_EMBEDDED 默认 false）。
 //
 // 形态：单静态二进制 + systemd，裸跑（无 docker）。进程内组装 xnc/rtv 的
-// 三腿（host QUIC + viewer WT；纯 IP 模式不开 WS 腿——浏览器无法对裸 IP
-// 钉扎，兜底由主站 relay-0 承担），经控制连接（wss → 主站 /api/relay/connect，
-// 经 caddy TCP443）完成注册-挑战-应答准入、心跳、统计上报、
-// RELAY_CONFIG（server 票据签名公钥，离线验票的信任根）与
-// RELAY_SESSION_KILL（本地墓碑 + 断连）。
+// host QUIC + viewer WT 两腿 + HTTP 腿（/ws 浏览器 WS 兜底 + /healthz，
+// 生产由主机 caddy 前置终结 TLS——浏览器 WS 无法钉扎自签证书，CA 域名
+// 是 WS 兜底的前置），经控制连接（wss → 主站 /api/relay/connect，经
+// caddy TCP443）完成注册-挑战-应答准入、心跳、统计上报、RELAY_CONFIG
+// （server 票据签名公钥，离线验票的信任根）、RELAY_SESSION_KILL（本地
+// 墓碑 + 断连）、RELAY_SESSION_GRANT（被动首约下发）与 RELAY_RECONCILE
+// （重连对账：上报在服会话集）。
 //
 // 纯 IP 自签模式：WT 腿用进程内自签证书，certSha256（DER 的 SHA-256）
 // 随注册端点下发——浏览器 serverCertificateHashes 钉扎，免备案约束下的
-// 唯一浏览器可用形态（spec §4.2）。
+// 唯一浏览器可用形态（spec §4.2）；host 腿同证书，server 侧据此对
+// xnc-host 下发 certSha256 钉扎（DesktopParams.CertSHA256）。
 //
 // 凭据纪律：身份私钥只在 <data-dir>/identity.json（0600），绝不入 argv/
 // 日志；日志剥离一切 query string 与票据。
@@ -32,6 +36,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -58,9 +63,17 @@ func main() {
 		hostPort    = flag.Int("host-port", 4433, "注册端点：host 腿对外端口")
 		wtPort      = flag.Int("wt-port", 443, "注册端点：WT 腿对外端口")
 		region      = flag.String("region", "", "区域标签（分配打分的区域权重）")
-		allowOrigin = flag.String("allow-origin", "", "WT 腿放行的页面 Origin（逗号分隔，如 https://xnc.app）——跨 host 外部 relay 必配：同 host 校验对 主站页面→relay 地址 的连接必拒")
+		allowOrigin = flag.String("allow-origin", "", "WT/WS 腿放行的页面 Origin（逗号分隔，如 https://xnc.app）——跨 host 外部 relay 必配：同 host 校验对 主站页面→relay 地址 的连接必拒")
 		maxSessions = flag.Int("max-sessions", 100, "容量声明：并发会话上限（打分用）")
 		maxMbpsOut  = flag.Int("max-mbps-out", 500, "容量声明：出带宽上限 Mbps")
+		// HTTP 腿（2026-09-11 Stage A）：/ws 浏览器 WS 兜底 + /healthz。
+		// 生产形态 = 本地明文 + 主机 caddy 前置（ACME/HTTPS，同主站模式）；
+		// 无 caddy 部署可用 --http-cert/--http-key 直启 TLS（需 CA 证书——
+		// 浏览器 WS 无法钉扎自签证书）。空串关闭 HTTP 腿。
+		httpAddr = flag.String("http-addr", "127.0.0.1:8080", "HTTP 腿监听地址（/ws + /healthz；空 = 关闭）")
+		wsPort   = flag.Int("ws-port", 443, "注册端点：WS 兜底腿对外端口（caddy 前置 = 443）")
+		httpCert = flag.String("http-cert", "", "HTTP 腿直启 TLS 证书（PEM；空 = 明文，由 caddy 前置终结 TLS）")
+		httpKey  = flag.String("http-key", "", "HTTP 腿直启 TLS 私钥（PEM）")
 	)
 	flag.Parse()
 	if *serverURL == "" || *publicHost == "" {
@@ -103,7 +116,7 @@ func main() {
 		HostAddr: *hostAddr, WTAddr: *wtAddr,
 		RelayID:        relayID, // 空则首个合法 host hello 之前由控制连接回填
 		WTAllowOrigins: allowOrigins,
-	}, tlsProv, host, nil)
+	}, tlsProv, host, allowOrigins) // WS 兜底腿 Origin 白名单同 WT（跨 host 页面 → relay /ws）
 	if err := srv.Start(); err != nil {
 		log.Error("legs start", "err", err)
 		os.Exit(1)
@@ -112,6 +125,14 @@ func main() {
 	endpoints := []proto.EndpointDesc{
 		{Transport: "wt", Host: *publicHost, Port: *wtPort, Path: "/wt", CertSHA256: certSHA},
 		{Transport: "quic", Host: *publicHost, Port: *hostPort, ALPN: rtv.HostALPN},
+	}
+	// HTTP 腿（/ws 浏览器兜底）：开启即注册 ws 候选（browser 按 wt→ws
+	// 顺序尝试；无 CA 证书的部署 ws 握手必败，viewer 自然回落，无害）。
+	if *httpAddr != "" {
+		startHTTPLeg(*httpAddr, *httpCert, *httpKey, srv)
+		endpoints = append(endpoints, proto.EndpointDesc{
+			Transport: "ws", Host: *publicHost, Port: *wsPort, Path: "/ws",
+		})
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -122,6 +143,31 @@ func main() {
 
 	<-ctx.Done()
 	log.Info("xnc-relay shutting down")
+}
+
+// startHTTPLeg 起 HTTP 腿（/ws 兜底 + /healthz）：默认明文本地口（生产由
+// caddy 前置终结 TLS）；--http-cert/--http-key 给出则直启 TLS。
+func startHTTPLeg(addr, certFile, keyFile string, srv *rtv.Server) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", srv.WSHandler())
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	srvHTTP := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		var err error
+		if certFile != "" && keyFile != "" {
+			log.Info("http leg (tls)", "addr", addr)
+			err = srvHTTP.ListenAndServeTLS(certFile, keyFile)
+		} else {
+			log.Info("http leg (plain; front with caddy for browser TLS)", "addr", addr)
+			err = srvHTTP.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
+			log.Error("http leg failed", "err", err)
+		}
+	}()
 }
 
 // controlLoop 控制连接：注册 → 挑战-应答 → 服务（心跳/统计/配置/击杀）。
@@ -220,6 +266,17 @@ func controlSession(ctx context.Context, serverURL, relayID, pubHex string, priv
 	}
 	log.Info("control session authenticated", "relayId", relayID)
 
+	// 认证通过即对账（RELAY_RECONCILE）：上报在服会话集——server 重启后
+	// 重建 sticky/最小会话记录（孤儿收敛的 relay 侧事实源；server 回的
+	// Alive 差集墓碑由 P2 接续，本向先通）。
+	live := srv.Hub.LiveSessions()
+	rl := make([]proto.RelayLiveSession, 0, len(live))
+	for _, e := range live {
+		rl = append(rl, proto.RelayLiveSession{SessionID: e.SessionID, NodeID: e.NodeID, Viewers: e.Viewers})
+	}
+	_ = send(proto.Message{Type: proto.TypeRelayReconcile,
+		Payload: mustJSON(proto.RelayReconcile{Live: rl})})
+
 	// ③ 服务循环 + 心跳/统计上报。
 	stats := newStatsReporter(srv, func(st proto.RelayStats) {
 		_ = send(proto.Message{Type: proto.TypeRelayStats, Payload: mustJSON(st)})
@@ -256,6 +313,13 @@ func controlSession(ctx context.Context, serverURL, relayID, pubHex string, priv
 			if msg.Decode(&k) == nil {
 				srv.KillSession(k.NodeID, k.SessionID, k.Reason)
 				log.Info("session killed", "node", k.NodeID, "reason", k.Reason)
+			}
+		case proto.TypeRelaySessionGrant:
+			// 被动首约（2026-09-11 Stage A）：本地仲裁机空闲时授予——
+			// 外部会话与内嵌 relay-0 的首 viewer UX 对齐。
+			var g proto.RelaySessionGrant
+			if msg.Decode(&g) == nil {
+				srv.Hub.Arbiter().Grant(g.NodeID, g.SessionID, g.Holder)
 			}
 		case proto.TypeRelayHeartbeatAck:
 			// 无载荷。

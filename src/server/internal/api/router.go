@@ -84,32 +84,10 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		sess.DesktopIdleTimeout = cfg.DesktopIdleTimeout
 	}
 	h := &handlers{st: st, cfg: cfg, reg: reg, sess: sess}
-	// RTV 中继（desktop 媒体面）：host QUIC + WT 两腿绑 UDP；WS 兜底腿挂主
-	// mux（/ws，经 caddy TCP443 反代）。relay-plane：准入 = RelayTicket 离线
-	// 验签（PlaneHost 单缝取代原五处注入），控制权仲裁在中继本地 Arbiter
-	// （策略留在签发侧的 ticket claims）。
-	var tlsProv func([]string) *tls.Config
-	switch {
-	case cfg.RTVACMEDomain != "":
-		certFile, keyFile, err := rtv.StartACME(rtv.ACMEConfig{
-			Dir: cfg.RTVACMEDir, Domain: cfg.RTVACMEDomain, Email: cfg.RTVACMEEmail,
-			AlidnsKey: cfg.AlidnsKey, AlidnsSecret: cfg.AlidnsSecret,
-			Staging: cfg.RTVACMEStaging,
-		})
-		if err != nil {
-			slog.Error("rtv: acme failed, falling back to dev self-signed (WT legs will be browser-unusable; WS fallback rides caddy)", "err", err)
-			tlsProv = rtv.DevSelfSigned()
-		} else {
-			tlsProv = rtv.CertFiles(certFile, keyFile)
-		}
-	case cfg.RTVCertFile != "" && cfg.RTVKeyFile != "":
-		tlsProv = rtv.CertFiles(cfg.RTVCertFile, cfg.RTVKeyFile)
-	default:
-		tlsProv = rtv.DevSelfSigned()
-	}
-	// RelayTicket 签发/验签（relay-plane spec §3.1/§3.4）：签名密钥 env
-	// 注入（部署持久）；缺省进程内生成并告警（重启作废——relay-0 会话本就
-	// 随进程消亡，可接受；部署外部 relay 前必须配置 XNC_RTV_SIGNING_KEY）。
+	// RTV 票据签发/验签（relay-plane spec §3.1/§3.4）：签名密钥 env 注入
+	// （部署持久）；缺省进程内生成并告警（重启作废——relay-0 会话本就随进程
+	// 消亡，可接受；部署外部 relay 前必须配置 XNC_RTV_SIGNING_KEY）。
+	// 签发/验签与内嵌无关（relay-only 形态也要给外置 relay 出票），恒装配。
 	var rtvSign *rtv.Signer
 	if hexKey := cfg.RTVSigningKey; hexKey != "" {
 		s, err := rtv.NewSignerFromHex(hexKey)
@@ -128,25 +106,56 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		}
 		slog.Warn("rtv: using EPHEMERAL ticket signing key (no XNC_RTV_SIGNING_KEY); tickets die with process restart")
 	}
-	verifier, err := rtv.NewVerifier([]string{rtvSign.PublicKeyHex()})
-	if err != nil {
-		slog.Error("rtv: verifier init failed", "err", err)
-	}
-	rtvHost := &rtv.SimpleHost{Verifier: verifier,
-		TouchFn: sess.TouchActivity, // viewer 控制帧 → janitor idle/lease 判据
-		EventFn: func(typ, node, session string) {
-			slog.Info("rtv event", "typ", typ, "node", node, "session", session)
-		}}
-	h.rtv = rtv.New(rtv.Options{HostAddr: cfg.RTVHostAddr, WTAddr: cfg.RTVWTAddr},
-		tlsProv, rtvHost, cfg.RTVWSOrigins)
 	h.rtvSign = rtvSign
-	// relay 池管理器（外部中继；relay-0 之外的全部）。控制连接挂公开路由
-	// （身份 = 注册公钥的挑战-应答）；健康探测随 router 生命周期。
+
+	// 内嵌 RTV（relay-0）装配：仅 XNC_RTV_EMBEDDED=true（dev 单机全内嵌）。
+	// 默认 false（2026-09-11 主站缩减决策）：主站不创建媒体面、不挂 /ws、
+	// 不启 ACME——桌面只经外置 relay（无可用 → 503 RTV_NO_RELAY）。
+	if cfg.RTVEmbedded {
+		var tlsProv func([]string) *tls.Config
+		switch {
+		case cfg.RTVACMEDomain != "":
+			certFile, keyFile, err := rtv.StartACME(rtv.ACMEConfig{
+				Dir: cfg.RTVACMEDir, Domain: cfg.RTVACMEDomain, Email: cfg.RTVACMEEmail,
+				AlidnsKey: cfg.AlidnsKey, AlidnsSecret: cfg.AlidnsSecret,
+				Staging: cfg.RTVACMEStaging,
+			})
+			if err != nil {
+				slog.Error("rtv: acme failed, falling back to dev self-signed (WT legs will be browser-unusable; WS fallback rides caddy)", "err", err)
+				tlsProv = rtv.DevSelfSigned()
+			} else {
+				tlsProv = rtv.CertFiles(certFile, keyFile)
+			}
+		case cfg.RTVCertFile != "" && cfg.RTVKeyFile != "":
+			tlsProv = rtv.CertFiles(cfg.RTVCertFile, cfg.RTVKeyFile)
+		default:
+			tlsProv = rtv.DevSelfSigned()
+		}
+		verifier, err := rtv.NewVerifier([]string{rtvSign.PublicKeyHex()})
+		if err != nil {
+			slog.Error("rtv: verifier init failed", "err", err)
+		}
+		rtvHost := &rtv.SimpleHost{Verifier: verifier,
+			TouchFn: sess.TouchActivity, // viewer 控制帧 → janitor idle/lease 判据
+			EventFn: func(typ, node, session string) {
+				slog.Info("rtv event", "typ", typ, "node", node, "session", session)
+			}}
+		h.rtv = rtv.New(rtv.Options{HostAddr: cfg.RTVHostAddr, WTAddr: cfg.RTVWTAddr},
+			tlsProv, rtvHost, cfg.RTVWSOrigins)
+		if err := h.rtv.Start(); err != nil {
+			slog.Error("rtv legs failed to start", "err", err)
+		}
+	} else {
+		slog.Info("rtv: embedded relay disabled (XNC_RTV_EMBEDDED=false); desktop sessions require external relays")
+		if cfg.RTVStreamEndpoint != "" {
+			slog.Warn("rtv: XNC_RTV_ENDPOINT ignored (embedded relay disabled; relay-only mode assigns relay host legs)")
+		}
+	}
+	// relay 池管理器（外部中继）。控制连接挂公开路由（身份 = 注册公钥的
+	// 挑战-应答）；健康探测随 router 生命周期。relay-only 形态这是唯一
+	// 媒体路径的来源。
 	h.pool = rtvpool.New(st, cfg, slog.Default(), rtvSign.PublicKeyHex(), sess.TouchActivity)
 	h.pool.Start()
-	if err := h.rtv.Start(); err != nil {
-		slog.Error("rtv legs failed to start", "err", err)
-	}
 	r := chi.NewRouter()
 
 	r.Get("/api/health", func(w http.ResponseWriter, _ *http.Request) {
@@ -208,8 +217,11 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 	// 会话 WS（两侧均 token 即凭证，不走 JWT）
 	r.Get("/api/session/{id}", h.clientSessionWS)
 	r.Get("/api/agent/session", h.agentSessionWS)
-	// RTV WS 兜底腿（token 即凭证；经 caddy TCP443 → 主 mux）
-	r.Get("/ws", h.rtv.WSHandler())
+	// RTV WS 兜底腿（token 即凭证；经 caddy TCP443 → 主 mux）——仅内嵌
+	// 模式挂载（relay-only 的 WS 兜底在 relay 主机的 HTTP mux 上）。
+	if h.rtv != nil {
+		r.Get("/ws", h.rtv.WSHandler())
+	}
 	// relay 控制连接（公开：身份凭据 = 注册公钥挑战-应答，无 JWT）
 	r.Get("/api/relay/connect", h.pool.Handler())
 

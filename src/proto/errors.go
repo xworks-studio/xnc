@@ -28,8 +28,15 @@ const (
 	CodeAgentVersionUnsupported = "AGENT_VERSION_UNSUPPORTED"
 	// CodeRtvUnconfigured：server 无 RTV 配置（XNC_RTV_ENDPOINT）时拒绝
 	// desktop 会话（RTV 重构：503 优于开一个必死的会话；TURN 语义随栈退役）。
+	// CodeRtvUnconfigured：内嵌模式（XNC_RTV_EMBEDDED=true）下 server 无
+	// XNC_RTV_ENDPOINT 配置时拒绝 desktop 会话（RTV 重构：503 优于开一个
+	// 必死的会话；TURN 语义随栈退役）。
 	CodeRtvUnconfigured = "RTV_UNCONFIGURED"
-	CodeInternal        = "INTERNAL"
+	// CodeRtvNoRelay：relay-only 形态（XNC_RTV_EMBEDDED=false，2026-09-11
+	// 主站缩减默认）下 relay 池无可用中继（全离线/pending/健康探测不过）——
+	// 主站不跑媒体，无 relay 即无桌面，503 直报不做内嵌兜底。
+	CodeRtvNoRelay = "RTV_NO_RELAY"
+	CodeInternal   = "INTERNAL"
 )
 
 // APIError is the REST error envelope body: {"error":{"code","message"}}.
