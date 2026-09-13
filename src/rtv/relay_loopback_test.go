@@ -34,7 +34,7 @@ func newLoopSrv(t *testing.T) (*Server, *Signer) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	signer := &Signer{priv: priv, hostCache: map[string]string{}}
+	signer := &Signer{priv: priv, hostCache: map[string]hostTicket{}}
 	verifier, err := NewVerifier([]string{signer.PublicKeyHex()})
 	if err != nil {
 		t.Fatal(err)
@@ -147,6 +147,50 @@ func mediaPkt(frame uint32, payload byte) []byte {
 
 // TestHostTicketValidation — host 张票据校验：空/垃圾/typ 错/节点不匹配/
 // rid 不匹配全拒；(node,relay) 粒度跨会话字节等值；墓碑撤销。
+// TestHostTicketCacheExpiry（2026-09-13 fleet 事故回归）：HostTicketFor
+// 缓存命中必须校验过期——原实现命中即返回，24h 后稳态下发的全是过期
+// 票（relay 全拒 bad token，桌面全网死锁直到 server 重启）。
+func TestHostTicketCacheExpiry(t *testing.T) {
+	priv, err := GenerateSigningKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer := NewSignerFromKey(priv)
+	verifier, err := NewVerifier([]string{signer.PublicKeyHex()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first := signer.HostTicketFor("node-cache", "rl-x")
+	if again := signer.HostTicketFor("node-cache", "rl-x"); again != first {
+		t.Fatal("cache hit within validity must be byte-equal (host reuse precondition)")
+	}
+	if tk, err := verifier.Verify(first); err != nil || tk.Typ != TicketHost {
+		t.Fatalf("fresh ticket must verify: %v", err)
+	}
+
+	// 模拟过期：把缓存条目的过期时刻压到过去，再取必须重铸（新票可验）。
+	signer.mu.Lock()
+	for k, e := range signer.hostCache {
+		if e.tok == first {
+			e.expUnix = time.Now().Add(-time.Hour).Unix()
+			signer.hostCache[k] = e
+		}
+	}
+	signer.mu.Unlock()
+
+	// 跨过秒边界再取（iat/exp 秒级 + ed25519 确定性：同秒重铸会产出
+	// 字节相同的新票——生产场景重铸间隔 24h，不会撞秒）。
+	time.Sleep(1100 * time.Millisecond)
+	reminted := signer.HostTicketFor("node-cache", "rl-x")
+	if reminted == first {
+		t.Fatal("expired cache entry must be re-minted, not returned")
+	}
+	if tk, err := verifier.Verify(reminted); err != nil || tk.Typ != TicketHost {
+		t.Fatalf("re-minted ticket must verify: %v", err)
+	}
+}
+
 func TestHostTicketValidation(t *testing.T) {
 	s, signer := newLoopSrv(t)
 	tok := signer.HostTicketFor("n1", EmbeddedRelayID)
@@ -192,7 +236,7 @@ func TestTicketExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	signer := &Signer{priv: priv, hostCache: map[string]string{}}
+	signer := &Signer{priv: priv, hostCache: map[string]hostTicket{}}
 	v, err := NewVerifier([]string{signer.PublicKeyHex()})
 	if err != nil {
 		t.Fatal(err)

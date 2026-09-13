@@ -89,7 +89,16 @@ type Signer struct {
 	priv ed25519.PrivateKey
 
 	mu        sync.Mutex
-	hostCache map[string]string
+	hostCache map[string]hostTicket
+}
+
+// hostTicket 缓存条目：票据串 + 过期时刻（2026-09-13 修复：原实现只
+// 缓存字符串、命中即返回——24h 过期后仍下发过期票，relay 全拒
+// "bad token"，桌面全网死锁直到 server 重启。稳态运行 >24h 必现；
+// 此前每次发版重启清缓存掩盖了它）。
+type hostTicket struct {
+	tok     string
+	expUnix int64
 }
 
 // GenerateSigningKey 生成新的 ed25519 签名密钥（部署工具用）。
@@ -104,12 +113,12 @@ func NewSignerFromHex(privHex string) (*Signer, error) {
 	if err != nil || len(b) != ed25519.PrivateKeySize {
 		return nil, fmt.Errorf("rtv: bad signing key (want %d-byte hex)", ed25519.PrivateKeySize)
 	}
-	return &Signer{priv: ed25519.PrivateKey(b), hostCache: map[string]string{}}, nil
+	return &Signer{priv: ed25519.PrivateKey(b), hostCache: map[string]hostTicket{}}, nil
 }
 
 // NewSignerFromKey 从已有私钥构造（GenerateSigningKey 的配套）。
 func NewSignerFromKey(priv ed25519.PrivateKey) *Signer {
-	return &Signer{priv: priv, hostCache: map[string]string{}}
+	return &Signer{priv: priv, hostCache: map[string]hostTicket{}}
 }
 
 // PublicKeyHex 当前签名公钥（hex，供 relay 验签侧配置）。
@@ -124,10 +133,13 @@ func (s *Signer) HostTicketFor(nodeID, relayID string) string {
 	key := nodeID + "\x00" + relayID
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if t, ok := s.hostCache[key]; ok {
-		return t
-	}
+	// 命中且距过期 > 轮转余量（对齐 relay 验签 leeway）：返回缓存票
+	// （字节等值，core 复用 host 不换血）。过期/临近过期：重铸——运行
+	// 中的 host 连接不受影响，新票只随下一次 SESSION_OPEN 到新 host。
 	now := time.Now()
+	if t, ok := s.hostCache[key]; ok && now.Unix() < t.expUnix-int64(ticketLeeway.Seconds()) {
+		return t.tok
+	}
 	tok, err := mint(&ticketClaims{
 		V: ticketV1, Typ: TicketHost, NID: nodeID, RID: relayID, Gen: 1,
 		Iat: now.Unix(), Exp: now.Add(24 * time.Hour).Unix(),
@@ -135,7 +147,7 @@ func (s *Signer) HostTicketFor(nodeID, relayID string) string {
 	if err != nil {
 		panic(err) // ed25519 签名失败不可恢复
 	}
-	s.hostCache[key] = tok
+	s.hostCache[key] = hostTicket{tok: tok, expUnix: now.Add(24 * time.Hour).Unix()}
 	return tok
 }
 
