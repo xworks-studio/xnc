@@ -2,7 +2,10 @@
 //
 // xnc-core 以用户令牌或 SYSTEM@会话令牌 spawn 本进程;profile 白名单
 // 自解析(PWSH/BASH 缺失 → exit 2);pipe secret 经 --secret-stdin 从
-// stdin 读(命令行零敏感字段)。进程以 spawn 时的令牌运行,子进程
+// stdin 读,oneshot 命令同样经 stdin(--command-stdin,secret 行之后的
+// u32LE 长度前缀帧)——命令行零敏感字段,且 argv 无法无损承载任意用户
+// 命令(内嵌引号/尾反斜杠会被 core 的 BuildChildCommandLine 拒绝,
+// 2026-09-14 静默 243 事故)。进程以 spawn 时的令牌运行,子进程
 // (ConPTY/oneshot)自然继承该令牌语义。
 //
 // 用法:
@@ -11,12 +14,14 @@
 //	              --profile POWERSHELL|PWSH|CMD|BASH
 //	              --mode interactive|oneshot
 //	              [--cols N --rows N] [--cwd DIR] [--env K=V]...
-//	              [--command LINE] [--timeout SEC] [--log-file PATH]
+//	              [--command-stdin] [--timeout SEC] [--log-file PATH]
 //
 // 退出码:0 正常终态;1 使用/运行错误;2 profile 缺失(PWSH/BASH 探测失败)。
 package main
 
 import (
+	"bufio"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
@@ -39,7 +44,7 @@ func run() int {
 		cols       = flag.Int("cols", 0, "initial pty columns (interactive)")
 		rows       = flag.Int("rows", 0, "initial pty rows (interactive)")
 		cwd        = flag.String("cwd", "", "working directory for the child")
-		command    = flag.String("command", "", "oneshot command line (inline)")
+		commandIn  = flag.Bool("command-stdin", false, "read oneshot command from stdin (u32LE length frame after the secret line)")
 		timeout    = flag.Int("timeout", 0, "oneshot timeout seconds (0 = default 300)")
 		logFile    = flag.String("log-file", "", "also append log output to this file (service spawns have no console)")
 	)
@@ -62,14 +67,25 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "usage: xnc-shell.exe --pipe <name> --secret-stdin --profile <POWERSHELL|PWSH|CMD|BASH> --mode <interactive|oneshot> [...]")
 		return 1
 	}
-	if *mode == "oneshot" && *command == "" {
-		fmt.Fprintln(os.Stderr, "xnc-shell: --mode oneshot requires --command")
-		return 1
-	}
 
-	secret, err := readSecretStdin(os.Stdin)
+	// secret 行与命令帧共用一个 bufio 读端:帧字节可能与 secret 行同批
+	// 抵达,逐块裸读会吞掉换行之后的内容。
+	br := bufio.NewReader(os.Stdin)
+	secret, err := readSecretStdin(br)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "xnc-shell: %v\n", err)
+		return 1
+	}
+	var command string
+	if *commandIn {
+		command, err = readCommandFrame(br)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "xnc-shell: %v\n", err)
+			return 1
+		}
+	}
+	if *mode == "oneshot" && command == "" {
+		fmt.Fprintln(os.Stderr, "xnc-shell: --mode oneshot requires a command (--command-stdin frame empty)")
 		return 1
 	}
 
@@ -87,7 +103,7 @@ func run() int {
 
 	o := &serverOpts{
 		pipe: *pipe, secret: secret, profile: profile, exe: exe, mode: *mode,
-		cols: *cols, rows: *rows, cwd: *cwd, env: []string(envFlag), command: *command,
+		cols: *cols, rows: *rows, cwd: *cwd, env: []string(envFlag), command: command,
 		timeout: *timeout,
 	}
 	return serve(o)
@@ -132,13 +148,16 @@ func serve(o *serverOpts) int {
 }
 
 // readSecretStdin 镜像 xnc-desktop 的 --secret-stdin 语义:恰好 64 hex
-// 字符(32 字节),可选尾部 "\n"/"\r\n"(或无换行);首行之后的内容忽略。
-func readSecretStdin(r io.Reader) ([]byte, error) {
-	line, err := readFirstLine(r)
-	if err != nil {
+// 字符(32 字节),可选尾部 "\n"/"\r\n"(或无换行)。首行经 bufio 读取:
+// secret 行之后 stdin 还可能跟随 oneshot 命令帧,换行后的字节必须留在
+// 缓冲里交给 readCommandFrame(旧实现按块裸读,同批抵达的帧字节会被
+// 连带吞掉)。
+func readSecretStdin(r *bufio.Reader) ([]byte, error) {
+	line, err := r.ReadString('\n')
+	if err != nil && err != io.EOF {
 		return nil, fmt.Errorf("--secret-stdin: reading stdin failed: %w", err)
 	}
-	// 剥一个可选尾部换行对。
+	// 剥一个可选尾部换行对;EOF 无换行同视,交给长度校验。
 	if n := len(line); n >= 2 && line[n-2] == '\r' && line[n-1] == '\n' {
 		line = line[:n-2]
 	} else if n := len(line); n >= 1 && (line[n-1] == '\n' || line[n-1] == '\r') {
@@ -159,20 +178,24 @@ func readSecretStdin(r io.Reader) ([]byte, error) {
 	return out, nil
 }
 
-func readFirstLine(r io.Reader) (string, error) {
-	var sb strings.Builder
-	buf := make([]byte, 128)
-	for {
-		n, err := r.Read(buf)
-		sb.Write(buf[:n])
-		s := sb.String()
-		if strings.Contains(s, "\n") || len(s) > 256 {
-			return s, nil
-		}
-		if err != nil {
-			return s, nil // EOF(写端关闭)与读错误同视:交给长度校验
-		}
+// readCommandFrame 读 oneshot 命令帧:u32 LE 字节长度 + UTF-8 命令。
+// 长度上界 0xFFFF 对齐 core 解码器(0x0120 payload 的 u16 长度域);
+// 超界或半截帧即报错退出——绝不猜着执行残缺命令(引号事故的教训:
+// 静默改坏命令比失败更危险)。
+func readCommandFrame(r io.Reader) (string, error) {
+	var hdr [4]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return "", fmt.Errorf("--command-stdin: reading length: %w", err)
 	}
+	n := binary.LittleEndian.Uint32(hdr[:])
+	if n > 0xFFFF {
+		return "", fmt.Errorf("--command-stdin: frame length %d exceeds 64KB bound", n)
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return "", fmt.Errorf("--command-stdin: reading %d command bytes: %w", n, err)
+	}
+	return string(buf), nil
 }
 
 func hexNibble(c byte) (byte, bool) {

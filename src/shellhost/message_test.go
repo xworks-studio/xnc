@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"encoding/hex"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -74,18 +76,28 @@ func TestMessageRoundTrip(t *testing.T) {
 // TestSecretStdin 镜像 xnc-desktop ParseSecretStdinLine 语义。
 func TestSecretStdin(t *testing.T) {
 	good := "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
-	sec, err := readSecretStdin(strReader(good))
+	sec, err := readSecretStdin(bufio.NewReader(strings.NewReader(good)))
 	require.NoError(t, err)
 	assert.Len(t, sec, 32)
 
 	for _, in := range []string{good + "\n", good + "\r\n", good + "\r"} {
-		sec, err = readSecretStdin(strReader(in))
+		sec, err = readSecretStdin(bufio.NewReader(strings.NewReader(in)))
 		require.NoError(t, err)
 		assert.Len(t, sec, 32)
 	}
 
-	for _, in := range []string{"", "abcd", good[:63], good + "ff", "zz" + good[2:], good + "\nsecond"} {
-		_, err = readSecretStdin(strReader(in))
+	for _, in := range []string{"", "abcd", good[:63], good + "ff", "zz" + good[2:]} {
+		_, err = readSecretStdin(bufio.NewReader(strings.NewReader(in)))
 		assert.Errorf(t, err, "input len=%d must be rejected", len(in))
 	}
+
+	// 换行后的内容不再导致拒绝:--command-stdin 修复后,secret 行之后的
+	// stdin 是命令帧字节(同批抵达是常态),由 readCommandFrame 消费。
+	br := bufio.NewReader(strings.NewReader(good + "\n" + string(commandFrame("echo hi"))))
+	sec, err = readSecretStdin(br)
+	require.NoError(t, err)
+	assert.Len(t, sec, 32)
+	cmd, err := readCommandFrame(br)
+	require.NoError(t, err)
+	assert.Equal(t, "echo hi", cmd)
 }
