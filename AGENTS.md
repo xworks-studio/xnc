@@ -260,6 +260,12 @@ vcpkg 无基线锁定，ffmpeg 头漂移（FF_PROFILE_* 枚举缺定义）编译
   主站 xnc.app 的 80/443 目前未被拦（308/正常），但同域名风险仍在。
   relay 主机 SSH 凭据在 deploy/.env 的 `RELAY1_*/RELAY2_*` 键。
 - web HUD 码率/收包显示累计值（未做每秒差分）；e2e 显示跨时钟偏差。
+- **显示器休眠（非无输出）→ RTV 采集全黑**（2026-09-14 真机实测）：物理
+  屏休眠时 DXGI 采集内容为黑、变化驱动编码器近似零流量（relay ~53s
+  idle-timeout 收会话）；IDD auto 策略只认盒盖/无物理输出，不认屏休眠。
+  手动出路：`XNC_IDD_ENABLED=1`（机器环境）+ 重启 agent + `xnc display on`。
+  待办：auto 建屏条件纳入屏休眠/黑帧检测，或 RTV 会话期间
+  SetThreadExecutionState 保活显示。
 
 ## 9. 索引
 
