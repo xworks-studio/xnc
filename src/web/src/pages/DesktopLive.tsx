@@ -689,7 +689,7 @@ export default function DesktopLive() {
             setRelayInfo(
               c.relayId === "rl-0"
                 ? `主站内嵌（${curTransport.toUpperCase()}）`
-                : `${c.host}:${c.port}${c.region ? ` · ${c.region}` : ""}（${curTransport.toUpperCase()}）`,
+                : `${base}${c.region ? ` · ${c.region}` : ""}（${curTransport.toUpperCase()}）`,
             );
             finish();
             return;
@@ -705,10 +705,12 @@ export default function DesktopLive() {
 
       const wtUrl = withToken(resp.wtUrl);
       const wsUrl = withToken(resp.wsUrl);
-      // 旧响应形态（无 candidates）：从 URL 提取 host 展示
-      const legacyHost = (u: string) => {
+      // 旧响应形态（无 candidates）：从 URL 提取 origin+path 展示（剥
+      // query——票据不得进统计面板）
+      const legacyUrl = (u: string) => {
         try {
-          return new URL(u).host;
+          const p = new URL(u);
+          return p.origin + p.pathname;
         } catch {
           return "";
         }
@@ -717,18 +719,18 @@ export default function DesktopLive() {
         curTransport = "ws";
         await connectWS(wsUrl);
         startWorker(true);
-        setRelayInfo(`${legacyHost(wsUrl) || "主站内嵌"}（WS）`);
+        setRelayInfo(`${legacyUrl(wsUrl) || "主站内嵌"}（WS）`);
       } else {
         curTransport = "wt";
         try {
           await connectWT(wtUrl);
-          setRelayInfo(`${legacyHost(wtUrl) || "主站内嵌"}（WT）`);
+          setRelayInfo(`${legacyUrl(wtUrl) || "主站内嵌"}（WT）`);
         } catch (e) {
           log(`WebTransport 失败（${e}），回退 WebSocket`);
           curTransport = "ws";
           await connectWS(wsUrl);
           startWorker(true);
-          setRelayInfo(`${legacyHost(wsUrl) || "主站内嵌"}（WS）`);
+          setRelayInfo(`${legacyUrl(wsUrl) || "主站内嵌"}（WS）`);
         }
       }
       finish();
