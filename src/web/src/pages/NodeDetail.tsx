@@ -108,6 +108,11 @@ export default function NodeDetail() {
             Windows login. To view or control the screen right in the browser, use
             Live Desktop instead.
           </div>
+          <div className="dim">
+            Machine already locked? Live Desktop cannot click through the lock
+            screen (Windows secure-desktop restriction) — use{" "}
+            <code>xnc rdp {node.name}</code> to unlock, then switch back.
+          </div>
           <div className="dim">Connect from a machine with the xnc CLI installed:</div>
           <code className="cmd">xnc rdp {node.name}</code>
         </div>
