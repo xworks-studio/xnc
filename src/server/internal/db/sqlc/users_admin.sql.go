@@ -11,6 +11,20 @@ import (
 	"github.com/google/uuid"
 )
 
+const countNodesInOwnedClusters = `-- name: CountNodesInOwnedClusters :one
+SELECT count(*) FROM nodes n JOIN clusters c ON c.id = n.cluster_id
+WHERE c.owner_id = $1
+`
+
+// 删除用户前置检查：用户名下（owner_id 归属）集群仍挂节点则 409 拒绝——
+// 节点是资产，删除用户不得连带吞掉机器注册记录。
+func (q *Queries) CountNodesInOwnedClusters(ctx context.Context, ownerID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countNodesInOwnedClusters, ownerID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countUsersByEmail = `-- name: CountUsersByEmail :one
 SELECT count(*) FROM users WHERE email = $1
 `
@@ -25,7 +39,7 @@ func (q *Queries) CountUsersByEmail(ctx context.Context, email string) (int64, e
 const createUserByEmail = `-- name: CreateUserByEmail :one
 
 INSERT INTO users (email, display_name, password_hash)
-VALUES ($1, $2, $3) RETURNING id, email, display_name, password_hash, created_at, is_admin
+VALUES ($1, $2, $3) RETURNING id, email, display_name, password_hash, created_at, is_admin, last_login_at
 `
 
 type CreateUserByEmailParams struct {
@@ -46,12 +60,41 @@ func (q *Queries) CreateUserByEmail(ctx context.Context, arg CreateUserByEmailPa
 		&i.PasswordHash,
 		&i.CreatedAt,
 		&i.IsAdmin,
+		&i.LastLoginAt,
 	)
 	return i, err
 }
 
+const deleteOwnedClusters = `-- name: DeleteOwnedClusters :execrows
+DELETE FROM clusters WHERE owner_id = $1
+`
+
+// 删除用户时清掉其名下（此时必然已无节点）的集群行：membership 级联，
+// enrollment token 经 0006 的 ON DELETE CASCADE 级联。
+func (q *Queries) DeleteOwnedClusters(ctx context.Context, ownerID uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteOwnedClusters, ownerID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteUser = `-- name: DeleteUser :execrows
+DELETE FROM users WHERE id = $1
+`
+
+// 用户行硬删除：membership 级联（cluster_members user FK ON DELETE CASCADE），
+// 审计行保留、user_id 置空（0006 FK 语义）。
+func (q *Queries) DeleteUser(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteUser, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const listUsers = `-- name: ListUsers :many
-SELECT id, email, display_name, password_hash, created_at, is_admin FROM users ORDER BY email
+SELECT id, email, display_name, password_hash, created_at, is_admin, last_login_at FROM users ORDER BY email
 `
 
 func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
@@ -70,6 +113,7 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 			&i.PasswordHash,
 			&i.CreatedAt,
 			&i.IsAdmin,
+			&i.LastLoginAt,
 		); err != nil {
 			return nil, err
 		}

@@ -1187,3 +1187,44 @@ td.cell-actions {
 td.cell-actions button + button {
   margin-left: 6px;
 }
+
+/* 用户管理对话框：概览行 + 分节（改名 / admin / 重置密码 / 危险区） */
+.manage-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.manage-section {
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+}
+
+.manage-section + .manage-section {
+  margin-top: 14px;
+}
+
+.manage-section label {
+  flex: 1;
+}
+
+.manage-section button {
+  flex-shrink: 0;
+}
+
+.manage-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+}
+
+.manage-danger {
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
