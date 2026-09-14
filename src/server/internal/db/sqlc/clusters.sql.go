@@ -28,6 +28,20 @@ func (q *Queries) AddMembership(ctx context.Context, arg AddMembershipParams) er
 	return err
 }
 
+const countOwnedLiveClusters = `-- name: CountOwnedLiveClusters :one
+SELECT count(*) FROM clusters c
+JOIN cluster_members m ON m.cluster_id = c.id
+WHERE m.user_id = $1 AND m.role = 'owner' AND c.deleted_at IS NULL
+`
+
+// 自助建 cluster 的每用户限额判定（只数存活且任 owner 的 cluster）。
+func (q *Queries) CountOwnedLiveClusters(ctx context.Context, userID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countOwnedLiveClusters, userID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createCluster = `-- name: CreateCluster :one
 INSERT INTO clusters (id, name, owner_id, personal) VALUES ($1, $2, $3, $4) RETURNING id, name, owner_id, created_at, deleted_at, personal
 `

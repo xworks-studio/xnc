@@ -37,12 +37,14 @@ func EnsureAdmin(ctx context.Context, st *db.Store, cfg config.Config) error {
 	defer tx.Rollback(ctx) // 提交后为无害空操作
 	u, err := st.Q().WithTx(tx).CreateUser(ctx, sqlc.CreateUserParams{
 		ID: uuid.New(), Email: cfg.AdminEmail, DisplayName: "Admin", PasswordHash: hash,
+		IsAdmin: true,
 	})
 	if err != nil {
 		return err
 	}
+	// default cluster 标 personal（0005 语义：系统自动创建的个人集群）。
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO clusters(id, name, owner_id) VALUES($1,'default',$2)`,
+		`INSERT INTO clusters(id, name, owner_id, personal) VALUES($1,'default',$2,true)`,
 		uuid.New(), u.ID); err != nil {
 		return err
 	}

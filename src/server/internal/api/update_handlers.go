@@ -33,7 +33,7 @@ const maxUploadBytes = 128 << 20 // setup+cli 合计上限
 // 400 明确报错（bundle channel retired），避免流水线静默降级到坏形态。
 func (h *handlers) adminUploadRelease(w http.ResponseWriter, r *http.Request) {
 	u := auth.UserFrom(r.Context())
-	if !isAdminUser(r.Context(), h.st, u.ID) {
+	if !u.IsAdmin {
 		respondError(w, proto.Err(403, proto.CodeForbidden, "admin required"))
 		return
 	}
@@ -124,7 +124,7 @@ func (h *handlers) adminUploadRelease(w http.ResponseWriter, r *http.Request) {
 // adminListReleases — GET /api/admin/releases。
 func (h *handlers) adminListReleases(w http.ResponseWriter, r *http.Request) {
 	u := auth.UserFrom(r.Context())
-	if !isAdminUser(r.Context(), h.st, u.ID) {
+	if !u.IsAdmin {
 		respondError(w, proto.Err(403, proto.CodeForbidden, "admin required"))
 		return
 	}
@@ -151,7 +151,7 @@ func (h *handlers) adminListReleases(w http.ResponseWriter, r *http.Request) {
 // 删、latest 回落是刻意语义（清理坏版本/历史版本用）。
 func (h *handlers) adminDeleteRelease(w http.ResponseWriter, r *http.Request) {
 	u := auth.UserFrom(r.Context())
-	if !isAdminUser(r.Context(), h.st, u.ID) {
+	if !u.IsAdmin {
 		respondError(w, proto.Err(403, proto.CodeForbidden, "admin required"))
 		return
 	}
@@ -173,12 +173,13 @@ func (h *handlers) adminDeleteRelease(w http.ResponseWriter, r *http.Request) {
 }
 
 // adminRollout — POST /api/admin/rollout：
-//   {version, nodeId}                    pin 节点到版本 + 强制推送
-//   {nodeId, channel: "dev"}             切节点频道 + 强制推送（新频道的最新）
-//   {unpin: true}                        清除所有 pin（跟随频道最新）
+//
+//	{version, nodeId}                    pin 节点到版本 + 强制推送
+//	{nodeId, channel: "dev"}             切节点频道 + 强制推送（新频道的最新）
+//	{unpin: true}                        清除所有 pin（跟随频道最新）
 func (h *handlers) adminRollout(w http.ResponseWriter, r *http.Request) {
 	u := auth.UserFrom(r.Context())
-	if !isAdminUser(r.Context(), h.st, u.ID) {
+	if !u.IsAdmin {
 		respondError(w, proto.Err(403, proto.CodeForbidden, "admin required"))
 		return
 	}

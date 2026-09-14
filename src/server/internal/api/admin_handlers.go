@@ -104,7 +104,7 @@ func (h *handlers) deleteCluster(w http.ResponseWriter, r *http.Request) {
 // 404；成功 200（空 body）。
 func (h *handlers) adminDeleteNode(w http.ResponseWriter, r *http.Request) {
 	u := auth.UserFrom(r.Context())
-	if !isAdminUser(r.Context(), h.st, u.ID) {
+	if !u.IsAdmin {
 		respondError(w, proto.Err(403, proto.CodeForbidden, "admin required"))
 		return
 	}

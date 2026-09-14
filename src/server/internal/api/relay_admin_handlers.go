@@ -36,7 +36,7 @@ func relayStatusLegal(from, to string) bool {
 // 含注册画像与状态；在线/负载画像由池管理器（rtvpool）注入 live 字段。
 func (h *handlers) adminListRelays(w http.ResponseWriter, r *http.Request) {
 	u := auth.UserFrom(r.Context())
-	if !isAdminUser(r.Context(), h.st, u.ID) {
+	if !u.IsAdmin {
 		respondError(w, proto.Err(403, proto.CodeForbidden, "admin only"))
 		return
 	}
@@ -58,7 +58,7 @@ func (h *handlers) adminListRelays(w http.ResponseWriter, r *http.Request) {
 // （审批 pending→active 是主路径）。relay id 是文本（rl-<8hex>）非 UUID。
 func (h *handlers) adminSetRelayStatus(w http.ResponseWriter, r *http.Request) {
 	u := auth.UserFrom(r.Context())
-	if !isAdminUser(r.Context(), h.st, u.ID) {
+	if !u.IsAdmin {
 		respondError(w, proto.Err(403, proto.CodeForbidden, "admin only"))
 		return
 	}

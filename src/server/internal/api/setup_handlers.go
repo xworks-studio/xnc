@@ -101,4 +101,3 @@ func (h *handlers) setupManifest(w http.ResponseWriter, r *http.Request) {
 		"releasedAt": rel.CreatedAt,
 	})
 }
-

@@ -6,25 +6,17 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"xnc/proto"
 	"xnc/server/internal/auth"
-	"xnc/server/internal/db"
+	"xnc/server/internal/bootstrap"
 	"xnc/server/internal/db/sqlc"
 )
 
-// isAdminUser 判定用户是否 admin：是任一 cluster 的 owner 即视为 admin（简化
-// 判定，Phase 5 无独立 isAdmin 字段；bootstrap admin 天然是 default cluster 的
-// owner）。查询失败按非 admin 处理（fail closed）。
-func isAdminUser(ctx context.Context, st *db.Store, userID uuid.UUID) bool {
-	var is bool
-	err := st.Pool().QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM cluster_members WHERE user_id=$1 AND role='owner')`,
-		userID).Scan(&is)
-	return err == nil && is
-}
+// admin 判定走 users.is_admin（0005 起）：auth middleware 每请求全行查库，
+// u.IsAdmin 即当前值；此前"任一 cluster owner 即 admin"的派生谓词在人人拥有
+// 默认 cluster 后会让所有用户变成平台 admin，故废弃。
 
 type createUserReq struct {
 	Email       string `json:"email"`
@@ -33,10 +25,12 @@ type createUserReq struct {
 }
 
 // createUser 处理 POST /api/users：admin-only 用户创建（无自注册）。bcrypt 落库
-// 绝不回传；UNIQUE email 冲突 → 409；审计 user.create {email}。
+// 绝不回传；UNIQUE email 冲突 → 409；同一事务内建个人默认 cluster + owner
+// 成员（0005：保证新用户 register 有 cluster 可选）；审计 user.create
+// {email, default_cluster_id}。
 func (h *handlers) createUser(w http.ResponseWriter, r *http.Request) {
 	u := auth.UserFrom(r.Context())
-	if !isAdminUser(r.Context(), h.st, u.ID) {
+	if !u.IsAdmin {
 		respondError(w, proto.Err(403, proto.CodeForbidden, "admin required"))
 		return
 	}
@@ -56,7 +50,15 @@ func (h *handlers) createUser(w http.ResponseWriter, r *http.Request) {
 		respondError(w, proto.Err(409, proto.CodeInternal, "email already exists"))
 		return
 	}
-	created, err := h.st.Q().CreateUserByEmail(r.Context(), sqlc.CreateUserByEmailParams{
+	// 建号 + 默认 cluster 同事务：任一失败整体回滚，不留无 cluster 的半成品。
+	tx, err := h.st.Pool().Begin(r.Context())
+	if err != nil {
+		respondError(w, proto.Err(500, proto.CodeInternal, "tx"))
+		return
+	}
+	defer tx.Rollback(r.Context())
+	q := h.st.Q().WithTx(tx)
+	created, err := q.CreateUserByEmail(r.Context(), sqlc.CreateUserByEmailParams{
 		Email: req.Email, DisplayName: req.DisplayName, PasswordHash: hash,
 	})
 	if err != nil {
@@ -68,12 +70,23 @@ func (h *handlers) createUser(w http.ResponseWriter, r *http.Request) {
 		respondError(w, proto.Err(500, proto.CodeInternal, "create user"))
 		return
 	}
+	pc, err := bootstrap.EnsurePersonalCluster(r.Context(), tx, created)
+	if err != nil {
+		respondError(w, proto.Err(500, proto.CodeInternal, "default cluster"))
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		respondError(w, proto.Err(500, proto.CodeInternal, "commit"))
+		return
+	}
 	// 审计沿用 startSession 模式：独立 background ctx，不受客户端断连影响。
 	actx, acancel := context.WithTimeout(context.Background(), auditInsertTimeout)
 	defer acancel()
 	_ = h.st.Q().InsertAuditLog(actx, sqlc.InsertAuditLogParams{
 		UserID: pgUUID(u.ID), Action: "user.create",
-		Metadata: mustJSON(map[string]string{"email": created.Email}),
+		Metadata: mustJSON(map[string]string{
+			"email": created.Email, "default_cluster_id": pc.ID.String(),
+		}),
 	})
 	respondJSON(w, http.StatusCreated,
 		newUserDTO(created.ID.String(), created.Email, created.DisplayName))
@@ -82,7 +95,7 @@ func (h *handlers) createUser(w http.ResponseWriter, r *http.Request) {
 // listUsers 处理 GET /api/users：admin-only，返回脱敏列表（无 password_hash）。
 func (h *handlers) listUsers(w http.ResponseWriter, r *http.Request) {
 	u := auth.UserFrom(r.Context())
-	if !isAdminUser(r.Context(), h.st, u.ID) {
+	if !u.IsAdmin {
 		respondError(w, proto.Err(403, proto.CodeForbidden, "admin required"))
 		return
 	}

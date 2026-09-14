@@ -16,9 +16,12 @@ type Config struct {
 	AdminPassword    string
 	HeartbeatTimeout time.Duration
 	EnrollTokenTTL   time.Duration
-	ShellPerNode     int           // XNC_SHELL_PER_NODE，默认 10，0 = 不限
-	ShellIdleTimeout time.Duration // XNC_SHELL_IDLE，默认 30m，0 = 不限
-	ShellMaxLifetime time.Duration // XNC_SHELL_MAX，默认 8h，0 = 不限
+	// MaxClustersPerUser 自助建 cluster 的每用户限额（XNC_MAX_CLUSTERS_PER_USER，
+	// 默认 20，0 视为默认）：只数"我任 owner 的存活 cluster"，防刷。
+	MaxClustersPerUser int
+	ShellPerNode       int           // XNC_SHELL_PER_NODE，默认 10，0 = 不限
+	ShellIdleTimeout   time.Duration // XNC_SHELL_IDLE，默认 30m，0 = 不限
+	ShellMaxLifetime   time.Duration // XNC_SHELL_MAX，默认 8h，0 = 不限
 
 	// —— RTV 桌面中继（2026-09-08 重构，替代 TURN/WebRTC 面）。
 	// RTVEmbedded（XNC_RTV_EMBEDDED，默认 false，2026-09-11 主站缩减决策）：
@@ -84,6 +87,7 @@ func Load() (Config, error) {
 		AdminPassword:         os.Getenv("XNC_ADMIN_PASSWORD"),
 		HeartbeatTimeout:      envDur("XNC_HEARTBEAT_TIMEOUT", 90*time.Second),
 		EnrollTokenTTL:        envDur("XNC_ENROLL_TOKEN_TTL", 30*time.Minute),
+		MaxClustersPerUser:    envInt("XNC_MAX_CLUSTERS_PER_USER", 20),
 		ShellPerNode:          envInt("XNC_SHELL_PER_NODE", 10),
 		ShellIdleTimeout:      envDur("XNC_SHELL_IDLE", 30*time.Minute),
 		ShellMaxLifetime:      envDur("XNC_SHELL_MAX", 8*time.Hour),

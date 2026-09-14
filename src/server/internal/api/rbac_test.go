@@ -82,11 +82,11 @@ func (f *rbacFixture) rbacEndpoints() map[string]struct {
 		path string
 		body string
 	}{
-		"exec":      {base + "/exec", `{"command":"hostname"}`},
-		"shell":     {base + "/shell", `{}`},
-		"upload":    {base + "/files/upload", `{"path":"C:\\tmp\\f.bin","size":16,"sha256":"` + rbacSHA + `"}`},
-		"download":  {base + "/files/download", `{"path":"C:\\tmp\\f.bin"}`},
-		"tunnel":    {base + "/tunnel", `{"target":"rdp"}`},
+		"exec":     {base + "/exec", `{"command":"hostname"}`},
+		"shell":    {base + "/shell", `{}`},
+		"upload":   {base + "/files/upload", `{"path":"C:\\tmp\\f.bin","size":16,"sha256":"` + rbacSHA + `"}`},
+		"download": {base + "/files/download", `{"path":"C:\\tmp\\f.bin"}`},
+		"tunnel":   {base + "/tunnel", `{"target":"rdp"}`},
 	}
 }
 

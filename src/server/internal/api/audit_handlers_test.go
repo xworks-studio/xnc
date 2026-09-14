@@ -30,24 +30,26 @@ func auditRows(t *testing.T, f *rbacFixture, tok, query string) []map[string]any
 
 // TestAuditQuery：admin-only 审计查询——可选过滤（nodeId/userId/action/since）
 // 可组合、created_at DESC、LIMIT/OFFSET 分页、非法参数 400。
-// 布景复用 rbacFixture：其 owner（任一 cluster owner）即 admin，operator/
-// viewer 非 admin；disable/enable 再补两行带 node 维度的审计。
+// 布景复用 rbacFixture。0005 起 admin = users.is_admin：断言用 bootstrap
+// admin；cluster owner（非 is_admin）归入 403 组——"建 cluster 不再变平台
+// admin"的回归断言。
 func TestAuditQuery(t *testing.T) {
 	f := newRBACFixture(t)
+	admin := f.env.AdminToken(t)
 	assert.Equal(t, 204, doJSON(t, f.srv.URL, "POST",
 		"/api/nodes/"+f.nodeID+"/disable", f.tokens["owner"], "").StatusCode)
 	assert.Equal(t, 204, doJSON(t, f.srv.URL, "POST",
 		"/api/nodes/"+f.nodeID+"/enable", f.tokens["owner"], "").StatusCode)
 	ownerID := userIDByEmail(t, f, "rbac-owner@t.local")
 
-	// 未认证 → 401；非 admin（operator/viewer）→ 403
+	// 未认证 → 401；非 admin（operator/viewer/cluster owner）→ 403
 	assert.Equal(t, 401, doJSON(t, f.srv.URL, "GET", "/api/audit", "", "").StatusCode)
-	for _, tok := range []string{f.tokens["operator"], f.tokens["viewer"]} {
+	for _, tok := range []string{f.tokens["operator"], f.tokens["viewer"], f.tokens["owner"]} {
 		assert.Equal(t, 403, doJSON(t, f.srv.URL, "GET", "/api/audit", tok, "").StatusCode)
 	}
 
 	// admin 全量：非空、created_at 严格 DESC、行形态齐全（metadata 为对象）
-	all := auditRows(t, f, f.tokens["owner"], "")
+	all := auditRows(t, f, admin, "")
 	require.Greater(t, len(all), 5)
 	for i := 1; i < len(all); i++ {
 		prev, _ := time.Parse(time.RFC3339Nano, all[i-1]["created_at"].(string))
@@ -58,14 +60,14 @@ func TestAuditQuery(t *testing.T) {
 	assert.IsType(t, map[string]any{}, all[0]["metadata"], "metadata must be an object")
 
 	// action 过滤：只余 node.disable
-	byAction := auditRows(t, f, f.tokens["owner"], "?action=node.disable")
+	byAction := auditRows(t, f, admin, "?action=node.disable")
 	require.Greater(t, len(byAction), 0)
 	for _, row := range byAction {
 		assert.Equal(t, "node.disable", row["action"])
 	}
 
 	// nodeId 过滤：全部挂在该节点，含 node.enroll 与 node.disable
-	byNode := auditRows(t, f, f.tokens["owner"], "?nodeId="+f.nodeID)
+	byNode := auditRows(t, f, admin, "?nodeId="+f.nodeID)
 	require.Greater(t, len(byNode), 0)
 	actions := map[string]bool{}
 	for _, row := range byNode {
@@ -76,38 +78,38 @@ func TestAuditQuery(t *testing.T) {
 	assert.True(t, actions["node.disable"])
 
 	// userId 过滤：全部为该 actor；组合 nodeId+action 进一步收窄
-	byUser := auditRows(t, f, f.tokens["owner"], "?userId="+ownerID)
+	byUser := auditRows(t, f, admin, "?userId="+ownerID)
 	require.Greater(t, len(byUser), 0)
 	for _, row := range byUser {
 		assert.Equal(t, ownerID, row["user_id"])
 	}
-	combo := auditRows(t, f, f.tokens["owner"],
+	combo := auditRows(t, f, admin,
 		"?nodeId="+f.nodeID+"&action=node.enable")
 	require.Len(t, combo, 1)
 	assert.Equal(t, f.nodeID, combo[0]["node_id"])
 
 	// since：相对时长（1h/7d）命中；RFC3339 未来时刻 → 空
-	assert.NotEmpty(t, auditRows(t, f, f.tokens["owner"], "?since=1h"))
-	assert.NotEmpty(t, auditRows(t, f, f.tokens["owner"], "?since=7d"))
+	assert.NotEmpty(t, auditRows(t, f, admin, "?since=1h"))
+	assert.NotEmpty(t, auditRows(t, f, admin, "?since=7d"))
 	// since：相对时长（1h/7d）命中；RFC3339 未来时刻 → 空（QueryEscape——
 	// 本机时区 +08:00 的 + 在 query 里原样会被解码成空格）
 	future := url.QueryEscape(time.Now().Add(time.Hour).Format(time.RFC3339))
-	assert.Empty(t, auditRows(t, f, f.tokens["owner"], "?since="+future))
+	assert.Empty(t, auditRows(t, f, admin, "?since="+future))
 
 	// 非法参数 → 400（不静默吞）
 	for _, q := range []string{
 		"?nodeId=not-a-uuid", "?userId=not-a-uuid", "?since=nonsense",
 		"?since=-1h", "?limit=abc", "?limit=0", "?offset=-1",
 	} {
-		resp := doJSON(t, f.srv.URL, "GET", "/api/audit"+q, f.tokens["owner"], "")
+		resp := doJSON(t, f.srv.URL, "GET", "/api/audit"+q, admin, "")
 		assert.Equal(t, 400, resp.StatusCode, q)
 	}
 	// 超上限 limit 不报错（钳制到 200）
-	assert.NotEmpty(t, auditRows(t, f, f.tokens["owner"], "?limit=1000"))
+	assert.NotEmpty(t, auditRows(t, f, admin, "?limit=1000"))
 
 	// 分页：limit=2 两页与全量前缀一致且不相交
-	page1 := auditRows(t, f, f.tokens["owner"], "?limit=2&offset=0")
-	page2 := auditRows(t, f, f.tokens["owner"], "?limit=2&offset=2")
+	page1 := auditRows(t, f, admin, "?limit=2&offset=0")
+	page2 := auditRows(t, f, admin, "?limit=2&offset=2")
 	require.Len(t, page1, 2)
 	require.Len(t, page2, 2)
 	for i := range page1 {

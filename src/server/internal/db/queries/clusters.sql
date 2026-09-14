@@ -16,3 +16,9 @@ SELECT * FROM clusters WHERE id = $1 AND deleted_at IS NULL;
 -- name: AddMembership :exec
 INSERT INTO cluster_members (cluster_id, user_id, role) VALUES ($1, $2, $3)
 ON CONFLICT DO NOTHING;
+
+-- name: CountOwnedLiveClusters :one
+-- 自助建 cluster 的每用户限额判定（只数存活且任 owner 的 cluster）。
+SELECT count(*) FROM clusters c
+JOIN cluster_members m ON m.cluster_id = c.id
+WHERE m.user_id = $1 AND m.role = 'owner' AND c.deleted_at IS NULL;

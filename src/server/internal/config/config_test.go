@@ -13,7 +13,6 @@ func setRequiredEnv(t *testing.T) {
 	t.Setenv("XNC_JWT_SECRET", "0123456789abcdef0123456789abcdef")
 }
 
-
 // TestRTVEnv（RTV 重构）：XNC_RTV_ENDPOINT 缺省空；配置后透传；
 // 腿地址缺省 :4433/:443。
 func TestRTVEnv(t *testing.T) {

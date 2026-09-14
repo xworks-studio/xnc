@@ -43,7 +43,7 @@ type auditDTO struct {
 // （默认 50，上限 200）。非法参数一律 400，不静默吞。
 func (h *handlers) listAudit(w http.ResponseWriter, r *http.Request) {
 	u := auth.UserFrom(r.Context())
-	if !isAdminUser(r.Context(), h.st, u.ID) {
+	if !u.IsAdmin {
 		respondError(w, proto.Err(403, proto.CodeForbidden, "admin required"))
 		return
 	}
@@ -110,7 +110,7 @@ func (h *handlers) listAudit(w http.ResponseWriter, r *http.Request) {
 			ID: row.ID, UserID: uuidPtr(row.UserID), UserEmail: textPtr(row.UserEmail),
 			ClusterID: uuidPtr(row.ClusterID),
 			NodeID:    uuidPtr(row.NodeID), NodeName: textPtr(row.NodeName),
-			Action: row.Action,
+			Action:    row.Action,
 			SessionID: row.SessionID, Metadata: json.RawMessage(row.Metadata),
 			CreatedAt: row.CreatedAt,
 		})
