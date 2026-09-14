@@ -70,7 +70,8 @@ Global flags:
 
 Exit codes:
   0 success | 2 usage | 240 auth | 241 forbidden | 242 node offline
-  243 timeout | 244 not found | 245 network | 246 quota | 250 internal
+  243 timeout | 244 not found | 245 network | 246 quota | 247 node rejected
+  250 internal
   Other values: remote process exit code passthrough (exec only)`,
 		SilenceUsage:  true,
 		SilenceErrors: true,

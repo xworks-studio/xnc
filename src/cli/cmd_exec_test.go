@@ -129,6 +129,78 @@ func TestExecStreamsAndPassthroughExit(t *testing.T) {
 	assert.Equal(t, int64(5), env.Data.Duration)
 }
 
+// fakeExecRejectServer streams a terminal EXEC_RESULT carrying a stable
+// rejection code and a null exit code (agent-side refusal: core down,
+// payload rejected, spawn refused...).
+func fakeExecRejectServer(t *testing.T, code string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/nodes" && r.Method == "GET":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(execNodesJSON))
+		case r.URL.Path == "/api/nodes/"+execNodeUUID+"/exec" && r.Method == "POST":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(202)
+			_, _ = w.Write([]byte(`{"sessionId":"s1","token":"ct","expiresAt":"2026-01-01T00:00:00Z",` +
+				`"websocketUrl":"/api/session/s1?token=ct"}`))
+		case r.URL.Path == "/api/session/s1":
+			c, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				defer c.CloseNow()
+				_ = c.Write(ctx, websocket.MessageText,
+					[]byte(`{"type":"EXEC_RESULT","payload":`+mustJSONStr(proto.ExecResult{
+						ExitCode: nil, TimedOut: false, DurationMs: 2, Code: code,
+					})+`}`))
+				_ = c.Close(websocket.StatusNormalClosure, "")
+			}()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	return srv
+}
+
+// TestExecRejectedCodeExits247 节点拒绝(稳定码 + null exit code)必须以
+// 247 与明确提示浮出,不得伪装成超时 243(2026-09-14 静默 243 事故的
+// 放大器修复钉子)。
+func TestExecRejectedCodeExits247(t *testing.T) {
+	srv := fakeExecRejectServer(t, "CORE_UNAVAILABLE")
+	defer srv.Close()
+
+	// JSON 模式:信封携带 code,exitCode null,退出 247。
+	out, code := captureStdout(t, func() int {
+		return runCLI(t.Context(), []string{"exec", "n1", "--json",
+			"--server", srv.URL, "--token", "tk", "--", "hostname"})
+	})
+	require.Equal(t, 247, code)
+	var env struct {
+		Data struct {
+			ExitCode *int   `json:"exitCode"`
+			TimedOut bool   `json:"timedOut"`
+			Code     string `json:"code"`
+		} `json:"data"`
+	}
+	require.NoError(t, jsonUnmarshalStr(lastJSONLine(t, out), &env))
+	assert.Nil(t, env.Data.ExitCode)
+	assert.False(t, env.Data.TimedOut)
+	assert.Equal(t, "CORE_UNAVAILABLE", env.Data.Code)
+
+	// 文本模式:stderr 提示稳定码,退出 247。
+	stderr, code2 := captureStderr(t, func() int {
+		return runCLI(t.Context(), []string{"exec", "n1",
+			"--server", srv.URL, "--token", "tk", "--", "hostname"})
+	})
+	require.Equal(t, 247, code2)
+	assert.Contains(t, stderr, "CORE_UNAVAILABLE")
+	assert.Contains(t, stderr, "rejected")
+}
+
 func TestExecTimedOutExits243(t *testing.T) {
 	srv := fakeExecServer(t, nil, "slow", "", "") // exitCode null + timedOut true
 	defer srv.Close()
