@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import type { MouseEvent as ReactMouseEvent } from "react";
 import { api } from "../api";
-import type { DesktopCandidate } from "../types";
+import type { DesktopCandidate, NodeDTO } from "../types";
 import {
   classifyKeyDown,
   isPasteCombo,
@@ -132,6 +132,21 @@ export default function DesktopLive() {
   const [phase, setPhase] = useState<Phase>("connecting");
   const [fatalMsg, setFatalMsg] = useState("");
   const [transport, setTransport] = useState<"wt" | "ws" | "-">("-");
+  // 顶栏机器名（best-effort；拉取失败回落 node id 前缀——Terminal 同款模式）
+  const [nodeName, setNodeName] = useState<string | null>(null);
+  useEffect(() => {
+    let alive = true;
+    api<NodeDTO>(`/api/nodes/${nodeId}`)
+      .then((n) => {
+        if (alive) setNodeName(n.name);
+      })
+      .catch(() => {
+        /* 顶栏回落 node id 前缀 */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [nodeId]);
   // 中继归属（连接成功时记录；统计面板"节点/区域"两行展示）：host 展示
   // 域名（server 标注 displayHost，缺省回落裸 IP），region 为区域代码
   // （渲染时映射中文）。真实连接串（裸 IP）单独存于 relayReal 供悬浮排查。
@@ -987,7 +1002,7 @@ export default function DesktopLive() {
         <Link className="dt-back" to={`/nodes/${nodeId}`} title="返回节点详情">
           ←
         </Link>
-        <span className="dt-title">桌面 · {nodeId.slice(0, 8)}</span>
+        <span className="dt-title">桌面 · {nodeName ?? nodeId.slice(0, 8)}</span>
         <div className="dt-chips">
           <span
             className={`dt-chip ${transport === "wt" ? "ok" : transport === "ws" ? "warn" : ""}`}
