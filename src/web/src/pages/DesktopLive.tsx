@@ -116,8 +116,10 @@ export default function DesktopLive() {
   const [phase, setPhase] = useState<Phase>("connecting");
   const [fatalMsg, setFatalMsg] = useState("");
   const [transport, setTransport] = useState<"wt" | "ws" | "-">("-");
-  // 当前使用的中继（连接成功时按候选/URL 记录；统计面板展示）
+  // 当前使用的中继（连接成功时按候选/URL 记录；统计面板展示域名形 URL，
+  // 真实连接串（裸 IP）单独存于 relayReal 供悬浮提示排查）
   const [relayInfo, setRelayInfo] = useState<string | null>(null);
+  const [relayReal, setRelayReal] = useState<string | null>(null);
   const [codecInfo, setCodecInfo] = useState("");
   // 控制权归属（服务器 controlState 广播；null = 尚未收到）
   const [control, setControl] = useState<{
@@ -686,10 +688,14 @@ export default function DesktopLive() {
               await connectWS(withToken(base));
               startWorker(true);
             }
+            // 面板展示域名形 URL（displayHost = server 标注的 relay 域名，
+            // 缺省回落裸 IP）；实际连接串进 title 悬浮提示。
+            const shown = `${c.transport === "wt" ? "https" : "wss"}://${c.displayHost || c.host}:${c.port}${c.path.startsWith("/") ? c.path : `/${c.path}`}`;
+            setRelayReal(base);
             setRelayInfo(
               c.relayId === "rl-0"
                 ? `主站内嵌（${curTransport.toUpperCase()}）`
-                : `${base}${c.region ? ` · ${c.region}` : ""}（${curTransport.toUpperCase()}）`,
+                : `${shown}${c.region ? ` · ${c.region}` : ""}（${curTransport.toUpperCase()}）`,
             );
             finish();
             return;
@@ -1127,7 +1133,7 @@ export default function DesktopLive() {
             <div className="dt-stats-title">实时统计</div>
             <div className="dt-m">
               <div className="k">中继</div>
-              <div className="v" title={relayInfo ?? undefined}>
+              <div className="v" title={relayReal ?? relayInfo ?? undefined}>
                 {relayInfo ?? "–"}
               </div>
             </div>

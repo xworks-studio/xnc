@@ -166,6 +166,11 @@ type EndpointDesc struct {
 	// relay-0。web 统计面板展示"当前使用的中继"用。
 	RelayID string `json:"relayId,omitempty"`
 	Region  string `json:"region,omitempty"`
+	// DisplayHost 由 server 标注：relay 的域名（取自其 sdata 端点 host，
+	// 如 r1.xnc.app）。媒体腿连接本身仍走 Host 的裸 IP（自签钉扎 + 不受
+	// 域名级拦截影响），此字段仅供 web 统计面板展示域名形 URL；未宣告
+	// sdata 的纯 IP relay 缺省。
+	DisplayHost string `json:"displayHost,omitempty"`
 }
 
 // RelayChallengeResponse 挑战应答（relay 侧；复用 Challenge 的 nonce）。

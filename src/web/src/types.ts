@@ -53,4 +53,5 @@ export interface DesktopCandidate {
   certSha256?: string;
   relayId?: string; // 归属中继（"rl-0" = 主站内嵌）
   region?: string; // 区域标签（embedded = 主站内嵌）
+  displayHost?: string; // relay 域名（server 取其 sdata 端点标注；仅展示用，连接仍走 host 裸 IP）
 }
