@@ -35,3 +35,10 @@ WHERE id = $5 RETURNING *;
 -- 机器自注销（spec §7：控制连接上 NODE_DELETE，机器身份即凭据）。返回删除
 -- 行数：0 = 节点已不存在（重复注销按幂等成功处理）。
 DELETE FROM nodes WHERE id = $1;
+
+-- name: MoveNodeCluster :execrows
+-- node move（POST /api/nodes/{id}/move）：源 cluster_id 作乐观并发条件（并发
+-- move/删除 → 0 行由调用方判重）。machine 全局唯一索引兜底跨 cluster 冲突、
+-- (cluster_id,name) 唯一约束兜底名字竞态——两类 23505 由 handler 按约束名分流。
+UPDATE nodes SET cluster_id = $2, name = $3
+WHERE id = $1 AND cluster_id = $4;

@@ -279,6 +279,9 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		// 管理动作：owner-only（handler 内经 requireMinRoleIgnoreDisabled 判定）
 		nr.Post("/{id}/disable", h.nodeDisable)
 		nr.Post("/{id}/enable", h.nodeEnable)
+		// 跨 cluster 搬迁（0005）：源 ∧ 目标 cluster 双 owner（handler 内判定）；
+		// nodeId/公钥/在线连接保留，替代"admin 删节点+重注册"的旧出路
+		nr.Post("/{id}/move", h.moveNode)
 		// 管理端硬删除节点：admin-only（handler 内 isAdminUser 判定），在线则
 		// 同时逐出其控制连接
 		nr.Delete("/{id}", h.adminDeleteNode)

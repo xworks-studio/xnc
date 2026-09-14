@@ -231,3 +231,31 @@ func (q *Queries) GetNodeByNameInCluster(ctx context.Context, arg GetNodeByNameI
 	)
 	return i, err
 }
+
+const moveNodeCluster = `-- name: MoveNodeCluster :execrows
+UPDATE nodes SET cluster_id = $2, name = $3
+WHERE id = $1 AND cluster_id = $4
+`
+
+type MoveNodeClusterParams struct {
+	ID          uuid.UUID `json:"id"`
+	ClusterID   uuid.UUID `json:"cluster_id"`
+	Name        string    `json:"name"`
+	ClusterID_2 uuid.UUID `json:"cluster_id_2"`
+}
+
+// node move（POST /api/nodes/{id}/move）：源 cluster_id 作乐观并发条件（并发
+// move/删除 → 0 行由调用方判重）。machine 全局唯一索引兜底跨 cluster 冲突、
+// (cluster_id,name) 唯一约束兜底名字竞态——两类 23505 由 handler 按约束名分流。
+func (q *Queries) MoveNodeCluster(ctx context.Context, arg MoveNodeClusterParams) (int64, error) {
+	result, err := q.db.Exec(ctx, moveNodeCluster,
+		arg.ID,
+		arg.ClusterID,
+		arg.Name,
+		arg.ClusterID_2,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}

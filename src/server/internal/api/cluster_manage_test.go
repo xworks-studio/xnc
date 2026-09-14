@@ -231,10 +231,12 @@ func TestDeleteClusterNameReuse(t *testing.T) {
 	require.NotEmpty(t, cid)
 	assert.Equal(t, 204, doJSON(t, srv.URL, "DELETE", "/api/clusters/"+cid, admin, "").StatusCode)
 
-	// 列表不含已删；原名可重建；原名被占后他人撞名仍 400。
+	// 列表不含已删（改名形态也不得残留）；原名可重建；原名被占后他人撞名 400。
 	require.NoError(t, decodeJSON(doJSON(t, srv.URL, "GET", "/api/clusters", admin, "").Body, &cl))
 	for _, c := range cl {
 		assert.NotEqual(t, "tmp", c["name"], "deleted cluster must not be listed")
+		assert.NotContains(t, c["name"], "tmp_deleted_",
+			"deletion must tombstone via deleted_at, not rename")
 	}
 	assert.Equal(t, 201, doJSON(t, srv.URL, "POST", "/api/clusters", admin,
 		`{"name":"tmp"}`).StatusCode)

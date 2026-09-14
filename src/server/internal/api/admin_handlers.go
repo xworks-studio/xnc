@@ -2,14 +2,10 @@ package api
 
 import (
 	"context"
-	"errors"
 	"net/http"
-	"strconv"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgconn"
 
 	"xnc/proto"
 	"xnc/server/internal/auth"
@@ -59,9 +55,9 @@ func (h *handlers) setNodeStatus(w http.ResponseWriter, r *http.Request,
 }
 
 // deleteCluster 处理 DELETE /api/clusters/{id}：仅 owner；仍有节点 → 409
-// CLUSTER_NOT_EMPTY（先 disable/清理节点）；软删除——name 追加
-// _deleted_<unix 秒> 后缀，保留行与审计链（audit_logs.cluster_id 无外键，
-// 但节点/membership 硬删除不可逆，重命名可兜底恢复）。审计 cluster.delete。
+// CLUSTER_NOT_EMPTY（先 disable/清理节点，或把节点 move 到别的 cluster）；
+// 软删除 = 打 deleted_at（0005 起；恢复 = 清 deleted_at，原名经存活行
+// 部分唯一索引自动可复用，不再需要改名释放）。审计 cluster.delete。
 func (h *handlers) deleteCluster(w http.ResponseWriter, r *http.Request) {
 	c, apiErr := h.authorizeClusterOwner(r, chi.URLParam(r, "id"))
 	if apiErr != nil {
@@ -76,16 +72,7 @@ func (h *handlers) deleteCluster(w http.ResponseWriter, r *http.Request) {
 			"cluster still has nodes; disable or remove them first"))
 		return
 	}
-	newName := c.Name + "_deleted_" + strconv.FormatInt(time.Now().Unix(), 10)
-	if err := h.st.Q().SoftDeleteCluster(r.Context(), sqlc.SoftDeleteClusterParams{
-		ID: c.ID, Name: newName,
-	}); err != nil {
-		// 并发窗口内重命名撞 UNIQUE（同秒内同名重建+再删）——重试即可恢复。
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-			respondError(w, proto.Err(409, proto.CodeInternal, "name conflict; retry"))
-			return
-		}
+	if _, err := h.st.Q().SoftDeleteCluster(r.Context(), c.ID); err != nil {
 		respondError(w, proto.Err(500, proto.CodeInternal, "delete cluster"))
 		return
 	}

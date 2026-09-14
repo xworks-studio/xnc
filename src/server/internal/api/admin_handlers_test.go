@@ -2,7 +2,6 @@ package api
 
 import (
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -98,9 +97,9 @@ func nodeStatus(t *testing.T, f *rbacFixture, nodeID string) string {
 	return node.Status
 }
 
-// TestAdminClusterDelete：软删除语义——空 cluster → 204 且 name 追加
-// _deleted_<ts>（原 name 释放、行保留）；有节点 → 409 CLUSTER_NOT_EMPTY；
-// 非 owner → 403；审计 cluster.delete。
+// TestAdminClusterDelete：软删除语义（0005 起 = 打 deleted_at，原名保留、
+// 行保留、原名经存活行部分唯一索引可复用）；有节点 → 409
+// CLUSTER_NOT_EMPTY；非 owner → 403；审计 cluster.delete。
 func TestAdminClusterDelete(t *testing.T) {
 	env := NewTestEnv(t)
 	srv := httptest.NewServer(env.Router)
@@ -127,18 +126,18 @@ func TestAdminClusterDelete(t *testing.T) {
 	assert.Equal(t, 404, doJSON(t, srv.URL, "DELETE",
 		"/api/clusters/no-such", admin, "").StatusCode)
 
-	// owner 删除空 cluster → 204；行保留但 name 变为 del-me_deleted_<unix>
+	// owner 删除空 cluster → 204；行保留原名 + deleted_at 打标（不再改名）
 	assert.Equal(t, 204, doJSON(t, srv.URL, "DELETE",
 		"/api/clusters/del-me", admin, "").StatusCode)
-	var renamed string
+	var deletedAt string
 	require.NoError(t, env.Store.Pool().QueryRow(t.Context(),
-		`SELECT name FROM clusters WHERE name LIKE 'del-me_deleted_%'`).Scan(&renamed))
-	assert.True(t, strings.HasPrefix(renamed, "del-me_deleted_"), renamed)
-	// 原名已释放：membership 列表按 name 排序不再含 del-me 原名
-	var cnt int
-	require.NoError(t, env.Store.Pool().QueryRow(t.Context(),
-		`SELECT count(*) FROM clusters WHERE name = 'del-me'`).Scan(&cnt))
-	assert.Zero(t, cnt)
+		`SELECT deleted_at::text FROM clusters WHERE name='del-me'`).Scan(&deletedAt))
+	assert.NotEmpty(t, deletedAt, "row tombstoned in place with original name")
+	// 已删 cluster 按 name 解析 → 404；同名重建 → 201（部分唯一索引）。
+	assert.Equal(t, 404, doJSON(t, srv.URL, "DELETE",
+		"/api/clusters/del-me", admin, "").StatusCode)
+	assert.Equal(t, 201, doJSON(t, srv.URL, "POST", "/api/clusters", admin,
+		`{"name":"del-me"}`).StatusCode)
 
 	// 审计：cluster.delete，metadata 含原名
 	var action, meta string
