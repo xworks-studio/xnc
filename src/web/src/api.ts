@@ -65,7 +65,9 @@ export async function api<T>(path: string, opts?: ApiOptions): Promise<T> {
   }
 
   // 204 No Content (node disable/enable, member remove) — no JSON body to parse.
+  // 2xx 空 body（如 adminDeleteNode 的 200 空 body）同样返回 undefined——
+  // 直接 res.json() 会对空体抛 "Unexpected end of JSON input"。
   if (res.status === 204) return undefined as T;
-
-  return (await res.json()) as T;
+  const text = await res.text();
+  return (text ? JSON.parse(text) : undefined) as T;
 }
