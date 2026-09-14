@@ -8,8 +8,10 @@ import { formatRelativeTime } from "../reltime";
 /**
  * Node detail: info card + actions.
  * - Terminal → web terminal for this node.
- * - Remote Desktop → shows the `xnc rdp` CLI command (spec §52; RDP tunneling
- *   is a CLI feature, the web UI just surfaces the command).
+ * - Live Desktop → RTV 实时画面：浏览器内直接观看/操作本机屏幕（/desktop/:id）。
+ * - Windows RDP → 原生远程桌面会话：`xnc rdp` 经隧道拉起 mstsc（完整
+ *   Windows 登录会话）。Web 只展示命令（spec §52，RDP 是 CLI 特性）。
+ *   两个入口刻意命名区分：Live Desktop = 浏览器画面，Windows RDP = mstsc。
  * - Disable/Enable → POST admin endpoints, owner-only server-side. 403 is
  *   rendered as "permission denied" (viewer/operator keeps the buttons but
  *   the server rejects them).
@@ -84,9 +86,9 @@ export default function NodeDetail() {
       <h1>{node.name}</h1>
       <div className="btn-row">
         <Link className="btn" to={`/terminal/${node.id}`}>Terminal</Link>
-        <Link className="btn" to={`/desktop/${node.id}`}>远程桌面</Link>
+        <Link className="btn" to={`/desktop/${node.id}`}>Live Desktop</Link>
         <button type="button" onClick={() => setShowRdp((v) => !v)}>
-          {showRdp ? "Hide Remote Desktop" : "Remote Desktop"}
+          {showRdp ? "Hide Windows RDP" : "Windows RDP"}
         </button>
         {node.status !== "disabled" ? (
           <button type="button" className="danger" disabled={busy} onClick={() => toggleDisabled(false)}>
@@ -101,6 +103,11 @@ export default function NodeDetail() {
       </div>
       {showRdp && (
         <div className="rdp-hint">
+          <div className="dim">
+            Native Windows Remote Desktop session (mstsc) over an xnc tunnel — a full
+            Windows login. To view or control the screen right in the browser, use
+            Live Desktop instead.
+          </div>
           <div className="dim">Connect from a machine with the xnc CLI installed:</div>
           <code className="cmd">xnc rdp {node.name}</code>
         </div>
