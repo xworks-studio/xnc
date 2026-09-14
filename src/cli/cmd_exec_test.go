@@ -111,12 +111,12 @@ func TestExecStreamsAndPassthroughExit(t *testing.T) {
 	var env struct {
 		OK   bool `json:"ok"`
 		Data struct {
-			Node      string `json:"node"`
-			ExitCode  int    `json:"exitCode"`
-			Stdout    string `json:"stdout"`
-			Stderr    string `json:"stderr"`
-			Duration  int64  `json:"durationMs"`
-			TimedOut  bool   `json:"timedOut"`
+			Node     string `json:"node"`
+			ExitCode int    `json:"exitCode"`
+			Stdout   string `json:"stdout"`
+			Stderr   string `json:"stderr"`
+			Duration int64  `json:"durationMs"`
+			TimedOut bool   `json:"timedOut"`
 		} `json:"data"`
 	}
 	require.NoError(t, jsonUnmarshalStr(out, &env))

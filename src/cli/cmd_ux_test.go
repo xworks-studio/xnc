@@ -49,7 +49,7 @@ const (
 	seqTildeDown = "\x1b[192;41;126;1;48;1_" // Shift+` → ~  按下
 	seqTildeUp   = "\x1b[192;41;96;0;32;1_"  // ~ 抬起（无 shift，char 回落 96）
 	seqShiftUp   = "\x1b[16;42;0;0;32;1_"
-	seqDotDown   = "\x1b[190;52;46;1;32;1_"  // . 按下
+	seqDotDown   = "\x1b[190;52;46;1;32;1_" // . 按下
 	seqEnterDown = "\x1b[13;28;13;1;32;1_"
 	seqEnterUp   = "\x1b[13;28;13;0;32;1_"
 	seqEDown     = "\x1b[69;18;101;1;32;1_" // e 按下
