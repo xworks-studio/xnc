@@ -110,15 +110,33 @@ function hexTo32Bytes(hex: string): Uint8Array<ArrayBuffer> | null {
   return out;
 }
 
+/** 区域代码 → 中文展示（relay 注册的区域标识，Aliyun 域内常见值；
+ * 未知代码原样显示，空 = 连接方未提供（旧形态服务器）→ "–"）。 */
+const REGION_LABELS: Record<string, string> = {
+  "cn-hangzhou": "杭州",
+  "cn-shanghai": "上海",
+  "cn-beijing": "北京",
+  "cn-shenzhen": "深圳",
+  "cn-guangzhou": "广州",
+  "cn-qingdao": "青岛",
+  "cn-zhangjiakou": "张家口",
+  "cn-huhehaote": "呼和浩特",
+  "cn-chengdu": "成都",
+  "cn-hongkong": "香港",
+};
+const regionLabel = (r: string) => (r ? (REGION_LABELS[r] ?? r) : "–");
+
 export default function DesktopLive() {
   const { nodeId = "" } = useParams();
   const [epoch, setEpoch] = useState(0);
   const [phase, setPhase] = useState<Phase>("connecting");
   const [fatalMsg, setFatalMsg] = useState("");
   const [transport, setTransport] = useState<"wt" | "ws" | "-">("-");
-  // 当前使用的中继（连接成功时按候选/URL 记录；统计面板展示域名形 URL，
-  // 真实连接串（裸 IP）单独存于 relayReal 供悬浮提示排查）
-  const [relayInfo, setRelayInfo] = useState<string | null>(null);
+  // 中继归属（连接成功时记录；统计面板"节点/区域"两行展示）：host 展示
+  // 域名（server 标注 displayHost，缺省回落裸 IP），region 为区域代码
+  // （渲染时映射中文）。真实连接串（裸 IP）单独存于 relayReal 供悬浮排查。
+  const [relayHost, setRelayHost] = useState<string | null>(null);
+  const [relayRegion, setRelayRegion] = useState<string>("");
   const [relayReal, setRelayReal] = useState<string | null>(null);
   const [codecInfo, setCodecInfo] = useState("");
   // 控制权归属（服务器 controlState 广播；null = 尚未收到）
@@ -688,15 +706,16 @@ export default function DesktopLive() {
               await connectWS(withToken(base));
               startWorker(true);
             }
-            // 面板展示域名形 URL（displayHost = server 标注的 relay 域名，
-            // 缺省回落裸 IP）；实际连接串进 title 悬浮提示。
-            const shown = `${c.transport === "wt" ? "https" : "wss"}://${c.displayHost || c.host}:${c.port}${c.path.startsWith("/") ? c.path : `/${c.path}`}`;
+            // 面板"节点"行展示域名（displayHost = server 标注的 relay 域名，
+            // 缺省回落裸 IP）；实际连接串（IP）进 title 悬浮提示。
             setRelayReal(base);
-            setRelayInfo(
-              c.relayId === "rl-0"
-                ? `主站内嵌（${curTransport.toUpperCase()}）`
-                : `${shown}${c.region ? ` · ${c.region}` : ""}（${curTransport.toUpperCase()}）`,
-            );
+            if (c.relayId === "rl-0") {
+              setRelayHost("主站内嵌");
+              setRelayRegion("");
+            } else {
+              setRelayHost(c.displayHost || c.host);
+              setRelayRegion(c.region ?? "");
+            }
             finish();
             return;
           } catch (e) {
@@ -711,32 +730,35 @@ export default function DesktopLive() {
 
       const wtUrl = withToken(resp.wtUrl);
       const wsUrl = withToken(resp.wsUrl);
-      // 旧响应形态（无 candidates）：从 URL 提取 origin+path 展示（剥
-      // query——票据不得进统计面板）
-      const legacyUrl = (u: string) => {
+      // 旧响应形态（无 candidates）：host 从 URL 提取；origin+path（剥
+      // query——票据不得进面板）进悬浮提示。解析失败 = 主站内嵌形态。
+      const setLegacyRelay = (u: string) => {
         try {
           const p = new URL(u);
-          return p.origin + p.pathname;
+          setRelayHost(p.host);
+          setRelayReal(p.origin + p.pathname);
         } catch {
-          return "";
+          setRelayHost("主站内嵌");
+          setRelayReal(null);
         }
+        setRelayRegion("");
       };
       if (wanted === "ws") {
         curTransport = "ws";
         await connectWS(wsUrl);
         startWorker(true);
-        setRelayInfo(`${legacyUrl(wsUrl) || "主站内嵌"}（WS）`);
+        setLegacyRelay(wsUrl);
       } else {
         curTransport = "wt";
         try {
           await connectWT(wtUrl);
-          setRelayInfo(`${legacyUrl(wtUrl) || "主站内嵌"}（WT）`);
+          setLegacyRelay(wtUrl);
         } catch (e) {
           log(`WebTransport 失败（${e}），回退 WebSocket`);
           curTransport = "ws";
           await connectWS(wsUrl);
           startWorker(true);
-          setRelayInfo(`${legacyUrl(wsUrl) || "主站内嵌"}（WS）`);
+          setLegacyRelay(wsUrl);
         }
       }
       finish();
@@ -953,7 +975,9 @@ export default function DesktopLive() {
     repostRef.current = 0; // 手动重试从零开始完整重试预算
     setFatalMsg("");
     setPhase("connecting");
-    setRelayInfo(null);
+    setRelayHost(null);
+    setRelayRegion("");
+    setRelayReal(null);
     setEpoch((e) => e + 1);
   };
 
@@ -1132,10 +1156,14 @@ export default function DesktopLive() {
           <div className="dt-stats-inner">
             <div className="dt-stats-title">实时统计</div>
             <div className="dt-m">
-              <div className="k">中继</div>
-              <div className="v" title={relayReal ?? relayInfo ?? undefined}>
-                {relayInfo ?? "–"}
+              <div className="k">节点</div>
+              <div className="v" title={relayReal ?? undefined}>
+                {relayHost ?? "–"}
               </div>
+            </div>
+            <div className="dt-m">
+              <div className="k">区域</div>
+              <div className="v">{regionLabel(relayRegion)}</div>
             </div>
             <div className="dt-mgrid">
               <div className="dt-m">
