@@ -663,12 +663,17 @@ bool RealShellToken(uint32_t session, uint8_t token_kind, HANDLE* out) {
 }
 
 // Production shell spawn: xnc-shell.exe (whitelisted next to xnc-core.exe)
-// with the secret on inherited stdin (spec 1.5 - never argv). cwd/env/cmd
-// are operator data, not secrets: they ride argv as individual entries via
-// SpawnInSession's arg list (quoting handled by BuildChildCommandLine,
-// which rejects embedded quotes / trailing backslashes - surfacing as
-// INTERNAL here). The shell resolves its own profile exe (core passes the
-// whitelist NAME, never a path).
+// with the secret on inherited stdin (spec 1.5 - never argv). cwd/env ride
+// argv as individual entries via SpawnInSession's arg list (quoting handled
+// by BuildChildCommandLine, which rejects embedded quotes / trailing
+// backslashes - surfacing as BAD_PAYLOAD here). The oneshot COMMAND rides
+// stdin too, as a length-prefixed frame after the secret line: a user
+// command is arbitrary text (quotes/backslashes are legal payload, not
+// argv syntax), and putting it on argv made BuildChildCommandLine reject
+// every quoted inline exec as BAD_PAYLOAD (2026-09-14 incident: silent
+// exit-243 from `xnc exec <node> 'Write-Output "hello world"'`). The shell
+// resolves its own profile exe (core passes the whitelist NAME, never a
+// path).
 ShellSpawnResult RealShellSpawn(const ShellCreateReq& req, uint32_t session,
                                 const wchar_t* pipe_name, const uint8_t* secret,
                                 HANDLE token, Watchdog* wd) {
@@ -697,7 +702,6 @@ ShellSpawnResult RealShellSpawn(const ShellCreateReq& req, uint32_t session,
                                     L"--cols",          cols,
                                     L"--rows",          rows};
   const std::wstring cwd_w = WidenUtf8(req.cwd);
-  const std::wstring cmd_w = WidenUtf8(req.cmd);
   if (!cwd_w.empty()) {
     args.push_back(L"--cwd");
     args.push_back(cwd_w);
@@ -706,9 +710,11 @@ ShellSpawnResult RealShellSpawn(const ShellCreateReq& req, uint32_t session,
     args.push_back(L"--env");
     args.push_back(WidenUtf8(kv));
   }
-  if (!cmd_w.empty()) {
-    args.push_back(L"--command");
-    args.push_back(cmd_w);
+  // 命令绝不走 argv（BuildChildCommandLine 按契约拒绝内嵌引号/尾反斜杠，
+  // 而用户命令是任意文本）：--command-stdin 标记命令在 stdin 帧里，
+  // secret 行之后、关闭写端之前写入（见下方帧写入块）。
+  if (!req.cmd.empty()) {
+    args.push_back(L"--command-stdin");
   }
   args.push_back(L"--timeout");
   args.push_back(timeout);
@@ -745,8 +751,10 @@ ShellSpawnResult RealShellSpawn(const ShellCreateReq& req, uint32_t session,
   }
   CloseHandle(sec_rd);  // inheritance settled at CreateProcess
 
-  // One line - 64 hex chars + '\n' (65B) - then close (xnc-shell's
-  // --secret-stdin contract). Hex/secret never logged.
+  // One line - 64 hex chars + '\n' (65B) - then, when a command is present,
+  // the oneshot command frame (u32 LE byte length + UTF-8 bytes, decoder
+  // bounds cmd at 64KB), then close (xnc-shell's --secret-stdin /
+  // --command-stdin contract). Hex/secret/command never logged.
   {
     char hexline[2 * kDesktopSecretLen + 2] = {0};
     for (size_t i = 0; i < kDesktopSecretLen; i++)
@@ -759,6 +767,21 @@ ShellSpawnResult RealShellSpawn(const ShellCreateReq& req, uint32_t session,
       XNC_LOG_ERROR("create_shell: secret stdin write failed err=%lu",
                     GetLastError());
       // the child exits on its stdin error; the pipe wait reaps below
+    }
+    if (!req.cmd.empty()) {
+      const uint32_t clen = static_cast<uint32_t>(req.cmd.size());
+      const unsigned char hdr[4] = {static_cast<unsigned char>(clen & 0xFF),
+                                    static_cast<unsigned char>((clen >> 8) & 0xFF),
+                                    static_cast<unsigned char>((clen >> 16) & 0xFF),
+                                    static_cast<unsigned char>((clen >> 24) & 0xFF)};
+      if (!WriteFile(sec_wr, hdr, sizeof(hdr), &wrote, nullptr) ||
+          wrote != sizeof(hdr) ||
+          !WriteFile(sec_wr, req.cmd.data(), clen, &wrote, nullptr) ||
+          wrote != clen) {
+        XNC_LOG_ERROR("create_shell: command stdin frame write failed err=%lu",
+                      GetLastError());
+        // 同 secret 写失败：子进程按 stdin 契约自行退出，管道等待兜底
+      }
     }
     CloseHandle(sec_wr);
   }
