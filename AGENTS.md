@@ -243,6 +243,15 @@ vcpkg 无基线锁定，ffmpeg 头漂移（FF_PROFILE_* 枚举缺定义）编译
 - 阿里云安全组（主站）未放行 UDP443：仅影响内嵌/开发形态的 WT 腿
   （compose `XNC_RTV_WT_PORT` 过渡 14433/udp）；relay-only 生产形态主站
   不跑媒体腿，媒体在 relay 主机（r1/r2 已放行 UDP443/4433）。
+- **2026-09-14 会话面回落主站（现行）**：网络路径层对 r1/r2.xnc.app:443
+  出现按 ClientHello 特征的选择性丢包/RST（浏览器/schannel/Node 全灭，
+  Go/部分 openssl 可通；relay 主机自身健康，caddy+xnc-relay 正常）。
+  止损：两台 relay 的 systemd 单元已去掉 `--session-host/--session-port`
+  （备份 `.bak-sdata`），sdata 不再宣告 → 会话（exec/shell/file/tunnel）
+  全部回落主站旧路径，媒体腿（wt/quic/ws）不受影响。恢复：排查 Aliyun
+  侧（r2 有 1.3 万+ SSH 爆破记录，疑似触发云清洗）后用
+  `push_relay.py --session-host <域名>` 重推。relay 主机 SSH 凭据在
+  deploy/.env 的 `RELAY1_*/RELAY2_*` 键。
 - web HUD 码率/收包显示累计值（未做每秒差分）；e2e 显示跨时钟偏差。
 
 ## 9. 索引
