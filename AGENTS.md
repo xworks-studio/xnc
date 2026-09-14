@@ -254,9 +254,10 @@ vcpkg 无基线锁定，ffmpeg 头漂移（FF_PROFILE_* 枚举缺定义）编译
   （二进制换 `/usr/local/bin/xnc-relay`，备份 `.bak-origin`），浏览器
   经 `wss://r2.xnc.app:443` 全链验证通过。**现行**：sdata 已在 443 恢复
   宣告；caddy `:8443` 站点块双机已预置（域名证书，非标端口不经备案
-  SNI 拦截），**逃生开关 = 改单元 `--session-port 8443` + 重启
-  xnc-relay**——前置：阿里云安全组放行 8443/TCP（PORTS.md 清单只有
-  443/4433/8080，控制台操作）。**遗留风险**：relay 域名证书（LE，至
+  SNI 拦截），**安全组已放行 8443/TCP（2026-09-14 验证：浏览器经
+  `wss://r2.xnc.app:8443` 真实终端会话全链通过）；逃生开关 = 改单元
+  `--session-port 8443` + 重启 xnc-relay**（约 30 秒）。**遗留风险**：
+  relay 域名证书（LE，至
   2026-12-10）续期 ~11-10 走 80/443 挑战均被备案拦截所阻，需提前改
   dns-01；主站 xnc.app 同域名在大陆，80/443 目前正常但风险同源。
   relay 主机 SSH 凭据在 deploy/.env 的 `RELAY1_*/RELAY2_*` 键。
