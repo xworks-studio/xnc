@@ -24,7 +24,7 @@ func (q *Queries) CountUsers(ctx context.Context) (int64, error) {
 
 const createUser = `-- name: CreateUser :one
 INSERT INTO users (id, email, display_name, password_hash, is_admin)
-VALUES ($1, $2, $3, $4, $5) RETURNING id, email, display_name, password_hash, created_at, is_admin
+VALUES ($1, $2, $3, $4, $5) RETURNING id, email, display_name, password_hash, created_at, is_admin, last_login_at
 `
 
 type CreateUserParams struct {
@@ -53,12 +53,13 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.PasswordHash,
 		&i.CreatedAt,
 		&i.IsAdmin,
+		&i.LastLoginAt,
 	)
 	return i, err
 }
 
 const getUserByEmail = `-- name: GetUserByEmail :one
-SELECT id, email, display_name, password_hash, created_at, is_admin FROM users WHERE email = $1
+SELECT id, email, display_name, password_hash, created_at, is_admin, last_login_at FROM users WHERE email = $1
 `
 
 func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error) {
@@ -71,12 +72,13 @@ func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error
 		&i.PasswordHash,
 		&i.CreatedAt,
 		&i.IsAdmin,
+		&i.LastLoginAt,
 	)
 	return i, err
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, email, display_name, password_hash, created_at, is_admin FROM users WHERE id = $1
+SELECT id, email, display_name, password_hash, created_at, is_admin, last_login_at FROM users WHERE id = $1
 `
 
 func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
@@ -89,8 +91,19 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
 		&i.PasswordHash,
 		&i.CreatedAt,
 		&i.IsAdmin,
+		&i.LastLoginAt,
 	)
 	return i, err
+}
+
+const touchUserLogin = `-- name: TouchUserLogin :exec
+UPDATE users SET last_login_at = now() WHERE id = $1
+`
+
+// login 成功后记上次登录（best-effort：失败不阻断登录）。0006 起 Users 页独立列。
+func (q *Queries) TouchUserLogin(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, touchUserLogin, id)
+	return err
 }
 
 const updateUserDisplayName = `-- name: UpdateUserDisplayName :execrows

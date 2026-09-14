@@ -186,12 +186,14 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 	})
 
 	// 用户管理：无自注册，仅 admin（users.is_admin，0005 起显式列）可创建/
-	// 列出/修改（display_name、is_admin 授撤带最后 admin 保护）。
+	// 列出/修改（display_name、is_admin 授撤、管理员重置密码）/删除（0006，
+	// 最后 admin 与名下节点保护）。
 	r.Route("/api/users", func(ur chi.Router) {
 		ur.Use(auth.Middleware(cfg.JWTSecret, st))
 		ur.Post("/", h.createUser)
 		ur.Get("/", h.listUsers)
 		ur.Patch("/{id}", h.updateUser)
+		ur.Delete("/{id}", h.deleteUser)
 	})
 
 	// RTV 中继观测面（管理端；原 MVP /statsz 的收权版本）。

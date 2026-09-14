@@ -20,6 +20,8 @@ type userDTO struct {
 	// IsAdmin 仅 admin 视角的端点（listUsers/updateUser）填充；omitempty
 	// 保持 login/me 等既有响应形态不变。
 	IsAdmin bool `json:"is_admin,omitempty"`
+	// LastLoginAt 同为 admin 视角字段（0006）；nil = 从未登录。
+	LastLoginAt *time.Time `json:"last_login_at,omitempty"`
 }
 
 func newUserDTO(id, email, name string) userDTO {
@@ -42,6 +44,8 @@ func (h *handlers) login(w http.ResponseWriter, r *http.Request) {
 		respondError(w, proto.Err(500, proto.CodeInternal, "token"))
 		return
 	}
+	// 上次登录时间（0006，Users 页独立列）：best-effort，失败不阻断登录。
+	_ = h.st.Q().TouchUserLogin(r.Context(), u.ID)
 	respondJSON(w, 200, map[string]any{
 		"token": tok,
 		"user":  newUserDTO(u.ID.String(), u.Email, u.DisplayName),

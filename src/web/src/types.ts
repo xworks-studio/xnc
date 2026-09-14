@@ -6,6 +6,8 @@ export interface UserDTO {
   display_name: string;
   /** 仅 admin 视角端点（listUsers/updateUser）携带。 */
   is_admin?: boolean;
+  /** 0006 起：上次登录时间（admin 视角列表；undefined/null = 从未登录）。 */
+  last_login_at?: string | null;
 }
 
 export interface NodeDTO {

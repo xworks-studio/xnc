@@ -18,3 +18,7 @@ UPDATE users SET display_name = $2 WHERE id = $1;
 
 -- name: UpdateUserPassword :execrows
 UPDATE users SET password_hash = $2 WHERE id = $1;
+
+-- name: TouchUserLogin :exec
+-- login 成功后记上次登录（best-effort：失败不阻断登录）。0006 起 Users 页独立列。
+UPDATE users SET last_login_at = now() WHERE id = $1;

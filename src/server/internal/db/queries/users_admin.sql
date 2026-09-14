@@ -17,3 +17,19 @@ SELECT count(*) FROM users WHERE email = $1;
 UPDATE users SET is_admin = $2
 WHERE users.id = $1
   AND ($2 OR (SELECT count(*) FROM users sub WHERE sub.is_admin) > 1);
+
+-- name: CountNodesInOwnedClusters :one
+-- 删除用户前置检查：用户名下（owner_id 归属）集群仍挂节点则 409 拒绝——
+-- 节点是资产，删除用户不得连带吞掉机器注册记录。
+SELECT count(*) FROM nodes n JOIN clusters c ON c.id = n.cluster_id
+WHERE c.owner_id = $1;
+
+-- name: DeleteOwnedClusters :execrows
+-- 删除用户时清掉其名下（此时必然已无节点）的集群行：membership 级联，
+-- enrollment token 经 0006 的 ON DELETE CASCADE 级联。
+DELETE FROM clusters WHERE owner_id = $1;
+
+-- name: DeleteUser :execrows
+-- 用户行硬删除：membership 级联（cluster_members user FK ON DELETE CASCADE），
+-- 审计行保留、user_id 置空（0006 FK 语义）。
+DELETE FROM users WHERE id = $1;

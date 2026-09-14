@@ -40,9 +40,12 @@ const (
 	// CodeClusterNotFound 同为 404 存在性语义。
 	CodeUserNotFound = "USER_NOT_FOUND"
 	// CodeLastAdmin：最后 admin 保护——系统内最后一个 is_admin=true 用户不可
-	// 被撤销/自撤（清光 admin 后 EnsureAdmin 不自愈，只剩手工 SQL）。
+	// 被撤销/自撤/删除（清光 admin 后 EnsureAdmin 不自愈，只剩手工 SQL）。
 	CodeLastAdmin = "LAST_ADMIN"
-	CodeInternal  = "INTERNAL"
+	// CodeUserOwnsNodes：删除用户前置检查——用户名下集群仍挂节点（409），
+	// 出路 = 先 move/删除节点（节点是资产，删用户不得连带吞掉注册记录）。
+	CodeUserOwnsNodes = "USER_OWNS_NODES"
+	CodeInternal      = "INTERNAL"
 )
 
 // APIError is the REST error envelope body: {"error":{"code","message"}}.

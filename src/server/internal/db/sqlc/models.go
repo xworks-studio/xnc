@@ -98,10 +98,11 @@ type ReleaseArtifact struct {
 }
 
 type User struct {
-	ID           uuid.UUID `json:"id"`
-	Email        string    `json:"email"`
-	DisplayName  string    `json:"display_name"`
-	PasswordHash string    `json:"password_hash"`
-	CreatedAt    time.Time `json:"created_at"`
-	IsAdmin      bool      `json:"is_admin"`
+	ID           uuid.UUID          `json:"id"`
+	Email        string             `json:"email"`
+	DisplayName  string             `json:"display_name"`
+	PasswordHash string             `json:"password_hash"`
+	CreatedAt    time.Time          `json:"created_at"`
+	IsAdmin      bool               `json:"is_admin"`
+	LastLoginAt  pgtype.Timestamptz `json:"last_login_at"`
 }

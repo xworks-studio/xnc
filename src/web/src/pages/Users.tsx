@@ -3,12 +3,22 @@ import { api, APIError } from "../api";
 import Modal from "../components/Modal";
 import type { UserDTO } from "../types";
 
+/** "42s ago" / "5m ago" / local datetime — null means never logged in. */
+function lastLogin(iso: string | null | undefined): string {
+  if (!iso) return "never";
+  const ms = Date.now() - Date.parse(iso);
+  if (Number.isNaN(ms)) return "never";
+  if (ms < 60_000) return `${Math.max(1, Math.floor(ms / 1000))}s ago`;
+  if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m ago`;
+  if (ms < 86_400_000) return `${Math.floor(ms / 3_600_000)}h ago`;
+  return new Date(iso).toLocaleString();
+}
+
 /**
- * User management（2026-09-14 重设计）：admin-only（users.is_admin，服务端
- * 强制；非 admin 渲染 "Admin access required"）。页头 = 标题 + 计数 + 搜索 +
- * "New user"（低频创建收进对话框）；表格 = 邮箱（下行显示名）/ ADMIN 徽章（
- * 状态与动作分离：徽章示状态，小按钮做授予与撤销）/ 行内改名。最后 admin
- * 保护由服务端 400 LAST_ADMIN 兜底，错误内联展示。
+ * User management（2026-09-14 三轮迭代）：列表只呈现事实——显示名（含
+ * admin 徽章）/ 邮箱 / 上次登录；全部管理动作（改名、管理员设置、重置密码、
+ * 删除用户）收进单一 "Manage" 对话框。admin-only（users.is_admin，服务端
+ * 强制）。删除带两步确认；最后 admin / 名下有节点由服务端保护、错误内联。
  */
 export default function Users() {
   const [users, setUsers] = useState<UserDTO[] | null>(null);
@@ -18,15 +28,22 @@ export default function Users() {
 
   const [query, setQuery] = useState("");
 
-  // 对话框：创建 / 改名。
+  // 创建对话框。
   const [createOpen, setCreateOpen] = useState(false);
   const [email, setEmail] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
-  const [editTarget, setEditTarget] = useState<UserDTO | null>(null);
-  const [editName, setEditName] = useState("");
+  const [createBusy, setCreateBusy] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
+
+  // 管理对话框（单用户全部管理动作）。
+  const [target, setTarget] = useState<UserDTO | null>(null);
+  const [nameValue, setNameValue] = useState("");
+  const [pwdValue, setPwdValue] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const [dialogBusy, setDialogBusy] = useState(false);
   const [dialogError, setDialogError] = useState<string | null>(null);
+  const [dialogNotice, setDialogNotice] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -52,10 +69,19 @@ export default function Users() {
       )
     : usersList;
 
+  function openManage(u: UserDTO) {
+    setTarget(u);
+    setNameValue(u.display_name);
+    setPwdValue("");
+    setConfirmDelete(false);
+    setDialogError(null);
+    setDialogNotice(null);
+  }
+
   async function onCreateUser(e: FormEvent) {
     e.preventDefault();
-    setDialogBusy(true);
-    setDialogError(null);
+    setCreateBusy(true);
+    setCreateError(null);
     try {
       const created = await api<UserDTO>("/api/users", {
         method: "POST",
@@ -68,44 +94,47 @@ export default function Users() {
       setPassword("");
       await load();
     } catch (err) {
-      setDialogError(err instanceof Error ? err.message : "failed to create user");
+      setCreateError(err instanceof Error ? err.message : "failed to create user");
+    } finally {
+      setCreateBusy(false);
+    }
+  }
+
+  async function patch(body: Record<string, unknown>, okNotice: string) {
+    if (!target) return false;
+    setDialogBusy(true);
+    setDialogError(null);
+    setDialogNotice(null);
+    try {
+      await api(`/api/users/${target.id}`, {
+        method: "PATCH",
+        body: JSON.stringify(body),
+      });
+      setDialogNotice(okNotice);
+      await load();
+      return true;
+    } catch (err) {
+      setDialogError(err instanceof Error ? err.message : "request failed");
+      return false;
     } finally {
       setDialogBusy(false);
     }
   }
 
-  async function onEditName(e: FormEvent) {
-    e.preventDefault();
-    if (!editTarget) return;
+  async function onDeleteUser() {
+    if (!target) return;
     setDialogBusy(true);
     setDialogError(null);
     try {
-      await api(`/api/users/${editTarget.id}`, {
-        method: "PATCH",
-        body: JSON.stringify({ display_name: editName }),
-      });
-      setNotice(`Renamed ${editTarget.email} to ${editName}`);
-      setEditTarget(null);
+      await api(`/api/users/${target.id}`, { method: "DELETE" });
+      setNotice(`User ${target.email} deleted`);
+      setTarget(null);
       await load();
     } catch (err) {
-      setDialogError(err instanceof Error ? err.message : "failed to rename user");
+      setDialogError(err instanceof Error ? err.message : "failed to delete user");
+      setConfirmDelete(false);
     } finally {
       setDialogBusy(false);
-    }
-  }
-
-  async function onToggleAdmin(u: UserDTO) {
-    setError(null);
-    setNotice(null);
-    try {
-      await api(`/api/users/${u.id}`, {
-        method: "PATCH",
-        body: JSON.stringify({ is_admin: !u.is_admin }),
-      });
-      setNotice(`${u.email} is ${!u.is_admin ? "now an admin" : "no longer an admin"}`);
-      await load();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "failed to update admin flag");
     }
   }
 
@@ -140,7 +169,7 @@ export default function Users() {
             onChange={(e) => setQuery(e.target.value)}
             aria-label="Search users"
           />
-          <button onClick={() => { setCreateOpen(true); setDialogError(null); }}>
+          <button onClick={() => { setCreateOpen(true); setCreateError(null); }}>
             New user
           </button>
         </div>
@@ -154,7 +183,9 @@ export default function Users() {
           <table>
             <thead>
               <tr>
-                <th>User</th>
+                <th>Display name</th>
+                <th>Email</th>
+                <th>Last login</th>
                 <th></th>
               </tr>
             </thead>
@@ -162,28 +193,16 @@ export default function Users() {
               {filtered.map((u) => (
                 <tr key={u.id}>
                   <td>
-                    <span className="user-email">{u.email}</span>
-                    {u.display_name && (
-                      <span className="user-name-inline dim">{u.display_name}</span>
-                    )}
+                    <span className="user-email">{u.display_name || "—"}</span>
                     {u.is_admin && <span className="tag tag-admin">admin</span>}
                   </td>
+                  <td>{u.email}</td>
+                  <td className="dim" title={u.last_login_at ?? undefined}>
+                    {lastLogin(u.last_login_at)}
+                  </td>
                   <td className="cell-actions">
-                    <button
-                      className="secondary small"
-                      onClick={() => {
-                        setEditTarget(u);
-                        setEditName(u.display_name);
-                        setDialogError(null);
-                      }}
-                    >
-                      Rename
-                    </button>
-                    <button
-                      className="secondary small"
-                      onClick={() => void onToggleAdmin(u)}
-                    >
-                      {u.is_admin ? "Revoke admin" : "Make admin"}
+                    <button className="secondary small" onClick={() => openManage(u)}>
+                      Manage…
                     </button>
                   </td>
                 </tr>
@@ -232,44 +251,115 @@ export default function Users() {
             <p className="dim" style={{ margin: 0, fontSize: 13 }}>
               A personal default cluster is created automatically.
             </p>
-            {dialogError && <div className="form-error" role="alert">{dialogError}</div>}
+            {createError && <div className="form-error" role="alert">{createError}</div>}
             <div className="modal-foot">
               <button type="button" className="secondary" onClick={() => setCreateOpen(false)}>
                 Cancel
               </button>
-              <button type="submit" disabled={dialogBusy}>
-                {dialogBusy ? "Creating…" : "Create user"}
+              <button type="submit" disabled={createBusy}>
+                {createBusy ? "Creating…" : "Create user"}
               </button>
             </div>
           </form>
         </Modal>
       )}
 
-      {editTarget && (
-        <Modal title="Rename user" onClose={() => setEditTarget(null)}>
-          <form className="form-stack" onSubmit={onEditName} style={{ maxWidth: "none" }}>
-            <p className="dim" style={{ margin: 0, fontSize: 13 }}>
-              {editTarget.email}
-            </p>
+      {target && (
+        <Modal title="Manage user" onClose={() => setTarget(null)}>
+          <div className="manage-head">
+            <span className="user-email">{target.display_name || target.email}</span>
+            <span className="dim">{target.email}</span>
+            {target.is_admin && <span className="tag tag-admin">admin</span>}
+          </div>
+
+          <form
+            className="manage-section"
+            onSubmit={async (e) => {
+              e.preventDefault();
+              const ok = await patch({ display_name: nameValue }, "Display name saved");
+              if (ok) setTarget({ ...target, display_name: nameValue });
+            }}
+          >
             <label>
               Display name
               <input
-                value={editName}
-                onChange={(e) => setEditName(e.target.value)}
-                autoFocus
+                value={nameValue}
+                onChange={(e) => setNameValue(e.target.value)}
                 autoComplete="off"
               />
             </label>
-            {dialogError && <div className="form-error" role="alert">{dialogError}</div>}
-            <div className="modal-foot">
-              <button type="button" className="secondary" onClick={() => setEditTarget(null)}>
-                Cancel
-              </button>
-              <button type="submit" disabled={dialogBusy}>
-                {dialogBusy ? "Saving…" : "Save"}
+            <button type="submit" className="secondary small" disabled={dialogBusy}>
+              Save
+            </button>
+          </form>
+
+          <div className="manage-section">
+            <div className="manage-line">
+              <span>
+                Platform admin
+                <span className="dim" style={{ marginLeft: 8 }}>
+                  {target.is_admin ? "grants full console access" : "not an admin"}
+                </span>
+              </span>
+              <button
+                className="secondary small"
+                disabled={dialogBusy}
+                onClick={async () => {
+                  const ok = await patch(
+                    { is_admin: !target.is_admin },
+                    target.is_admin ? "Admin access revoked" : "Admin access granted",
+                  );
+                  if (ok) setTarget({ ...target, is_admin: !target.is_admin });
+                }}
+              >
+                {target.is_admin ? "Revoke" : "Make admin"}
               </button>
             </div>
+          </div>
+
+          <form
+            className="manage-section"
+            onSubmit={async (e) => {
+              e.preventDefault();
+              const ok = await patch({ password: pwdValue }, "Password reset (next login)");
+              if (ok) { setPwdValue(""); setTarget(null); }
+            }}
+          >
+            <label>
+              Reset password
+              <input
+                type="password"
+                value={pwdValue}
+                onChange={(e) => setPwdValue(e.target.value)}
+                placeholder="New password"
+                autoComplete="new-password"
+                required
+              />
+            </label>
+            <button type="submit" className="secondary small" disabled={dialogBusy || !pwdValue}>
+              Reset
+            </button>
           </form>
+
+          <div className="manage-section manage-danger">
+            <div className="manage-line">
+              <span className="dim" style={{ fontSize: 13 }}>
+                Delete user — their clusters must contain no nodes.
+              </span>
+              {confirmDelete ? (
+                <button className="danger small" disabled={dialogBusy} onClick={() => void onDeleteUser()}>
+                  {dialogBusy ? "Deleting…" : "Confirm delete"}
+                </button>
+              ) : (
+                <button className="danger small" disabled={dialogBusy} onClick={() => setConfirmDelete(true)}>
+                  Delete…
+                </button>
+              )}
+            </div>
+          </div>
+
+          {dialogError && <div className="form-error" role="alert">{dialogError}</div>}
+          {dialogNotice && <div className="notice" role="status">{dialogNotice}</div>}
         </Modal>
       )}
     </div>
