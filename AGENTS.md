@@ -227,6 +227,11 @@ vcpkg 无基线锁定，ffmpeg 头漂移（FF_PROFILE_* 枚举缺定义）编译
 
 ## 8. 已知小缺口（勿重复发现，按需修）
 
+- `xnc exec` 的 `--cwd`/`--env` 值仍走 core argv（BuildChildCommandLine
+  按契约拒绝内嵌双引号/尾反斜杠 → BAD_PAYLOAD）；命令本体已改经 stdin
+  帧传输（core 写 secret 行后 u32LE 长度前缀帧，xnc-shell `--command-stdin`
+  读），节点拒绝一律以 CLI 退出码 247 + 稳定码可见报错（2026-09-14
+  静默 243 引号事故，fix/exec-inline-quote-reject）。
 - `HEAD /installer` 落到 SPA（chi Get 不含 Head）。
 - 安装器 PATH 写回会展开 REG_EXPAND_SZ 引用（触发于增删 XNC 项时）。
 - 同版本重传 release 不删除缺席制品（旧制品可能残留可下载）。
