@@ -274,8 +274,15 @@ vcpkg 无基线锁定，ffmpeg 头漂移（FF_PROFILE_* 枚举缺定义）编译
   屏休眠时 DXGI 采集内容为黑、变化驱动编码器近似零流量（relay ~53s
   idle-timeout 收会话）；IDD auto 策略只认盒盖/无物理输出，不认屏休眠。
   手动出路：`XNC_IDD_ENABLED=1`（机器环境）+ 重启 agent + `xnc display on`。
-  待办：auto 建屏条件纳入屏休眠/黑帧检测，或 RTV 会话期间
-  SetThreadExecutionState 保活显示。
+  **修复已合入（feat/host-session-keep-awake，host 会话期
+  SetThreadExecutionState 保活，待随安装器发布）**；存量已锁会话见下条。
+- **锁屏（Secure Desktop）上 Live Desktop 无法交互**（2026-09-14）：
+  锁屏/UAC 运行在 Winlogon 安全桌面，仅 SYSTEM 特权进程可注入输入；host
+  按契约以用户身份运行（core 用户 token 拉起），SendInput 被静默丢弃。
+  出路：① 已锁会话用 `xnc rdp`（mstsc 经隧道，RDP 栈有 TCB 权限可操作
+  锁屏）解锁后回 Live Desktop（节点详情页 RDP 提示已注明）；② 保活修复
+  上线后"观看中被锁"不再发生；③ Live Desktop 直接操作锁屏 = 后续架构项
+  （仿 RustDesk 的 SYSTEM 会话内注入通道，涉新特权组件 + 安全面评审）。
 
 ## 9. 索引
 
