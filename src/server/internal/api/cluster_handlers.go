@@ -22,11 +22,13 @@ func (h *handlers) listClusters(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// role 供 Web/CLI 区分"我的角色"；personal 标记系统自动建的个人默认
-	// cluster（徽标用）。已删 cluster 已在查询层过滤。
+	// cluster（徽标用）；member/node 计数随行（主从布局列表直显）。已删
+	// cluster 已在查询层过滤。
 	out := make([]map[string]any, 0, len(rows))
 	for _, c := range rows {
 		out = append(out, map[string]any{
 			"id": c.ID, "name": c.Name, "personal": c.Personal, "role": c.Role,
+			"memberCount": c.MemberCount, "nodeCount": c.NodeCount,
 		})
 	}
 	respondJSON(w, 200, out)

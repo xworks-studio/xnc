@@ -27,6 +27,9 @@ export interface ClusterDTO {
   personal?: boolean;
   /** 0005 起：我在该 cluster 的角色（owner 时页内开放管理操作）。 */
   role?: "owner" | "operator" | "viewer";
+  /** 0005.1 起：成员/节点计数随列表行带出（主从布局直显）。 */
+  memberCount?: number;
+  nodeCount?: number;
 }
 
 /** GET /api/clusters/{id}/members rows. */

@@ -109,21 +109,27 @@ func (q *Queries) GetClusterByName(ctx context.Context, name string) (Cluster, e
 }
 
 const listClustersForUser = `-- name: ListClustersForUser :many
-SELECT c.id, c.name, c.owner_id, c.created_at, c.personal, m.role
+SELECT c.id, c.name, c.owner_id, c.created_at, c.personal, m.role,
+       (SELECT count(*) FROM cluster_members cm
+         WHERE cm.cluster_id = c.id) AS member_count,
+       (SELECT count(*) FROM nodes n WHERE n.cluster_id = c.id) AS node_count
 FROM clusters c JOIN cluster_members m ON m.cluster_id = c.id
 WHERE m.user_id = $1 AND c.deleted_at IS NULL ORDER BY c.name
 `
 
 type ListClustersForUserRow struct {
-	ID        uuid.UUID `json:"id"`
-	Name      string    `json:"name"`
-	OwnerID   uuid.UUID `json:"owner_id"`
-	CreatedAt time.Time `json:"created_at"`
-	Personal  bool      `json:"personal"`
-	Role      string    `json:"role"`
+	ID          uuid.UUID `json:"id"`
+	Name        string    `json:"name"`
+	OwnerID     uuid.UUID `json:"owner_id"`
+	CreatedAt   time.Time `json:"created_at"`
+	Personal    bool      `json:"personal"`
+	Role        string    `json:"role"`
+	MemberCount int64     `json:"member_count"`
+	NodeCount   int64     `json:"node_count"`
 }
 
 // deleted_at IS NULL：软删除的 cluster 不再出现在用户列表（0005 存量缺陷修复）。
+// member/node 计数随行带出（子查询聚合，Web 列表页一次拉齐免 N+1）。
 func (q *Queries) ListClustersForUser(ctx context.Context, userID uuid.UUID) ([]ListClustersForUserRow, error) {
 	rows, err := q.db.Query(ctx, listClustersForUser, userID)
 	if err != nil {
@@ -140,6 +146,8 @@ func (q *Queries) ListClustersForUser(ctx context.Context, userID uuid.UUID) ([]
 			&i.CreatedAt,
 			&i.Personal,
 			&i.Role,
+			&i.MemberCount,
+			&i.NodeCount,
 		); err != nil {
 			return nil, err
 		}
