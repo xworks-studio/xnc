@@ -1,6 +1,10 @@
 -- name: ListClustersForUser :many
 -- deleted_at IS NULL：软删除的 cluster 不再出现在用户列表（0005 存量缺陷修复）。
-SELECT c.id, c.name, c.owner_id, c.created_at, c.personal, m.role
+-- member/node 计数随行带出（子查询聚合，Web 列表页一次拉齐免 N+1）。
+SELECT c.id, c.name, c.owner_id, c.created_at, c.personal, m.role,
+       (SELECT count(*) FROM cluster_members cm
+         WHERE cm.cluster_id = c.id) AS member_count,
+       (SELECT count(*) FROM nodes n WHERE n.cluster_id = c.id) AS node_count
 FROM clusters c JOIN cluster_members m ON m.cluster_id = c.id
 WHERE m.user_id = $1 AND c.deleted_at IS NULL ORDER BY c.name;
 
