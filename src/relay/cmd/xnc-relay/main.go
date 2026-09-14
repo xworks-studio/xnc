@@ -129,8 +129,9 @@ func main() {
 	}
 
 	// 会话数据路由器（Stage B）：sdata 票据验签 + 双腿粘合泵。rid 经
-	// 闭包取（控制连接回填后才可用；空 = 拒绝接入）。
-	sessRouter := newSessionRouter(verifier, func() string { return srv.RelayID })
+	// 闭包取（控制连接回填后才可用；空 = 拒绝接入）。Origin 白名单同
+	// WT/WS 腿（2026-09-14 修复：此前漏传，浏览器跨 host 腿恒 403）。
+	sessRouter := newSessionRouter(verifier, func() string { return srv.RelayID }, allowOrigins)
 
 	endpoints := []proto.EndpointDesc{
 		{Transport: "wt", Host: *publicHost, Port: *wtPort, Path: "/wt", CertSHA256: certSHA},

@@ -14,8 +14,13 @@ import (
 	"xnc/rtv"
 )
 
-// newTestRouter 构造带签名器配套验签器的 session router（rid 固定）。
+// newTestRouter 构造带签名器配套验签器的 session router（rid 固定；
+// patterns 为空 = 沿用旧行为基线）。
 func newTestRouter(t *testing.T) (*sessionRouter, *rtv.Signer, *httptest.Server) {
+	return newTestRouterWithPatterns(t, nil)
+}
+
+func newTestRouterWithPatterns(t *testing.T, patterns []string) (*sessionRouter, *rtv.Signer, *httptest.Server) {
 	t.Helper()
 	priv, err := rtv.GenerateSigningKey()
 	if err != nil {
@@ -26,7 +31,7 @@ func newTestRouter(t *testing.T) (*sessionRouter, *rtv.Signer, *httptest.Server)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sr := newSessionRouter(verifier, func() string { return "rl-test" })
+	sr := newSessionRouter(verifier, func() string { return "rl-test" }, patterns)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/agent/session", sr.AgentLegHandler())
 	mux.HandleFunc("/api/session/{sid}", sr.ClientLegHandler())
@@ -165,6 +170,46 @@ func tryDial(t *testing.T, url string) *websocket.Conn {
 	}
 	_ = c.CloseNow()
 	return c
+}
+
+// TestSessionRouterCrossOriginBrowserLeg：浏览器腿带页面 Origin（web
+// app 源 xnc.app → relay 域名 r*.xnc.app，跨 host）。回归钉子：patterns
+// 未配置时同 Host 校验必拒（2026-09-14 前的线上形态）；配置 --allow-origin
+// 形态后必须放行。
+func TestSessionRouterCrossOriginBrowserLeg(t *testing.T) {
+	const sid = "sess-origin-1"
+	dialWithOrigin := func(srvURL, token, origin string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		h := http.Header{}
+		if origin != "" {
+			h.Set("Origin", origin)
+		}
+		c, _, err := websocket.Dial(ctx, srvURL+"/api/session/"+sid+"?token="+token, &websocket.DialOptions{HTTPHeader: h})
+		if err != nil {
+			return err
+		}
+		_ = c.CloseNow()
+		return nil
+	}
+
+	// 旧行为基线：无 patterns，跨 host Origin 必拒。
+	_, sign, srv := newTestRouter(t)
+	ctok, _ := sign.SessionDataTicket(sid, "node-1", "rl-test", "client", time.Hour)
+	if err := dialWithOrigin(srv.URL, ctok, "https://xnc.app"); err == nil {
+		t.Fatal("cross-origin leg without patterns must be rejected")
+	}
+	srv.Close()
+
+	// 修复后：patterns 放行页面源；无 Origin（CLI/agent 腿）不受影响。
+	_, sign2, srv2 := newTestRouterWithPatterns(t, []string{"https://xnc.app"})
+	ctok2, _ := sign2.SessionDataTicket(sid, "node-1", "rl-test", "client", time.Hour)
+	if err := dialWithOrigin(srv2.URL, ctok2, "https://xnc.app"); err != nil {
+		t.Fatalf("cross-origin leg with allow-origin patterns must pass: %v", err)
+	}
+	if err := dialWithOrigin(srv2.URL, ctok2, ""); err != nil {
+		t.Fatalf("origin-less leg (CLI/agent) must pass: %v", err)
+	}
 }
 
 // TestSessionRouterKill：server 撤销关双腿。
