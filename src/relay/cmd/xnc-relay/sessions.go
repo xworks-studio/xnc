@@ -40,6 +40,11 @@ const attachWaitWindow = 60 * time.Second
 type sessionRouter struct {
 	verifier *rtv.Verifier
 	relayID  func() string // 控制连接回填 rid 前为空（空 = 拒绝，与 host leg 一致）
+	// originPatterns 客户端腿放行的页面 Origin（--allow-origin 同源配置；
+	// 2026-09-14 修复：此前漏传，websocket.Accept 零值走同 Host 校验，
+	// 浏览器（xnc.app 页面 → r*.xnc.app relay）永远 403，仅无 Origin 头的
+	// CLI/agent 腿可用——web terminal 经 relay 从未通过过的根因）。
+	originPatterns []string
 
 	mu       sync.Mutex
 	sessions map[string]*dataSession
@@ -56,12 +61,13 @@ type dataSession struct {
 	closeOnce   sync.Once
 }
 
-func newSessionRouter(verifier *rtv.Verifier, relayID func() string) *sessionRouter {
-	return &sessionRouter{verifier: verifier, relayID: relayID, sessions: map[string]*dataSession{}}
+func newSessionRouter(verifier *rtv.Verifier, relayID func() string, originPatterns []string) *sessionRouter {
+	return &sessionRouter{verifier: verifier, relayID: relayID, originPatterns: originPatterns, sessions: map[string]*dataSession{}}
 }
 
 // AgentLegHandler 挂 /api/agent/session（token 即凭证，sid 在票据内——
-// 与主站同形：agent 引擎对 URL 形态无假设）。
+// 与主站同形：agent 引擎对 URL 形态无假设）。agent 腿无浏览器 Origin，
+// AcceptOptions 仅保持与客户端腿同一构造（空 Origin 不受 patterns 约束）。
 func (sr *sessionRouter) AgentLegHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tk, apiErr := sr.verifyLeg(r.URL.Query().Get("token"), "", "agent")
@@ -69,7 +75,7 @@ func (sr *sessionRouter) AgentLegHandler() http.HandlerFunc {
 			http.Error(w, apiErr.Message, apiErr.Status)
 			return
 		}
-		c, err := websocket.Accept(w, r, nil)
+		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{OriginPatterns: sr.originPatterns})
 		if err != nil {
 			return
 		}
@@ -78,7 +84,9 @@ func (sr *sessionRouter) AgentLegHandler() http.HandlerFunc {
 }
 
 // ClientLegHandler 挂 /api/session/{sid}（路径 sid 必须与票据一致——
-// 防票据挪用他sid）。
+// 防票据挪用他sid）。浏览器腿带页面 Origin（xnc.app）而 Host 是 relay
+// 域名（r*.xnc.app）——跨 host 必须经 OriginPatterns 放行（同
+// --allow-origin 的媒体腿语义）。
 func (sr *sessionRouter) ClientLegHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sid := r.PathValue("sid")
@@ -87,7 +95,7 @@ func (sr *sessionRouter) ClientLegHandler() http.HandlerFunc {
 			http.Error(w, apiErr.Message, apiErr.Status)
 			return
 		}
-		c, err := websocket.Accept(w, r, nil)
+		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{OriginPatterns: sr.originPatterns})
 		if err != nil {
 			return
 		}
