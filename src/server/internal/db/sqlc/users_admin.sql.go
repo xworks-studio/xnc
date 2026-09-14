@@ -7,6 +7,8 @@ package sqlc
 
 import (
 	"context"
+
+	"github.com/google/uuid"
 )
 
 const countUsersByEmail = `-- name: CountUsersByEmail :one
@@ -77,4 +79,25 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 		return nil, err
 	}
 	return items, nil
+}
+
+const updateUserIsAdmin = `-- name: UpdateUserIsAdmin :execrows
+UPDATE users SET is_admin = $2
+WHERE users.id = $1
+  AND ($2 OR (SELECT count(*) FROM users sub WHERE sub.is_admin) > 1)
+`
+
+type UpdateUserIsAdminParams struct {
+	ID      uuid.UUID `json:"id"`
+	IsAdmin bool      `json:"is_admin"`
+}
+
+// admin 授/撤（PATCH /api/users/{id}）。撤（$2=false）带最后 admin 保护：
+// 系统内须仍有其他 is_admin 用户。返回 0 行 = 目标不存在或触发保护。
+func (q *Queries) UpdateUserIsAdmin(ctx context.Context, arg UpdateUserIsAdminParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateUserIsAdmin, arg.ID, arg.IsAdmin)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

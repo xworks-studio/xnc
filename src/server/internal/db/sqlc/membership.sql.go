@@ -107,3 +107,51 @@ func (q *Queries) RemoveMember(ctx context.Context, arg RemoveMemberParams) erro
 	_, err := q.db.Exec(ctx, removeMember, arg.ClusterID, arg.UserID)
 	return err
 }
+
+const removeMemberGuarded = `-- name: RemoveMemberGuarded :execrows
+DELETE FROM cluster_members AS m
+WHERE m.cluster_id = $1 AND m.user_id = $2
+  AND (m.role <> 'owner'
+       OR (SELECT count(*) FROM cluster_members sub
+           WHERE sub.cluster_id = $1 AND sub.role = 'owner') > 1)
+`
+
+type RemoveMemberGuardedParams struct {
+	ClusterID uuid.UUID `json:"cluster_id"`
+	UserID    uuid.UUID `json:"user_id"`
+}
+
+// 原子化的最后 owner 保护：目标非 owner 直接删；是 owner 则须还有其他
+// owner（子查询在同一语句内判定，封死查-删分离窗口的并发双删清光 owner）。
+// 返回 0 行 = 未删（非成员 或 最后一个 owner），由调用方区分。
+func (q *Queries) RemoveMemberGuarded(ctx context.Context, arg RemoveMemberGuardedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, removeMemberGuarded, arg.ClusterID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const updateMemberRole = `-- name: UpdateMemberRole :execrows
+UPDATE cluster_members AS m SET role = $3
+WHERE m.cluster_id = $1 AND m.user_id = $2
+  AND (m.role <> 'owner' OR $3 = 'owner'
+       OR (SELECT count(*) FROM cluster_members sub
+           WHERE sub.cluster_id = $1 AND sub.role = 'owner') > 1)
+`
+
+type UpdateMemberRoleParams struct {
+	ClusterID uuid.UUID `json:"cluster_id"`
+	UserID    uuid.UUID `json:"user_id"`
+	Role      string    `json:"role"`
+}
+
+// 改 role 的同款保护：owner 降级为非 owner 须还有其他 owner。返回 0 行 =
+// 未改（非成员 或 最后一个 owner 降级），由调用方区分。
+func (q *Queries) UpdateMemberRole(ctx context.Context, arg UpdateMemberRoleParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateMemberRole, arg.ClusterID, arg.UserID, arg.Role)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}

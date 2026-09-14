@@ -17,6 +17,9 @@ type userDTO struct {
 	ID          string `json:"id"`
 	Email       string `json:"email"`
 	DisplayName string `json:"display_name"`
+	// IsAdmin 仅 admin 视角的端点（listUsers/updateUser）填充；omitempty
+	// 保持 login/me 等既有响应形态不变。
+	IsAdmin bool `json:"is_admin,omitempty"`
 }
 
 func newUserDTO(id, email, name string) userDTO {

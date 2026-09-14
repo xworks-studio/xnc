@@ -13,6 +13,9 @@ SELECT * FROM clusters WHERE name = $1 AND deleted_at IS NULL;
 -- name: GetClusterByID :one
 SELECT * FROM clusters WHERE id = $1 AND deleted_at IS NULL;
 
+-- name: RenameCluster :one
+UPDATE clusters SET name = $2 WHERE id = $1 AND deleted_at IS NULL RETURNING *;
+
 -- name: AddMembership :exec
 INSERT INTO cluster_members (cluster_id, user_id, role) VALUES ($1, $2, $3)
 ON CONFLICT DO NOTHING;

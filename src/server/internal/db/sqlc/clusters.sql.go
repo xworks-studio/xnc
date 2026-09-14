@@ -150,3 +150,26 @@ func (q *Queries) ListClustersForUser(ctx context.Context, userID uuid.UUID) ([]
 	}
 	return items, nil
 }
+
+const renameCluster = `-- name: RenameCluster :one
+UPDATE clusters SET name = $2 WHERE id = $1 AND deleted_at IS NULL RETURNING id, name, owner_id, created_at, deleted_at, personal
+`
+
+type RenameClusterParams struct {
+	ID   uuid.UUID `json:"id"`
+	Name string    `json:"name"`
+}
+
+func (q *Queries) RenameCluster(ctx context.Context, arg RenameClusterParams) (Cluster, error) {
+	row := q.db.QueryRow(ctx, renameCluster, arg.ID, arg.Name)
+	var i Cluster
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.OwnerID,
+		&i.CreatedAt,
+		&i.DeletedAt,
+		&i.Personal,
+	)
+	return i, err
+}

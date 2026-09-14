@@ -176,17 +176,22 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		cr.Use(auth.Middleware(cfg.JWTSecret, st))
 		cr.Get("/", h.listClusters)
 		cr.Post("/", h.createCluster)
+		// 详情：任一成员（非成员 404）；改名：owner-only
+		cr.Get("/{id}", h.getCluster)
+		cr.Patch("/{id}", h.renameCluster)
 		// 软删除：owner-only，有节点 409（handler 内判定）
 		cr.Delete("/{id}", h.deleteCluster)
 		// 用户 JWT 授权的节点注册（spec §6.4）：任一成员；409 含冲突 cluster 名
 		cr.Post("/{id}/nodes/register", h.userRegisterNode)
 	})
 
-	// 用户管理：无自注册，仅 admin（任一 cluster owner）可创建/列出。
+	// 用户管理：无自注册，仅 admin（users.is_admin，0005 起显式列）可创建/
+	// 列出/修改（display_name、is_admin 授撤带最后 admin 保护）。
 	r.Route("/api/users", func(ur chi.Router) {
 		ur.Use(auth.Middleware(cfg.JWTSecret, st))
 		ur.Post("/", h.createUser)
 		ur.Get("/", h.listUsers)
+		ur.Patch("/{id}", h.updateUser)
 	})
 
 	// RTV 中继观测面（管理端；原 MVP /statsz 的收权版本）。
@@ -205,11 +210,12 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		tr.Use(auth.Middleware(cfg.JWTSecret, st))
 		tr.Post("/", h.createEnrollToken)
 	})
-	// membership 管理：列表任一成员可用；增删仅 owner（handler 内判定）。
+	// membership 管理：列表任一成员可用；增删/改角色仅 owner（handler 内判定）。
 	r.Route("/api/clusters/{id}/members", func(mr chi.Router) {
 		mr.Use(auth.Middleware(cfg.JWTSecret, st))
 		mr.Get("/", h.listMembers)
 		mr.Post("/", h.addMember)
+		mr.Patch("/{userId}", h.updateMemberRole)
 		mr.Delete("/{userId}", h.removeMember)
 	})
 	r.Post("/api/agent/enroll", h.agentEnroll)

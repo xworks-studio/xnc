@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -29,6 +30,68 @@ func (h *handlers) listClusters(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	respondJSON(w, 200, out)
+}
+
+// getCluster 处理 GET /api/clusters/{id}：任一成员可看（非成员 404，与
+// listMembers 同一隐藏语义）；返回 {id,name,personal,memberCount,nodeCount}。
+func (h *handlers) getCluster(w http.ResponseWriter, r *http.Request) {
+	u := auth.UserFrom(r.Context())
+	c, apiErr := h.resolveCluster(r, chi.URLParam(r, "id"))
+	if apiErr != nil {
+		respondError(w, apiErr)
+		return
+	}
+	if _, err := h.st.Q().GetMemberRole(r.Context(), sqlc.GetMemberRoleParams{
+		ClusterID: c.ID, UserID: u.ID,
+	}); err != nil {
+		respondError(w, proto.Err(404, proto.CodeClusterNotFound, "cluster not found"))
+		return
+	}
+	members, err := h.st.Q().ListMembers(r.Context(), c.ID)
+	if err != nil {
+		respondError(w, proto.Err(500, proto.CodeInternal, "list members"))
+		return
+	}
+	nodes, err := h.st.Q().CountNodesInCluster(r.Context(), c.ID)
+	if err != nil {
+		respondError(w, proto.Err(500, proto.CodeInternal, "count nodes"))
+		return
+	}
+	respondJSON(w, 200, map[string]any{
+		"id": c.ID, "name": c.Name, "personal": c.Personal,
+		"memberCount": len(members), "nodeCount": nodes,
+	})
+}
+
+// renameCluster 处理 PATCH /api/clusters/{id}：owner-only 改名（cluster 唯一
+// 可变属性）；撞名 400（与 createCluster 同语义）；审计 cluster.rename。
+func (h *handlers) renameCluster(w http.ResponseWriter, r *http.Request) {
+	c, apiErr := h.authorizeClusterOwner(r, chi.URLParam(r, "id"))
+	if apiErr != nil {
+		respondError(w, apiErr)
+		return
+	}
+	u := auth.UserFrom(r.Context())
+	var req struct{ Name string }
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		respondError(w, proto.Err(400, proto.CodeInternal, "name required"))
+		return
+	}
+	updated, err := h.st.Q().RenameCluster(r.Context(), sqlc.RenameClusterParams{
+		ID: c.ID, Name: req.Name,
+	})
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			respondError(w, proto.Err(400, proto.CodeInternal, "cluster name exists"))
+			return
+		}
+		respondError(w, proto.Err(500, proto.CodeInternal, "rename cluster"))
+		return
+	}
+	h.auditMember(r, u.ID, c.ID, "cluster.rename",
+		map[string]string{"from": c.Name, "to": updated.Name})
+	respondJSON(w, 200, map[string]any{"id": updated.ID, "name": updated.Name})
 }
 
 // maxClusterLimit 兜底（config 零值 = 默认 20）。

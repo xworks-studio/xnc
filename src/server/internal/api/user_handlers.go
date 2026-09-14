@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"xnc/proto"
@@ -17,6 +20,9 @@ import (
 // admin 判定走 users.is_admin（0005 起）：auth middleware 每请求全行查库，
 // u.IsAdmin 即当前值；此前"任一 cluster owner 即 admin"的派生谓词在人人拥有
 // 默认 cluster 后会让所有用户变成平台 admin，故废弃。
+
+// errLastAdmin：UpdateUserIsAdmin 触发最后 admin 保护（0 行）的哨兵。
+var errLastAdmin = errors.New("last admin")
 
 type createUserReq struct {
 	Email       string `json:"email"`
@@ -106,7 +112,99 @@ func (h *handlers) listUsers(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]userDTO, 0, len(users))
 	for _, usr := range users {
-		out = append(out, newUserDTO(usr.ID.String(), usr.Email, usr.DisplayName))
+		dto := newUserDTO(usr.ID.String(), usr.Email, usr.DisplayName)
+		dto.IsAdmin = usr.IsAdmin
+		out = append(out, dto)
 	}
 	respondJSON(w, http.StatusOK, out)
+}
+
+// updateUser 处理 PATCH /api/users/{id}：admin-only。可改 display_name 与
+// is_admin（授/撤，撤带最后 admin 保护 → 400 LAST_ADMIN——EnsureAdmin 只在
+// 零用户时自愈，清光 admin 后没有 API 出路）。审计 user.update /
+// user.admin.toggle。
+func (h *handlers) updateUser(w http.ResponseWriter, r *http.Request) {
+	u := auth.UserFrom(r.Context())
+	if !u.IsAdmin {
+		respondError(w, proto.Err(403, proto.CodeForbidden, "admin required"))
+		return
+	}
+	uid, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		respondError(w, proto.Err(404, proto.CodeUserNotFound, "user not found"))
+		return
+	}
+	target, err := h.st.Q().GetUserByID(r.Context(), uid)
+	if err != nil {
+		respondError(w, proto.Err(404, proto.CodeUserNotFound, "user not found"))
+		return
+	}
+	var req struct {
+		DisplayName *string `json:"display_name"`
+		IsAdmin     *bool   `json:"is_admin"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil ||
+		(req.DisplayName == nil && req.IsAdmin == nil) {
+		respondError(w, proto.Err(400, proto.CodeInternal, "nothing to update"))
+		return
+	}
+	if req.DisplayName != nil && *req.DisplayName != target.DisplayName {
+		if _, err := h.st.Q().UpdateUserDisplayName(r.Context(), sqlc.UpdateUserDisplayNameParams{
+			ID: uid, DisplayName: *req.DisplayName,
+		}); err != nil {
+			respondError(w, proto.Err(500, proto.CodeInternal, "update display name"))
+			return
+		}
+		target.DisplayName = *req.DisplayName
+		h.auditUser(u.ID, "user.update",
+			map[string]string{"user_id": uid.String()})
+	}
+	if req.IsAdmin != nil && *req.IsAdmin != target.IsAdmin {
+		// 最后 admin 守卫的并发双撤同样有旧快照竞态，经全局 advisory 锁串行。
+		err := func() error {
+			tx, terr := h.st.Pool().Begin(r.Context())
+			if terr != nil {
+				return terr
+			}
+			defer tx.Rollback(r.Context())
+			if _, terr := tx.Exec(r.Context(),
+				`SELECT pg_advisory_xact_lock(hashtextextended('users:is_admin', 0))`); terr != nil {
+				return terr
+			}
+			n, terr := sqlc.New(tx).UpdateUserIsAdmin(r.Context(), sqlc.UpdateUserIsAdminParams{
+				ID: uid, IsAdmin: *req.IsAdmin,
+			})
+			if terr != nil {
+				return terr
+			}
+			if n == 0 {
+				return errLastAdmin
+			}
+			return tx.Commit(r.Context())
+		}()
+		if errors.Is(err, errLastAdmin) {
+			respondError(w, proto.Err(400, proto.CodeLastAdmin,
+				"cannot demote the last admin"))
+			return
+		}
+		if err != nil {
+			respondError(w, proto.Err(500, proto.CodeInternal, "update is_admin"))
+			return
+		}
+		target.IsAdmin = *req.IsAdmin
+		h.auditUser(u.ID, "user.admin.toggle",
+			map[string]string{"user_id": uid.String(), "is_admin": strconv.FormatBool(*req.IsAdmin)})
+	}
+	dto := newUserDTO(target.ID.String(), target.Email, target.DisplayName)
+	dto.IsAdmin = target.IsAdmin
+	respondJSON(w, http.StatusOK, dto)
+}
+
+// auditUser 用户维度审计（无 cluster 关联），沿用独立 background ctx 模式。
+func (h *handlers) auditUser(actor uuid.UUID, action string, meta map[string]string) {
+	actx, acancel := context.WithTimeout(context.Background(), auditInsertTimeout)
+	defer acancel()
+	_ = h.st.Q().InsertAuditLog(actx, sqlc.InsertAuditLogParams{
+		UserID: pgUUID(actor), Action: action, Metadata: mustJSON(meta),
+	})
 }
