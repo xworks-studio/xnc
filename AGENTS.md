@@ -243,21 +243,22 @@ vcpkg 无基线锁定，ffmpeg 头漂移（FF_PROFILE_* 枚举缺定义）编译
 - 阿里云安全组（主站）未放行 UDP443：仅影响内嵌/开发形态的 WT 腿
   （compose `XNC_RTV_WT_PORT` 过渡 14433/udp）；relay-only 生产形态主站
   不跑媒体腿，媒体在 relay 主机（r1/r2 已放行 UDP443/4433）。
-- **2026-09-14 会话面回落主站（现行，根因：未备案域名拦截）**：xnc.app
-  未做 ICP 备案。relay 主机 80 端口持续返回阿里云 beian-block 拦截页；
-  TCP443 对带该 SNI 的浏览器级握手出现过**间歇性**丢弃/RST（当日
-  15:00-15:50 全灭，16:10 起 r1/r2 双双恢复，r1 未做任何变更即恢复=执法
-  波动而非配置问题；Go/部分 openssl 全程可通）。媒体腿（wt/quic，裸 IP
-  无 SNI）不受影响。止损：两台 relay 的 systemd 单元去掉
-  `--session-host/--session-port`（备份 `.bak-sdata`），sdata 不宣告 →
-  会话回落主站旧路径。恢复 sdata：443 可通时重推
-  `push_relay.py --session-host <域名>` 即可；**避险端口方案**（避开
-  80/443 的备案自动拦截，如 8443）可行但需先在阿里云安全组放行
-  （PORTS.md 清单只有 443/4433/8080；r2 caddy 已预置 `:8443` 站点块，
-  caddy 已升 2.11.4 二进制直装）。**证书续期风险**：relay 域名证书
-  （LE，至 2026-12-10）下次续期 ~11-10，http-01 已被 80 拦截阻断、
-  tls-alpn-01 受 443 波动影响——需提前改 dns-01（DNS API 凭据）。
-  主站 xnc.app 的 80/443 目前未被拦（308/正常），但同域名风险仍在。
+- **2026-09-14 web terminal 经 relay 断连（根因已修正：会话路由器 Origin
+  缺陷，非备案拦截）**：xnc-relay 的 session router `websocket.Accept`
+  零值走同 Host Origin 校验——浏览器腿（页面源 xnc.app → relay 域
+  r*.xnc.app）恒 403，CLI/agent 腿（无 Origin 头）恒通。Stage B
+  （2026-09-11）接线时漏传 `--allow-origin`，即 web terminal 经 relay
+  从未通过；当日并发的大陆备案拦截（80 端口 beian-block 页持续存在、
+  443 SNI 级 RST 间歇波动）掩盖了判读。修复 `fix/relay-session-origin`
+  （dc99d59）：patterns 接入双腿 Accept + 跨源回归测试；已直推双 relay
+  （二进制换 `/usr/local/bin/xnc-relay`，备份 `.bak-origin`），浏览器
+  经 `wss://r2.xnc.app:443` 全链验证通过。**现行**：sdata 已在 443 恢复
+  宣告；caddy `:8443` 站点块双机已预置（域名证书，非标端口不经备案
+  SNI 拦截），**逃生开关 = 改单元 `--session-port 8443` + 重启
+  xnc-relay**——前置：阿里云安全组放行 8443/TCP（PORTS.md 清单只有
+  443/4433/8080，控制台操作）。**遗留风险**：relay 域名证书（LE，至
+  2026-12-10）续期 ~11-10 走 80/443 挑战均被备案拦截所阻，需提前改
+  dns-01；主站 xnc.app 同域名在大陆，80/443 目前正常但风险同源。
   relay 主机 SSH 凭据在 deploy/.env 的 `RELAY1_*/RELAY2_*` 键。
 - web HUD 码率/收包显示累计值（未做每秒差分）；e2e 显示跨时钟偏差。
 - **显示器休眠（非无输出）→ RTV 采集全黑**（2026-09-14 真机实测）：物理
