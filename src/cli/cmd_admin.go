@@ -57,7 +57,8 @@ func newNodeAdminCmd(action, short string) *cobra.Command {
 
 // newClusterDeleteCmd: `xnc cluster delete <cluster>` — owner-only soft
 // delete. The server refuses clusters that still have nodes (409
-// CLUSTER_NOT_EMPTY, CLI exit 250) and keeps the row under a renamed name.
+// CLUSTER_NOT_EMPTY, CLI exit 250); the row is tombstoned via deleted_at and
+// the name becomes reusable (0005).
 func newClusterDeleteCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "delete <cluster>",

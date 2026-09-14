@@ -23,8 +23,8 @@ func (q *Queries) CountUsers(ctx context.Context) (int64, error) {
 }
 
 const createUser = `-- name: CreateUser :one
-INSERT INTO users (id, email, display_name, password_hash)
-VALUES ($1, $2, $3, $4) RETURNING id, email, display_name, password_hash, created_at
+INSERT INTO users (id, email, display_name, password_hash, is_admin)
+VALUES ($1, $2, $3, $4, $5) RETURNING id, email, display_name, password_hash, created_at, is_admin
 `
 
 type CreateUserParams struct {
@@ -32,14 +32,18 @@ type CreateUserParams struct {
 	Email        string    `json:"email"`
 	DisplayName  string    `json:"display_name"`
 	PasswordHash string    `json:"password_hash"`
+	IsAdmin      bool      `json:"is_admin"`
 }
 
+// is_admin 显式入参：bootstrap 首启 admin 需 true（0005 起 admin 是显式列，
+// 全新库不经迁移回填，漏设则首启 admin 不是 admin）。
 func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, error) {
 	row := q.db.QueryRow(ctx, createUser,
 		arg.ID,
 		arg.Email,
 		arg.DisplayName,
 		arg.PasswordHash,
+		arg.IsAdmin,
 	)
 	var i User
 	err := row.Scan(
@@ -48,12 +52,13 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.DisplayName,
 		&i.PasswordHash,
 		&i.CreatedAt,
+		&i.IsAdmin,
 	)
 	return i, err
 }
 
 const getUserByEmail = `-- name: GetUserByEmail :one
-SELECT id, email, display_name, password_hash, created_at FROM users WHERE email = $1
+SELECT id, email, display_name, password_hash, created_at, is_admin FROM users WHERE email = $1
 `
 
 func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error) {
@@ -65,12 +70,13 @@ func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error
 		&i.DisplayName,
 		&i.PasswordHash,
 		&i.CreatedAt,
+		&i.IsAdmin,
 	)
 	return i, err
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, email, display_name, password_hash, created_at FROM users WHERE id = $1
+SELECT id, email, display_name, password_hash, created_at, is_admin FROM users WHERE id = $1
 `
 
 func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
@@ -82,6 +88,7 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
 		&i.DisplayName,
 		&i.PasswordHash,
 		&i.CreatedAt,
+		&i.IsAdmin,
 	)
 	return i, err
 }

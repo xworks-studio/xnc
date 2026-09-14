@@ -4,6 +4,8 @@ export interface UserDTO {
   id: string;
   email: string;
   display_name: string;
+  /** 仅 admin 视角端点（listUsers/updateUser）携带。 */
+  is_admin?: boolean;
 }
 
 export interface NodeDTO {
@@ -21,6 +23,10 @@ export interface NodeDTO {
 export interface ClusterDTO {
   id: string;
   name: string;
+  /** 0005 起：系统自动建的个人默认 cluster（徽标用）。 */
+  personal?: boolean;
+  /** 0005 起：我在该 cluster 的角色（owner 时页内开放管理操作）。 */
+  role?: "owner" | "operator" | "viewer";
 }
 
 /** GET /api/clusters/{id}/members rows. */

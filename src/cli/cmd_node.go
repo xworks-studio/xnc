@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net/url"
 
 	"github.com/spf13/cobra"
@@ -30,7 +31,57 @@ func (n nodeDTO) lastSeen() string {
 
 func newNodeCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "node", Short: "Node operations"}
-	cmd.AddCommand(newNodeListCmd(), newNodeShowCmd(), newNodeDisableCmd(), newNodeEnableCmd())
+	cmd.AddCommand(newNodeListCmd(), newNodeShowCmd(), newNodeDisableCmd(),
+		newNodeEnableCmd(), newNodeMoveCmd())
+	return cmd
+}
+
+// newNodeMoveCmd: `xnc node move <node> --cluster <target>` — 跨 cluster 搬迁
+//（0005）：须同时是源与目标 cluster 的 owner；nodeId/公钥/在线连接保留，
+// 目标内重名自动加 -2 后缀（输出实际落地 name）。
+func newNodeMoveCmd() *cobra.Command {
+	var target string
+	cmd := &cobra.Command{
+		Use:   "move <node>",
+		Short: "Move a node to another cluster (owner of both clusters required)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if target == "" {
+				return failUsage(cmd, "--cluster is required")
+			}
+			cl, usage := dial(cmd, true)
+			if usage != "" {
+				return failUsage(cmd, usage)
+			}
+			ref, e := resolveNode(cl, args[0])
+			if e != nil {
+				return failAPI(cmd, e)
+			}
+			var resp struct {
+				NodeID    string `json:"nodeId"`
+				ClusterID string `json:"clusterId"`
+				Name      string `json:"name"`
+			}
+			path := "/api/nodes/" + url.PathEscape(ref.ID) + "/move"
+			if e := cl.Do("POST", path, map[string]string{"target": target}, &resp); e != nil {
+				return failAPI(cmd, e)
+			}
+			if jsonOut(cmd) {
+				PrintJSON(true, resp, nil)
+				return nil
+			}
+			label := args[0]
+			if resp.Name != "" && resp.Name != label {
+				fmt.Printf("moved %s to cluster %s (renamed to %s: name taken)\n",
+					label, target, resp.Name)
+				return nil
+			}
+			fmt.Printf("moved %s to cluster %s\n", label, target)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&target, "cluster", "", "target cluster name or UUID")
+	addJSONFlag(cmd)
 	return cmd
 }
 

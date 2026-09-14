@@ -5,12 +5,14 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"xnc/proto"
@@ -116,6 +118,14 @@ func (h *handlers) enrollNode(ctx context.Context, clusterID uuid.UUID, req enro
 	defer tx.Rollback(ctx)
 	q := sqlc.New(tx)
 
+	// cluster 存活防御（0005）：token 路径的 enrollment token 不随 cluster
+	// 软删除失效，此前已删 cluster 的未过期 token 仍可注册节点进"幽灵"
+	// cluster（列表过滤后不可见）。JWT 路径的 resolveCluster 已过滤，此处
+	// 主要兜 token 路径（agentEnroll 另有更友好的 410 预检）。
+	if _, err := q.GetClusterByID(ctx, clusterID); err != nil {
+		return sqlc.Node{}, proto.Err(404, proto.CodeClusterNotFound, "cluster not found")
+	}
+
 	// 幂等：同 (cluster, machineId, publicKey) 复用既有节点。
 	if existing, err := q.GetNodeByIdentity(ctx, sqlc.GetNodeByIdentityParams{
 		ClusterID: clusterID, MachineID: req.MachineID}); err == nil {
@@ -180,6 +190,21 @@ func (h *handlers) enrollNode(ctx context.Context, clusterID uuid.UUID, req enro
 		AgentVersion: req.AgentVersion, PublicKey: req.PublicKey,
 	})
 	if err != nil {
+		// 23505 按约束名分流（0005 起 machine_id 全局唯一）：
+		// nodes_machine_id_key = 跨 cluster 并发注册竞态/漏检（token 路径
+		// 此前不查跨 cluster 冲突，靠此兜底）；nodes_cluster_id_name_key =
+		// 名字唯一化的查-插竞态（极窄窗口，让客户端重试）。
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			if pgErr.ConstraintName == "nodes_machine_id_key" {
+				return sqlc.Node{}, proto.Err(409, proto.CodeMachineIDConflict,
+					"machineId already registered in another cluster")
+			}
+			if pgErr.ConstraintName == "nodes_cluster_id_name_key" {
+				return sqlc.Node{}, proto.Err(409, proto.CodeInternal,
+					"node name conflict; retry")
+			}
+		}
 		return sqlc.Node{}, proto.Err(500, proto.CodeInternal, "create node")
 	}
 	// audit_logs 的 user_id/cluster_id/node_id 为可空列，sqlc 生成 pgtype.UUID（见 Task 6 评审注记）。
@@ -219,6 +244,13 @@ func (h *handlers) agentEnroll(w http.ResponseWriter, r *http.Request) {
 	}
 	if time.Now().After(tok.ExpiresAt) {
 		respondError(w, proto.Err(410, proto.CodeEnrollmentTokenExpired, "token expired"))
+		return
+	}
+	// cluster 存活预检（0005）：token 随所属 cluster 软删除视作失效——比
+	// enrollNode 兜底的 404 语义更贴切（token 侧问题 token 侧答）。
+	if _, err := h.st.Q().GetClusterByID(r.Context(), tok.ClusterID); err != nil {
+		respondError(w, proto.Err(410, proto.CodeEnrollmentTokenInvalid,
+			"cluster no longer exists"))
 		return
 	}
 	pub, err := base64.StdEncoding.DecodeString(req.PublicKey)

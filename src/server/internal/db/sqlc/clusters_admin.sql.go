@@ -17,7 +17,8 @@ SELECT count(*) FROM nodes WHERE cluster_id = $1
 `
 
 // Cluster 删除（DELETE /api/clusters/{id}）查询。
-// 软删除策略：有节点时端点层拒绝（409），删除即重命名保留审计链。
+// 软删除策略：有节点时端点层拒绝（409）；0005 起删除 = 打 deleted_at（name
+// 唯一性是存活行部分索引，原名自动可复用，不再需要改名把戏）。
 func (q *Queries) CountNodesInCluster(ctx context.Context, clusterID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countNodesInCluster, clusterID)
 	var count int64
@@ -25,16 +26,15 @@ func (q *Queries) CountNodesInCluster(ctx context.Context, clusterID uuid.UUID) 
 	return count, err
 }
 
-const softDeleteCluster = `-- name: SoftDeleteCluster :exec
-UPDATE clusters SET name = $2 WHERE id = $1
+const softDeleteCluster = `-- name: SoftDeleteCluster :execrows
+UPDATE clusters SET deleted_at = now()
+WHERE id = $1 AND deleted_at IS NULL
 `
 
-type SoftDeleteClusterParams struct {
-	ID   uuid.UUID `json:"id"`
-	Name string    `json:"name"`
-}
-
-func (q *Queries) SoftDeleteCluster(ctx context.Context, arg SoftDeleteClusterParams) error {
-	_, err := q.db.Exec(ctx, softDeleteCluster, arg.ID, arg.Name)
-	return err
+func (q *Queries) SoftDeleteCluster(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, softDeleteCluster, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

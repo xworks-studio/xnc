@@ -124,7 +124,8 @@ func (q *Queries) DeleteNode(ctx context.Context, id uuid.UUID) (int64, error) {
 
 const getMachineIDConflictCluster = `-- name: GetMachineIDConflictCluster :one
 SELECT c.name FROM nodes n JOIN clusters c ON c.id = n.cluster_id
-WHERE n.machine_id = $1 AND n.cluster_id <> $2 LIMIT 1
+WHERE n.machine_id = $1 AND n.cluster_id <> $2
+  AND c.deleted_at IS NULL LIMIT 1
 `
 
 type GetMachineIDConflictClusterParams struct {
@@ -134,6 +135,8 @@ type GetMachineIDConflictClusterParams struct {
 
 // 跨 cluster machineId 冲突检查（用户 JWT 注册 409，spec §6.4）：machineId 已
 // 注册于其他 cluster 时返回该 cluster 名（供 CLI 提示 --force 或管理端处理）。
+// deleted_at IS NULL 仅为卫生性过滤——删除 cluster 前置要求节点清空，正常
+// 数据不会出现已删 cluster 挂节点。
 func (q *Queries) GetMachineIDConflictCluster(ctx context.Context, arg GetMachineIDConflictClusterParams) (string, error) {
 	row := q.db.QueryRow(ctx, getMachineIDConflictCluster, arg.MachineID, arg.ClusterID)
 	var name string
@@ -227,4 +230,32 @@ func (q *Queries) GetNodeByNameInCluster(ctx context.Context, arg GetNodeByNameI
 		&i.Channel,
 	)
 	return i, err
+}
+
+const moveNodeCluster = `-- name: MoveNodeCluster :execrows
+UPDATE nodes SET cluster_id = $2, name = $3
+WHERE id = $1 AND cluster_id = $4
+`
+
+type MoveNodeClusterParams struct {
+	ID          uuid.UUID `json:"id"`
+	ClusterID   uuid.UUID `json:"cluster_id"`
+	Name        string    `json:"name"`
+	ClusterID_2 uuid.UUID `json:"cluster_id_2"`
+}
+
+// node move（POST /api/nodes/{id}/move）：源 cluster_id 作乐观并发条件（并发
+// move/删除 → 0 行由调用方判重）。machine 全局唯一索引兜底跨 cluster 冲突、
+// (cluster_id,name) 唯一约束兜底名字竞态——两类 23505 由 handler 按约束名分流。
+func (q *Queries) MoveNodeCluster(ctx context.Context, arg MoveNodeClusterParams) (int64, error) {
+	result, err := q.db.Exec(ctx, moveNodeCluster,
+		arg.ID,
+		arg.ClusterID,
+		arg.Name,
+		arg.ClusterID_2,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

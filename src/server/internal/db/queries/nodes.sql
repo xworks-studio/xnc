@@ -15,8 +15,11 @@ SELECT * FROM nodes WHERE id = $1;
 -- name: GetMachineIDConflictCluster :one
 -- 跨 cluster machineId 冲突检查（用户 JWT 注册 409，spec §6.4）：machineId 已
 -- 注册于其他 cluster 时返回该 cluster 名（供 CLI 提示 --force 或管理端处理）。
+-- deleted_at IS NULL 仅为卫生性过滤——删除 cluster 前置要求节点清空，正常
+-- 数据不会出现已删 cluster 挂节点。
 SELECT c.name FROM nodes n JOIN clusters c ON c.id = n.cluster_id
-WHERE n.machine_id = $1 AND n.cluster_id <> $2 LIMIT 1;
+WHERE n.machine_id = $1 AND n.cluster_id <> $2
+  AND c.deleted_at IS NULL LIMIT 1;
 
 -- name: AdoptNodeIdentity :one
 -- 同 cluster 同 machineId 换 key 重注册（adopt，controller 批准设计）：重绑
@@ -32,3 +35,10 @@ WHERE id = $5 RETURNING *;
 -- 机器自注销（spec §7：控制连接上 NODE_DELETE，机器身份即凭据）。返回删除
 -- 行数：0 = 节点已不存在（重复注销按幂等成功处理）。
 DELETE FROM nodes WHERE id = $1;
+
+-- name: MoveNodeCluster :execrows
+-- node move（POST /api/nodes/{id}/move）：源 cluster_id 作乐观并发条件（并发
+-- move/删除 → 0 行由调用方判重）。machine 全局唯一索引兜底跨 cluster 冲突、
+-- (cluster_id,name) 唯一约束兜底名字竞态——两类 23505 由 handler 按约束名分流。
+UPDATE nodes SET cluster_id = $2, name = $3
+WHERE id = $1 AND cluster_id = $4;

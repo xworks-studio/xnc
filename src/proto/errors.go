@@ -36,7 +36,13 @@ const (
 	// 主站缩减默认）下 relay 池无可用中继（全离线/pending/健康探测不过）——
 	// 主站不跑媒体，无 relay 即无桌面，503 直报不做内嵌兜底。
 	CodeRtvNoRelay = "RTV_NO_RELAY"
-	CodeInternal   = "INTERNAL"
+	// CodeUserNotFound：按 email/ID 解析目标用户失败（add member 等）。与
+	// CodeClusterNotFound 同为 404 存在性语义。
+	CodeUserNotFound = "USER_NOT_FOUND"
+	// CodeLastAdmin：最后 admin 保护——系统内最后一个 is_admin=true 用户不可
+	// 被撤销/自撤（清光 admin 后 EnsureAdmin 不自愈，只剩手工 SQL）。
+	CodeLastAdmin = "LAST_ADMIN"
+	CodeInternal  = "INTERNAL"
 )
 
 // APIError is the REST error envelope body: {"error":{"code","message"}}.

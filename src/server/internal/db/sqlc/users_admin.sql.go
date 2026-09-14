@@ -7,6 +7,8 @@ package sqlc
 
 import (
 	"context"
+
+	"github.com/google/uuid"
 )
 
 const countUsersByEmail = `-- name: CountUsersByEmail :one
@@ -23,7 +25,7 @@ func (q *Queries) CountUsersByEmail(ctx context.Context, email string) (int64, e
 const createUserByEmail = `-- name: CreateUserByEmail :one
 
 INSERT INTO users (email, display_name, password_hash)
-VALUES ($1, $2, $3) RETURNING id, email, display_name, password_hash, created_at
+VALUES ($1, $2, $3) RETURNING id, email, display_name, password_hash, created_at, is_admin
 `
 
 type CreateUserByEmailParams struct {
@@ -43,12 +45,13 @@ func (q *Queries) CreateUserByEmail(ctx context.Context, arg CreateUserByEmailPa
 		&i.DisplayName,
 		&i.PasswordHash,
 		&i.CreatedAt,
+		&i.IsAdmin,
 	)
 	return i, err
 }
 
 const listUsers = `-- name: ListUsers :many
-SELECT id, email, display_name, password_hash, created_at FROM users ORDER BY email
+SELECT id, email, display_name, password_hash, created_at, is_admin FROM users ORDER BY email
 `
 
 func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
@@ -66,6 +69,7 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 			&i.DisplayName,
 			&i.PasswordHash,
 			&i.CreatedAt,
+			&i.IsAdmin,
 		); err != nil {
 			return nil, err
 		}
@@ -75,4 +79,25 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 		return nil, err
 	}
 	return items, nil
+}
+
+const updateUserIsAdmin = `-- name: UpdateUserIsAdmin :execrows
+UPDATE users SET is_admin = $2
+WHERE users.id = $1
+  AND ($2 OR (SELECT count(*) FROM users sub WHERE sub.is_admin) > 1)
+`
+
+type UpdateUserIsAdminParams struct {
+	ID      uuid.UUID `json:"id"`
+	IsAdmin bool      `json:"is_admin"`
+}
+
+// admin 授/撤（PATCH /api/users/{id}）。撤（$2=false）带最后 admin 保护：
+// 系统内须仍有其他 is_admin 用户。返回 0 行 = 目标不存在或触发保护。
+func (q *Queries) UpdateUserIsAdmin(ctx context.Context, arg UpdateUserIsAdminParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateUserIsAdmin, arg.ID, arg.IsAdmin)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
