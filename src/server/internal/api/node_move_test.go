@@ -239,3 +239,36 @@ func TestTokenEnrollDeletedCluster(t *testing.T) {
 	defer resp.Body.Close()
 	assert.Equal(t, 410, resp.StatusCode)
 }
+
+// TestNodeRename：owner 改名 200 + 审计；cluster 内重名 409；operator 403；
+// 未知节点 404。
+func TestNodeRename(t *testing.T) {
+	env := NewTestEnv(t)
+	srv := httptest.NewServer(env.Router)
+	defer srv.Close()
+	admin := env.AdminToken(t)
+
+	a := env.EnrollNode(t, "REN-1", "mid-ren-1")
+	b := env.EnrollNode(t, "REN-2", "mid-ren-2")
+
+	// owner 改名 → 200，name 生效。
+	assert.Equal(t, 200, doJSON(t, srv.URL, "PATCH", "/api/nodes/"+a, admin,
+		`{"name":"web-01"}`).StatusCode)
+	// cluster 内重名 → 409。
+	resp := doJSON(t, srv.URL, "PATCH", "/api/nodes/"+b, admin, `{"name":"web-01"}`)
+	assert.Equal(t, 409, resp.StatusCode)
+	// operator（非 owner）→ 403；未知节点 → 404。
+	opID, opTok := createUserViaAPI(t, srv.URL, admin, "ren-op@t.local", "Op")
+	assert.Equal(t, 201, doJSON(t, srv.URL, "POST", "/api/clusters/default/members", admin,
+		`{"user_id":"`+opID+`","role":"operator"}`).StatusCode)
+	assert.Equal(t, 403, doJSON(t, srv.URL, "PATCH", "/api/nodes/"+a, opTok,
+		`{"name":"nope"}`).StatusCode)
+	assert.Equal(t, 404, doJSON(t, srv.URL, "PATCH",
+		"/api/nodes/00000000-0000-0000-0000-000000000000", admin,
+		`{"name":"x"}`).StatusCode)
+	// 审计 node.rename。
+	var n int
+	require.NoError(t, env.Store.Pool().QueryRow(t.Context(),
+		`SELECT count(*) FROM audit_logs WHERE action='node.rename'`).Scan(&n))
+	assert.Equal(t, 1, n)
+}
