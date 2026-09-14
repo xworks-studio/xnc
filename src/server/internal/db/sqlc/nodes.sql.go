@@ -259,3 +259,36 @@ func (q *Queries) MoveNodeCluster(ctx context.Context, arg MoveNodeClusterParams
 	}
 	return result.RowsAffected(), nil
 }
+
+const renameNode = `-- name: RenameNode :one
+UPDATE nodes SET name = $2 WHERE id = $1 RETURNING id, cluster_id, name, machine_id, hostname, os_version, agent_version, shell_type, public_key, status, last_seen_at, created_at, target_release, channel
+`
+
+type RenameNodeParams struct {
+	ID   uuid.UUID `json:"id"`
+	Name string    `json:"name"`
+}
+
+// 节点改名（PATCH /api/nodes/{id}，0006 后管理弹窗）：cluster 内重名撞
+// (cluster_id,name) 唯一约束，由 handler 映射 409。
+func (q *Queries) RenameNode(ctx context.Context, arg RenameNodeParams) (Node, error) {
+	row := q.db.QueryRow(ctx, renameNode, arg.ID, arg.Name)
+	var i Node
+	err := row.Scan(
+		&i.ID,
+		&i.ClusterID,
+		&i.Name,
+		&i.MachineID,
+		&i.Hostname,
+		&i.OsVersion,
+		&i.AgentVersion,
+		&i.ShellType,
+		&i.PublicKey,
+		&i.Status,
+		&i.LastSeenAt,
+		&i.CreatedAt,
+		&i.TargetRelease,
+		&i.Channel,
+	)
+	return i, err
+}

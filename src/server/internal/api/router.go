@@ -264,6 +264,8 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		nr.Use(auth.Middleware(cfg.JWTSecret, st))
 		nr.Get("/", h.listNodes)
 		nr.Get("/{id}", h.getNode)
+		// 节点改名（0006 后管理弹窗）：owner-only，cluster 内重名 409
+		nr.Patch("/{id}", h.renameNode)
 		// exec：鉴权 + membership 通过后创建会话并下发 SESSION_OPEN，202 异步语义
 		nr.Post("/{id}/exec", h.execStart)
 		// shell：同一会话创建路径（startSession），kind=shell，ConPTY 交互式终端

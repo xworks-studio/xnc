@@ -42,3 +42,8 @@ DELETE FROM nodes WHERE id = $1;
 -- (cluster_id,name) 唯一约束兜底名字竞态——两类 23505 由 handler 按约束名分流。
 UPDATE nodes SET cluster_id = $2, name = $3
 WHERE id = $1 AND cluster_id = $4;
+
+-- name: RenameNode :one
+-- 节点改名（PATCH /api/nodes/{id}，0006 后管理弹窗）：cluster 内重名撞
+-- (cluster_id,name) 唯一约束，由 handler 映射 409。
+UPDATE nodes SET name = $2 WHERE id = $1 RETURNING *;

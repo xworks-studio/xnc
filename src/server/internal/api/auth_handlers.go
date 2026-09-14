@@ -54,8 +54,10 @@ func (h *handlers) login(w http.ResponseWriter, r *http.Request) {
 
 func (h *handlers) me(w http.ResponseWriter, r *http.Request) {
 	u := auth.UserFrom(r.Context())
+	dto := newUserDTO(u.ID.String(), u.Email, u.DisplayName)
+	dto.IsAdmin = u.IsAdmin // 0006 起 Web 管理弹窗的删除按钮等 admin 视图判断
 	respondJSON(w, 200, map[string]any{
-		"user": newUserDTO(u.ID.String(), u.Email, u.DisplayName),
+		"user": dto,
 	})
 }
 
