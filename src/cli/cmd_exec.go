@@ -40,6 +40,7 @@ type execOutcome struct {
 	exitCode  *int
 	timedOut  bool
 	truncated bool // EXEC_RESULT.Truncated(T5:输出超预算丢弃)
+	code      string
 	duration  int64
 	gotResult bool
 	stdout    strings.Builder
@@ -247,6 +248,7 @@ func runSession(cl *Client, ref nodeRef, body map[string]any, cmd *cobra.Command
 			var r proto.ExecResult
 			if m.Decode(&r) == nil {
 				out.exitCode, out.timedOut, out.truncated, out.duration = r.ExitCode, r.TimedOut, r.Truncated, r.DurationMs
+				out.code = r.Code
 				out.gotResult = true
 			}
 		}
@@ -267,12 +269,23 @@ func runSession(cl *Client, ref nodeRef, body map[string]any, cmd *cobra.Command
 		if out.exitCode != nil {
 			ec = *out.exitCode
 		}
+		rc := any(nil)
+		if out.code != "" {
+			rc = out.code
+		}
 		PrintJSON(true, map[string]any{
 			"node": out.node, "exitCode": ec, "stdout": out.stdout.String(),
 			"stderr": out.stderr.String(), "durationMs": out.duration, "timedOut": out.timedOut, "truncated": out.truncated,
+			"code": rc,
 		}, nil)
+	} else if out.code != "" {
+		// 节点拒绝执行(核心不可达/负载被拒等):ExitCode=null + 稳定码。
+		// 静默吞掉会伪装成超时(2026-09-14 静默 243 事故的放大器)。
+		fmt.Fprintf(os.Stderr, "xnc: node rejected exec: %s\n", out.code)
 	}
 	switch {
+	case out.exitCode == nil && out.code != "":
+		return &exitError{code: exitRejected}
 	case out.exitCode == nil:
 		return &exitError{code: exitTimeout}
 	case *out.exitCode == 0:

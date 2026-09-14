@@ -9,10 +9,11 @@ const (
 	exitAuth     = 240 // UNAUTHORIZED, ENROLLMENT_TOKEN_INVALID
 	exitForbid   = 241 // FORBIDDEN
 	exitOffline  = 242 // NODE_OFFLINE
-	exitTimeout  = 243 // EXEC_RESULT received with timedOut/no exit code; resultless disconnects are 245
+	exitTimeout  = 243 // EXEC_RESULT with timedOut and no exit code
 	exitMissing  = 244 // CLUSTER_NOT_FOUND, NODE_NOT_FOUND, NODE_ALREADY_ENROLLED, MACHINE_ID_CONFLICT, FILE_NOT_FOUND
 	exitNet      = 245 // NETWORK (client-side network failure)
 	exitQuota    = 246 // SESSION_LIMIT_EXCEEDED, FILE_TOO_LARGE, HASH_MISMATCH
+	exitRejected = 247 // EXEC_RESULT with a stable rejection code (node refused to run: CORE_UNAVAILABLE, BAD_PAYLOAD, ...)
 	exitInternal = 250 // everything else
 )
 
