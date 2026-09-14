@@ -19,6 +19,7 @@ mod encoder;
 mod framing;
 mod input;
 mod keymap;
+mod power;
 mod qos;
 mod rs;
 mod shared;
@@ -216,6 +217,14 @@ fn main() -> Result<()> {
     } else if cfg.cert_sha256.is_some() {
         // 钉扎模式（指纹本身非机密；绝不打印 token 等其余配置内容）
         tracing::info!("TLS relay certificate pinning enabled (certSha256)");
+    }
+
+    // 会话电源保活（main 线程贯穿进程生命周期；进程退出自动释放）：
+    // 观看中显示器不熄、系统不睡——防"息屏→锁定"与采集全黑，见 power.rs。
+    if power::keep_display_awake() {
+        tracing::info!("display keep-awake held for this desktop session");
+    } else {
+        tracing::warn!("SetThreadExecutionState failed; display may sleep during session");
     }
 
     let shared = Arc::new(Shared::new(
