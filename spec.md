@@ -412,6 +412,7 @@ User
 id
 email
 display_name
+is_admin      # 0005：平台 admin 显式列（取代"任一 cluster owner 即 admin"派生谓词）
 created_at
 ```
 
@@ -423,8 +424,10 @@ created_at
 Cluster
 -------
 id
-name
+name          # 存活行内唯一（部分唯一索引；已删行保留原名，可重建复用）
 owner_id
+personal      # 0005：系统自动建的个人默认 cluster
+deleted_at    # 0005：软删除打标（NULL = 存活）
 created_at
 ```
 
@@ -468,7 +471,9 @@ last_seen_at
 created_at
 ```
 
-`machine_id` 用于识别 Windows 节点。
+`machine_id` 用于识别 Windows 节点。0005 起**全局唯一**（DB 唯一索引）：
+一台机器同一时间只属于一个 cluster，跨 cluster 重复注册 409，换组走
+双边 owner 的 node move。
 
 `shell_type` 记录 Agent 探测到的实际 shell：
 
@@ -1291,10 +1296,16 @@ POST /api/auth/login
 
 ```text
 GET    /api/clusters
-POST   /api/clusters
+POST   /api/clusters                      # 自助建（限额 XNC_MAX_CLUSTERS_PER_USER，默认 20）
 GET    /api/clusters/{id}
-DELETE /api/clusters/{id}
+PATCH  /api/clusters/{id}                 # 改名（owner-only；0005）
+DELETE /api/clusters/{id}                 # 软删除（deleted_at 打标，原名可复用；0005）
 ```
+
+0005（用户自助 cluster）：建号事务内自动建个人默认 cluster（personal=true、
+owner 成员，命名 `<email 本地部分>-default`）——`xnc register` 永远有 cluster
+可选；平台 admin 改为显式 `users.is_admin`（不再"任一 cluster owner 即
+admin"，否则人人默认 cluster = 人人平台 admin）。
 
 ---
 
@@ -1302,8 +1313,9 @@ DELETE /api/clusters/{id}
 
 ```text
 GET    /api/clusters/{id}/members
-POST   /api/clusters/{id}/members
-DELETE /api/clusters/{id}/members/{userId}
+POST   /api/clusters/{id}/members             # {email}（优先）或 {user_id} + role；0005
+PATCH  /api/clusters/{id}/members/{userId}    # 改角色（owner-only；最后 owner 不可降级；0005）
+DELETE /api/clusters/{id}/members/{userId}    # 最后 owner 不可移除（保护原子化）
 ```
 
 ---
@@ -1331,7 +1343,12 @@ GET  /api/nodes
 GET  /api/nodes/{id}
 POST /api/nodes/{id}/disable
 POST /api/nodes/{id}/enable
+POST /api/nodes/{id}/move          # {target: clusterId 或 name}；源∧目标双 owner；0005
 ```
+
+0005：machine_id 数据库层全局唯一（一台机器同一时间只属于一个 cluster）；
+跨 cluster 注册一律 409 MACHINE_ID_CONFLICT，唯一合法换组路径 = 双边
+owner 的 move（nodeId/公钥/在线连接保留，替代 admin 删节点+重注册）。
 
 ---
 
@@ -2675,8 +2692,9 @@ xnc rdp <node> [--local-port N] [--native]       # 默认浏览器 desktop；--n
 xnc node list [--cluster c] [--status online]
 xnc node show <node>
 xnc node disable|enable <node>
-xnc cluster list|show|create|delete
-xnc cluster member list|add|remove
+xnc node move <node> --cluster <target>          # 跨 cluster 搬迁（源∧目标 owner；nodeId 保留；0005）
+xnc cluster list|show|create|rename|delete
+xnc cluster member list|add|role|remove          # add/role/remove 接受 email 或 user-id
 xnc token create <cluster> [--ttl 30m] [--max-uses 1]
 xnc audit list [--node n] [--user u] [--action a] [--since 7d]
 

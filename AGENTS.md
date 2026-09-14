@@ -90,8 +90,13 @@ vendored RustDeskIddDriver + 微软 IddSample 基底，MS-PL；控制侧在
    installer-cache 里的上一版安装器（staging 只做下载）；安装器保证可重入。
    agent 不再解包搬文件——发现→sha256 校验→静默执行安装器→看门狗兜底。
 6. **machineId 语义**：同 cluster 同 machineId 异 key 的注册=**adopt**（沿用原
-   nodeId、重绑公钥、驱逐旧连接）；同 key=幂等；跨 cluster=409（出路是管理端
-   删除旧记录后重注册）。
+   nodeId、重绑公钥、驱逐旧连接）；同 key=幂等；跨 cluster=409（0005 起
+   machine_id 全局唯一索引硬约束；出路 = **双边 owner 的 `POST
+   /api/nodes/{id}/move`**（nodeId/公钥/在线连接保留，`xnc node move`）或
+   管理端删除旧记录后重注册）。另：平台 admin 是显式 `users.is_admin`
+   （0005 起），**不再是**"任一 cluster owner 即 admin"——建 cluster 不升权；
+   每用户建号即得 personal 默认 cluster（migration 0005 + 设计
+   docs/superpowers/specs/2026-09-14-user-cluster-self-service-design.md）。
 7. **凭据纪律**：`deploy/.env` 是唯一凭据源（SRV_*/NODE_*，gitignored）；
    严禁入库、严禁回显。测试/诊断脚本不落盘 token。
 
