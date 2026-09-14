@@ -23,10 +23,12 @@ type AuditLog struct {
 }
 
 type Cluster struct {
-	ID        uuid.UUID `json:"id"`
-	Name      string    `json:"name"`
-	OwnerID   uuid.UUID `json:"owner_id"`
-	CreatedAt time.Time `json:"created_at"`
+	ID        uuid.UUID          `json:"id"`
+	Name      string             `json:"name"`
+	OwnerID   uuid.UUID          `json:"owner_id"`
+	CreatedAt time.Time          `json:"created_at"`
+	DeletedAt pgtype.Timestamptz `json:"deleted_at"`
+	Personal  bool               `json:"personal"`
 }
 
 type ClusterMember struct {
@@ -101,4 +103,5 @@ type User struct {
 	DisplayName  string    `json:"display_name"`
 	PasswordHash string    `json:"password_hash"`
 	CreatedAt    time.Time `json:"created_at"`
+	IsAdmin      bool      `json:"is_admin"`
 }

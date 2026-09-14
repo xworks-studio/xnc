@@ -29,29 +29,37 @@ func (q *Queries) AddMembership(ctx context.Context, arg AddMembershipParams) er
 }
 
 const createCluster = `-- name: CreateCluster :one
-INSERT INTO clusters (id, name, owner_id) VALUES ($1, $2, $3) RETURNING id, name, owner_id, created_at
+INSERT INTO clusters (id, name, owner_id, personal) VALUES ($1, $2, $3, $4) RETURNING id, name, owner_id, created_at, deleted_at, personal
 `
 
 type CreateClusterParams struct {
-	ID      uuid.UUID `json:"id"`
-	Name    string    `json:"name"`
-	OwnerID uuid.UUID `json:"owner_id"`
+	ID       uuid.UUID `json:"id"`
+	Name     string    `json:"name"`
+	OwnerID  uuid.UUID `json:"owner_id"`
+	Personal bool      `json:"personal"`
 }
 
 func (q *Queries) CreateCluster(ctx context.Context, arg CreateClusterParams) (Cluster, error) {
-	row := q.db.QueryRow(ctx, createCluster, arg.ID, arg.Name, arg.OwnerID)
+	row := q.db.QueryRow(ctx, createCluster,
+		arg.ID,
+		arg.Name,
+		arg.OwnerID,
+		arg.Personal,
+	)
 	var i Cluster
 	err := row.Scan(
 		&i.ID,
 		&i.Name,
 		&i.OwnerID,
 		&i.CreatedAt,
+		&i.DeletedAt,
+		&i.Personal,
 	)
 	return i, err
 }
 
 const getClusterByID = `-- name: GetClusterByID :one
-SELECT id, name, owner_id, created_at FROM clusters WHERE id = $1
+SELECT id, name, owner_id, created_at, deleted_at, personal FROM clusters WHERE id = $1 AND deleted_at IS NULL
 `
 
 func (q *Queries) GetClusterByID(ctx context.Context, id uuid.UUID) (Cluster, error) {
@@ -62,12 +70,14 @@ func (q *Queries) GetClusterByID(ctx context.Context, id uuid.UUID) (Cluster, er
 		&i.Name,
 		&i.OwnerID,
 		&i.CreatedAt,
+		&i.DeletedAt,
+		&i.Personal,
 	)
 	return i, err
 }
 
 const getClusterByName = `-- name: GetClusterByName :one
-SELECT id, name, owner_id, created_at FROM clusters WHERE name = $1
+SELECT id, name, owner_id, created_at, deleted_at, personal FROM clusters WHERE name = $1 AND deleted_at IS NULL
 `
 
 func (q *Queries) GetClusterByName(ctx context.Context, name string) (Cluster, error) {
@@ -78,14 +88,16 @@ func (q *Queries) GetClusterByName(ctx context.Context, name string) (Cluster, e
 		&i.Name,
 		&i.OwnerID,
 		&i.CreatedAt,
+		&i.DeletedAt,
+		&i.Personal,
 	)
 	return i, err
 }
 
 const listClustersForUser = `-- name: ListClustersForUser :many
-SELECT c.id, c.name, c.owner_id, c.created_at, m.role
+SELECT c.id, c.name, c.owner_id, c.created_at, c.personal, m.role
 FROM clusters c JOIN cluster_members m ON m.cluster_id = c.id
-WHERE m.user_id = $1 ORDER BY c.name
+WHERE m.user_id = $1 AND c.deleted_at IS NULL ORDER BY c.name
 `
 
 type ListClustersForUserRow struct {
@@ -93,9 +105,11 @@ type ListClustersForUserRow struct {
 	Name      string    `json:"name"`
 	OwnerID   uuid.UUID `json:"owner_id"`
 	CreatedAt time.Time `json:"created_at"`
+	Personal  bool      `json:"personal"`
 	Role      string    `json:"role"`
 }
 
+// deleted_at IS NULL：软删除的 cluster 不再出现在用户列表（0005 存量缺陷修复）。
 func (q *Queries) ListClustersForUser(ctx context.Context, userID uuid.UUID) ([]ListClustersForUserRow, error) {
 	rows, err := q.db.Query(ctx, listClustersForUser, userID)
 	if err != nil {
@@ -110,6 +124,7 @@ func (q *Queries) ListClustersForUser(ctx context.Context, userID uuid.UUID) ([]
 			&i.Name,
 			&i.OwnerID,
 			&i.CreatedAt,
+			&i.Personal,
 			&i.Role,
 		); err != nil {
 			return nil, err

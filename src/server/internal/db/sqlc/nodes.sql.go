@@ -124,7 +124,8 @@ func (q *Queries) DeleteNode(ctx context.Context, id uuid.UUID) (int64, error) {
 
 const getMachineIDConflictCluster = `-- name: GetMachineIDConflictCluster :one
 SELECT c.name FROM nodes n JOIN clusters c ON c.id = n.cluster_id
-WHERE n.machine_id = $1 AND n.cluster_id <> $2 LIMIT 1
+WHERE n.machine_id = $1 AND n.cluster_id <> $2
+  AND c.deleted_at IS NULL LIMIT 1
 `
 
 type GetMachineIDConflictClusterParams struct {
@@ -134,6 +135,8 @@ type GetMachineIDConflictClusterParams struct {
 
 // 跨 cluster machineId 冲突检查（用户 JWT 注册 409，spec §6.4）：machineId 已
 // 注册于其他 cluster 时返回该 cluster 名（供 CLI 提示 --force 或管理端处理）。
+// deleted_at IS NULL 仅为卫生性过滤——删除 cluster 前置要求节点清空，正常
+// 数据不会出现已删 cluster 挂节点。
 func (q *Queries) GetMachineIDConflictCluster(ctx context.Context, arg GetMachineIDConflictClusterParams) (string, error) {
 	row := q.db.QueryRow(ctx, getMachineIDConflictCluster, arg.MachineID, arg.ClusterID)
 	var name string
