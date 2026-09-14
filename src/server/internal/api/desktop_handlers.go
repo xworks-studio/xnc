@@ -139,10 +139,14 @@ func (h *handlers) desktopStart(w http.ResponseWriter, r *http.Request) {
 	var wtURL, wsURL string
 	if rid != rtv.EmbeddedRelayID {
 		ordered := orderCandidates(candidates)
-		// 标注归属中继（观测信息；web 统计面板展示当前中继）。
+		// 标注归属中继（观测信息；web 统计面板展示当前中继）。DisplayHost
+		// 取该 relay 的 sdata 端点域名——媒体腿连接本身仍走裸 IP（自签钉扎
+		// + 不受域名级拦截），域名仅供面板展示域名形 URL。
+		displayHost := relayDisplayHost(candidates)
 		for i := range ordered {
 			ordered[i].RelayID = assignRelayID
 			ordered[i].Region = assignRegion
+			ordered[i].DisplayHost = displayHost
 		}
 		candidates = ordered
 		wtHostPort := candidateHostPort(ordered, "wt")
@@ -228,6 +232,17 @@ func (h *handlers) viewerName(r *http.Request) string {
 		name = usr.DisplayName
 	}
 	return name
+}
+
+// relayDisplayHost 从 relay 注册端点集取 sdata 端点的域名（面板展示用；
+// 未宣告 sdata 或域名为空返回 ""，web 回落显示连接用的裸 IP）。
+func relayDisplayHost(eps []proto.EndpointDesc) string {
+	for _, e := range eps {
+		if e.Transport == "sdata" && e.Host != "" {
+			return e.Host
+		}
+	}
+	return ""
 }
 
 // relayHostLeg 从候选里取 host 腿地址（transport=quic）。
