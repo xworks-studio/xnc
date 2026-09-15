@@ -22,6 +22,7 @@
 #include "../common/log.h"
 #include "pipe_server.h"
 #include "service.h"
+#include "spawn.h"  // RotateLogFileIfLarge(启动期日志轮转)
 
 namespace xnc {
 namespace {
@@ -75,7 +76,9 @@ DWORD WINAPI HandlerEx(DWORD ctrl, DWORD, void*, void*) {
 
 // Under SCM, stderr goes nowhere: reopen it as <exe dir>\xnc-core-service.log
 // (append) so the drain/stop gate has a log to read. Console mode's stderr
-// is untouched (this is ServiceMain-only).
+// is untouched (this is ServiceMain-only). 打开前做大小轮转
+// (RotateLogFileIfLarge,2026-09-15 规范 §3.2:启动期轮转覆盖低频日志的
+// 绝大多数场景)。
 void RedirectServiceLog() {
   wchar_t exe[MAX_PATH];
   DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
@@ -84,6 +87,7 @@ void RedirectServiceLog() {
   if (!slash) return;
   slash[1] = L'\0';
   wcscat_s(exe, L"xnc-core-service.log");
+  xnc::RotateLogFileIfLarge(exe);
   if (_wfreopen(exe, L"a", stderr)) setvbuf(stderr, nullptr, _IONBF, 0);
 }
 

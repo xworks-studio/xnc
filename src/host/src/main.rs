@@ -479,20 +479,131 @@ fn init_tracing(log_file: Option<&str>) -> Result<()> {
         .with_ansi(false);
     match log_file {
         Some(path) => {
-            // xnc-core 形态：日志落 ProgramData\XNC\logs（追加写，父目录由创建方保证）
+            // 服务形态：追加写 --log-file（父目录按需创建；路径由 core 经
+            // 规范 §3 解析）。写侧带大小轮转（rotating_file，规范 §3.2：
+            // 8MB×3 份）——host 的 1s stats 行是日志量大头，仅靠外部治理
+            // 不可持续。
             if let Some(parent) = std::path::Path::new(path).parent() {
                 std::fs::create_dir_all(parent).ok();
             }
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
+            let rf = RotatingFile::open(path, LOG_ROTATE_MAX_BYTES, LOG_ROTATE_KEEP)
                 .with_context(|| format!("open log file {path}"))?;
-            builder
-                .with_writer(move || file.try_clone().expect("log file clone"))
-                .init();
+            let mk = MakeRotating(std::sync::Mutex::new(rf));
+            builder.with_writer(mk).init();
         }
         None => builder.init(),
     }
     Ok(())
+}
+
+/// 单文件轮转上限与保留份数（规范 §3.2；测试经 RotatingFile::open 参数
+/// 注入小值驱动边界）。
+const LOG_ROTATE_MAX_BYTES: u64 = 8 << 20;
+const LOG_ROTATE_KEEP: u32 = 3;
+
+/// 大小轮转的追加写文件：超过 max 时 rename 链（.1 最新、keep 最旧被
+/// 覆盖）后重开；轮转/重开失败静默继续向旧句柄追加——轮转问题绝不
+/// 阻断日志本身。
+struct RotatingFile {
+    path: std::path::PathBuf,
+    f: std::fs::File,
+    size: u64,
+    max: u64,
+    keep: u32,
+}
+
+impl RotatingFile {
+    fn open(path: &str, max: u64, keep: u32) -> std::io::Result<Self> {
+        let f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+        Ok(Self { path: path.into(), f, size, max, keep })
+    }
+
+    fn rotate(&mut self) {
+        let _ = std::io::Write::flush(&mut self.f);
+        for i in (1..self.keep).rev() {
+            let _ = std::fs::rename(
+                format!("{}.{}", self.path.display(), i),
+                format!("{}.{}", self.path.display(), i + 1),
+            );
+        }
+        if std::fs::rename(&self.path, format!("{}.1", self.path.display())).is_ok() {
+            if let Ok(nf) = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)
+            {
+                self.f = nf;
+                self.size = 0;
+            }
+        }
+        // 失败路径：保持旧句柄继续追加（体积失控但日志不丢）。
+    }
+}
+
+impl std::io::Write for RotatingFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // 超限先轮转再落盘：当前记录进新文件，旧内容完整归档。
+        if self.size + buf.len() as u64 > self.max {
+            self.rotate();
+        }
+        let n = std::io::Write::write(&mut self.f, buf)?;
+        self.size += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut self.f)
+    }
+}
+
+/// tracing MakeWriter 适配：fmt 子系统按行调用 make_writer；std 未给
+/// MutexGuard 提供 io::Write 转发，包一层显式委托，轮转状态在锁内串行更新。
+struct MakeRotating(std::sync::Mutex<RotatingFile>);
+
+struct RotatingGuard<'a>(std::sync::MutexGuard<'a, RotatingFile>);
+
+impl std::io::Write for RotatingGuard<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MakeRotating {
+    type Writer = RotatingGuard<'a>;
+    fn make_writer(&'a self) -> Self::Writer {
+        RotatingGuard(self.0.lock().expect("log writer mutex"))
+    }
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    /// 轮转语义（规范 §3.2）：超限先轮转再落盘（当前记录进新文件）；
+    /// keep 封顶（.4 不出现、.3 存在）。max 注入小值驱动边界。
+    #[test]
+    fn rotating_file_rotation() {
+        let dir = std::env::temp_dir().join(format!("xnc-logrot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("xnc-host.log");
+        let _ = std::fs::remove_file(&path);
+        for i in 1..=5 {
+            let _ = std::fs::remove_file(dir.join(format!("xnc-host.log.{i}")));
+        }
+        let ps = path.to_str().unwrap().to_string();
+
+        let mut w = RotatingFile::open(&ps, 10, LOG_ROTATE_KEEP).unwrap();
+        w.write_all(b"0123456789A").unwrap(); // 11B > 10B → 轮转（旧空）后写入
+        w.write_all(b"BCDEFGHIJKL").unwrap(); // 再超限 → 首段进 .1
+        assert_eq!(std::fs::read(dir.join("xnc-host.log.1")).unwrap(), b"0123456789A");
+        assert_eq!(std::fs::read(&path).unwrap(), b"BCDEFGHIJKL");
+
+        for _ in 0..5 {
+            w.write_all(b"0123456789Z").unwrap();
+        }
+        assert!(!dir.join("xnc-host.log.4").exists(), "keep cap");
+        assert!(dir.join("xnc-host.log.3").exists(), "oldest kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

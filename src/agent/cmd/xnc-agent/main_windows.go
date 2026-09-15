@@ -34,10 +34,10 @@ func runAgent(server, token, stateDir, serviceName, desktopCorePipe, desktopCore
 	a := &agent.Agent{ServerURL: server, Token: token, StateDir: stateDir}
 	if svcapp.IsService() {
 		// 服务上下文无有效 stdout/stderr——日志落盘 state 目录（否则
-		// slog 默认写入无效句柄，诊断全部丢失）。
-		if f, ferr := os.OpenFile(filepath.Join(stateDir, "agent-service.log"),
-			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); ferr == nil {
-			slog.SetDefault(slog.New(slog.NewTextHandler(f, nil)))
+		// slog 默认写入无效句柄，诊断全部丢失）。写侧带大小轮转
+		// (rotatingWriter,2026-09-15 规范 §3.2):8MB×3 份封顶。
+		if w, werr := newRotatingWriter(filepath.Join(stateDir, "agent-service.log")); werr == nil {
+			slog.SetDefault(slog.New(slog.NewTextHandler(w, nil)))
 		}
 		// logger 已装好：回放迁移期间缓冲的诊断（此前默认句柄无效）。
 		replayMigrationLogs(migrationLogs)

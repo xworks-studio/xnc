@@ -214,11 +214,32 @@ func hexNibble(c byte) (byte, bool) {
 // (健康会话不产生 0 字节 xnc-shell.log)。打开失败:一次性提示到
 // stderr,之后的记录照常经 MultiWriter 落到 stderr(与启动即开的
 // 既有降级语义一致)。
+//
+// 大小轮转(2026-09-15 规范 §3.2):超过 maxBytes(默认 8MB)时
+// rename 链轮转(.1 最新,keep 最旧删除),写侧进行、失败静默——轮转
+// 问题绝不阻断日志本身。max 字段仅为测试可注入,生产取 logRotateMaxBytes。
 type logFileWriter struct {
 	mu     sync.Mutex
 	path   string
 	f      *os.File
 	failed bool
+	size   int64
+	max    int64
+}
+
+// logRotateMaxBytes 单文件上限;logRotateKeep 连同当前文件外保留份数。
+const (
+	logRotateMaxBytes int64 = 8 << 20
+	logRotateKeep           = 3
+)
+
+// rotateLogFile rename 链轮转:keep-1→keep(覆盖)、…、.1→.2、path→.1。
+// 任何一步失败即中止(下次超限重试),绝不返回错误。
+func rotateLogFile(path string, keep int) {
+	for i := keep - 1; i >= 1; i-- {
+		_ = os.Rename(fmt.Sprintf("%s.%d", path, i), fmt.Sprintf("%s.%d", path, i+1))
+	}
+	_ = os.Rename(path, path+".1")
 }
 
 func (w *logFileWriter) Write(p []byte) (int, error) {
@@ -232,9 +253,31 @@ func (w *logFileWriter) Write(p []byte) (int, error) {
 			return len(p), nil // 吞掉本记录:stderr 已被 MultiWriter 写入
 		}
 		w.f = f
+		if st, serr := f.Stat(); serr == nil {
+			w.size = st.Size()
+		}
+		if w.max == 0 {
+			w.max = logRotateMaxBytes
+		}
 	}
 	if w.f != nil {
-		return w.f.Write(p)
+		// 超限先轮转再落盘:当前记录进新文件,旧内容完整归档。
+		if w.size+int64(len(p)) > w.max {
+			w.f.Close()
+			rotateLogFile(w.path, logRotateKeep)
+			if f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+				w.f = f
+				w.size = 0
+			} else {
+				// 重开失败:置 failed 走 stderr 降级(与打开失败同语义)。
+				w.f = nil
+				w.failed = true
+				return len(p), nil
+			}
+		}
+		n, err := w.f.Write(p)
+		w.size += int64(n)
+		return n, err
 	}
 	return len(p), nil
 }
