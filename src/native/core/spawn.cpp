@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <cwchar>
+#include <shlobj.h>  // SHGetKnownFolderPath / SHCreateDirectory (ResolveLogDir)
 #include <userenv.h>  // CreateEnvironmentBlock / DestroyEnvironmentBlock
 #include <vector>
 
@@ -43,6 +44,39 @@ std::wstring OwnModuleDir() {
   const size_t slash = p.find_last_of(L"\\/");
   if (slash == std::wstring::npos) return L".";
   return p.substr(0, slash);
+}
+
+std::wstring ResolveLogDir() {
+  // 进程内缓存:调用点(service 启动重开 stderr、host/shell 的 --log-file
+  // 拼路径)每会话多次触发,目录解析/创建只做一次。
+  static const std::wstring cached = []() -> std::wstring {
+    PWSTR base = nullptr;
+    std::wstring dir;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramData, 0, nullptr,
+                                       &base)) &&
+        base) {
+      dir = std::wstring(base) + L"\\XNC\\logs";
+      CoTaskMemFree(base);
+      // SHCreateDirectory 递归建中间目录;已存在不算失败。
+      const HRESULT hr = SHCreateDirectory(nullptr, dir.c_str());
+      if (SUCCEEDED(hr) || hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) {
+        return dir;
+      }
+      XNC_LOG_ERROR("ResolveLogDir: create %ls failed hr=0x%08lX, falling "
+                    "back to exe dir",
+                    dir.c_str(), static_cast<unsigned long>(hr));
+    } else {
+      if (base) CoTaskMemFree(base);
+      XNC_LOG_ERROR("ResolveLogDir: ProgramData resolve failed, falling back "
+                    "to exe dir");
+    }
+    return OwnModuleDir();  // 极端 ACL 兜底:回到旧安装目录行为
+  }();
+  return cached;
+}
+
+std::wstring LogFilePath(const wchar_t* name) {
+  return JoinSiblingPath(ResolveLogDir(), name);
 }
 
 bool BuildChildCommandLine(const wchar_t* exe, int argc, wchar_t** argv,

@@ -467,8 +467,9 @@ CaptureSpawnResult RealCaptureSpawn(uint32_t session, const std::string& cfg,
   std::vector<std::wstring> args = {L"--stdin-config"};
   // --log-file: host opens its own log (service spawns have no console;
   // inherited-stdio redirection proved unreliable - 2026-08-24 incident).
+  // 2026-09-15 规范 §3:运行日志归 %ProgramData%\XNC\logs\。
   args.push_back(L"--log-file");
-  args.push_back(JoinSiblingPath(OwnModuleDir(), L"xnc-host.log"));
+  args.push_back(LogFilePath(L"xnc-host.log"));
   if (degraded) {
     // Crash-loop lock (spec 15.2 对应物): Rust host 无 --backend 旋钮，
     // DXGI->GDI 回退由其内部状态机处理；core 侧降级=锁定软件编码器
@@ -720,9 +721,9 @@ ShellSpawnResult RealShellSpawn(const ShellCreateReq& req, uint32_t session,
   args.push_back(timeout);
   // --log-file: shell opens its own log (service spawns have no console;
   // inherited-stdio redirection proved unreliable — same single log channel
-  // as desktop; xnc-shell.log next to xnc-core.exe).
+  // as desktop). 2026-09-15 规范 §3:xnc-shell.log 归 logs\ 目录。
   args.push_back(L"--log-file");
-  args.push_back(JoinSiblingPath(OwnModuleDir(), L"xnc-shell.log"));
+  args.push_back(LogFilePath(L"xnc-shell.log"));
 
   std::vector<wchar_t*> av;
   for (auto& a : args) av.push_back(&a[0]);

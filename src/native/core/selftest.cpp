@@ -185,6 +185,10 @@ struct Loop2 {
 
 int SelftestMain() {
     using namespace xnc;
+    { // ResolveLogDir 可观测性（规范 §3）：打印三份运行日志的落点，
+      // 安装/升级验证时直接核对 logs\ 归位（创建失败时回落安装目录）。
+      std::printf("log dir=%ls\n", ResolveLogDir().c_str());
+    }
     { // V1 wire vector
         Frame f{kFlagResponse, kMsgPing, 0xDEADBEEF, {0x78,0x6E,0x63}};
         std::vector<uint8_t> wire;
