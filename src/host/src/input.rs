@@ -19,7 +19,7 @@
 
 use serde_json::Value;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use winapi::ctypes::c_int;
 use winapi::shared::minwindef::UINT;
@@ -44,6 +44,16 @@ static ENC_H: AtomicUsize = AtomicUsize::new(0);
 // 坐标，副屏（origin≠0,0）不加减原点会注入/绘制到错误位置。
 static ORIGIN_X: AtomicI32 = AtomicI32::new(0);
 static ORIGIN_Y: AtomicI32 = AtomicI32::new(0);
+// GDI→DXGI 回探提示：输入注入（SendInput/SetCursorPos 是真实输入事件）
+// 会重置电源空闲计时、大概率唤醒显示器，DXGI 通常随之恢复——采集循环
+// 每 tick 检查此提示，GDI 驻留时立即试切，免去最长 60s 的 GDI 驻留
+//（capture.rs DXGI_RETRY_INTERVAL）。
+static DXGI_RETRY_HINT: AtomicBool = AtomicBool::new(false);
+
+/// 采集循环每 tick 取走输入提示（30fps tick 粒度足够）。
+pub fn take_dxgi_retry_hint() -> bool {
+    DXGI_RETRY_HINT.swap(false, Ordering::SeqCst)
+}
 
 /// 采集管线启动时登记两套分辨率与显示器原点（run_pipeline 调用）。
 pub fn set_viewport(native: (usize, usize), encoded: (usize, usize), origin: (i32, i32)) {
@@ -81,6 +91,7 @@ fn to_native(x: f64, y: f64) -> (i32, i32) {
 /// 处理 web 端发来的 input 控制消息（docs/proto.md §2 控制面扩展）。
 /// 出错只告警不中断——注入失败不应影响媒体流。
 pub fn handle(v: &Value) {
+    DXGI_RETRY_HINT.store(true, Ordering::SeqCst);
     match v["event"].as_str().unwrap_or("") {
         "mouse" => handle_mouse(v),
         "keyboard" => handle_keyboard(v),
