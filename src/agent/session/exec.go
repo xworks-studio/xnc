@@ -276,18 +276,48 @@ func buildExecCommand(p proto.ExecParams, scriptPath string) (command, profile s
 
 func (ex *Exec) writeScript(sessionID, script string) (string, error) {
 	path := ex.scriptPath(sessionID)
+	// 会话脚本归 StateDir\tmp\(2026-09-15 规范 §3.3):目录按需创建,
+	// 崩溃残留被限制在 tmp\ 内(agent 启动清扫 24h 前的 xnc-*.ps1)。
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
 	// 0o644:shell 经用户令牌运行,须可读(agent SYSTEM 落盘,0644 让
 	// 用户 token 侧的 xnc-shell 能读取)。
 	return path, os.WriteFile(path, []byte(script), 0o644)
 }
 
 func (ex *Exec) scriptPath(sessionID string) string {
-	dir := ex.TmpDir
-	if dir == "" {
-		dir = ex.StateDir
+	if ex.TmpDir != "" {
+		return filepath.Join(ex.TmpDir, "xnc-"+sessionID+".ps1")
 	}
-	if dir == "" {
-		dir = os.TempDir()
+	if ex.StateDir != "" {
+		// 规范 §3.3:会话临时脚本归 StateDir\tmp\(与 staging/、logs/
+		// 同级;不再散落 StateDir 根)。
+		return filepath.Join(ex.StateDir, "tmp", "xnc-"+sessionID+".ps1")
 	}
-	return filepath.Join(dir, "xnc-"+sessionID+".ps1")
+	return filepath.Join(os.TempDir(), "xnc-"+sessionID+".ps1")
+}
+
+// CleanupStaleSessionScripts 清扫会话脚本残留(2026-09-15 规范 §3.3):
+// tmp\ 内 24h 前的 xnc-*.ps1(会话结束/超时本会删除;残留=崩溃/断连遗物),
+// 顺带清扫迁移前散落在 StateDir 根的同名残留。幂等、尽力而为。
+func CleanupStaleSessionScripts(stateDir string) {
+	if stateDir == "" {
+		return
+	}
+	cutoff := 24 * time.Hour
+	for _, pattern := range []string{
+		filepath.Join(stateDir, "tmp", "xnc-*.ps1"),
+		filepath.Join(stateDir, "xnc-*.ps1"), // 迁移前的根位置残留
+	} {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
+		for _, m := range matches {
+			if st, serr := os.Stat(m); serr == nil && time.Since(st.ModTime()) > cutoff {
+				_ = os.Remove(m)
+			}
+		}
+	}
 }

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"xnc/agent"
+	"xnc/agent/session"
 	"xnc/agent/svcapp"
 )
 
@@ -31,6 +32,8 @@ func runAgent(server, token, stateDir, serviceName, desktopCorePipe, desktopCore
 	if stateDir == defaultStateDir() {
 		stateDir, migrationLogs = migrateLegacyStateDir(stateDir)
 	}
+	// 会话脚本残留清扫(规范 §3.3):tmp\ 与根位置的 24h 前 xnc-*.ps1。
+	session.CleanupStaleSessionScripts(stateDir)
 	a := &agent.Agent{ServerURL: server, Token: token, StateDir: stateDir}
 	if svcapp.IsService() {
 		// 服务上下文无有效 stdout/stderr——日志落盘 state 目录（否则

@@ -101,9 +101,11 @@ Source: "..\..\bin\driver\xncidd\XncIdd.cat"; DestDir: "{app}\driver\xncidd"; Co
 ; Runtime-generated files under {app} that setup never copied and hence is
 ; not tracking: xnc-core writes its service log next to its exe, and the
 ; prep step's in-use CLI swap leaves xnc.exe.old behind (also removed by the
-; uninstall prep script; this is the belt-and-braces pass).
+; uninstall prep script; this is the belt-and-braces pass). *.old2 covers
+; legacy self-update leftovers (2026-09-15 spec section 3.3).
 Type: files; Name: "{app}\*.log"
 Type: files; Name: "{app}\*.old"
+Type: files; Name: "{app}\*.old2"
 
 [Code]
 const
