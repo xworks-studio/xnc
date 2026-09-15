@@ -35,6 +35,11 @@ func main() {
 	os.Exit(run())
 }
 
+// shellVersion 必须是 var(非 const):构建期经 ldflags 注入
+// `-X main.shellVersion=<版本>`(installer/build.ps1 五进制版本同源注入,
+// 2026-09-15 规范)。缺省 0.0.0-dev 标识未走安装器构建的开发产物。
+var shellVersion = "0.0.0-dev"
+
 func run() int {
 	var (
 		pipe       = flag.String("pipe", "", "pipe name to listen on (required)")
@@ -47,9 +52,15 @@ func run() int {
 		commandIn  = flag.Bool("command-stdin", false, "read oneshot command from stdin (u32LE length frame after the secret line)")
 		timeout    = flag.Int("timeout", 0, "oneshot timeout seconds (0 = default 300)")
 		logFile    = flag.String("log-file", "", "also append log output to this file (service spawns have no console)")
+		showVer    = flag.Bool("version", false, "print shellhost version and exit")
 	)
 	flag.Var(&envFlag, "env", "environment variable K=V (repeatable)")
 	flag.Parse()
+
+	if *showVer {
+		fmt.Println(shellVersion)
+		return 0
+	}
 
 	if *logFile != "" {
 		// 服务模式(无 console,继承 stdio 不可靠):xnc-core spawn 时传
@@ -106,6 +117,9 @@ func run() int {
 		cols: *cols, rows: *rows, cwd: *cwd, env: []string(envFlag), command: command,
 		timeout: *timeout,
 	}
+	// 启动版本行:排障时从 xnc-shell.log 直接确认运行版本(五进制版本
+	// 同源注入,见 main.go 顶部 shellVersion 注释)。
+	slog.Info("shellhost starting", "version", shellVersion, "pid", os.Getpid(), "mode", *mode, "profile", profile)
 	return serve(o)
 }
 

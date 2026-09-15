@@ -35,7 +35,10 @@ function Invoke-Step([string]$name, [scriptblock]$body) {
     if ($LASTEXITCODE -ne 0) { throw "$name failed (exit $LASTEXITCODE)" }
 }
 
-# 1) five binaries (version injected into the agent; see Makefile AGENT_LDFLAGS).
+# 1) five binaries (five-binary version single-source, 2026-09-15 spec:
+#    agent via ldflags as before; CLI/shellhost via -X main.<name>Version;
+#    host via XNC_HOST_VERSION env + build.rs rerun-if-env-changed; core via
+#    XNC_VERSION env -> build.bat /DXNC_VERSION).
 Invoke-Step "build xnc-agent.exe" {
     Push-Location (Join-Path $src "agent")
     try { go build -ldflags "-X xnc/agent/machineinfo.Version=$Version" -o (Join-Path $bin "xnc-agent.exe") ./cmd/xnc-agent }
@@ -43,12 +46,12 @@ Invoke-Step "build xnc-agent.exe" {
 }
 Invoke-Step "build xnc.exe (cli)" {
     Push-Location (Join-Path $src "cli")
-    try { go build -o (Join-Path $bin "xnc.exe") . }
+    try { go build -ldflags "-X main.cliVersion=$Version" -o (Join-Path $bin "xnc.exe") . }
     finally { Pop-Location }
 }
 Invoke-Step "build xnc-shell.exe (shellhost)" {
     Push-Location (Join-Path $src "shellhost")
-    try { go build -o (Join-Path $bin "xnc-shell.exe") . }
+    try { go build -ldflags "-X main.shellVersion=$Version" -o (Join-Path $bin "xnc-shell.exe") . }
     finally { Pop-Location }
 }
 # Native build.bat scripts must run via cmd from their own directory (they
@@ -58,8 +61,15 @@ Invoke-Step "build xnc-shell.exe (shellhost)" {
 # 永远全量重建。
 if (-not ($ReuseNative -and (Test-Path (Join-Path $bin "xnc-core.exe")))) {
     Invoke-Step "build xnc-core.exe" {
-        $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c build.bat" -WorkingDirectory (Join-Path $src "native\core") -NoNewWindow -Wait -PassThru
-        $global:LASTEXITCODE = $p.ExitCode
+        # 五进制版本同源：build.bat 读 XNC_VERSION 编进 /DXNC_VERSION 宏
+        #（common/version.h）。作用域内设置，构建后还原。
+        $env:XNC_VERSION = $Version
+        try {
+            $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c build.bat" -WorkingDirectory (Join-Path $src "native\core") -NoNewWindow -Wait -PassThru
+            $global:LASTEXITCODE = $p.ExitCode
+        } finally {
+            Remove-Item Env:XNC_VERSION -ErrorAction SilentlyContinue
+        }
     }
 } else { Write-Output "build.ps1: reuse cached xnc-core.exe" }
 # RTV host（Rust，2026-09-08 重构替代 C++ xnc-desktop）：cargo release；
@@ -74,10 +84,16 @@ if (-not ($ReuseNative -and (Test-Path (Join-Path $bin "xnc-host.exe")))) {
     Invoke-Step "build xnc-host.exe (cargo release)" {
         Push-Location (Join-Path $src "host")
         try {
+            # 五进制版本同源：option_env! 编译期取值，host/build.rs 的
+            # rerun-if-env-changed 保证版本变更不命中陈旧缓存。
+            $env:XNC_HOST_VERSION = $Version
             cargo build --release
             if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
             Copy-Item (Join-Path $PWD "target\release\xnc-host.exe") (Join-Path $bin "xnc-host.exe") -Force
-        } finally { Pop-Location }
+        } finally {
+            Remove-Item Env:XNC_HOST_VERSION -ErrorAction SilentlyContinue
+            Pop-Location
+        }
     }
 } else { Write-Output "build.ps1: reuse cached xnc-host.exe" }
 
@@ -124,11 +140,26 @@ if (-not $SkipIdd) {
     } else { Write-Output "build.ps1: reuse cached idd driver"; $iddBuilt = $true }
 }
 
-# Version single-source check: the agent's self-reported version must equal
-# the version being packaged.
-$reported = (& (Join-Path $bin "xnc-agent.exe") --version | Out-String).Trim()
-if ($reported -ne $Version) {
-    throw "agent self-reported version '$reported' != packaging version '$Version' (rebuild with matching -ldflags)"
+# Version single-source check (five-binary, 2026-09-15 spec): every packaged
+# binary must self-report the version being packaged. CLI/shell/host/core
+# speak `--version` (agent: existing flag; CLI: cobra; shellhost: stdlib
+# flag; host: clap; core: wmain branch). Any mismatch fails the build —
+# catches a missing ldflags/env injection AND stale cargo caches.
+$versionTargets = @(
+    @{ Exe = "xnc-agent.exe";  Flag = "--version" },
+    @{ Exe = "xnc.exe";         Flag = "--version" },
+    @{ Exe = "xnc-shell.exe";   Flag = "--version" },
+    @{ Exe = "xnc-host.exe";    Flag = "--version" },
+    @{ Exe = "xnc-core.exe";    Flag = "--version" }
+)
+foreach ($vt in $versionTargets) {
+    # 取输出末段 token：agent/host/core/shell 输出裸版本号，CLI 的 cobra
+    # --version 带 "xnc version " 前缀——统一按末段比对。
+    $reported = (& (Join-Path $bin $vt.Exe) $vt.Flag | Out-String).Trim()
+    if ($reported) { $reported = ($reported -split '\s+')[-1] }
+    if ($reported -ne $Version) {
+        throw "$($vt.Exe) self-reported version '$reported' != packaging version '$Version' (rebuild with matching version injection)"
+    }
 }
 
 # Authenticode signing (self-signed interim, spec §13): sign the five exes

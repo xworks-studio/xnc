@@ -20,6 +20,7 @@
 #include <thread>
 
 #include "../common/log.h"
+#include "../common/version.h"
 #include "pipe_server.h"
 #include "service.h"
 
@@ -97,7 +98,8 @@ void WINAPI ServiceMain(DWORD argc, wchar_t** argv) {
     return;
   }
   Report(SERVICE_START_PENDING, 10000, 0, 0);
-  XNC_LOG_INFO("service: starting name=%ls pipe=%ls", name, g_pipe_name);
+  XNC_LOG_INFO("service: starting name=%ls pipe=%ls version=%hs", name,
+               g_pipe_name, XNC_VERSION_S);
 
   g_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   if (!g_stop_event) {
