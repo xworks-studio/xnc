@@ -261,7 +261,18 @@ machine. Polls until the node is online and prints the panel URL.`,
 				}
 			}
 
-			// 第 4 步：--force 先反注册（忽略 not_registered），再注册。
+			// 第 4 步：电源策略（远程管理前置——显示器必须保持可见,
+			// 合盖不触发睡眠;失败仅告警不阻断注册）。
+			outf(cmd, "configuring power settings for remote management...\n")
+			applied, failed := applyPowerSettings()
+			for _, a := range applied {
+				outf(cmd, "  ✓ %s\n", a)
+			}
+			for _, f := range failed {
+				outf(cmd, "  ⚠ %s (run from an elevated terminal to fix)\n", f)
+			}
+
+			// 第 5 步：--force 先反注册（忽略 not_registered），再注册。
 			if force {
 				resp, err := agentctlCall(agentctlReq{Op: agentctlOpDeregister})
 				if err != nil {
