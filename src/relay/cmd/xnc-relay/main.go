@@ -98,11 +98,18 @@ func main() {
 	// relay id：首注册由 server 分配（挑战回传），此后持久化复用。
 	relayID := loadRelayID(*dataDir)
 
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
 	// 自签证书 + 钉扎指纹（纯 IP 模式的浏览器可用性来源）。有效期 7 天
 	// 持久化：WebTransport serverCertificateHashes 钉扎规范要求证书有效
-	// 期 ≤14 天（825 天的通用自签会被浏览器拒绝——真机验收踩坑）；剩余
-	// <24h 自动重签，指纹随注册端点自动流转到新会话。
-	tlsProv, certSHA := loadOrCreateCert(*dataDir)
+	// 期 ≤14 天（825 天的通用自签会被浏览器拒绝——真机验收踩坑）。
+	// 2026-09-16 r1 事故修复：续期不再只在启动时检查——certManager 进程
+	// 内看护（剩余 <24h 重签 + GetCertificate 热替换 + 通知控制连接重连，
+	// 新指纹随注册端点自动流转到 server/host/浏览器三方）。
+	certs := newCertManager(ctx, *dataDir)
+	tlsProv, certSHA := certs.provider(), certs.SHA()
+	_ = certSHA // endpoints 经 buildEndpoints 动态取（轮转后重注册新指纹）
 
 	// 验票器：bootstrap 态空钥（RELAY_CONFIG 到达前全拒——无会话无害）。
 	verifier, err := rtv.NewVerifier(nil)
@@ -133,33 +140,23 @@ func main() {
 	// WT/WS 腿（2026-09-14 修复：此前漏传，浏览器跨 host 腿恒 403）。
 	sessRouter := newSessionRouter(verifier, func() string { return srv.RelayID }, allowOrigins)
 
-	endpoints := []proto.EndpointDesc{
-		{Transport: "wt", Host: *publicHost, Port: *wtPort, Path: "/wt", CertSHA256: certSHA},
-		{Transport: "quic", Host: *publicHost, Port: *hostPort, ALPN: rtv.HostALPN},
+	// 注册端点动态构建(2026-09-16):证书指纹经闭包实时取——轮转后控制
+	// 重连即向 server 重注册新指纹。--session-host 给出对外域名时,ws
+	// 候选按 域名→裸IP 顺序宣告:浏览器 WS 无法钉扎自签证书,裸 IP ws 在
+	// 浏览器侧恒败(设计容忍的自然回落),域名 ws 经主机 caddy 的 CA 证书
+	// 可用——wt 腿故障(如证书过期事故)时的真实浏览器兜底。
+	epCfg := endpointConfig{
+		publicHost: *publicHost, wtPort: *wtPort, hostPort: *hostPort,
+		wsPort: *wsPort, sessionHost: *sessionHost, sessionPort: *sessionPort,
+		httpLeg: *httpAddr != "", certSHA: certs.SHA,
 	}
-	// HTTP 腿（/ws 浏览器兜底 + 会话数据腿 + /healthz）：开启即注册 ws
-	// 候选（browser 按 wt→ws 顺序尝试；无 CA 证书的部署 ws 握手必败，
-	// viewer 自然回落，无害）。会话数据端点（sdata）仅在 --session-host
-	// 给出对外域名时宣告（浏览器/agent WS 均无法钉扎自签——域名 + caddy
-	// CA 是数据腿的硬前置）。
+	endpointsFn := func() []proto.EndpointDesc { return epCfg.build() }
 	if *httpAddr != "" {
 		startHTTPLeg(*httpAddr, *httpCert, *httpKey, srv, sessRouter)
-		endpoints = append(endpoints, proto.EndpointDesc{
-			Transport: "ws", Host: *publicHost, Port: *wsPort, Path: "/ws",
-		})
-		if *sessionHost != "" {
-			endpoints = append(endpoints, proto.EndpointDesc{
-				Transport: "sdata", Host: *sessionHost, Port: *sessionPort,
-			})
-			log.Info("session data plane advertised", "host", *sessionHost, "port", *sessionPort)
-		}
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-
-	go controlLoop(ctx, *serverURL, relayID, pubHex, priv, endpoints,
-		*region, *maxSessions, *maxMbpsOut, srv, verifier, *dataDir, sessRouter)
+	go controlLoop(ctx, *serverURL, relayID, pubHex, priv, endpointsFn,
+		*region, *maxSessions, *maxMbpsOut, srv, verifier, *dataDir, sessRouter, certs.Changed)
 
 	<-ctx.Done()
 	log.Info("xnc-relay shutting down")
@@ -196,17 +193,20 @@ func startHTTPLeg(addr, certFile, keyFile string, srv *rtv.Server, sessRouter *s
 
 // controlLoop 控制连接：注册 → 挑战-应答 → 服务（心跳/统计/配置/击杀）。
 // 断线指数退避重连（2s → 30s），server 重启即重连重注册（软状态重建）。
+// certChanged 是证书轮转通知的取用函数（certManager 触发）：断开当前
+// 连接重注册，让 server/host/浏览器三方拿到新指纹。
 func controlLoop(ctx context.Context, serverURL, relayID, pubHex string, priv ed25519.PrivateKey,
-	endpoints []proto.EndpointDesc, region string, maxSessions, maxMbpsOut int,
+	endpointsFn func() []proto.EndpointDesc, region string, maxSessions, maxMbpsOut int,
 	srv *rtv.Server, verifier *rtv.Verifier, dataDir string, sessRouter *sessionRouter,
+	certChanged func() <-chan struct{},
 ) {
 	backoff := 2 * time.Second
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		if err := controlSession(ctx, serverURL, relayID, pubHex, priv, endpoints,
-			region, maxSessions, maxMbpsOut, srv, verifier, dataDir, sessRouter); err != nil {
+		if err := controlSession(ctx, serverURL, relayID, pubHex, priv, endpointsFn,
+			region, maxSessions, maxMbpsOut, srv, verifier, dataDir, sessRouter, certChanged); err != nil {
 			log.Warn("control session ended", "err", err)
 		}
 		select {
@@ -222,8 +222,9 @@ func controlLoop(ctx context.Context, serverURL, relayID, pubHex string, priv ed
 }
 
 func controlSession(ctx context.Context, serverURL, relayID, pubHex string, priv ed25519.PrivateKey,
-	endpoints []proto.EndpointDesc, region string, maxSessions, maxMbpsOut int,
+	endpointsFn func() []proto.EndpointDesc, region string, maxSessions, maxMbpsOut int,
 	srv *rtv.Server, verifier *rtv.Verifier, dataDir string, sessRouter *sessionRouter,
+	certChanged func() <-chan struct{},
 ) error {
 	dialCtx, dialCancel := context.WithTimeout(ctx, 15*time.Second)
 	c, _, err := websocket.Dial(dialCtx, serverURL, nil)
@@ -247,10 +248,10 @@ func controlSession(ctx context.Context, serverURL, relayID, pubHex string, priv
 		return c.Write(wctx, websocket.MessageText, b)
 	}
 
-	// ① 注册。
+	// ① 注册（端点动态构建：证书轮转后重连即注册新指纹）。
 	reg, _ := proto.NewMsg(proto.TypeRelayRegister, proto.RelayRegister{
 		RelayID: relayID, PublicKey: pubHex, Region: region,
-		Endpoints: endpoints, MaxSessions: maxSessions, MaxMbpsOut: maxMbpsOut,
+		Endpoints: endpointsFn(), MaxSessions: maxSessions, MaxMbpsOut: maxMbpsOut,
 		Version: "p1", ClockUnix: time.Now().Unix(),
 	})
 	if err := send(reg); err != nil {
@@ -330,6 +331,20 @@ func controlSession(ctx context.Context, serverURL, relayID, pubHex string, priv
 			}
 		}
 	}()
+	// 证书轮转看护（2026-09-16 事故修复）：certManager 重签后立即断开
+	// 本连接——读循环报错退出 → controlLoop 重连 → 新指纹随注册端点
+	// 流转。已建立的媒体连接不受影响（GetCertificate 只影响新握手）。
+	if certChanged != nil {
+		go func() {
+			select {
+			case <-hbStop:
+			case <-ctx.Done():
+			case <-certChanged():
+				log.Info("wt cert rotated; reconnecting control to re-register fingerprint")
+				c.CloseNow()
+			}
+		}()
+	}
 	for {
 		typ, data, err := c.Read(ctx)
 		if err != nil {
@@ -377,11 +392,11 @@ func controlSession(ctx context.Context, serverURL, relayID, pubHex string, priv
 // ---------------- 统计上报（10s 差分） ----------------
 
 type statsReporter struct {
-	srv         *rtv.Server
-	sessRouter  *sessionRouter
-	send        func(proto.RelayStats)
-	stopF       chan struct{}
-	once        sync.Once
+	srv        *rtv.Server
+	sessRouter *sessionRouter
+	send       func(proto.RelayStats)
+	stopF      chan struct{}
+	once       sync.Once
 }
 
 func newStatsReporter(srv *rtv.Server, sessRouter *sessionRouter, send func(proto.RelayStats)) *statsReporter {
@@ -499,25 +514,95 @@ func saveRelayID(dir, id string) {
 	_ = os.WriteFile(filepath.Join(dir, "relay.json"), b, 0o600)
 }
 
-// loadOrCreateCert 自签证书（纯 IP 模式）：有效期 7 天（WebTransport
-// serverCertificateHashes 钉扎要求证书有效期 ≤14 天）、落盘复用（剩余
-// >24h）、到期重签。指纹随注册端点下发（浏览器 serverCertificateHashes /
-// host cfg certSha256 钉扎）。
-func loadOrCreateCert(dir string) (func([]string) *tls.Config, string) {
+// certRenewBefore 到期前的重签阈值：7 天有效期的第 6 天起看护即可换新
+//（WebTransport 钉扎要求 ≤14 天，阈值留足轮转+重注册的传播窗口）。
+const certRenewBefore = 24 * time.Hour
+
+// certWatchInterval 看护巡检周期：轮转时效性要求远低于 30 分钟，取值
+// 只影响过期后未巡检窗口的上限。
+const certWatchInterval = 30 * time.Minute
+
+// certManager — WT 自签证书的进程内持有与轮转（2026-09-16 r1 事故修复：
+// 证书 9-15 14:07 GMT 过期而续期检查只在启动时执行，长跑进程原地过期，
+// 浏览器 WT 腿全拒——Chrome 的 serverCertificateHashes 豁免 CA 信任但
+// 不豁免有效期；host 腿不受影响（rustls 钉扎验证器刻意不查有效期），
+// 导致症状只剩浏览器侧）。
+//
+// 修复形态：GetCertificate 按连接取当前证书（QUIC/WT 腿新握手即用新证，
+// 已建立连接不受影响）；看护 goroutine 剩余 <24h 时重签落盘 + 原子替换
+// + 关闭 Changed 通道——controlSession 的看护协程收到后断开控制连接，
+// 重连即向 server 重注册新指纹（浏览器钉扎值与 host cfg certSha256 都
+// 从注册端点流转，无需重启进程/断媒体会话）。
+type certManager struct {
+	mu      sync.RWMutex
+	cert    *tls.Certificate
+	sha     string
+	changed chan struct{}
+	dir     string
+}
+
+// newCertManager 加载或生成证书并启动看护（ctx 控制生命周期）。
+func newCertManager(ctx context.Context, dir string) *certManager {
+	m := &certManager{dir: dir, changed: make(chan struct{})}
 	certPath := filepath.Join(dir, "wt-cert.pem")
 	keyPath := filepath.Join(dir, "wt-key.pem")
 	if cert, err := tls.LoadX509KeyPair(certPath, keyPath); err == nil {
 		if leaf, err := x509.ParseCertificate(cert.Certificate[0]); err == nil &&
-			time.Until(leaf.NotAfter) > 24*time.Hour {
+			time.Until(leaf.NotAfter) > certRenewBefore {
 			sum := sha256.Sum256(cert.Certificate[0])
 			log.Info("wt cert loaded", "notAfter", leaf.NotAfter.Format(time.RFC3339))
-			return tlsProvider(cert), hex.EncodeToString(sum[:])
+			m.cert = &cert
+			m.sha = hex.EncodeToString(sum[:])
+			go m.watch(ctx)
+			return m
+		}
+		log.Info("wt cert on disk expired or expiring soon; regenerating")
+	}
+	m.rotate()
+	go m.watch(ctx)
+	return m
+}
+
+// watch 巡检到期：剩余 < 阈值即轮转。生成失败保留旧证书下轮重试
+//（旧证书到期前还有多次巡检窗口；彻底失败的表现 = 浏览器腿拒新握手，
+// 与修复前一致，不会更糟）。
+func (m *certManager) watch(ctx context.Context) {
+	t := time.NewTicker(certWatchInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if m.expiresIn() < certRenewBefore {
+				m.rotate()
+			}
 		}
 	}
+}
+
+// expiresIn 当前证书剩余有效期（无证书 = 0，触发轮转）。
+func (m *certManager) expiresIn() time.Duration {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.cert == nil {
+		return 0
+	}
+	leaf, err := x509.ParseCertificate(m.cert.Certificate[0])
+	if err != nil {
+		return 0
+	}
+	return time.Until(leaf.NotAfter)
+}
+
+// rotate 生成新证书：落盘（tmp+rename 原子替换，读端只见完整文件对）→
+// 内存替换 → 关闭 changed 通知重连重注册。任何步骤失败都不 panic
+//（旧证书继续服务，下轮巡检重试）。
+func (m *certManager) rotate() {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		log.Error("cert keygen", "err", err)
-		os.Exit(1)
+		return
 	}
 	tpl := &x509.Certificate{
 		SerialNumber: big.NewInt(time.Now().Unix()),
@@ -530,26 +615,112 @@ func loadOrCreateCert(dir string) (func([]string) *tls.Config, string) {
 	der, err := x509.CreateCertificate(rand.Reader, tpl, tpl, &key.PublicKey, key)
 	if err != nil {
 		log.Error("cert create", "err", err)
-		os.Exit(1)
+		return
 	}
-	// 落盘（0600）；失败不致命——进程内证书仍可用，重启换指纹而已。
 	keyDER, _ := x509.MarshalECPrivateKey(key)
-	_ = os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600)
-	_ = os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600)
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	certPath := filepath.Join(m.dir, "wt-cert.pem")
+	keyPath := filepath.Join(m.dir, "wt-key.pem")
+	if werr := atomicWrite(certPath+".tmp", certPEM); werr != nil {
+		log.Error("cert write", "err", werr)
+		return
+	}
+	if werr := atomicWrite(keyPath+".tmp", keyPEM); werr != nil {
+		log.Error("key write", "err", werr)
+		return
+	}
+	_ = os.Rename(certPath+".tmp", certPath)
+	_ = os.Rename(keyPath+".tmp", keyPath)
+
 	sum := sha256.Sum256(der)
 	cert := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
-	log.Info("wt cert generated", "notAfter", tpl.NotAfter.Format(time.RFC3339))
-	return tlsProvider(cert), hex.EncodeToString(sum[:])
+	m.mu.Lock()
+	m.cert = &cert
+	m.sha = hex.EncodeToString(sum[:])
+	close(m.changed)
+	m.changed = make(chan struct{})
+	m.mu.Unlock()
+	log.Info("wt cert generated", "notAfter", tpl.NotAfter.Format(time.RFC3339),
+		"sha256", hex.EncodeToString(sum[:])[:16])
 }
 
-func tlsProvider(cert tls.Certificate) func([]string) *tls.Config {
+// atomicWrite 0600 落盘（证书/私钥的既有权限语义）。
+func atomicWrite(path string, b []byte) error {
+	return os.WriteFile(path, b, 0o600)
+}
+
+// SHA 当前证书指纹（注册端点消费；轮转后下一次重连注册即为新值）。
+func (m *certManager) SHA() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.sha
+}
+
+// Changed 取当前轮转通知通道（closed = 已轮转；调用方重新取）。
+func (m *certManager) Changed() <-chan struct{} {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.changed
+}
+
+// provider TLS 配置构造器：GetCertificate 按连接取当前证书——轮转后
+// 新握手即用新证（QUIC 的 Certificates 字段在 Listen 时快照，不能承载
+// 热替换，故走回调）。
+func (m *certManager) provider() func([]string) *tls.Config {
 	return func(alpn []string) *tls.Config {
 		return &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			NextProtos:   alpn,
-			MinVersion:   tls.VersionTLS13,
+			NextProtos: alpn,
+			MinVersion: tls.VersionTLS13,
+			GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+				m.mu.RLock()
+				defer m.mu.RUnlock()
+				if m.cert == nil {
+					return nil, fmt.Errorf("wt cert not ready")
+				}
+				return m.cert, nil
+			},
 		}
 	}
+}
+
+// endpointConfig 注册端点构造（纯函数，便于单测覆盖候选顺序语义）。
+type endpointConfig struct {
+	publicHost  string
+	wtPort      int
+	hostPort    int
+	wsPort      int
+	sessionHost string
+	sessionPort int
+	httpLeg     bool
+	certSHA     func() string
+}
+
+func (c endpointConfig) build() []proto.EndpointDesc {
+	eps := []proto.EndpointDesc{
+		{Transport: "wt", Host: c.publicHost, Port: c.wtPort, Path: "/wt", CertSHA256: c.certSHA()},
+		{Transport: "quic", Host: c.publicHost, Port: c.hostPort, ALPN: rtv.HostALPN},
+	}
+	if !c.httpLeg {
+		return eps
+	}
+	// 域名 ws 优先于裸 IP ws（2026-09-16）：浏览器 WS 无法钉扎自签证书，
+	// IP ws 在浏览器侧恒败（每次 wt 故障回退都白耗一次尝试）；域名 ws
+	// 经主机 caddy 的 CA 证书可用，是真实浏览器兜底。
+	if c.sessionHost != "" {
+		eps = append(eps, proto.EndpointDesc{
+			Transport: "ws", Host: c.sessionHost, Port: c.wsPort, Path: "/ws",
+		})
+	}
+	eps = append(eps, proto.EndpointDesc{
+		Transport: "ws", Host: c.publicHost, Port: c.wsPort, Path: "/ws",
+	})
+	if c.sessionHost != "" {
+		eps = append(eps, proto.EndpointDesc{
+			Transport: "sdata", Host: c.sessionHost, Port: c.sessionPort,
+		})
+	}
+	return eps
 }
 
 func mustJSON(v any) json.RawMessage {
