@@ -101,8 +101,8 @@ Source: "..\..\bin\driver\xncidd\XncIdd.cat"; DestDir: "{app}\driver\xncidd"; Co
 ; 运行日志/会话临时目录（2026-09-15 规范 §3）：agent 运行时也会按需创建
 ; （ResolveLogDir/agent MkdirAll），安装期预建做双保险；{code:} 在
 ; [Dirs] 处理期展开，XNCStateDir 是纯函数（GetEnv）无时序问题。
-Name: "{code:XNCStateDir}\logs"
-Name: "{code:XNCStateDir}\tmp"
+Name: "{code:XNCStateDirCode}\logs"
+Name: "{code:XNCStateDirCode}\tmp"
 
 [UninstallDelete]
 ; Runtime-generated files under {app} that setup never copied and hence is
@@ -152,6 +152,13 @@ begin
   if pd = '' then
     pd := 'C:\ProgramData';
   Result := pd + '\XNC';
+end;
+
+// {code:} 常量引用要求单 String 参数原型（此前 XNCStateDir 仅在 [Code]
+// 内被直接调用零参形态）；包装一层供 [Dirs] 消费。
+function XNCStateDirCode(Param: String): String;
+begin
+  Result := XNCStateDir();
 end;
 
 function PowerShellExe(): String;
