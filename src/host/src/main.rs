@@ -37,9 +37,24 @@ use capture::{CaptureOutcome, ScreenCapturer};
 use encoder::VideoEncoder;
 use shared::{ControlMsg, EncoderMeta, Shared};
 
+/// 五进制版本同源注入:installer/build.ps1 在 cargo build 前设
+/// XNC_HOST_VERSION 环境变量(build.rs 有 rerun-if-env-changed,版本变更
+/// 不会命中陈旧缓存);缺省 0.0.0-dev 标识未走安装器构建的开发产物。
+/// Cargo.toml 的 0.1.0 无产品语义,不再引用。
+fn host_version() -> &'static str {
+    // 空串按未注入处理（XNC_HOST_VERSION= 形态），防御开发环境的半配置。
+    match option_env!("XNC_HOST_VERSION") {
+        Some(v) if !v.is_empty() => v,
+        _ => "0.0.0-dev",
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(about = "XNC desktop host: capture + encode + FEC + QUIC")]
 struct Args {
+    /// 打印版本号并退出（构建管线五进制版本同源校验用）
+    #[arg(long)]
+    version: bool,
     /// 中转服务器 QUIC 地址（host leg，UDP）。本地调试用；生产经 stdin 配置下发
     #[arg(long)]
     server: Option<String>,
@@ -197,11 +212,17 @@ fn resolve_config(args: &Args) -> Result<RunConfig> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    // --version 早退:构建管线(installer/build.ps1)用它做五进制版本同源
+    // 校验;打印且仅打印版本号,输出被 Trim 后与打包版本比对。
+    if args.version {
+        println!("{}", host_version());
+        return Ok(());
+    }
     let cfg = resolve_config(&args)?;
     init_tracing(cfg.log_file.as_deref())?;
 
     tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
+        version = host_version(),
         endpoint = %cfg.endpoint,
         server_name = %cfg.server_name,
         node_id = %cfg.node_id,

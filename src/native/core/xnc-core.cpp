@@ -29,6 +29,7 @@
 #include "../common/frame.h"
 #include "../common/handshake.h"
 #include "../common/log.h"
+#include "../common/version.h"
 #include "pipe_server.h"
 #include "secret_file.h"
 #include "service.h"
@@ -279,6 +280,10 @@ int wmain(int argc, wchar_t** argv) {
   for (int i = 1; i < argc; i++) {
     if (std::wcscmp(argv[i], L"--console") == 0) {
       console = true;
+    } else if (std::wcscmp(argv[i], L"--version") == 0) {
+      // 五进制版本同源校验（installer/build.ps1）：仅打印版本号退出。
+      std::printf("%s\n", XNC_VERSION_S);
+      return 0;
     } else if (std::wcscmp(argv[i], L"--service") == 0 && i + 1 < argc) {
       service_mode = true;
       service_name = argv[++i];

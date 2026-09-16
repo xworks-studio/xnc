@@ -20,6 +20,7 @@
 
 #include "../common/frame.h"
 #include "../common/handshake.h"
+#include "../common/version.h"
 #include "pipe_server.h"
 #include "secret_file.h"
 #include "spawn.h"
@@ -185,6 +186,9 @@ struct Loop2 {
 
 int SelftestMain() {
     using namespace xnc;
+    // 版本行（五进制同源注入，2026-09-15 规范）：与 service 启动日志、
+    // --version 同源（common/version.h），排障时可直接核对。
+    std::printf("selftest version=%s\n", XNC_VERSION_S);
     { // V1 wire vector
         Frame f{kFlagResponse, kMsgPing, 0xDEADBEEF, {0x78,0x6E,0x63}};
         std::vector<uint8_t> wire;

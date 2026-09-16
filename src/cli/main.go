@@ -17,7 +17,11 @@ import (
 	"xnc/proto"
 )
 
-const cliVersion = "0.3.1"
+// cliVersion 必须是 var（非 const）：构建期经 ldflags 注入
+// `-X main.cliVersion=<版本>`（installer/build.ps1 五进制版本同源注入；
+// const 无法被 ldflags 覆盖——2026-09-15 前长期冻在 0.3.x 的根因）。
+// 缺省 0.0.0-dev 标识未走安装器构建的开发产物。
+var cliVersion = "0.0.0-dev"
 
 // defaultServerURL 是 CLI 的固定生产控制面（设计 §3.4）：register/login
 // 不再询问 server；--server 与 XNC_SERVER 仅为开发/测试保留（MarkHidden，
