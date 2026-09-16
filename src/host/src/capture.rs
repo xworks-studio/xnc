@@ -98,6 +98,19 @@ impl ScreenCapturer {
     pub fn new(display_index: usize, draw_cursor: bool) -> IoResult<Self> {
         let mut displays = Display::all()?;
         if displays.is_empty() {
+            // 枚举无输出：显示器可能睡着——唤醒后重试一轮（Sunshine
+            // display_base.cpp:550-555 同款；调用线程已持有保活态，
+            // 这里单次 ES_DISPLAY_REQUIRED 立即触发上电）。
+            tracing::warn!("no display found; powering on display and retrying");
+            unsafe {
+                winapi::um::winbase::SetThreadExecutionState(
+                    winapi::um::winnt::ES_CONTINUOUS | winapi::um::winnt::ES_DISPLAY_REQUIRED,
+                );
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            displays = Display::all()?;
+        }
+        if displays.is_empty() {
             return Err(std::io::Error::new(ErrorKind::NotFound, "no display found"));
         }
         if display_index >= displays.len() {

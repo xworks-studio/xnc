@@ -331,6 +331,17 @@ fn main() -> Result<()> {
 
 /// 一轮完整采集→编码管线；返回 Err 时上层带退避重启（rustdesk SWITCH 模式）。
 fn run_pipeline(shared: &Arc<Shared>, cfg: &RunConfig) -> Result<()> {
+    // 显示器保活（Sunshine display_base.cpp:241-248 同款，2026-09-16 实测
+    // 踩坑后引入）：会话期全程持有 ES_DISPLAY_REQUIRED。屏一旦睡着：DXGI
+    // 立即零帧（黑屏/停更），兜底 GDI 全帧 BitBlt ~60ms/帧（2880x1800 实测）
+    // → 控制延迟 200-350ms 且掉帧；更糟的是"睡着→探测→唤醒→再睡"循环。
+    // SetThreadExecutionState 是线程级状态：本函数跑在 host 主线程（采集
+    // 线程），管线重启同线程复用、状态持续；进程退出自动清零。
+    unsafe {
+        winapi::um::winbase::SetThreadExecutionState(
+            winapi::um::winnt::ES_CONTINUOUS | winapi::um::winnt::ES_DISPLAY_REQUIRED,
+        );
+    }
     let mut capturer =
         ScreenCapturer::new(cfg.display, cfg.cursor).context("create capturer")?;
     let (w, h) = (capturer.width, capturer.height);
@@ -395,6 +406,12 @@ fn run_pipeline(shared: &Arc<Shared>, cfg: &RunConfig) -> Result<()> {
         if viewers > prev_viewers && viewers > 0 {
             tracing::info!(prev = prev_viewers, now = viewers, "viewer joined, force frame");
             capturer.force_frame();
+            // GDI 驻留时 viewer 加入立即回探 DXGI：保活已点亮显示器（本
+            // 函数入口持有 ES_DISPLAY_REQUIRED），冷启动探针若在显示器
+            // 完成上电动画前到期会落到 GDI——这里是补回收敛窗口。
+            if capturer.is_gdi() {
+                capturer.retry_dxgi_now();
+            }
         }
         if viewers == 0 && prev_viewers > 0 {
             // 最后一个 viewer 离开：无人注入，松开残留按键（连接仍在的
