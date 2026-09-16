@@ -406,10 +406,6 @@ fn run_pipeline(shared: &Arc<Shared>, cfg: &RunConfig) -> Result<()> {
         if viewers > prev_viewers && viewers > 0 {
             tracing::info!(prev = prev_viewers, now = viewers, "viewer joined, force frame");
             capturer.force_frame();
-            // GDI 驻留时 viewer 加入立即触发管线重建回 DXGI(理由同上)。
-            if capturer.is_gdi() {
-                anyhow::bail!("GDI → DXGI rebuild (viewer joined)");
-            }
         }
         if viewers == 0 && prev_viewers > 0 {
             // 最后一个 viewer 离开：无人注入，松开残留按键（连接仍在的
@@ -420,19 +416,6 @@ fn run_pipeline(shared: &Arc<Shared>, cfg: &RunConfig) -> Result<()> {
 
         // ---- 剪贴板轮询（内部限频 200ms；连接断开时 ctrl_send 自行丢弃）----
         clipboard::poll(&shared);
-
-        // ---- GDI 驻留时输入触发立即回切 DXGI(全管线重建:原 cancel_gdi
-        // 会因 duplication 状态过期而永远 WouldBlock → 画面冻结)----
-        if capturer.is_gdi() && input::take_dxgi_retry_hint() {
-            anyhow::bail!("GDI → DXGI rebuild (input observed)");
-        }
-
-        // ---- 纯 IDR 请求（frameLoss 无 viewer 计数变化）在静止桌面无帧
-        // 可编码而饿死：拉采集端产帧承载（idr_requested 的消费仍在编码处，
-        // flag 未被消耗前每 tick 重复 force 无害——需求计时取最早时刻）----
-        if shared.idr_requested.load(Ordering::SeqCst) {
-            capturer.force_frame();
-        }
 
         // ---- 采集 ----
         let t_cap = Instant::now();

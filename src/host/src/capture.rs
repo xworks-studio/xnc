@@ -37,12 +37,6 @@ const DI_NORMAL: u32 = 0x0003;
 const CURSOR_CACHE_CAP: usize = 8;
 /// 精灵尺寸防御上限（正常光标 ≤64px；掩码位图高度为 2 倍）。
 const SPRITE_MAX_DIM: usize = 512;
-/// 产帧需求兜底时限（产品口径 5s）：force_frame 挂起（新 viewer 待 IDR /
-/// frameLoss 重传）超过此时限仍无产出 → 降级 GDI。
-const FRAME_DEMAND_TIMEOUT: Duration = Duration::from_secs(5);
-/// GDI 驻留期 DXGI 回探间隔：静默期 cancel_gdi 试切（输入事件可提前
-/// 触发，见 input::take_dxgi_retry_hint）。试切对静态画面无感知。
-const DXGI_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 
 /// 采集结果
 pub enum CaptureOutcome<'a> {
@@ -65,12 +59,8 @@ pub struct ScreenCapturer {
     last_raw: Vec<u8>,
     /// 叠加光标后的输出缓冲
     composited: Vec<u8>,
-    /// 产帧需求挂起时刻（force_frame 置位、最早时刻保留；成功产出
-    /// Frame 或降级 GDI 时清除）。
-    frame_demand_since: Option<Instant>,
-    /// GDI 驻留期的 DXGI 回探时刻（静默期 WouldBlock 分支消费；输入
-    /// 事件经 retry_dxgi_now 提前）。None = 非 GDI 或无回探安排。
-    dxgi_retry_at: Option<Instant>,
+    /// 连续 WouldBlock 的起点（None = 有帧；Some = 正在累计静止时长）
+    would_block_since: Option<Instant>,
     display_check_at: Instant,
     cursor: CursorPainter,
     draw_cursor: bool,
@@ -131,13 +121,6 @@ impl ScreenCapturer {
             "creating DXGI capturer"
         );
         let cap = Capturer::new(display)?; // 失败时内部自动可用 GDI 显示器（scrap 保证）
-        // 构造期即落 GDI（duplication 创建失败）→ 安排回探。
-        let boot = Instant::now();
-        let dxgi_retry_at = if cap.is_gdi() {
-            Some(boot + DXGI_RETRY_INTERVAL)
-        } else {
-            None
-        };
         Ok(Self {
             cap,
             width,
@@ -145,8 +128,7 @@ impl ScreenCapturer {
             origin,
             last_raw: Vec::new(),
             composited: Vec::new(),
-            frame_demand_since: None,
-            dxgi_retry_at,
+            would_block_since: None,
             display_check_at: Instant::now(),
             cursor: CursorPainter::new(),
             draw_cursor,
@@ -161,14 +143,8 @@ impl ScreenCapturer {
     /// 强制下一 tick 产出一帧（即使画面与光标均未变化）。
     /// 用于新 viewer 加入：服务器合成 frameLoss 置 IDR 标志，但静止桌面下
     /// 采集端永远 NoChange，编码路径不执行，viewer 将等不到关键帧。
-    /// 同时挂起产帧需求计时：DXGI 给不出（盒盖/屏休眠）超过
-    /// FRAME_DEMAND_TIMEOUT 时降级 GDI 兜底。
     pub fn force_frame(&mut self) {
         self.force_next = true;
-        // 取最早挂起时刻：viewer 加入与 IDR 请求叠加时不应刷新兜底窗口。
-        if self.frame_demand_since.is_none() {
-            self.frame_demand_since = Some(Instant::now());
-        }
     }
 
     pub fn is_gdi(&self) -> bool {
@@ -197,38 +173,19 @@ impl ScreenCapturer {
             }
         }
 
-        // 拉帧（WouldBlock = 无新帧——静止桌面下 DXGI 合法地不产生帧，
-        // 这不是采集异常。Sunshine 的处理：不做"无帧=死了"判定，持续等
-        // 待；DXGI 真死了通过错误码（ConnectionReset/Aborted → 上抛重建，
-        // 见下方 match 臂）而非帧缺失判定。2026-09-16 XIAOXIN/YOGA9 双机
-        // 实测确认：开盖静止桌面 DXGI 持续 WouldBlock，原首帧探针(1.5s)
-        // 把所有静止桌面会话误判为"DXGI 死"→ 全部落 GDI 慢路径。）
+        // 拉帧（WouldBlock = 无新帧——静止桌面下 DXGI 合法地不产生帧）
         let frame = match self.cap.frame(timeout) {
             Ok(f) => f,
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                // 唯一在 WouldBlock 路径上的降级触发：产帧需求超时
-                // （force_frame 挂起 5s 无产出——真需要一帧但 DXGI 给不出，
-                // 例如显示器物理断开后的残留会话）。静止桌面无 force
-                // 挂起时永不触发。
-                let now = Instant::now();
-                if let Some(since) = self.frame_demand_since {
-                    if now.duration_since(since) >= FRAME_DEMAND_TIMEOUT && !self.cap.is_gdi() {
-                        tracing::warn!(
-                            timeout_ms = FRAME_DEMAND_TIMEOUT.as_millis() as u64,
-                            "DXGI unresponsive with pending frame demand, falling back to GDI"
-                        );
-                        self.fall_to_gdi(now);
-                    }
-                }
-                // GDI 驻留回探到期：管线重建获取新 duplication（原地
-                // cancel_gdi 会因 duplication 状态过期而永远 WouldBlock，
-                /// 2026-09-16 冻结事故——见 retry_dxgi_now 注释）。
-                if self.cap.is_gdi() {
-                    if let Some(at) = self.dxgi_retry_at {
-                        if now >= at {
-                            tracing::info!("GDI dwell reached deadline, requesting pipeline rebuild for DXGI");
-                            return Ok(CaptureOutcome::Reinit);
-                        }
+                // 静止桌面 DXGI 合法地不产生帧。仅当连续 30s 无帧才视为
+                // DXGI 采集异常 → 切 GDI，落下去就留 GDI（2026-09-16 回滚
+                // 到简洁形态：cancel_gdi 回切产生僵尸 duplication → 画面
+                // 冻结，宁可慢不可断；管线重建自然回 DXGI）。
+                let since = *self.would_block_since.get_or_insert_with(Instant::now);
+                if since.elapsed() > Duration::from_secs(30) && !self.cap.is_gdi() {
+                    tracing::warn!("no DXGI frames for 30s, falling back to GDI");
+                    if self.cap.set_gdi() {
+                        tracing::info!("GDI capture enabled");
                     }
                 }
                 return self.cursor_only_or_none();
@@ -254,9 +211,8 @@ impl ScreenCapturer {
             }
         };
 
-        // 任何 Ok 都证明后端活着（静止桌面下此行不执行——Ok 只在有变化
-        // 时出现）。清 demand 计时。
-        self.frame_demand_since = None;
+        // 任何 Ok 都证明后端活着：重置静止计时。
+        self.would_block_since = None;
 
         let Frame::PixelBuffer(pb) = &frame else {
             return self.cursor_only_or_none();
@@ -301,8 +257,8 @@ impl ScreenCapturer {
         if self.draw_cursor {
             self.cursor.draw(&mut self.composited, w, h, &snap, self.origin);
         }
-        // 帧已实际产出：产帧需求（新 viewer/IDR 待承载）视为满足。
-        self.frame_demand_since = None;
+        // 帧已实际产出：静止计时重置。
+        self.would_block_since = None;
         Ok(CaptureOutcome::Frame(&self.composited))
     }
 
@@ -335,37 +291,7 @@ impl ScreenCapturer {
         if self.draw_cursor {
             self.cursor.draw(&mut self.composited, self.width, self.height, &snap, self.origin);
         }
-        // 帧已实际产出：产帧需求视为满足。
-        self.frame_demand_since = None;
         Ok(CaptureOutcome::Frame(&self.composited))
-    }
-
-    /// 降级 GDI：收口探针/需求状态，安排 DXGI 回探；30s 稳态窗口与
-    fn fall_to_gdi(&mut self, now: Instant) {
-        let ok = self.cap.set_gdi();
-        if ok {
-            tracing::info!("GDI capture enabled");
-        } else {
-            tracing::error!("set_gdi failed; staying on DXGI (error path will retry)");
-        }
-        self.frame_demand_since = None;
-        self.dxgi_retry_at = Some(now + DXGI_RETRY_INTERVAL);
-    }
-
-    /// 输入触发的立即回切：输入注入后桌面即将有变化（光标移动等），
-    /// 全管线重建（新 duplication 立即拿到当前桌面首帧）。返回 true =
-    /// 需要 Reinit。仅 GDI 驻留时有效。
-    ///
-    /// 2026-09-16 冻结事故修复：此前用 cancel_gdi() 原地回切——但 GDI
-    /// 驻留期间 AcquireNextFrame 未被调用，duplication 内部状态过期
-    /// （帧索引堆积/桌面面变化），回切后永远 WouldBlock → 画面冻结。
-    /// 唯一可靠回切 = 管线重建（新 duplication 对象、新 D3D 设备句柄）。
-    pub fn retry_dxgi_now(&mut self) -> bool {
-        if self.cap.is_gdi() {
-            tracing::info!("input observed while in GDI, rebuilding pipeline for fresh DXGI");
-            return true; // 调用方 bail!("GDI → DXGI rebuild") 触发管线重启
-        }
-        false
     }
 }
 
