@@ -1,12 +1,13 @@
 //! 屏幕采集（Windows）：scrap DXGI → GDI 回退 + 帧比较跳帧 + 可选光标合成。
 //!
-//! - GDI 回退分三层（2026-09-15 规范，决策见 fallback_action）：
-//!   ①首帧探针（1.5s）：duplication 创建/回切后首帧必达，超期 = DXGI
-//!     不可用（盒盖/屏休眠）→ 立即 GDI，冷启动首帧从 30s 计时器等死
-//!     变为亚秒级判定；②产帧需求兜底（5s）：force_frame 挂起无产出
-//!     （会话中途屏入睡/静止桌面 IDR 饿死）→ GDI；③稳态 30s：原语义
-//!     保留（健康静止桌面不误降级）。GDI 驻留期每 60s/输入事件回探
-//!     DXGI（cancel_gdi + 探针裁决）。
+//! - GDI 回退策略（2026-09-16 修正，废弃"首帧探针"）：
+//!   WouldBlock（无新帧）是静止桌面的**正常行为**，不是 DXGI 死了的信号
+//!   （AcquireNextFrame 只在有变化时返回帧）。Sunshine 的做法：不做
+//!   "无帧=死了"判定，持续等待；DXGI 真死通过**错误码**（ConnectionReset/
+//!   Aborted → 上抛重建，或一般错误 → 切 GDI 再重建）判定。
+//!   唯一保留的 WouldBlock 路径降级触发：**产帧需求超时**（force_frame
+//!   挂起 5s 无产出——真需要一帧但 DXGI 给不出，如显示器物理断开）。
+//!   GDI 驻留期每 60s/输入事件回探 DXGI（cancel_gdi）。
 //! - 回退/重试模式移植自 rustdesk `src/server/video_service.rs:805-864`
 //!   （WouldBlock 持续超阈值或采集错误 → set_gdi；显示器变化 → 重建）。
 //! - 帧内容比较跳帧移植自 rustdesk `would_block_if_equal`（画面未变不编码）。
@@ -36,17 +37,11 @@ const DI_NORMAL: u32 = 0x0003;
 const CURSOR_CACHE_CAP: usize = 8;
 /// 精灵尺寸防御上限（正常光标 ≤64px；掩码位图高度为 2 倍）。
 const SPRITE_MAX_DIM: usize = 512;
-/// 首帧探针窗口：DXGI duplication 创建（或 GDI 回切）后首帧必达（静止
-/// 桌面亦然——所有 duplication 采集器依赖此语义取基础帧）。超期即判定
-/// DXGI 不可用（盒盖/屏休眠典型：首帧永远不来）→ 立即降级 GDI。
-const DXGI_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 /// 产帧需求兜底时限（产品口径 5s）：force_frame 挂起（新 viewer 待 IDR /
-/// frameLoss 重传）超过此时限仍无产出 → 降级 GDI。覆盖探针之后的窗口
-/// （会话中途显示器入睡、纯 IDR 请求在静止桌面饿死等）。
+/// frameLoss 重传）超过此时限仍无产出 → 降级 GDI。
 const FRAME_DEMAND_TIMEOUT: Duration = Duration::from_secs(5);
 /// GDI 驻留期 DXGI 回探间隔：静默期 cancel_gdi 试切（输入事件可提前
-/// 触发，见 input::take_dxgi_retry_hint）。试切对静态画面无感知，失败
-/// 由首帧探针在 1.5s 内再次降级。
+/// 触发，见 input::take_dxgi_retry_hint）。试切对静态画面无感知。
 const DXGI_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 
 /// 采集结果
@@ -70,11 +65,6 @@ pub struct ScreenCapturer {
     last_raw: Vec<u8>,
     /// 叠加光标后的输出缓冲
     composited: Vec<u8>,
-    would_block_since: Option<Instant>,
-    /// 首帧探针期限（Some = 探针在途）：DXGI 路由下任何 Ok 帧（含纯
-    /// 光标帧）都会证明后端活着并收口探针；WouldBlock 持续到期限即
-    /// ProbeFail。fall_to_gdi / 构造期落 GDI 时置 None。
-    dxgi_probe_deadline: Option<Instant>,
     /// 产帧需求挂起时刻（force_frame 置位、最早时刻保留；成功产出
     /// Frame 或降级 GDI 时清除）。
     frame_demand_since: Option<Instant>,
@@ -141,13 +131,12 @@ impl ScreenCapturer {
             "creating DXGI capturer"
         );
         let cap = Capturer::new(display)?; // 失败时内部自动可用 GDI 显示器（scrap 保证）
-        // 探针/回探的初始安排：DXGI 起步 → 首帧探针在途；构造期即落 GDI
-        // （duplication 创建失败）→ 直接安排回探。
+        // 构造期即落 GDI（duplication 创建失败）→ 安排回探。
         let boot = Instant::now();
-        let (dxgi_probe_deadline, dxgi_retry_at) = if cap.is_gdi() {
-            (None, Some(boot + DXGI_RETRY_INTERVAL))
+        let dxgi_retry_at = if cap.is_gdi() {
+            Some(boot + DXGI_RETRY_INTERVAL)
         } else {
-            (Some(boot + DXGI_PROBE_TIMEOUT), None)
+            None
         };
         Ok(Self {
             cap,
@@ -156,8 +145,6 @@ impl ScreenCapturer {
             origin,
             last_raw: Vec::new(),
             composited: Vec::new(),
-            would_block_since: None,
-            dxgi_probe_deadline,
             frame_demand_since: None,
             dxgi_retry_at,
             display_check_at: Instant::now(),
@@ -210,52 +197,37 @@ impl ScreenCapturer {
             }
         }
 
-        // 拉帧（WouldBlock = 无新帧）
+        // 拉帧（WouldBlock = 无新帧——静止桌面下 DXGI 合法地不产生帧，
+        // 这不是采集异常。Sunshine 的处理：不做"无帧=死了"判定，持续等
+        // 待；DXGI 真死了通过错误码（ConnectionReset/Aborted → 上抛重建，
+        // 见下方 match 臂）而非帧缺失判定。2026-09-16 XIAOXIN/YOGA9 双机
+        // 实测确认：开盖静止桌面 DXGI 持续 WouldBlock，原首帧探针(1.5s)
+        // 把所有静止桌面会话误判为"DXGI 死"→ 全部落 GDI 慢路径。）
         let frame = match self.cap.frame(timeout) {
             Ok(f) => f,
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                // 分层兜底（决策纯函数见 fallback_action，单测覆盖分层语义）：
-                // ①首帧探针：duplication 首帧必达，超期 = DXGI 不可用；
-                // ②产帧需求：force_frame 挂起 5s 无产出（会话中途屏入睡等）；
-                // ③GDI 驻留回探：静默期试切回 DXGI（输入事件提前触发）。
+                // 唯一在 WouldBlock 路径上的降级触发：产帧需求超时
+                // （force_frame 挂起 5s 无产出——真需要一帧但 DXGI 给不出，
+                // 例如显示器物理断开后的残留会话）。静止桌面无 force
+                // 挂起时永不触发。
                 let now = Instant::now();
-                match fallback_action(
-                    self.cap.is_gdi(),
-                    self.dxgi_probe_deadline,
-                    self.frame_demand_since,
-                    self.dxgi_retry_at,
-                    now,
-                ) {
-                    FallbackAction::ProbeFail => {
-                        tracing::warn!(
-                            timeout_ms = DXGI_PROBE_TIMEOUT.as_millis() as u64,
-                            "DXGI delivered no initial frame within probe window, falling back to GDI"
-                        );
-                        self.fall_to_gdi(now);
-                    }
-                    FallbackAction::DemandTimeout => {
+                if let Some(since) = self.frame_demand_since {
+                    if now.duration_since(since) >= FRAME_DEMAND_TIMEOUT && !self.cap.is_gdi() {
                         tracing::warn!(
                             timeout_ms = FRAME_DEMAND_TIMEOUT.as_millis() as u64,
                             "DXGI unresponsive with pending frame demand, falling back to GDI"
                         );
                         self.fall_to_gdi(now);
                     }
-                    FallbackAction::RetryDue => {
-                        tracing::info!("GDI dwell reached retry deadline, probing DXGI");
-                        self.try_dxgi_again(now);
-                    }
-                    FallbackAction::None => {}
                 }
-                // 静止桌面 DXGI 合法地不产生帧（本地光标模型下静止桌面
-                // 本就该零帧）。仅当连续 30s 无帧才视为 DXGI 采集异常 →
-                // 切 GDI（rustdesk "No image, fall back to gdi" 的量纲修正：
-                // 原承 2s 会在每次桌面静止 2s 后误降级——GDI 全屏 BitBlt
-                // 更慢，且 CAPTUREBLT 会把闪烁的物理光标烤进帧里，真机
-                // 表现为画面卡顿；30s 兼顾死 DXGI 的恢复时限）
-                let since = *self.would_block_since.get_or_insert_with(Instant::now);
-                if since.elapsed() > Duration::from_secs(30) && !self.cap.is_gdi() {
-                    tracing::warn!("no DXGI frames for 30s, falling back to GDI");
-                    self.fall_to_gdi(now);
+                // GDI 驻留回探（静默期试切回 DXGI；输入事件提前触发）。
+                if self.cap.is_gdi() {
+                    if let Some(at) = self.dxgi_retry_at {
+                        if now >= at {
+                            tracing::info!("GDI dwell reached retry deadline, probing DXGI");
+                            self.try_dxgi_again(now);
+                        }
+                    }
                 }
                 return self.cursor_only_or_none();
             }
@@ -280,8 +252,9 @@ impl ScreenCapturer {
             }
         };
 
-        // 任何 Ok（含纯光标帧）都证明当前后端活着：首帧探针收口。
-        self.dxgi_probe_deadline = None;
+        // 任何 Ok 都证明后端活着（静止桌面下此行不执行——Ok 只在有变化
+        // 时出现）。清 demand 计时。
+        self.frame_demand_since = None;
 
         let Frame::PixelBuffer(pb) = &frame else {
             return self.cursor_only_or_none();
@@ -290,7 +263,6 @@ impl ScreenCapturer {
         if data.is_empty() {
             return self.cursor_only_or_none();
         }
-        self.would_block_since = None;
         self.frames_captured += 1;
 
         // 分辨率/步长变化 → 重建（首帧时 last_raw 为空属正常，不算变化）
@@ -367,75 +339,36 @@ impl ScreenCapturer {
     }
 
     /// 降级 GDI：收口探针/需求状态，安排 DXGI 回探；30s 稳态窗口与
-    /// 探针窗口解耦（各自重新起算）。
     fn fall_to_gdi(&mut self, now: Instant) {
         let ok = self.cap.set_gdi();
         if ok {
             tracing::info!("GDI capture enabled");
         } else {
-            tracing::error!("set_gdi failed; staying on DXGI (30s steady fallback will retry)");
+            tracing::error!("set_gdi failed; staying on DXGI (error path will retry)");
         }
-        self.dxgi_probe_deadline = None;
         self.frame_demand_since = None;
         self.dxgi_retry_at = Some(now + DXGI_RETRY_INTERVAL);
-        self.would_block_since = None;
     }
 
-    /// GDI → DXGI 试切：cancel_gdi 后由首帧探针裁决（活的 duplication
-    /// 首帧必达；仍不可用则探针在窗口期内再次降级）。仅在静默期
+    /// GDI → DXGI 试切：cancel_gdi 回到 DXGI duplication。静止桌面下
+    /// 下一次 AcquireNextFrame 仍会 WouldBlock（正常行为），但只要桌面
+    /// 有变化即出帧——比 GDI 的全帧 BitBlt 快一个量级。仅在静默期
     /// （WouldBlock）或输入触发时调用，静态画面下切换无感知。
     fn try_dxgi_again(&mut self, now: Instant) {
         self.cap.cancel_gdi();
         self.dxgi_retry_at = None;
-        self.dxgi_probe_deadline = Some(now + DXGI_PROBE_TIMEOUT);
-        self.would_block_since = None;
+        let _ = now;
     }
 
-    /// 输入触发的立即回探：输入注入大概率唤醒显示器（物理输入事件重置
-    /// 电源空闲计时），DXGI 通常随之恢复——免去最长 DXGI_RETRY_INTERVAL
-    /// 的 GDI 驻留。仅 GDI 驻留时有效。
+    /// 输入触发的立即回探：输入注入后桌面即将有变化（光标移动等），
+    /// DXGI duplication 即将产帧——比 GDI 的全帧 BitBlt 快得多。仅 GDI
+    /// 驻留时有效。
     pub fn retry_dxgi_now(&mut self) {
         if self.cap.is_gdi() {
-            tracing::info!("input observed while in GDI, probing DXGI now");
+            tracing::info!("input observed while in GDI, switching to DXGI now");
             self.try_dxgi_again(Instant::now());
         }
     }
-}
-
-/// WouldBlock 状态下的分层兜底决策（纯函数，单测覆盖分层语义）。
-/// DXGI 路由下按优先级判 探针超期 → 需求超时；GDI 驻留下判回探到期。
-#[derive(Debug, PartialEq, Eq)]
-enum FallbackAction {
-    None,
-    ProbeFail,
-    DemandTimeout,
-    RetryDue,
-}
-
-fn fallback_action(
-    is_gdi: bool,
-    probe_deadline: Option<Instant>,
-    demand_since: Option<Instant>,
-    retry_at: Option<Instant>,
-    now: Instant,
-) -> FallbackAction {
-    if !is_gdi {
-        if let Some(dl) = probe_deadline {
-            if now >= dl {
-                return FallbackAction::ProbeFail;
-            }
-        }
-        if let Some(since) = demand_since {
-            if now.duration_since(since) >= FRAME_DEMAND_TIMEOUT {
-                return FallbackAction::DemandTimeout;
-            }
-        }
-    } else if let Some(at) = retry_at {
-        if now >= at {
-            return FallbackAction::RetryDue;
-        }
-    }
-    FallbackAction::None
 }
 
 // ---------------- 光标合成（精灵缓存 + 单次采样） ----------------
@@ -925,48 +858,6 @@ mod tests {
 
     fn sprite(w: usize, h: usize, data: Vec<u8>) -> CursorSprite {
         CursorSprite { w, h, hot_x: 0, hot_y: 0, data }
-    }
-
-    /// 分层兜底决策的边界语义（2026-09-15 规范 §1.2）：
-    /// 探针超期优先于需求超时；两者仅 DXGI 路由生效；GDI 驻留只看回探。
-    #[test]
-    fn fallback_action_layering() {
-        let now = Instant::now();
-        let past = |ms: u64| now - Duration::from_millis(ms);
-        let future = |ms: u64| now + Duration::from_millis(ms);
-
-        // DXGI 健康在途：探针未超期、无需求 → 无动作
-        assert_eq!(
-            fallback_action(false, Some(future(1500)), None, None, now),
-            FallbackAction::None
-        );
-        // 探针超期（需求同时已超时也由探针优先裁决）
-        assert_eq!(
-            fallback_action(false, Some(past(1)), Some(past(6000)), None, now),
-            FallbackAction::ProbeFail
-        );
-        // 需求超时的边界：4999ms 未到、5000ms 到点
-        assert_eq!(
-            fallback_action(false, None, Some(past(4999)), None, now),
-            FallbackAction::None
-        );
-        assert_eq!(
-            fallback_action(false, None, Some(past(5000)), None, now),
-            FallbackAction::DemandTimeout
-        );
-        // GDI 驻留：回探未到期无动作，到期 RetryDue；探针/需求不再触发
-        assert_eq!(
-            fallback_action(true, None, None, Some(future(1000)), now),
-            FallbackAction::None
-        );
-        assert_eq!(
-            fallback_action(true, None, None, Some(past(1)), now),
-            FallbackAction::RetryDue
-        );
-        assert_eq!(
-            fallback_action(true, Some(past(2000)), Some(past(6000)), None, now),
-            FallbackAction::None
-        );
     }
 
     /// 本机交互会话诊断探针：真实 GetCursorInfo → GetIconInfo → 精灵转换，
