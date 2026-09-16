@@ -121,10 +121,13 @@ func downloadAuthenticated(cl *Client, path string) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(resp.Body, 128<<20))
 }
 
-// cleanupOldCLI 启动时清扫自更新残留的 .old（幂等）。
+// cleanupOldCLI 启动时清扫自更新残留（幂等）。.old2 是历史版本自更新
+// 机制的遗物命名（现行代码只造 .old）——一并清理（2026-09-15 规范 §3.3；
+// 实测 XIAOXIN 安装目录残留 11MB 的 xnc.exe.old2 无人认领）。
 func cleanupOldCLI() {
 	if exe, err := os.Executable(); err == nil {
 		_ = os.Remove(exe + ".old")
+		_ = os.Remove(exe + ".old2")
 	}
 }
 

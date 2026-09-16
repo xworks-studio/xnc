@@ -110,9 +110,11 @@ Name: "{code:XNCStateDir}\tmp"
 ; xnc-shell logs next to the exes (now under StateDir\logs\; these entries
 ; stay as the legacy-leftover pass), and the prep step's in-use CLI swap
 ; leaves xnc.exe.old behind (also removed by the uninstall prep script and
-; the CLI's own cleanup; this is the belt-and-braces pass).
+; the CLI's own cleanup; this is the belt-and-braces pass). *.old2 covers
+; legacy self-update leftovers (2026-09-15 spec section 3.3).
 Type: files; Name: "{app}\*.log"
 Type: files; Name: "{app}\*.old"
+Type: files; Name: "{app}\*.old2"
 
 [Code]
 const
