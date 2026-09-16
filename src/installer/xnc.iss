@@ -97,11 +97,20 @@ Source: "..\..\bin\driver\xncidd\XncIdd.dll"; DestDir: "{app}\driver\xncidd"; Co
 Source: "..\..\bin\driver\xncidd\XncIdd.inf"; DestDir: "{app}\driver\xncidd"; Components: idd; Flags: ignoreversion
 Source: "..\..\bin\driver\xncidd\XncIdd.cat"; DestDir: "{app}\driver\xncidd"; Components: idd; Flags: ignoreversion
 
+[Dirs]
+; 运行日志/会话临时目录（2026-09-15 规范 §3）：agent 运行时也会按需创建
+; （ResolveLogDir/agent MkdirAll），安装期预建做双保险；{code:} 在
+; [Dirs] 处理期展开，XNCStateDir 是纯函数（GetEnv）无时序问题。
+Name: "{code:XNCStateDir}\logs"
+Name: "{code:XNCStateDir}\tmp"
+
 [UninstallDelete]
 ; Runtime-generated files under {app} that setup never copied and hence is
-; not tracking: xnc-core writes its service log next to its exe, and the
-; prep step's in-use CLI swap leaves xnc.exe.old behind (also removed by the
-; uninstall prep script; this is the belt-and-braces pass).
+; not tracking: pre-2026-09-15 builds wrote xnc-core-service/xnc-host/
+; xnc-shell logs next to the exes (now under StateDir\logs\; these entries
+; stay as the legacy-leftover pass), and the prep step's in-use CLI swap
+; leaves xnc.exe.old behind (also removed by the uninstall prep script and
+; the CLI's own cleanup; this is the belt-and-braces pass).
 Type: files; Name: "{app}\*.log"
 Type: files; Name: "{app}\*.old"
 

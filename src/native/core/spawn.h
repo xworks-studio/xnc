@@ -34,6 +34,15 @@ std::wstring JoinSiblingPath(const std::wstring& dir, const std::wstring& name);
 // Directory containing xnc-core.exe (own module path minus basename).
 std::wstring OwnModuleDir();
 
+// 运行日志目录(2026-09-15 规范 §3):%ProgramData%\XNC\logs,按需递归
+// 创建;创建失败(极端 ACL/策略)回落安装目录(旧行为)——日志路径问题
+// 绝不阻断服务。进程内缓存(agent 首启也会建 logs\,双保险)。
+std::wstring ResolveLogDir();
+
+// ResolveLogDir() + "\" + name:xnc-core-service/xnc-host/xnc-shell 三份
+// 运行日志的统一路径来源。
+std::wstring LogFilePath(const wchar_t* name);
+
 // 目标令牌派生环境块(userenv CreateEnvironmentBlock,bInherit=FALSE;
 // 纯包装,selftest 覆盖):APPDATA/TEMP/USERPROFILE 等随令牌用户走,与
 // xnc-core 自身(生产为 SYSTEM 服务)环境无关 —— 修复用户态子进程继承

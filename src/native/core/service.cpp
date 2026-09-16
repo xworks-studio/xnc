@@ -23,6 +23,7 @@
 #include "../common/version.h"
 #include "pipe_server.h"
 #include "service.h"
+#include "spawn.h"  // LogFilePath(ResolveLogDir)
 
 namespace xnc {
 namespace {
@@ -74,18 +75,13 @@ DWORD WINAPI HandlerEx(DWORD ctrl, DWORD, void*, void*) {
   }
 }
 
-// Under SCM, stderr goes nowhere: reopen it as <exe dir>\xnc-core-service.log
+// Under SCM, stderr goes nowhere: reopen it as <logs dir>\xnc-core-service.log
 // (append) so the drain/stop gate has a log to read. Console mode's stderr
-// is untouched (this is ServiceMain-only).
+// is untouched (this is ServiceMain-only). 2026-09-15 规范 §3:运行日志归
+// %ProgramData%\XNC\logs\(ResolveLogDir 带创建与安装目录兜底)。
 void RedirectServiceLog() {
-  wchar_t exe[MAX_PATH];
-  DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
-  if (n == 0 || n >= MAX_PATH) return;
-  wchar_t* slash = wcsrchr(exe, L'\\');
-  if (!slash) return;
-  slash[1] = L'\0';
-  wcscat_s(exe, L"xnc-core-service.log");
-  if (_wfreopen(exe, L"a", stderr)) setvbuf(stderr, nullptr, _IONBF, 0);
+  const std::wstring path = xnc::LogFilePath(L"xnc-core-service.log");
+  if (_wfreopen(path.c_str(), L"a", stderr)) setvbuf(stderr, nullptr, _IONBF, 0);
 }
 
 void WINAPI ServiceMain(DWORD argc, wchar_t** argv) {

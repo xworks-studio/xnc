@@ -189,6 +189,10 @@ int SelftestMain() {
     // 版本行（五进制同源注入，2026-09-15 规范）：与 service 启动日志、
     // --version 同源（common/version.h），排障时可直接核对。
     std::printf("selftest version=%s\n", XNC_VERSION_S);
+    { // ResolveLogDir 可观测性（规范 §3）：打印三份运行日志的落点，
+      // 安装/升级验证时直接核对 logs\ 归位（创建失败时回落安装目录）。
+      std::printf("log dir=%ls\n", ResolveLogDir().c_str());
+    }
     { // V1 wire vector
         Frame f{kFlagResponse, kMsgPing, 0xDEADBEEF, {0x78,0x6E,0x63}};
         std::vector<uint8_t> wire;

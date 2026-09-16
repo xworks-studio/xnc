@@ -33,9 +33,26 @@ func runAgent(server, token, stateDir, serviceName, desktopCorePipe, desktopCore
 	}
 	a := &agent.Agent{ServerURL: server, Token: token, StateDir: stateDir}
 	if svcapp.IsService() {
-		// 服务上下文无有效 stdout/stderr——日志落盘 state 目录（否则
-		// slog 默认写入无效句柄，诊断全部丢失）。
-		if f, ferr := os.OpenFile(filepath.Join(stateDir, "agent-service.log"),
+		// 服务上下文无有效 stdout/stderr——日志落盘（否则 slog 默认写入
+		// 无效句柄，诊断全部丢失）。2026-09-15 规范 §3:运行日志归
+		// stateDir\logs\（目录按需创建；core/host/shell 同目录，xnc.iss
+		// [Dirs] 安装期双保险）。历史根位置文件一次性 rename 迁移。
+		logsDir := filepath.Join(stateDir, "logs")
+		if err := os.MkdirAll(logsDir, 0o700); err != nil {
+			// 目录建不起来（极端 ACL）：回落根位置——日志本身绝不能丢。
+			slog.Warn("logs dir unavailable, falling back to state root", "err", err)
+		} else {
+			legacy := filepath.Join(stateDir, "agent-service.log")
+			migrated := filepath.Join(logsDir, "agent-service.log")
+			if _, serr := os.Stat(legacy); serr == nil {
+				if _, serr2 := os.Stat(migrated); os.IsNotExist(serr2) {
+					if rerr := os.Rename(legacy, migrated); rerr != nil {
+						slog.Warn("agent-service.log migration failed (appending in place)", "err", rerr)
+					}
+				}
+			}
+		}
+		if f, ferr := os.OpenFile(agentServiceLogPath(stateDir),
 			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); ferr == nil {
 			slog.SetDefault(slog.New(slog.NewTextHandler(f, nil)))
 		}
@@ -45,6 +62,16 @@ func runAgent(server, token, stateDir, serviceName, desktopCorePipe, desktopCore
 	}
 	replayMigrationLogs(migrationLogs) // 前台模式：默认 stderr 句柄有效
 	return a.Run(cmdContext())
+}
+
+// agentServiceLogPath 服务日志路径：logs\ 目录可用即落其中（规范 §3），
+// 否则回落历史根位置（与旧版/AGENTS.md §7 兼容）。
+func agentServiceLogPath(stateDir string) string {
+	logsDir := filepath.Join(stateDir, "logs")
+	if st, err := os.Stat(logsDir); err == nil && st.IsDir() {
+		return filepath.Join(logsDir, "agent-service.log")
+	}
+	return filepath.Join(stateDir, "agent-service.log")
 }
 
 // installService 以当前可执行文件安装服务（名/显示名由 serviceName 决定；
