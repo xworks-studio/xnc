@@ -81,8 +81,10 @@ vendored RustDeskIddDriver + 微软 IddSample 基底，MS-PL；控制侧在
    `sc.exe config` 路径；SID 由服务名派生，重建无损）。
 3. **StateDir 布局**：机器级状态统一 `C:\ProgramData\XNC`
    （binding.json/identity.json/core-secret.hex/update-pending.json/
-   staging\/installer-cache\/logs\）；用户会话在 `~/.xnc/`。用户 JWT 永不落
-   ProgramData。
+   staging\ /installer-cache\ /tmp\（会话临时脚本）/ logs\（全部运行
+   日志：agent-service.log、xnc-core-service.log、xnc-host.log、
+   xnc-shell.log，均 8MB×3 份大小轮转，2026-09-15 规范））；用户会话在
+   `~/.xnc/`。用户 JWT 永不落 ProgramData。
 4. **环境来源**：core 用用户 token 拉起的子进程必须携带 token 派生的用户环境
    （CreateEnvironmentBlock）；子进程读 `XNC_*` 调试旋钮走注册表环境，服务
    环境不再透传（有意收窄）。
@@ -203,7 +205,9 @@ vcpkg 无基线锁定，ffmpeg 头漂移（FF_PROFILE_* 枚举缺定义）编译
 
 - **节点管理**：`DELETE /api/nodes/{id}`（平台管理员）删孤儿/换主记录；
   节点离线回收策略尚无自动化（待办）。
-- **诊断模板**：agent 日志 `C:\ProgramData\XNC\agent-service.log`。健康链
+- **诊断模板**：agent 日志 `C:\ProgramData\XNC\logs\agent-service.log`
+  （2026-09-15 规范起运行日志统一归 logs\；host/core/shell 同目录；
+  安装目录下的同名 .log 是旧版残留）。健康链
   `registered via agentctl → binding detected (woken) → control connection
   ready`；卡在 wake 前=管道/注册问题，卡在 dial=网络问题。
 - **已知网络约束**：agent 需可建立 websocket 长连接；严格代理网络会以
