@@ -406,11 +406,9 @@ fn run_pipeline(shared: &Arc<Shared>, cfg: &RunConfig) -> Result<()> {
         if viewers > prev_viewers && viewers > 0 {
             tracing::info!(prev = prev_viewers, now = viewers, "viewer joined, force frame");
             capturer.force_frame();
-            // GDI 驻留时 viewer 加入立即回探 DXGI：保活已点亮显示器（本
-            // 函数入口持有 ES_DISPLAY_REQUIRED），冷启动探针若在显示器
-            // 完成上电动画前到期会落到 GDI——这里是补回收敛窗口。
+            // GDI 驻留时 viewer 加入立即触发管线重建回 DXGI(理由同上)。
             if capturer.is_gdi() {
-                capturer.retry_dxgi_now();
+                anyhow::bail!("GDI → DXGI rebuild (viewer joined)");
             }
         }
         if viewers == 0 && prev_viewers > 0 {
@@ -423,10 +421,10 @@ fn run_pipeline(shared: &Arc<Shared>, cfg: &RunConfig) -> Result<()> {
         // ---- 剪贴板轮询（内部限频 200ms；连接断开时 ctrl_send 自行丢弃）----
         clipboard::poll(&shared);
 
-        // ---- GDI 驻留时输入触发立即回探（输入注入大概率唤醒显示器，DXGI
-        // 通常随之恢复；静默期的定时回探由 capturer 内部处理）----
+        // ---- GDI 驻留时输入触发立即回切 DXGI(全管线重建:原 cancel_gdi
+        // 会因 duplication 状态过期而永远 WouldBlock → 画面冻结)----
         if capturer.is_gdi() && input::take_dxgi_retry_hint() {
-            capturer.retry_dxgi_now();
+            anyhow::bail!("GDI → DXGI rebuild (input observed)");
         }
 
         // ---- 纯 IDR 请求（frameLoss 无 viewer 计数变化）在静止桌面无帧

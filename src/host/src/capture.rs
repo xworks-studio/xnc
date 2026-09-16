@@ -220,12 +220,14 @@ impl ScreenCapturer {
                         self.fall_to_gdi(now);
                     }
                 }
-                // GDI 驻留回探（静默期试切回 DXGI；输入事件提前触发）。
+                // GDI 驻留回探到期：管线重建获取新 duplication（原地
+                // cancel_gdi 会因 duplication 状态过期而永远 WouldBlock，
+                /// 2026-09-16 冻结事故——见 retry_dxgi_now 注释）。
                 if self.cap.is_gdi() {
                     if let Some(at) = self.dxgi_retry_at {
                         if now >= at {
-                            tracing::info!("GDI dwell reached retry deadline, probing DXGI");
-                            self.try_dxgi_again(now);
+                            tracing::info!("GDI dwell reached deadline, requesting pipeline rebuild for DXGI");
+                            return Ok(CaptureOutcome::Reinit);
                         }
                     }
                 }
@@ -350,24 +352,20 @@ impl ScreenCapturer {
         self.dxgi_retry_at = Some(now + DXGI_RETRY_INTERVAL);
     }
 
-    /// GDI → DXGI 试切：cancel_gdi 回到 DXGI duplication。静止桌面下
-    /// 下一次 AcquireNextFrame 仍会 WouldBlock（正常行为），但只要桌面
-    /// 有变化即出帧——比 GDI 的全帧 BitBlt 快一个量级。仅在静默期
-    /// （WouldBlock）或输入触发时调用，静态画面下切换无感知。
-    fn try_dxgi_again(&mut self, now: Instant) {
-        self.cap.cancel_gdi();
-        self.dxgi_retry_at = None;
-        let _ = now;
-    }
-
-    /// 输入触发的立即回探：输入注入后桌面即将有变化（光标移动等），
-    /// DXGI duplication 即将产帧——比 GDI 的全帧 BitBlt 快得多。仅 GDI
-    /// 驻留时有效。
-    pub fn retry_dxgi_now(&mut self) {
+    /// 输入触发的立即回切：输入注入后桌面即将有变化（光标移动等），
+    /// 全管线重建（新 duplication 立即拿到当前桌面首帧）。返回 true =
+    /// 需要 Reinit。仅 GDI 驻留时有效。
+    ///
+    /// 2026-09-16 冻结事故修复：此前用 cancel_gdi() 原地回切——但 GDI
+    /// 驻留期间 AcquireNextFrame 未被调用，duplication 内部状态过期
+    /// （帧索引堆积/桌面面变化），回切后永远 WouldBlock → 画面冻结。
+    /// 唯一可靠回切 = 管线重建（新 duplication 对象、新 D3D 设备句柄）。
+    pub fn retry_dxgi_now(&mut self) -> bool {
         if self.cap.is_gdi() {
-            tracing::info!("input observed while in GDI, switching to DXGI now");
-            self.try_dxgi_again(Instant::now());
+            tracing::info!("input observed while in GDI, rebuilding pipeline for fresh DXGI");
+            return true; // 调用方 bail!("GDI → DXGI rebuild") 触发管线重启
         }
+        false
     }
 }
 
