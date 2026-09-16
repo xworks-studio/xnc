@@ -43,6 +43,13 @@ std::wstring ResolveLogDir();
 // 运行日志的统一路径来源。
 std::wstring LogFilePath(const wchar_t* name);
 
+// 大小轮转(2026-09-15 规范 §3.2):path 现存体积超过 maxBytes 时执行
+// rename 链(keep-1→keep 覆盖、…、.1→.2、path→.1),随后由调用方重开
+// 追加。任何失败静默返回(轮转问题不阻断日志);maxBytes<=0 取缺省
+// 8MB,keep 固定 3。core 服务日志为启动期轮转(XNC_LOG 低频,启动
+// 检查覆盖绝大多数场景)。
+void RotateLogFileIfLarge(const std::wstring& path, unsigned long long maxBytes = 0);
+
 // 目标令牌派生环境块(userenv CreateEnvironmentBlock,bInherit=FALSE;
 // 纯包装,selftest 覆盖):APPDATA/TEMP/USERPROFILE 等随令牌用户走,与
 // xnc-core 自身(生产为 SYSTEM 服务)环境无关 —— 修复用户态子进程继承

@@ -79,6 +79,27 @@ std::wstring LogFilePath(const wchar_t* name) {
   return JoinSiblingPath(ResolveLogDir(), name);
 }
 
+void RotateLogFileIfLarge(const std::wstring& path, unsigned long long maxBytes) {
+  if (maxBytes == 0) maxBytes = 8ull << 20;  // 8MB 缺省(规范 §3.2)
+  WIN32_FILE_ATTRIBUTE_DATA st;
+  if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &st)) return;
+  const unsigned long long size =
+      (static_cast<unsigned long long>(st.nFileSizeHigh) << 32) | st.nFileSizeLow;
+  if (size < maxBytes) return;
+  // rename 链:.2→.3(MoveFileEx 覆盖)、.1→.2、path→.1;任一步失败
+  // 静默中止(下次启动重试),绝不影响随后的追加打开。
+  const int keep = 3;
+  for (int i = keep - 1; i >= 1; i--) {
+    std::wstring from = path + L"." + std::to_wstring(i);
+    std::wstring to = path + L"." + std::to_wstring(i + 1);
+    if (!MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+      // 源不存在是正常链尾;真失败(占用等)也直接中止。
+      if (GetLastError() != ERROR_FILE_NOT_FOUND) return;
+    }
+  }
+  MoveFileExW(path.c_str(), (path + L".1").c_str(), MOVEFILE_REPLACE_EXISTING);
+}
+
 bool BuildChildCommandLine(const wchar_t* exe, int argc, wchar_t** argv,
                            int from, std::wstring* out, std::string* err) {
   auto reject = [err](const char* what, int argi, int pos) {

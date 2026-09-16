@@ -36,7 +36,8 @@ func runAgent(server, token, stateDir, serviceName, desktopCorePipe, desktopCore
 		// 服务上下文无有效 stdout/stderr——日志落盘（否则 slog 默认写入
 		// 无效句柄，诊断全部丢失）。2026-09-15 规范 §3:运行日志归
 		// stateDir\logs\（目录按需创建；core/host/shell 同目录，xnc.iss
-		// [Dirs] 安装期双保险）。历史根位置文件一次性 rename 迁移。
+		// [Dirs] 安装期双保险）。历史根位置文件一次性 rename 迁移;写侧
+		// 带大小轮转（rotatingWriter,规范 §3.2:8MB×3 份封顶）。
 		logsDir := filepath.Join(stateDir, "logs")
 		if err := os.MkdirAll(logsDir, 0o700); err != nil {
 			// 目录建不起来（极端 ACL）：回落根位置——日志本身绝不能丢。
@@ -52,9 +53,8 @@ func runAgent(server, token, stateDir, serviceName, desktopCorePipe, desktopCore
 				}
 			}
 		}
-		if f, ferr := os.OpenFile(agentServiceLogPath(stateDir),
-			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); ferr == nil {
-			slog.SetDefault(slog.New(slog.NewTextHandler(f, nil)))
+		if w, werr := newRotatingWriter(agentServiceLogPath(stateDir)); werr == nil {
+			slog.SetDefault(slog.New(slog.NewTextHandler(w, nil)))
 		}
 		// logger 已装好：回放迁移期间缓冲的诊断（此前默认句柄无效）。
 		replayMigrationLogs(migrationLogs)
