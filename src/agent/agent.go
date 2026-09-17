@@ -366,6 +366,10 @@ func (a *Agent) runConnected(ctx context.Context, b *binding.Binding) error {
 	c.UpdateAvailableFunc = func(ctx context.Context, push proto.UpdateAvailable) {
 		_ = upd.HandlePush(ctx, push)
 	}
+	// SAS_REQUEST（web "发送 Ctrl+Alt+Del"，2026-09-17 安全桌面交互）：
+	// core 0x0110 往返后经当前连接回 SAS_RESULT。注册在连接周期内、
+	// 回调里经 a.currentConn() 取活连接（重连后自动指向新连接）。
+	c.SasRequestFunc = a.handleSasRequest
 	if err := c.Run(cycleCtx); err != nil && ctx.Err() == nil && cycleCtx.Err() == nil {
 		return err
 	}

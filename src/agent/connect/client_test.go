@@ -572,3 +572,35 @@ func TestDispatchesUpdateAvailable(t *testing.T) {
 		t.Fatal("no UPDATE_AVAILABLE dispatched")
 	}
 }
+
+// TestDispatchesSasRequest（2026-09-17 安全桌面交互）：SAS_REQUEST 到达必须
+// 经 SasRequestFunc 分发（独立 goroutine，不阻塞读循环），载荷 reqId/reason
+// 完整到达——与 TestDispatchesUpdateAvailable 同形。
+func TestDispatchesSasRequest(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	got := make(chan proto.SasRequest, 1)
+
+	srv := fakeServerWithHooks(t, pub, func(write func(typ string, p any)) {
+		write(proto.TypeSasRequest, proto.SasRequest{ReqID: "sas-1", Reason: "admin@xnc.app"})
+	})
+	defer srv.Close()
+
+	k := &identity.Key{NodeID: "node-x", Priv: priv}
+	c := NewClient("ws"+srv.URL[4:], k, machineinfo.Info{})
+	c.Beat = 50 * time.Millisecond
+	c.SasRequestFunc = func(_ context.Context, sr proto.SasRequest) {
+		got <- sr
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+
+	select {
+	case sr := <-got:
+		assert.Equal(t, "sas-1", sr.ReqID)
+		assert.Equal(t, "admin@xnc.app", sr.Reason)
+	case <-time.After(3 * time.Second):
+		t.Fatal("no SAS_REQUEST dispatched")
+	}
+}
