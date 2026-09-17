@@ -73,13 +73,13 @@ if (-not ($ReuseNative -and (Test-Path (Join-Path $bin "xnc-core.exe")))) {
     }
 } else { Write-Output "build.ps1: reuse cached xnc-core.exe" }
 # RTV host（Rust，2026-09-08 重构替代 C++ xnc-desktop）：cargo release；
-# 需 VCPKG_ROOT（x64-windows-static：ffmpeg[amf,nvcodec,qsv] + libyuv）与
+# 需 VCPKG_ROOT（x64-windows-static：ffmpeg[amf,avcodec,avformat,nvcodec,openh264,qsv,swresample,swscale] + libyuv）与
 # LIBCLANG_PATH（bindgen）。产物 crt-static 单文件，复制进 bin。
 # -ReuseNative：bin 里已有产物时跳过 cargo（CI 缓存命中路径；缓存键 =
 # host/** + third_party/scrap/** 哈希）。release 构建不传此开关——发版
 # 永远全量重建。
 if (-not ($ReuseNative -and (Test-Path (Join-Path $bin "xnc-host.exe")))) {
-    if (-not $env:VCPKG_ROOT) { throw "xnc-host build needs VCPKG_ROOT (x64-windows-static with ffmpeg[amf,nvcodec,qsv] + libyuv)" }
+    if (-not $env:VCPKG_ROOT) { throw "xnc-host build needs VCPKG_ROOT (x64-windows-static with ffmpeg[amf,avcodec,avformat,nvcodec,openh264,qsv,swresample,swscale] + libyuv)" }
     if (-not $env:LIBCLANG_PATH) { throw "xnc-host build needs LIBCLANG_PATH (bindgen)" }
     Invoke-Step "build xnc-host.exe (cargo release)" {
         Push-Location (Join-Path $src "host")
