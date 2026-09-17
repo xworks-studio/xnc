@@ -94,6 +94,9 @@ func main() {
 		dur      = flag.Duration("dur", 30*time.Second, "采集时长")
 		dump     = flag.String("dump", "", "完整帧 Annex-B 落盘路径（空=不落盘）")
 		insecure = flag.Bool("insecure", false, "跳过服务端证书校验（dev 自签时用）")
+		// -esc-after：连上 N 秒后向 host 注入一次 Escape down+up（单发）。
+		// 验收场景：CAD 菜单（SAS 触发）经 Esc 注销——覆盖安全桌面输入路径。
+		escAfter = flag.Duration("esc-after", 0, "连上 N 秒后注入一次 Escape（0=不注入）")
 	)
 	flag.Parse()
 	if !strings.Contains(*url, "token=") {
@@ -254,6 +257,7 @@ func main() {
 	go func() {
 		tick := time.NewTicker(time.Second)
 		defer tick.Stop()
+		var escSent bool
 		for {
 			select {
 			case <-ctx.Done():
@@ -274,6 +278,16 @@ func main() {
 					"type": "feedback", "rttMs": rtt, "decodeQueueDepth": 0,
 					"decodedFps": 0, "arrivalGapP95Ms": gapP95,
 				})
+				// 一次性 Escape 注入（安全桌面输入验收）
+				if *escAfter > 0 && !escSent && time.Since(t0) >= *escAfter {
+					escSent = true
+					for _, kind := range []string{"down", "up"} {
+						sendCtrl(stream, map[string]any{
+							"type": "input", "event": "keyboard", "kind": kind, "code": "Escape",
+						})
+					}
+					log.Printf("injected Escape (after %s)", *escAfter)
+				}
 			}
 		}
 	}()
