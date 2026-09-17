@@ -44,51 +44,6 @@ const CURSOR_CACHE_CAP: usize = 8;
 /// 精灵尺寸防御上限（正常光标 ≤64px；掩码位图高度为 2 倍）。
 const SPRITE_MAX_DIM: usize = 512;
 
-// ---- DXGI 死亡标记（机器级持久化，2026-09-17）----
-//
-// 无 GPU 机器（如 Hyper-V VM）上 DXGI 采集器能创建成功但永不出帧：桌面
-// 跟随重绑（登录/锁屏往返）后管线从 DXGI 重新起步，必然重付 30s 无帧
-// 死等才回落 GDI——CAD 登录后首帧被拖 30s 的真机事故根因。host 进程在
-// 每次注销时随会话消亡，进程内记忆不够，标记落盘 ProgramData\XNC\。
-// 误报代价 = 该机此后直接 GDI 起步（GDI 处处可用，仅高分辨率 CPU 占用
-// 更高）；加装 GPU / 启用 IDD 虚拟屏后删除标记文件即可恢复 DXGI。
-
-/// 标记文件路径（base 参数化供单测；生产 = %ProgramData%\XNC\dxgi-dead）。
-fn dxgi_dead_marker_under(base: &std::path::Path) -> std::path::PathBuf {
-    base.join("dxgi-dead")
-}
-
-fn dxgi_dead_marker() -> Option<std::path::PathBuf> {
-    std::env::var_os("ProgramData")
-        .map(|p| dxgi_dead_marker_under(&std::path::PathBuf::from(p).join("XNC")))
-}
-
-/// DXGI 死亡判定落盘（best-effort：失败仅记日志，采集路径不受影响）。
-fn mark_dxgi_dead() {
-    let Some(path) = dxgi_dead_marker() else { return };
-    if path.exists() {
-        return;
-    }
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    match std::fs::write(&path, b"dxgi created ok but never produced frames\n") {
-        Ok(()) => tracing::warn!(path = %path.display(), "dxgi marked dead (machine-level, sticky)"),
-        Err(e) => tracing::warn!("dxgi-dead marker write failed: {e}"),
-    }
-}
-
-fn dxgi_dead_marked() -> bool {
-    dxgi_dead_marker().is_some_and(|p| p.exists())
-}
-
-/// 起步模式决策（纯函数，单测覆盖）：安全桌面恒 GDI；非安全桌面下，
-/// scrap 创建即落 GDI（DXGI 创建失败的自信号——同为机器级证据，落盘
-/// 标记）或已有机器级标记 → GDI。
-fn start_mode_gdi(secure: bool, created_on_gdi: bool, marked_dead: bool) -> bool {
-    secure || created_on_gdi || marked_dead
-}
-
 /// 采集结果
 pub enum CaptureOutcome<'a> {
     /// 可编码的 BGRA 帧（已含光标）
@@ -186,22 +141,11 @@ impl ScreenCapturer {
             "creating capturer"
         );
         // 失败时内部自动可用 GDI 显示器（scrap 保证）；安全桌面跟随 ②：
-        // Winlogon 期间 DXGI 可见性无保证，显式切 GDI。非安全桌面：创建即
-        // 落 GDI = DXGI 创建失败的机器级证据（落盘标记，此后该机直接 GDI
-        // 起步）；已有标记 = 跳过注定 30s 死等的 DXGI 重试（2026-09-17
-        // 登录首帧拖 30s 事故：无 GPU 机器 DXGI 创建成功但永不出帧）。
+        // Winlogon 期间 DXGI 可见性无保证，显式切 GDI（set_gdi 为公开
+        // trait 方法，落下去留 GDI——回 Default 后管线重建自然回探 DXGI）。
         let mut cap = Capturer::new(display)?;
-        let created_on_gdi = cap.is_gdi();
-        let marked = dxgi_dead_marked();
-        if start_mode_gdi(secure, created_on_gdi, marked) && !cap.is_gdi() {
-            if cap.set_gdi() {
-                tracing::info!(secure, marked, "starting on GDI (forced)");
-            } else {
-                tracing::warn!("GDI switch failed, keeping DXGI");
-            }
-        }
-        if !secure && created_on_gdi && !marked {
-            mark_dxgi_dead();
+        if secure && !cap.is_gdi() && !cap.set_gdi() {
+            tracing::warn!("secure desktop: GDI switch failed, keeping DXGI");
         }
         Ok(Self {
             cap,
@@ -279,9 +223,6 @@ impl ScreenCapturer {
                     if self.cap.set_gdi() {
                         tracing::info!("GDI capture enabled");
                     }
-                    // 机器级落盘：无 GPU 机器 DXGI 创建成功但永不出帧，桌面
-                    // 跟随重绑/进程重启后不再重付这 30s（见文件头注释）。
-                    mark_dxgi_dead();
                 }
                 return self.cursor_only_or_none();
             }
@@ -877,38 +818,6 @@ mod tests {
 
     fn sprite(w: usize, h: usize, data: Vec<u8>) -> CursorSprite {
         CursorSprite { w, h, hot_x: 0, hot_y: 0, data }
-    }
-
-    #[test]
-    fn start_mode_gdi_decision_table() {
-        // 安全桌面恒 GDI（与创建结果/标记无关）。
-        assert!(start_mode_gdi(true, false, false));
-        // 健康机器非安全桌面：DXGI 创建成功且无标记 → DXGI 起步。
-        assert!(!start_mode_gdi(false, false, false));
-        // 创建即落 GDI（DXGI 创建失败）或机器级标记存在 → GDI。
-        assert!(start_mode_gdi(false, true, false));
-        assert!(start_mode_gdi(false, false, true));
-        assert!(start_mode_gdi(false, true, true));
-    }
-
-    #[test]
-    fn dxgi_dead_marker_roundtrip_under_base() {
-        // 标记路径 base 参数化：临时目录内写/读往返，不触碰真实
-        // ProgramData（dxgi_dead_marker()/mark_dxgi_dead() 生产路径的
-        // 薄封装，逻辑全在此）。
-        let base = std::env::temp_dir().join(format!(
-            "xnc-dxgi-dead-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let path = dxgi_dead_marker_under(&base);
-        assert!(!path.exists());
-        std::fs::create_dir_all(&base).unwrap();
-        std::fs::write(&path, b"probe").unwrap();
-        assert!(path.exists());
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// 本机交互会话诊断探针：真实 GetCursorInfo → GetIconInfo → 精灵转换，
