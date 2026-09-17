@@ -209,8 +209,12 @@ uint32_t SasAuditCount();
 // default). SendSAS type per sas.h: VOID WINAPI SendSAS(BOOL AsUser).
 using SasSendFn = void (WINAPI*)(BOOL as_user);
 using SasResolveFn = SasSendFn (*)();  // default: dynamic sas.dll resolve
+// 2026-09-17: SoftwareSASGeneration 注册表策略的幂等开启（生产默认 =
+// RealEnsureSoftwareSasPolicy；selftest 注入 no-op stub 隔离真注册表）。
+using SasPolicyFn = bool (*)();
 void SetSasSendForTest(SasSendFn fn);
 void SetSasResolveForTest(SasResolveFn fn);
+void SetSasPolicyForTest(SasPolicyFn fn);
 
 // Capture-spawn seam: everything from token minting to the stdin config
 // handoff (production default = RealCaptureSpawn). cfg = 不透明的 xnc-host
