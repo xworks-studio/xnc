@@ -27,6 +27,14 @@ namespace xnc {
 // active_console == 0xFFFFFFFF ("no physical console") rejects everything.
 bool SessionTargetAllowed(uint32_t want, uint32_t active_console);
 
+// 重启重解析（selftest 覆盖，纯函数）：控制台登录/注销会销毁并重建控制台
+// 会话，会话 ID 随之改变。崩溃重启若复用 StartCapture 时刻的旧 ID，token
+// 守卫必然 TOKEN_FAILED（旧 ID 已不是活动控制台）→ 退避滚满 + 降级锁，
+// host 永远起不来（2026-09-17 真机事故：CAD 登录后视频流卡死）。重启的
+// 意图是"把控制台采集拉回来"，应取当前活动控制台；无物理控制台
+// （0xFFFFFFFF）时保底原值，保持既有失败语义不掩盖。
+uint32_t ResolveRestartSession(uint32_t stored, uint32_t active_console);
+
 class TokenManager {
  public:
   // Duplicate the calling process's primary token (SYSTEM; per spec 4.2

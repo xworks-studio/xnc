@@ -16,6 +16,12 @@ bool SessionTargetAllowed(uint32_t want, uint32_t active_console) {
   return want == active_console;
 }
 
+uint32_t ResolveRestartSession(uint32_t stored, uint32_t active_console) {
+  if (active_console != 0xFFFFFFFFUL && stored != active_console)
+    return active_console;
+  return stored;
+}
+
 namespace {
 
 // Best-effort enable of SeTcbPrivilege on our own token: SYSTEM processes
