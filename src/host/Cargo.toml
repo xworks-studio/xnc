@@ -7,7 +7,9 @@ description = "XNC 桌面采集端：scrap 采集 + hwcodec 编码 + RS FEC + QU
 [dependencies]
 # 采集复用 third_party/scrap（rustdesk fork 的 XNC 裁剪版：Windows DXGI/GDI + libyuv）
 scrap = { path = "../third_party/scrap" }
-hwcodec = { git = "https://github.com/rustdesk-org/hwcodec" }
+# hwcodec vendor 副本（ffmpeg 9 头漂移 FF_PROFILE_* 回退 + openh264/vpl 补链，
+# 详见 ../third_party/hwcodec/VENDOR.md）
+hwcodec = { path = "../third_party/hwcodec" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
 quinn = "0.11"
