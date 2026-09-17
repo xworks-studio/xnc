@@ -6,14 +6,19 @@
 //!   desktop.rs）。DXGI 路径对安全桌面的可见性无保证（duplication 是
 //!   输出级，行为依驱动而定），安全桌面期间强制 GDI，回 Default 后管线
 //!   重建自然回探 DXGI。
-//! - GDI 回退策略（2026-09-16 修正，废弃"首帧探针"）：
-//!   WouldBlock（无新帧）是静止桌面的**正常行为**，不是 DXGI 死了的信号
-//!   （AcquireNextFrame 只在有变化时返回帧）。Sunshine 的做法：不做
-//!   "无帧=死了"判定，持续等待；DXGI 真死通过**错误码**（ConnectionReset/
-//!   Aborted → 上抛重建，或一般错误 → 切 GDI 再重建）判定。
-//!   唯一保留的 WouldBlock 路径降级触发：**产帧需求超时**（force_frame
-//!   挂起 5s 无产出——真需要一帧但 DXGI 给不出，如显示器物理断开）。
-//!   GDI 驻留期每 60s/输入事件回探 DXGI（cancel_gdi）。
+//! - GDI 回退策略（2026-09-17 起，忠实移植 rustdesk video_service.rs
+//!   @92d787b88 的 try_gdi 连击语义；旧 30s 定时器废弃）：
+//!   WouldBlock（无新帧）连击计数，初值 1、任何成功帧清零、>3 时落 GDI。
+//!   本循环 30fps 节拍（33ms/tick）与 rustdesk frame(spf) 同律，4 次连击
+//!   ≈ 132ms。静态桌面健康机同样会落 GDI——这是 rustdesk 数百万用户的
+//!   实证行为：GDI 功能完备（变化发生时 BitBlt 恒出帧），编码仍按变化
+//!   驱动（would_block_if_equal），代价仅是高分辨率下的采集开销；换来
+//!   无 GPU 机器（duplication 创建成功但永不出帧，如 Basic Display
+//!   Adapter 的 Hyper-V VM）百毫秒级恢复出流（旧 30s 兜底的 1/200）。
+//!   会话内不回切 DXGI（L3：cancel_gdi 僵尸 duplication 事故，宁可慢
+//!   不可断）；管线重建（桌面切换/分辨率变化/错误）自然回探 DXGI。
+//!   错误路径不变：一般错误 → 先切 GDI 再上抛重建（rustdesk 同款
+//!   "dxgi error, fall back to gdi"）。
 //! - 回退/重试模式移植自 rustdesk `src/server/video_service.rs:805-864`
 //!   （WouldBlock 持续超阈值或采集错误 → set_gdi；显示器变化 → 重建）。
 //! - 帧内容比较跳帧移植自 rustdesk `would_block_if_equal`（画面未变不编码）。
@@ -44,6 +49,30 @@ const CURSOR_CACHE_CAP: usize = 8;
 /// 精灵尺寸防御上限（正常光标 ≤64px；掩码位图高度为 2 倍）。
 const SPRITE_MAX_DIM: usize = 512;
 
+// ---- DXGI 无帧连击 → GDI（忠实移植 rustdesk try_gdi，纯函数锚定语义）----
+
+/// WouldBlock 时的连击推进决策（rustdesk video_service.rs @92d787b88：
+/// `if try_gdi > 0 && !is_gdi { if try_gdi > 3 { set_gdi } else { +=1 } }`，
+/// 初值 1、任何成功帧清零）。语义轨迹：1→2→3→4→FallToGdi；**成功帧后
+/// （清零）连击路径休眠**——rustdesk 的 `try_gdi > 0` 守卫使然，只有
+/// 会话起始 4 个 tick 全部无帧才落 GDI，中途开始静止不再触发（错误
+/// 路径另行兜底）。
+#[derive(Debug)]
+enum NoFrameAction {
+    FallToGdi,
+    Count(u32),
+    Idle,
+}fn no_frame_action(streak: u32, is_gdi: bool) -> NoFrameAction {
+    if is_gdi || streak == 0 {
+        return NoFrameAction::Idle;
+    }
+    if streak > 3 {
+        NoFrameAction::FallToGdi
+    } else {
+        NoFrameAction::Count(streak + 1)
+    }
+}
+
 /// 采集结果
 pub enum CaptureOutcome<'a> {
     /// 可编码的 BGRA 帧（已含光标）
@@ -65,8 +94,9 @@ pub struct ScreenCapturer {
     last_raw: Vec<u8>,
     /// 叠加光标后的输出缓冲
     composited: Vec<u8>,
-    /// 连续 WouldBlock 的起点（None = 有帧；Some = 正在累计静止时长）
-    would_block_since: Option<Instant>,
+    /// 连续 WouldBlock 的连击计数（rustdesk try_gdi 同款：DXGI 模式下
+    /// 无帧连击；任何成功帧清零；>3 落 GDI。GDI 模式不参与）
+    dxgi_no_frame_streak: u32,
     display_check_at: Instant,
     cursor: CursorPainter,
     draw_cursor: bool,
@@ -154,7 +184,7 @@ impl ScreenCapturer {
             origin,
             last_raw: Vec::new(),
             composited: Vec::new(),
-            would_block_since: None,
+            dxgi_no_frame_streak: 1,
             display_check_at: Instant::now(),
             cursor: CursorPainter::new(),
             draw_cursor,
@@ -213,16 +243,25 @@ impl ScreenCapturer {
         let frame = match self.cap.frame(timeout) {
             Ok(f) => f,
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                // 静止桌面 DXGI 合法地不产生帧。仅当连续 30s 无帧才视为
-                // DXGI 采集异常 → 切 GDI，落下去就留 GDI（2026-09-16 回滚
-                // 到简洁形态：cancel_gdi 回切产生僵尸 duplication → 画面
-                // 冻结，宁可慢不可断；管线重建自然回 DXGI）。
-                let since = *self.would_block_since.get_or_insert_with(Instant::now);
-                if since.elapsed() > Duration::from_secs(30) && !self.cap.is_gdi() {
-                    tracing::warn!("no DXGI frames for 30s, falling back to GDI");
-                    if self.cap.set_gdi() {
-                        tracing::info!("GDI capture enabled");
+                // DXGI 无帧连击 → GDI（忠实移植 rustdesk video_service.rs
+                // @92d787b88 L641/L794-813 的 try_gdi：初值 1，任何成功帧
+                // 清零，>3 落 GDI 且会话内不回切）。本循环 33ms/tick，4 次
+                // 连击 ≈ 132ms——静态桌面健康机同样落 GDI（GDI 功能完备，
+                // 编码仍按变化驱动，rustdesk 实证行为）；无 GPU 机百毫秒级
+                // 恢复出流。决策抽为纯函数 no_frame_action（单测锚定语义）。
+                match no_frame_action(self.dxgi_no_frame_streak, self.cap.is_gdi()) {
+                    NoFrameAction::FallToGdi => {
+                        tracing::warn!(
+                            streak = self.dxgi_no_frame_streak,
+                            "no DXGI frames (4 consecutive ticks), falling back to GDI"
+                        );
+                        if self.cap.set_gdi() {
+                            tracing::info!("GDI capture enabled");
+                        }
+                        self.dxgi_no_frame_streak = 0;
                     }
+                    NoFrameAction::Count(next) => self.dxgi_no_frame_streak = next,
+                    NoFrameAction::Idle => {}
                 }
                 return self.cursor_only_or_none();
             }
@@ -247,8 +286,8 @@ impl ScreenCapturer {
             }
         };
 
-        // 任何 Ok 都证明后端活着：重置静止计时。
-        self.would_block_since = None;
+        // 任何 Ok 都证明后端活着：连击清零（rustdesk try_gdi = 0）。
+        self.dxgi_no_frame_streak = 0;
 
         let Frame::PixelBuffer(pb) = &frame else {
             return self.cursor_only_or_none();
@@ -293,8 +332,8 @@ impl ScreenCapturer {
         if self.draw_cursor {
             self.cursor.draw(&mut self.composited, w, h, &snap, self.origin);
         }
-        // 帧已实际产出：静止计时重置。
-        self.would_block_since = None;
+        // 帧已实际产出：连击清零。
+        self.dxgi_no_frame_streak = 0;
         Ok(CaptureOutcome::Frame(&self.composited))
     }
 
@@ -818,6 +857,26 @@ mod tests {
 
     fn sprite(w: usize, h: usize, data: Vec<u8>) -> CursorSprite {
         CursorSprite { w, h, hot_x: 0, hot_y: 0, data }
+    }
+
+    #[test]
+    fn no_frame_action_matches_rustdesk_try_gdi() {
+        use NoFrameAction::*;
+        // 初始轨迹（rustdesk L641 初值 1 → L807-813 连击推进）：第 4 次
+        // WouldBlock 落 GDI。
+        let mut s = 1;
+        for expect in [2u32, 3, 4] {
+            match no_frame_action(s, false) {
+                Count(next) => assert_eq!(next, expect, "streak {s}"),
+                other => panic!("streak {s} => {other:?}, expect Count({expect})"),
+            }
+            s = expect;
+        }
+        assert!(matches!(no_frame_action(4, false), FallToGdi));
+        // 成功帧后（清零）连击路径休眠（`try_gdi > 0` 守卫）：不再推进。
+        assert!(matches!(no_frame_action(0, false), Idle));
+        // GDI 模式永不参与（is_gdi 守卫）。
+        assert!(matches!(no_frame_action(4, true), Idle));
     }
 
     /// 本机交互会话诊断探针：真实 GetCursorInfo → GetIconInfo → 精灵转换，
