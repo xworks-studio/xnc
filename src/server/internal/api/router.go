@@ -4,9 +4,11 @@ import (
 	"crypto/tls"
 	"log/slog"
 	"net/http"
+	"sync"
 
 	"github.com/go-chi/chi/v5"
 
+	"xnc/proto"
 	"xnc/rtv"
 	"xnc/server"
 	"xnc/server/internal/auth"
@@ -29,6 +31,11 @@ type handlers struct {
 	rtvSign *rtv.Signer
 	// pool relay 池管理器（nil 仅出现在未完成装配的测试构造里）。
 	pool *rtvpool.Manager
+	// SAS 回执关联表（2026-09-17 安全桌面交互）：reqId → 等待中的
+	// POST /desktop/sas handler。agentws 的 SAS_RESULT 分发投递；超时由
+	// 等待方自清（sasAckTimeout），迟到的回执静默落空。
+	sasMu      sync.Mutex
+	sasWaiters map[string]chan proto.SasResult
 }
 
 // Close 停止 handler 的后台 worker（RTV 中继随进程生命周期，无独立停止面）。
@@ -280,6 +287,9 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 		// desktop：实时桌面会话（RTV 中继），startSession 路径；
 		// XNC_RTV_ENDPOINT 未配置 → 503 RTV_UNCONFIGURED，每节点并发上限 + idle 治理
 		nr.Post("/{id}/desktop", h.desktopStart)
+		// SAS：web 工具栏"发送 Ctrl+Alt+Del"（2026-09-17 安全桌面交互），
+		// RBAC operator+；SAS_RESULT 回执关联见 sas_handlers.go
+		nr.Post("/{id}/desktop/sas", h.nodeSas)
 		// 管理动作：owner-only（handler 内经 requireMinRoleIgnoreDisabled 判定）
 		nr.Post("/{id}/disable", h.nodeDisable)
 		nr.Post("/{id}/enable", h.nodeEnable)
