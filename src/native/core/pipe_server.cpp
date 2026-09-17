@@ -559,6 +559,21 @@ void DesktopRestartLoop(uint32_t spawn_epoch, uint32_t session,
     }
     if (g_wd != nullptr) g_wd->Heartbeat();
 
+    // 控制台会话重编号恢复：登录/注销销毁重建控制台会话后 ID 会变，
+    // 复用冻结的旧 ID 重启必然 TOKEN_FAILED。按当前活动控制台重解析
+    // （ResolveRestartSession，含语义说明），成功后 g_capture.session
+    // 随本函数局部变量自然更新。
+    {
+      const uint32_t resolved = ResolveRestartSession(
+          session, WTSGetActiveConsoleSessionId());
+      if (resolved != session) {
+        XNC_LOG_INFO("desktop restart session re-resolved old=%lu new=%lu",
+                     static_cast<unsigned long>(session),
+                     static_cast<unsigned long>(resolved));
+        session = resolved;
+      }
+    }
+
     Watchdog* wd = g_wd;  // may predate Start() in the selftest loopback
     const CaptureSpawnResult r = CurrentSpawnFn()(session, cfg, wd, degraded);
     std::lock_guard<std::mutex> lk(g_capture.mu);

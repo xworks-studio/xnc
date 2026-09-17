@@ -242,6 +242,15 @@ int SelftestMain() {
       CHECK("sess-swapped", !SessionTargetAllowed(1, 2));
       CHECK("sess-no-console", !SessionTargetAllowed(1, 0xFFFFFFFF)); // 无物理 console
       CHECK("sess-invalid-target", !SessionTargetAllowed(0xFFFFFFFF, 1));
+      // 重启重解析:登录/注销后控制台重编号(旧 2 → 新 3)取新值;一致或
+      // 无物理 console 时保底原值(不掩盖失败语义)。
+      CHECK("restart-renumbered",
+            ResolveRestartSession(2, 3) == 3);
+      CHECK("restart-stable", ResolveRestartSession(3, 3) == 3);
+      CHECK("restart-invalid-stored",
+            ResolveRestartSession(0, 3) == 3);
+      CHECK("restart-no-console",
+            ResolveRestartSession(2, 0xFFFFFFFF) == 2);
       // exe 白名单:仅接受同目录相对名 xnc-host.exe(可带 .\ 前缀,
       // 大小写不敏感);绝对路径/穿越/子目录/多余后缀一律拒绝。
       CHECK("exe-allowed", SpawnExeArgAllowed(L"xnc-host.exe"));
