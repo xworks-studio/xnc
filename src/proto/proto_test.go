@@ -24,6 +24,10 @@ func TestMessageRoundtrip(t *testing.T) {
 		{"update_available", TypeUpdateAvailable, UpdateAvailable{Version: "0.6.2", URL: "/setup.exe?channel=stable", SHA256: "ab12"}, `{"type":"UPDATE_AVAILABLE","payload":{"version":"0.6.2","url":"/setup.exe?channel=stable","sha256":"ab12"}}`},
 		{"update_audit_ok", TypeUpdateAudit, UpdateAudit{Event: UpdateEventOK, From: "0.6.1", To: "0.6.2"}, `{"type":"UPDATE_AUDIT","payload":{"event":"update_ok","from":"0.6.1","to":"0.6.2"}}`},
 		{"update_audit_rollback", TypeUpdateAudit, UpdateAudit{Event: UpdateEventRollback, From: "0.6.1", To: "0.6.2", Reason: "watchdog deadline exceeded"}, `{"type":"UPDATE_AUDIT","payload":{"event":"update_rollback","from":"0.6.1","to":"0.6.2","reason":"watchdog deadline exceeded"}}`},
+		// SAS 安全注意序列（2026-09-17）：请求/回执载荷。
+		{"sas_request", TypeSasRequest, SasRequest{ReqID: "r1", Reason: "admin@xnc.app"}, `{"type":"SAS_REQUEST","payload":{"reqId":"r1","reason":"admin@xnc.app"}}`},
+		{"sas_result_ok", TypeSasResult, SasResult{ReqID: "r1", OK: true}, `{"type":"SAS_RESULT","payload":{"reqId":"r1","ok":true}}`},
+		{"sas_result_denied", TypeSasResult, SasResult{ReqID: "r2", OK: false, Code: "SAS_DENIED"}, `{"type":"SAS_RESULT","payload":{"reqId":"r2","ok":false,"code":"SAS_DENIED"}}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
