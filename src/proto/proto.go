@@ -54,7 +54,34 @@ const (
 	// RELAY_CONFIG：server → relay，下行票据验签公钥集合（双窗口轮换：
 	// 新旧并存；relay 收到即重建 Verifier）。认证通过后立即下发一次。
 	TypeRelayConfig = "RELAY_CONFIG"
+	// ── SAS（secure attention sequence，2026-09-17 安全桌面交互）──
+	// SAS_REQUEST：server → agent，触发一次软件 SAS（web 工具栏"发送
+	// Ctrl+Alt+Del"）。链路 = REST POST /api/nodes/{id}/desktop/sas（RBAC
+	// operator+ + 审计）→ 控制连接 → agent → XNCCore 0x0110（SendSAS）。
+	// ReqID 由 server 铸造，SAS_RESULT 凭其回执关联。
+	TypeSasRequest = "SAS_REQUEST"
+	// SAS_RESULT：agent → server，SAS_REQUEST 的异步回执（同控制连接）。
+	// OK=true 仅表示 core 未拒绝且 SendSAS 调用未抛异常（hr=0）；"安全桌面
+	// 真的出现"由 host 侧桌面跟随采集呈现，非本回执可证。
+	TypeSasResult = "SAS_RESULT"
 )
+
+// SasRequest 是 SAS_REQUEST 的载荷。Reason 仅供 core 侧 sas_audit 日志
+// 行（24 字节截断），内容 = 触发者标识（email/reqId）。
+type SasRequest struct {
+	ReqID  string `json:"reqId"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// SasResult 是 SAS_RESULT 的载荷。Code 取 core 拒绝稳定码
+// （SAS_DENIED / SAS_UNAVAILABLE / BAD_PAYLOAD）或 IPC 层错误摘要。
+type SasResult struct {
+	ReqID string `json:"reqId"`
+	OK    bool   `json:"ok"`
+	HR    uint32 `json:"hr,omitempty"`
+	Code  string `json:"code,omitempty"`
+	Err   string `json:"err,omitempty"`
+}
 
 func NewMsg(typ string, payload any) (Message, error) {
 	b, err := json.Marshal(payload)

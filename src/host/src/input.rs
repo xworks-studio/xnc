@@ -5,6 +5,14 @@
 //! 风格），注入坐标为显示器物理像素（与 DXGI 采集坐标系一致，DPI 缩放无关）。
 //! 在交互会话内运行（部署方式保证了这一点，见 deploy-host.ps1）。
 //!
+//! 安全桌面交互（2026-09-17）：SendInput 按调用线程所属桌面生效——登录/
+//! 锁屏/UAC 的 Winlogon 桌面上，只有锚定到该桌面的线程能把输入送进去。
+//! 因此注入收敛到**专用 OS 线程**（injector）：tokio 侧只做解析/坐标换算
+//! （handle），动作经 channel 串行进入 injector，injector 周期性跟随输入
+//! 桌面（desktop.rs，VNC lineage 的专线程纪律——持窗口/钩子的线程不能
+//! SetThreadDesktop，本线程无窗口无钩子）。粘键表也随之移入 injector
+//! （单线程自有，免锁）。
+//!
 //! 键盘两类事件（web 端分类，见 DesktopLive 键盘捕获）：
 //! - `kind:"down"/"up"` + `code`（浏览器物理键位）→ keymap 查 VK 注入；
 //!   修饰键自然成对转发，快捷键（Ctrl+A 等）在远端成立。
@@ -20,7 +28,8 @@
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::OnceLock;
 use winapi::ctypes::c_int;
 use winapi::shared::minwindef::UINT;
 use winapi::um::winuser::{
@@ -44,6 +53,119 @@ static ENC_H: AtomicUsize = AtomicUsize::new(0);
 // 坐标，副屏（origin≠0,0）不加减原点会注入/绘制到错误位置。
 static ORIGIN_X: AtomicI32 = AtomicI32::new(0);
 static ORIGIN_Y: AtomicI32 = AtomicI32::new(0);
+
+// ---- injector：专用注入线程（安全桌面跟随） ----
+
+/// 注入动作（tokio 侧解析换算完毕的最终形态；injector 串行执行）。
+/// SyncSender/Receiver：有界（256）——注入端过载时丢弃新事件并告警，
+/// 绝不反压阻塞 QUIC 控制分发（旧事件的时序价值高于新事件的完整性）。
+enum Op {
+    Cursor(i32, i32),
+    Mouse(u32, i32),
+    Key(u16, bool, bool),
+    Unicode(u16, bool),
+    /// 松开全部按住的键（控制权丢失）
+    ReleaseAll,
+}
+
+static TX: OnceLock<SyncSender<Op>> = OnceLock::new();
+
+/// injector 通道（懒启动线程，host 生命周期单例）。
+fn tx() -> SyncSender<Op> {
+    let tx = TX.get_or_init(|| {
+        // 256 缓冲：覆盖 wheel/text 突发；满则 try_send 丢弃（见上）。
+        let (tx, rx) = std::sync::mpsc::sync_channel(256);
+        std::thread::Builder::new()
+            .name("xnc-input".into())
+            .spawn(move || injector_loop(rx))
+            .expect("spawn input injector");
+        tx
+    });
+    tx.clone()
+}
+
+fn send_op(op: Op) {
+    if let Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) = tx().try_send(op) {
+        tracing::debug!("input injector queue full/disconnected, dropping event");
+    }
+}
+
+/// injector 主循环：跟随输入桌面（切换即重锚 + 记日志）→ 串行注入。
+/// 桌面检查每批事件前做一次 + 空闲时 200ms 轮询（登录界面无事件时也要
+/// 跟随到 Winlogon，否则首个按键丢失）。
+fn injector_loop(rx: Receiver<Op>) {
+    let mut bound = crate::desktop::bind_thread_to_input_desktop()
+        .unwrap_or_else(|_| crate::desktop::DEFAULT_DESKTOP.to_string());
+    let mut pressed: HashSet<(u16, bool)> = HashSet::new();
+    let mut last_check = std::time::Instant::now();
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(op) => {
+                maybe_follow(&mut bound, &mut last_check);
+                inject(op, &mut pressed);
+                // 批量排空（同一 tick 的事件共享一次桌面检查）。
+                while let Ok(op) = rx.try_recv() {
+                    inject(op, &mut pressed);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                maybe_follow(&mut bound, &mut last_check);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return; // 发送端全 drop（进程拆除）
+            }
+        }
+    }
+}
+
+/// 输入桌面跟随：名字变化才重锚（重锚含 SetThreadDesktop，保守调用）。
+fn maybe_follow(bound: &mut String, last_check: &mut std::time::Instant) {
+    if last_check.elapsed() < std::time::Duration::from_millis(100) {
+        return; // 限频：高频事件批不重复查询
+    }
+    *last_check = std::time::Instant::now();
+    if let Ok(name) = crate::desktop::input_desktop_name() {
+        if !name.eq_ignore_ascii_case(bound) {
+            match crate::desktop::bind_thread_to_input_desktop() {
+                Ok(new) => {
+                    tracing::warn!(from = %bound, to = %new, "injector followed input desktop");
+                    *bound = new;
+                }
+                Err(e) => tracing::warn!(?e, "injector desktop rebind failed"),
+            }
+        }
+    }
+}
+
+/// 执行一条注入动作（含粘键表维护）。
+fn inject(op: Op, pressed: &mut HashSet<(u16, bool)>) {
+    match op {
+        Op::Cursor(x, y) => unsafe {
+            if SetCursorPos(x, y) == 0 {
+                tracing::debug!(x, y, "SetCursorPos failed");
+            }
+        },
+        Op::Mouse(flags, data) => send_mouse(flags, data),
+        Op::Key(vk, extended, up) => {
+            send_key(vk, extended, up);
+            if up {
+                pressed.remove(&(vk, extended));
+            } else {
+                pressed.insert((vk, extended));
+            }
+        }
+        Op::Unicode(unit, up) => send_unicode(unit, up),
+        Op::ReleaseAll => {
+            if !pressed.is_empty() {
+                tracing::info!(n = pressed.len(), "releasing held keys after control loss");
+            }
+            for &(vk, extended) in pressed.iter() {
+                send_key(vk, extended, true);
+            }
+            pressed.clear();
+        }
+    }
+}
 
 /// 采集管线启动时登记两套分辨率与显示器原点（run_pipeline 调用）。
 pub fn set_viewport(native: (usize, usize), encoded: (usize, usize), origin: (i32, i32)) {
@@ -95,11 +217,7 @@ fn handle_mouse(v: &Value) {
         "move" => {
             let (Some(x), Some(y)) = (v["x"].as_f64(), v["y"].as_f64()) else { return };
             let (nx, ny) = to_native(x, y);
-            unsafe {
-                if SetCursorPos(nx, ny) == 0 {
-                    tracing::debug!(nx, ny, "SetCursorPos failed");
-                }
-            }
+            send_op(Op::Cursor(nx, ny));
         }
         "down" | "up" => {
             let down = kind == "down";
@@ -116,19 +234,19 @@ fn handle_mouse(v: &Value) {
                 _ => return,
             };
             let mouse_data: UINT = if button == 3 { XBUTTON1 as UINT } else if button == 4 { XBUTTON2 as UINT } else { 0 };
-            send_mouse(flags, mouse_data as i32);
+            send_op(Op::Mouse(flags, mouse_data as i32));
         }
         "wheel" => {
             // dy/dx 为“格”数（浏览器 deltaY/deltaX / 100）；换算 WHEEL_DELTA。
             // Windows：WHEEL 正值=向上滚，HWHEEL 正值=向右滚；浏览器正值分别为向下/向右。
             let dy = v["dy"].as_f64().unwrap_or(0.0);
             if dy != 0.0 {
-                send_mouse(MOUSEEVENTF_WHEEL, (-dy * WHEEL_DELTA as f64) as i32);
+                send_op(Op::Mouse(MOUSEEVENTF_WHEEL, (-dy * WHEEL_DELTA as f64) as i32));
             }
             let dx = v["dx"].as_f64().unwrap_or(0.0);
             if dx != 0.0 {
                 const MOUSEEVENTF_HWHEEL: u32 = 0x0800; // winapi 0.3 未导出
-                send_mouse(MOUSEEVENTF_HWHEEL, (dx * WHEEL_DELTA as f64) as i32);
+                send_op(Op::Mouse(MOUSEEVENTF_HWHEEL, (dx * WHEEL_DELTA as f64) as i32));
             }
         }
         _ => {}
@@ -144,8 +262,7 @@ fn handle_keyboard(v: &Value) {
                 return;
             };
             let up = v["kind"].as_str() == Some("up");
-            send_key(def.vk, def.extended, up);
-            track_pressed(def.vk, def.extended, !up);
+            send_op(Op::Key(def.vk, def.extended, up));
         }
         "text" => {
             // Unicode 文本：按 UTF-16 码元逐个 down+up（代理对拆成两个
@@ -154,41 +271,18 @@ fn handle_keyboard(v: &Value) {
             // 带修饰键状态（web 端仅在无修饰键时走此路径）。
             let Some(text) = v["text"].as_str() else { return };
             for unit in text.encode_utf16() {
-                send_unicode(unit, false);
-                send_unicode(unit, true);
+                send_op(Op::Unicode(unit, false));
+                send_op(Op::Unicode(unit, true));
             }
         }
         _ => {}
     }
 }
 
-// ---- 粘键防漏：记录当前按下的键，断连/无 viewer 时统一松开 ----
-
-static PRESSED: Mutex<Option<HashSet<(u16, bool)>>> = Mutex::new(None);
-
-fn track_pressed(vk: u16, extended: bool, down: bool) {
-    let mut guard = PRESSED.lock().unwrap();
-    let set = guard.get_or_insert_with(HashSet::new);
-    if down {
-        set.insert((vk, extended));
-    } else {
-        set.remove(&(vk, extended));
-    }
-}
-
 /// 松开全部仍按住的键（Shared::disconnect 与 viewers→0 时调用）。
-/// 键盘注入通道已断，直接 SendInput 抬键即可。
+/// 经 injector 执行（粘键表在其线程内）。
 pub fn release_all_keys() {
-    let mut guard = PRESSED.lock().unwrap();
-    if let Some(set) = guard.as_mut() {
-        if !set.is_empty() {
-            tracing::info!(n = set.len(), "releasing held keys after control loss");
-        }
-        for &(vk, extended) in set.iter() {
-            send_key(vk, extended, true);
-        }
-        set.clear();
-    }
+    send_op(Op::ReleaseAll);
 }
 
 fn send_mouse(flags: u32, mouse_data: i32) {

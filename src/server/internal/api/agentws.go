@@ -181,6 +181,13 @@ func (h *handlers) agentConnect(w http.ResponseWriter, r *http.Request) {
 			if err := m.Decode(&sr); err == nil && h.sess != nil {
 				h.sess.NotifyClose(sr.SessionID, "refused:"+sr.Code)
 			}
+		case proto.TypeSasResult:
+			// SAS 回执（2026-09-17 安全桌面交互）：reqId 关联投递给等待中的
+			// POST /desktop/sas；无等待方（迟到/重启后）记日志丢弃。
+			var res proto.SasResult
+			if m.Decode(&res) == nil {
+				h.sasDeliver(res)
+			}
 		case proto.TypeNodeDelete:
 			// 机器自注销（spec §7 deregister）：本连接已按节点身份完成挑战-验签，
 			// 机器身份即凭据（无 JWT）。删除节点行 → 审计 → 逐出该节点全部在线

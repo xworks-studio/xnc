@@ -190,6 +190,7 @@ uint32_t g_sas_audit_count = 0;
 // Seams (selftest injection; null = production default below).
 SasSendFn g_sas_send = nullptr;
 SasResolveFn g_sas_resolve = nullptr;
+SasPolicyFn g_sas_policy = nullptr;
 CaptureSpawnFn g_capture_spawn_fn = nullptr;
 BOOL (WINAPI* g_terminate_process)(HANDLE, UINT) = nullptr;
 
@@ -897,6 +898,45 @@ Frame HandleKillShell(const Frame& req) {
 // mutual-HMAC handshake (only secret holders reach the frame loop);
 // client_pid rides the audit line. Gate: --allow-sas only (ledger minimum
 // bar; M2-Slice3 wires the capability ticket on top).
+//
+// 2026-09-17 安全桌面交互（web "发送 Ctrl+Alt+Del"）：能力层 =
+// server 侧 REST RBAC(operator+) + 审计；服务态门常开（service.cpp）。
+// SendSAS 还需机器级"软件 SAS 服务许可"——SoftwareSASGeneration
+// （HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System，
+// DWORD：0=禁用 1=服务 2=易访问应用 3=全部；对应组策略"交互式登录：
+// 软件安全注意序列"）。EnsureSoftwareSasPolicy 在首次使用时幂等开启
+// （缺失/0 → 写 1），绝不覆盖管理员显式配置的 2/3——与 RustDesk send_sas
+// 同款 lazy 语义：不用的机器不留策略 footprint。
+// 经 g_sas_policy 接缝注入（selftest 以 no-op stub 隔离真注册表）。
+bool RealEnsureSoftwareSasPolicy() {
+  HKEY k = nullptr;
+  LONG r = RegCreateKeyExW(
+      HKEY_LOCAL_MACHINE,
+      L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", 0,
+      nullptr, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, nullptr, &k, nullptr);
+  if (r != ERROR_SUCCESS) {
+    XNC_LOG_ERROR("sas: open Policies\\System failed err=%ld", r);
+    return false;
+  }
+  DWORD v = 0, sz = sizeof(v), type = 0;
+  r = RegQueryValueExW(k, L"SoftwareSASGeneration", nullptr, &type,
+                       reinterpret_cast<LPBYTE>(&v), &sz);
+  if (r == ERROR_SUCCESS && type == REG_DWORD && v != 0) {
+    RegCloseKey(k);
+    return true; // 已配置（含管理员显式的 2/3）：尊重现状
+  }
+  v = 1; // services
+  r = RegSetValueExW(k, L"SoftwareSASGeneration", 0, REG_DWORD,
+                     reinterpret_cast<const BYTE*>(&v), sizeof(v));
+  RegCloseKey(k);
+  if (r != ERROR_SUCCESS) {
+    XNC_LOG_ERROR("sas: set SoftwareSASGeneration failed err=%ld", r);
+    return false;
+  }
+  XNC_LOG_INFO("sas: SoftwareSASGeneration=1 (services) enabled");
+  return true;
+}
+
 Frame HandleSas(const Frame& req, uint32_t client_pid) {
   if (req.payload.size() != kSasReasonLen) {
     return ErrorFrame(kMsgSas, req.request_id, "BAD_PAYLOAD");
@@ -908,6 +948,14 @@ Frame HandleSas(const Frame& req, uint32_t client_pid) {
   if (!g_sas_allowed.load()) {
     RecordSasAudit(client_pid, false, false, "sas_denied", reason, 0);
     return ErrorFrame(kMsgSas, req.request_id, "SAS_DENIED");
+  }
+  // 策略缺失时 SendSAS 以 C0000022 类异常拒绝（sas.h 无返回值）——先幂等
+  // 开启再调用；开不动（权限/策略锁定）按 SAS_UNAVAILABLE 报回。
+  SasPolicyFn policy = g_sas_policy != nullptr ? g_sas_policy
+                                               : &RealEnsureSoftwareSasPolicy;
+  if (!policy()) {
+    RecordSasAudit(client_pid, true, false, "sas_unavailable", reason, 0);
+    return ErrorFrame(kMsgSas, req.request_id, "SAS_UNAVAILABLE");
   }
   SasSendFn send = g_sas_send != nullptr
                        ? g_sas_send
@@ -1240,6 +1288,7 @@ uint32_t SasAuditCount() {
 
 void SetSasSendForTest(SasSendFn fn) { g_sas_send = fn; }
 void SetSasResolveForTest(SasResolveFn fn) { g_sas_resolve = fn; }
+void SetSasPolicyForTest(SasPolicyFn fn) { g_sas_policy = fn; }
 void SetCaptureSpawnForTest(CaptureSpawnFn fn) { g_capture_spawn_fn = fn; }
 void SetTerminateForTest(BOOL(WINAPI* fn)(HANDLE, UINT)) {
   g_terminate_process = fn;

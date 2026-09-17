@@ -94,6 +94,15 @@ func main() {
 		dur      = flag.Duration("dur", 30*time.Second, "采集时长")
 		dump     = flag.String("dump", "", "完整帧 Annex-B 落盘路径（空=不落盘）")
 		insecure = flag.Bool("insecure", false, "跳过服务端证书校验（dev 自签时用）")
+		// -esc-after：连上 N 秒后向 host 注入一次 Escape down+up（单发）。
+		// 验收场景：CAD 菜单（SAS 触发）经 Esc 注销——覆盖安全桌面输入路径。
+		escAfter = flag.Duration("esc-after", 0, "连上 N 秒后注入一次 Escape（0=不注入）")
+		// -enter-after：连上 N 秒后注入一次 Enter（登录磁贴 → 密码框聚焦）。
+		enterAfter = flag.Duration("enter-after", 0, "连上 N 秒后注入一次 Enter（0=不注入）")
+		// -text-after：连上 N 秒后注入一段 Unicode 文本（登录框圆点可视化，
+		// 无需真实凭据即可验证安全桌面输入）。
+		textAfter = flag.Duration("text-after", 0, "连上 N 秒后注入 -text 内容（0=不注入）")
+		textBody  = flag.String("text", "xnc-e2e", "与 -text-after 一起注入的文本")
 	)
 	flag.Parse()
 	if !strings.Contains(*url, "token=") {
@@ -254,6 +263,7 @@ func main() {
 	go func() {
 		tick := time.NewTicker(time.Second)
 		defer tick.Stop()
+		var escSent, enterSent, textSent bool
 		for {
 			select {
 			case <-ctx.Done():
@@ -273,6 +283,33 @@ func main() {
 				sendCtrl(stream, map[string]any{
 					"type": "feedback", "rttMs": rtt, "decodeQueueDepth": 0,
 					"decodedFps": 0, "arrivalGapP95Ms": gapP95,
+				})
+				// 一次性按键注入（安全桌面输入验收：Enter/Escape/文本）
+				sendKeyOnce := func(name string, after time.Duration, sent *bool, inj func()) {
+					if after > 0 && !*sent && time.Since(t0) >= after {
+						*sent = true
+						inj()
+						log.Printf("injected %s (after %s)", name, after)
+					}
+				}
+				sendKeyOnce("Escape", *escAfter, &escSent, func() {
+					for _, kind := range []string{"down", "up"} {
+						sendCtrl(stream, map[string]any{
+							"type": "input", "event": "keyboard", "kind": kind, "code": "Escape",
+						})
+					}
+				})
+				sendKeyOnce("Enter", *enterAfter, &enterSent, func() {
+					for _, kind := range []string{"down", "up"} {
+						sendCtrl(stream, map[string]any{
+							"type": "input", "event": "keyboard", "kind": kind, "code": "Enter",
+						})
+					}
+				})
+				sendKeyOnce("text", *textAfter, &textSent, func() {
+					sendCtrl(stream, map[string]any{
+						"type": "input", "event": "keyboard", "kind": "text", "text": *textBody,
+					})
 				})
 			}
 		}

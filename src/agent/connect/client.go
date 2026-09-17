@@ -53,6 +53,11 @@ type Client struct {
 	// 目标清单（URL+SHA256，已认证通道）；接收方也可选择忽略载荷、仅把
 	// 它当作"立即检查一轮"的信号（轮询路径拉 setup.json）。nil 时静默忽略。
 	UpdateAvailableFunc func(ctx context.Context, push proto.UpdateAvailable)
+	// SasRequestFunc：SAS_REQUEST 到达（独立 goroutine 分发；web 工具栏
+	// "发送 Ctrl+Alt+Del"，2026-09-17 安全桌面交互）。接收方完成 core
+	// 0x0110 往返后经 CurrentSend 回 SAS_RESULT（凭 reqId 关联）。nil 时
+	// 静默忽略（前向兼容同 UPDATE_AVAILABLE）。
+	SasRequestFunc func(ctx context.Context, sr proto.SasRequest)
 
 	sendMu      sync.Mutex
 	currentSend func(m proto.Message) error
@@ -317,6 +322,12 @@ func (c *Client) drain(pctx context.Context, ws *websocket.Conn, dead func()) {
 				var push proto.UpdateAvailable
 				if err := m.Decode(&push); err == nil {
 					go c.HandleUpdateAvailable(pctx, push) // 检查/下载不得阻塞心跳读取
+				}
+			case proto.TypeSasRequest:
+				var sr proto.SasRequest
+				if err := m.Decode(&sr); err == nil && c.SasRequestFunc != nil {
+					f := c.SasRequestFunc
+					go f(pctx, sr) // core 往返（秒级）不得阻塞心跳读取
 				}
 			case proto.TypeSessionClose:
 				var sc proto.SessionClose

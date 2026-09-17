@@ -645,6 +645,9 @@ int SelftestMain() {
         SetSasAllowed(false);           // default gate state
         SetSasSendForTest(nullptr);
         SetSasResolveForTest(nullptr);
+        // 2026-09-17: SoftwareSASGeneration 注册表策略接缝——自测进程不碰
+        // 真注册表（non-admin 写 HKLM 必败，会把 ok 路径误判 SAS_UNAVAILABLE）。
+        SetSasPolicyForTest([]() { return true; });
 
         CHECK("sas-badpayload-send",
               WriteFrame(c, Frame{0, kMsgSas, 21, std::vector<uint8_t>(23, 'x')}));

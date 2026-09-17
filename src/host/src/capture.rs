@@ -1,5 +1,11 @@
 //! 屏幕采集（Windows）：scrap DXGI → GDI 回退 + 帧比较跳帧 + 可选光标合成。
 //!
+//! - 安全桌面跟随（2026-09-17）：Winlogon 桌面（登录/锁屏/UAC）激活时，
+//!   GDI 的 GetDC(NULL)/BitBlt 绑定调用线程所属桌面——创建时锚定当前输入
+//!   桌面，500ms 巡检发现输入桌面名变化 → Reinit 重建（重建即重锚，见
+//!   desktop.rs）。DXGI 路径对安全桌面的可见性无保证（duplication 是
+//!   输出级，行为依驱动而定），安全桌面期间强制 GDI，回 Default 后管线
+//!   重建自然回探 DXGI。
 //! - GDI 回退策略（2026-09-16 修正，废弃"首帧探针"）：
 //!   WouldBlock（无新帧）是静止桌面的**正常行为**，不是 DXGI 死了的信号
 //!   （AcquireNextFrame 只在有变化时返回帧）。Sunshine 的做法：不做
@@ -68,6 +74,8 @@ pub struct ScreenCapturer {
     /// 强制产出一帧（viewer 新加入时静止桌面否则永远无帧：scrap GDI 内部
     /// would_block_if_equal 会把未变化帧变成 WouldBlock，IDR 请求无从消费）
     force_next: bool,
+    /// 创建时锚定的输入桌面名（安全桌面跟随基准，desktop.rs）
+    desktop_name: String,
     // 统计
     pub frames_captured: u64,
     pub frames_skipped_equal: u64,
@@ -76,6 +84,17 @@ pub struct ScreenCapturer {
 
 impl ScreenCapturer {
     pub fn new(display_index: usize, draw_cursor: bool) -> IoResult<Self> {
+        // 安全桌面跟随 ①：采集线程锚定当前输入桌面（SYSTEM 可锚 Winlogon；
+        // 桌面切换由 next() 的 500ms 巡检发现并触发重建重锚）。
+        let desktop_name = crate::desktop::bind_thread_to_input_desktop()
+            .unwrap_or_else(|e| {
+                tracing::warn!(?e, "bind to input desktop failed (staying on thread default)");
+                crate::desktop::DEFAULT_DESKTOP.to_string()
+            });
+        let secure = crate::desktop::is_secure(&desktop_name);
+        if secure {
+            tracing::warn!(desktop = %desktop_name, "starting on secure desktop (GDI forced)");
+        }
         let mut displays = Display::all()?;
         if displays.is_empty() {
             // 枚举无输出：显示器可能睡着——唤醒后重试一轮（Sunshine
@@ -118,9 +137,16 @@ impl ScreenCapturer {
             name = %disp_name,
             width, height,
             ?origin,
-            "creating DXGI capturer"
+            secure,
+            "creating capturer"
         );
-        let cap = Capturer::new(display)?; // 失败时内部自动可用 GDI 显示器（scrap 保证）
+        // 失败时内部自动可用 GDI 显示器（scrap 保证）；安全桌面跟随 ②：
+        // Winlogon 期间 DXGI 可见性无保证，显式切 GDI（set_gdi 为公开
+        // trait 方法，落下去留 GDI——回 Default 后管线重建自然回探 DXGI）。
+        let mut cap = Capturer::new(display)?;
+        if secure && !cap.is_gdi() && !cap.set_gdi() {
+            tracing::warn!("secure desktop: GDI switch failed, keeping DXGI");
+        }
         Ok(Self {
             cap,
             width,
@@ -134,6 +160,7 @@ impl ScreenCapturer {
             draw_cursor,
             last_cursor_sig: (0, 0, 0, false),
             force_next: false,
+            desktop_name,
             frames_captured: 0,
             frames_skipped_equal: 0,
             cursor_only_frames: 0,
@@ -157,6 +184,15 @@ impl ScreenCapturer {
         // 1s → 500ms：盒盖过渡时虚拟屏上线的识别延迟减半）
         if self.display_check_at.elapsed() >= Duration::from_millis(500) {
             self.display_check_at = Instant::now();
+            // 安全桌面跟随 ③：输入桌面名变化（Default↔Winlogon，登录/锁屏/
+            // UAC 激活与退出）→ 重建管线（重建即重锚新桌面 + 按 secure 与否
+            // 选 GDI/DXGI）。查询失败不触发（保守：winsta 异常不该杀管线）。
+            if let Ok(name) = crate::desktop::input_desktop_name() {
+                if !name.eq_ignore_ascii_case(&self.desktop_name) {
+                    tracing::warn!(from = %self.desktop_name, to = %name, "input desktop changed, reinit");
+                    return Ok(CaptureOutcome::Reinit);
+                }
+            }
             if let Ok(displays) = Display::all() {
                 let geometry: Vec<(i32, i32, usize, usize)> = displays
                     .iter()

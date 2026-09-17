@@ -174,6 +174,31 @@ export default function DesktopLive() {
   const [clipNotice, setClipNotice] = useState<string | null>(null);
   const [pasteOpen, setPasteOpen] = useState(false);
   const [pasteText, setPasteText] = useState("");
+  // SAS（"发送 Ctrl+Alt+Del"）：经 REST → agent → XNCCore SendSAS 触发安全
+  // 注意序列；host 侧桌面跟随让登录/锁屏/UAC 界面在流内可见可控。
+  const [sasBusy, setSasBusy] = useState(false);
+  const [sasMsg, setSasMsg] = useState<string | null>(null);
+  const sendSas = async () => {
+    if (sasBusy) return;
+    setSasBusy(true);
+    const flash = (m: string) => {
+      setSasMsg(m);
+      window.setTimeout(() => setSasMsg(null), 4000);
+    };
+    try {
+      const r = await api<{ ok: boolean; hr?: number; code?: string; err?: string }>(
+        `/api/nodes/${encodeURIComponent(nodeId)}/desktop/sas`,
+        { method: "POST", body: "{}" },
+      );
+      if (r.ok && !r.hr) flash("已发送（等待安全桌面呈现）");
+      else if (r.ok) flash(`已发送，但 hr=0x${(r.hr ?? 0).toString(16)}（可能被策略拒绝）`);
+      else flash(`节点拒绝：${r.code || r.err || "未知错误"}`);
+    } catch (e) {
+      flash(`发送失败：${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setSasBusy(false);
+    }
+  };
 
   const rootRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -1079,6 +1104,19 @@ export default function DesktopLive() {
           >
             复制
           </button>
+          <button
+            className="btn"
+            disabled={!inputAllowed || sasBusy}
+            onClick={() => void sendSas()}
+            title={
+              inputAllowed
+                ? "发送 Ctrl+Alt+Del（唤出登录/锁屏/任务管理器菜单；需要控制权）"
+                : "需先接管控制"
+            }
+          >
+            {sasBusy ? "发送中…" : "Ctrl+Alt+Del"}
+          </button>
+          {sasMsg && <span className="dt-chip dt-chip-num">{sasMsg}</span>}
           <button
             className="btn"
             onClick={() => setStatsOpen((v) => !v)}
