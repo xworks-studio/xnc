@@ -15,6 +15,7 @@
 
 mod capture;
 mod clipboard;
+mod desktop;
 mod encoder;
 mod framing;
 mod input;
