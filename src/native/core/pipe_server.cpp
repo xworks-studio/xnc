@@ -363,7 +363,7 @@ void WatchCaptureChild(HANDLE child, DWORD pid, uint32_t spawn_epoch) {
         g_desktop.degraded = true;
         XNC_LOG_INFO(
             "crash_loop_degraded kind=desktop exits=%zu window_ms=%zu "
-            "(desktop locked to --encoder libx264)",
+            "(desktop locked to --encoder libopenh264)",
             g_desktop.exit_ms.size(), (size_t)kCrashLoopWindowMs);
       }
       // A child that survived longer than the crash-loop window resets the
@@ -475,7 +475,7 @@ CaptureSpawnResult RealCaptureSpawn(uint32_t session, const std::string& cfg,
     // DXGI->GDI 回退由其内部状态机处理；core 侧降级=锁定软件编码器
     // （跳过 QSV/NVENC/AMF 探测链，规避驱动级崩溃循环）。
     args.push_back(L"--encoder");
-    args.push_back(L"libx264");
+    args.push_back(L"libopenh264");
   }
   std::vector<wchar_t*> av;
   for (auto& a : args) av.push_back(&a[0]);
@@ -576,7 +576,7 @@ void DesktopRestartLoop(uint32_t spawn_epoch, uint32_t session,
         g_desktop.degraded = true;
         XNC_LOG_INFO(
             "crash_loop_degraded kind=desktop exits=%zu window_ms=%zu "
-            "(desktop locked to --encoder libx264)",
+            "(desktop locked to --encoder libopenh264)",
             g_desktop.exit_ms.size(), (size_t)kCrashLoopWindowMs);
       }
       g_desktop.crash_index += 1;
