@@ -1,9 +1,8 @@
-//go:build !windows
+//go:build !windows && !linux
 
-// shellhost_other.go — 非 Windows 桩:生产 agent 的 Windows 形态依赖
-// XNCCore(令牌语义);Linux 的 direct PTY 宿主在 shellhost_linux.go
-// (GOOS=linux,落地时本文件标签收窄为 !windows && !linux)。本桩保证
-// session 包可移植构建,创建一律 CORE_UNAVAILABLE。
+// shellhost_other.go — 其余平台（darwin 等）桩:生产形态 Windows 依赖
+// XNCCore(令牌语义)、Linux 为 direct PTY 宿主(shellhost_linux.go)。
+// 本桩保证 session 包可移植构建,创建一律 CORE_UNAVAILABLE。
 package session
 
 import "log/slog"
