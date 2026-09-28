@@ -221,9 +221,12 @@ func TestExecNoActiveSessionPropagates(t *testing.T) {
 	assert.Equal(t, "NO_ACTIVE_SESSION", res.Code)
 }
 
-// TestExecCoreUnavailable:无 host 凭据(dev 无 xnc-core)→ CORE_UNAVAILABLE。
+// TestExecCoreUnavailable:宿主拒绝 CORE_UNAVAILABLE(Windows dev 无 core
+// 凭据的自然形态;Linux direct 宿主恒可用,统一以注入拒绝钉稳定码透传)
+// → EXEC_RESULT.Code。
 func TestExecCoreUnavailable(t *testing.T) {
-	ws := runExec(t, nil, proto.ExecParams{Command: "whoami", Shell: "cmd"})
+	host := &fakeHost{reject: &ShellHostError{Code: CodeCoreUnavailable}}
+	ws := runExec(t, host, proto.ExecParams{Command: "whoami", Shell: "cmd"})
 	_, _, res := collectExec(t, ws)
 	assert.Nil(t, res.ExitCode)
 	assert.Equal(t, "CORE_UNAVAILABLE", res.Code)
@@ -335,7 +338,19 @@ func TestBuildExecCommandMapping(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, []string{"BASH", "PWSH", "POWERSHELL", "CMD"}, profile)
 
-	_, _, err = buildExecCommand(proto.ExecParams{Command: "dir", Shell: "zsh"}, "")
+	// posix 词表（Linux 节点支持，2026-09-28）：sh/zsh 与 bash 同构（-c /
+	// 引号脚本路径）。
+	cmd, profile, err = buildExecCommand(proto.ExecParams{Command: "ls", Shell: "sh"}, "")
+	require.NoError(t, err)
+	assert.Equal(t, "ls", cmd)
+	assert.Equal(t, "SH", profile)
+
+	cmd, profile, err = buildExecCommand(proto.ExecParams{Script: "x", Shell: "zsh"}, "/tmp/xnc-s.sh")
+	require.NoError(t, err)
+	assert.Equal(t, "'/tmp/xnc-s.sh'", cmd)
+	assert.Equal(t, "ZSH", profile)
+
+	_, _, err = buildExecCommand(proto.ExecParams{Command: "dir", Shell: "fish"}, "")
 	assert.Error(t, err)
 
 	cmd, _, err = buildExecCommand(proto.ExecParams{Script: "x", Shell: "powershell"}, `C:\t\xnc-s.ps1`)

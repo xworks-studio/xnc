@@ -35,7 +35,12 @@ func osReleaseField(key string) string {
 	if err != nil {
 		return ""
 	}
-	for _, line := range strings.Split(string(b), "\n") {
+	return parseOSRelease(string(b), key)
+}
+
+// parseOSRelease 纯解析（供测试）：前缀精确匹配 KEY=，值去引号；缺失返回空。
+func parseOSRelease(content, key string) string {
+	for _, line := range strings.Split(content, "\n") {
 		if v, ok := strings.CutPrefix(line, key+"="); ok {
 			return strings.Trim(strings.TrimSpace(v), `"`)
 		}

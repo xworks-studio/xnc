@@ -211,9 +211,12 @@ func TestShellStartRejected(t *testing.T) {
 	assert.Equal(t, "NO_ACTIVE_SESSION", ep.Message)
 }
 
-// TestShellCoreUnavailable:无 host 凭据 → ERROR,code CORE_UNAVAILABLE。
+// TestShellCoreUnavailable:宿主拒绝 CORE_UNAVAILABLE(Windows dev 无 core
+// 凭据的自然形态;Linux direct 宿主恒可用,统一以注入拒绝钉稳定码透传)
+// → ERROR SHELL_START_FAILED,message 携带 CORE_UNAVAILABLE。
 func TestShellCoreUnavailable(t *testing.T) {
-	ws, _ := runShell(t, nil, proto.ShellParams{Cols: 80, Rows: 25})
+	host := &fakeHost{reject: &ShellHostError{Code: CodeCoreUnavailable}}
+	ws, _ := runShell(t, host, proto.ShellParams{Cols: 80, Rows: 25})
 	errFrame := collectUntil(t, ws, func(k string, d []byte) bool {
 		if k != "text" {
 			return false
