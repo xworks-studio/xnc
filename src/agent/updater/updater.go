@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -260,6 +261,14 @@ func (u *Updater) orchestrateTrigger(ctx context.Context, force bool, m *SetupMa
 		// 降级保护（§9.5）：常规路径拒绝旧版本（看门狗/回滚直执不受限）。
 		u.log().Info("update: target not newer; skipping",
 			"target", m.Version, "self", u.Version)
+		return nil
+	}
+	// 平台门槛（Linux 节点支持过渡期）：非 Windows 一律在下载前拒绝在线
+	// 编排——当前推送/轮询的 setup.exe 是 Windows 制品，落盘只污染 staging
+	// 与失败退避状态。Linux 升级 = 重跑 install.sh（保留版本目录回滚）。
+	if runtime.GOOS != "windows" {
+		u.log().Info("update: online orchestration unsupported on this platform; "+
+			"upgrade by re-running install.sh", "target", m.Version)
 		return nil
 	}
 	if reason, bad := Blacklisted(u.StateDir, m.Version); bad {
