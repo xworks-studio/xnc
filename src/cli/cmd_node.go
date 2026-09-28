@@ -20,6 +20,7 @@ type nodeDTO struct {
 	ShellType    string  `json:"shell_type"`
 	Status       string  `json:"status"`
 	LastSeenAt   *string `json:"last_seen_at"`
+	Platform     string  `json:"platform,omitempty"` // windows|linux（0007；空 = 旧服务端）
 }
 
 func (n nodeDTO) lastSeen() string {

@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -465,7 +466,7 @@ func registerNode(ctx context.Context, server, clusterID, jwt, publicKeyB64 stri
 	body, err := json.Marshal(map[string]string{
 		"hostname": info.Hostname, "machineId": info.MachineID,
 		"osVersion": info.OSVersion, "agentVersion": info.AgentVersion,
-		"publicKey": publicKeyB64,
+		"publicKey": publicKeyB64, "platform": runtime.GOOS,
 	})
 	if err != nil {
 		return "", fmt.Errorf("internal: %v", err)

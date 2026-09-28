@@ -14,7 +14,7 @@ import (
 
 const getNodeForUser = `-- name: GetNodeForUser :one
 SELECT n.id, n.cluster_id, n.name, n.hostname, n.os_version, n.agent_version,
-       n.shell_type, n.status, n.last_seen_at, c.name AS cluster_name
+       n.shell_type, n.status, n.last_seen_at, n.platform, c.name AS cluster_name
 FROM nodes n
 JOIN cluster_members m ON m.cluster_id = n.cluster_id AND m.user_id = $1
 JOIN clusters c ON c.id = n.cluster_id
@@ -36,6 +36,7 @@ type GetNodeForUserRow struct {
 	ShellType    string             `json:"shell_type"`
 	Status       string             `json:"status"`
 	LastSeenAt   pgtype.Timestamptz `json:"last_seen_at"`
+	Platform     string             `json:"platform"`
 	ClusterName  string             `json:"cluster_name"`
 }
 
@@ -52,6 +53,7 @@ func (q *Queries) GetNodeForUser(ctx context.Context, arg GetNodeForUserParams) 
 		&i.ShellType,
 		&i.Status,
 		&i.LastSeenAt,
+		&i.Platform,
 		&i.ClusterName,
 	)
 	return i, err
@@ -59,7 +61,7 @@ func (q *Queries) GetNodeForUser(ctx context.Context, arg GetNodeForUserParams) 
 
 const listNodesForUser = `-- name: ListNodesForUser :many
 SELECT n.id, n.cluster_id, n.name, n.hostname, n.os_version, n.agent_version,
-       n.shell_type, n.status, n.last_seen_at, c.name AS cluster_name
+       n.shell_type, n.status, n.last_seen_at, n.platform, c.name AS cluster_name
 FROM nodes n
 JOIN cluster_members m ON m.cluster_id = n.cluster_id AND m.user_id = $1
 JOIN clusters c ON c.id = n.cluster_id
@@ -76,6 +78,7 @@ type ListNodesForUserRow struct {
 	ShellType    string             `json:"shell_type"`
 	Status       string             `json:"status"`
 	LastSeenAt   pgtype.Timestamptz `json:"last_seen_at"`
+	Platform     string             `json:"platform"`
 	ClusterName  string             `json:"cluster_name"`
 }
 
@@ -98,6 +101,7 @@ func (q *Queries) ListNodesForUser(ctx context.Context, userID uuid.UUID) ([]Lis
 			&i.ShellType,
 			&i.Status,
 			&i.LastSeenAt,
+			&i.Platform,
 			&i.ClusterName,
 		); err != nil {
 			return nil, err
@@ -152,5 +156,22 @@ func (q *Queries) UpdateNodeMeta(ctx context.Context, arg UpdateNodeMetaParams) 
 		arg.AgentVersion,
 		arg.ID,
 	)
+	return err
+}
+
+const updateNodePlatform = `-- name: UpdateNodePlatform :exec
+UPDATE nodes SET platform = $2, os_version = $3 WHERE id = $1
+`
+
+type UpdateNodePlatformParams struct {
+	ID        uuid.UUID `json:"id"`
+	Platform  string    `json:"platform"`
+	OsVersion string    `json:"os_version"`
+}
+
+// 平台元数据刷新（0007）：仅新 agent 的 HELLO 携带 os 字段时调用（旧
+// agent 空值跳过，不清既有落库）。
+func (q *Queries) UpdateNodePlatform(ctx context.Context, arg UpdateNodePlatformParams) error {
+	_, err := q.db.Exec(ctx, updateNodePlatform, arg.ID, arg.Platform, arg.OsVersion)
 	return err
 }

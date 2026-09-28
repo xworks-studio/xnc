@@ -92,6 +92,17 @@ type enrollReq struct {
 	OSVersion    string `json:"osVersion"`
 	AgentVersion string `json:"agentVersion"`
 	PublicKey    string `json:"publicKey"`
+	// Platform 节点平台（windows|linux，0007；空按 windows——旧客户端与
+	// token 路径不带）。分发面与 UPDATE_AVAILABLE 推送按此选制品。
+	Platform string `json:"platform"`
+}
+
+// normalizePlatform 平台词表白名单：非 "linux" 一律归 windows（含空）。
+func normalizePlatform(p string) string {
+	if p == "linux" {
+		return "linux"
+	}
+	return "windows"
 }
 
 // enrollNode 共用注册落库事务（spec §6.4：JWT 注册路径"等价于服务端铸造并
@@ -142,7 +153,8 @@ func (h *handlers) enrollNode(ctx context.Context, clusterID uuid.UUID, req enro
 		}
 		node, err := q.AdoptNodeIdentity(ctx, sqlc.AdoptNodeIdentityParams{
 			PublicKey: req.PublicKey, Hostname: req.Hostname,
-			OsVersion: req.OSVersion, AgentVersion: req.AgentVersion, ID: existing.ID,
+			OsVersion: req.OSVersion, AgentVersion: req.AgentVersion,
+			Platform: normalizePlatform(req.Platform), ID: existing.ID,
 		})
 		if err != nil {
 			return sqlc.Node{}, proto.Err(500, proto.CodeInternal, "adopt node")
@@ -188,6 +200,7 @@ func (h *handlers) enrollNode(ctx context.Context, clusterID uuid.UUID, req enro
 		ID: uuid.New(), ClusterID: clusterID, Name: name, MachineID: req.MachineID,
 		Hostname: req.Hostname, OsVersion: req.OSVersion,
 		AgentVersion: req.AgentVersion, PublicKey: req.PublicKey,
+		Platform: normalizePlatform(req.Platform),
 	})
 	if err != nil {
 		// 23505 按约束名分流（0005 起 machine_id 全局唯一）：

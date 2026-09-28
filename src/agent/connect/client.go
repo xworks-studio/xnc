@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"math/rand"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -218,7 +219,8 @@ func (c *Client) handshake(ctx context.Context) (*websocket.Conn, error) {
 	}
 	if err := writeMsg(ctx, ws, proto.TypeHello, proto.Hello{
 		NodeID: c.Key.NodeID, Hostname: c.Info.Hostname,
-		AgentVersion: c.Info.AgentVersion, ShellType: c.Info.ShellType}); err != nil {
+		AgentVersion: c.Info.AgentVersion, ShellType: c.Info.ShellType,
+		OS: runtime.GOOS, Arch: runtime.GOARCH, OSVersion: c.Info.OSVersion}); err != nil {
 		return nil, err
 	}
 	m, err = readMsg(ctx, ws, 30*time.Second)

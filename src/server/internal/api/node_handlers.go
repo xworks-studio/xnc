@@ -12,12 +12,12 @@ import (
 	"xnc/server/internal/db/sqlc"
 )
 
-func (h *handlers) nodeDTO(id, name, cluster, hostname, osv, agentv, shell, status string,
+func (h *handlers) nodeDTO(id, name, cluster, hostname, osv, agentv, shell, status, platform string,
 	lastSeen any) map[string]any {
 	return map[string]any{
 		"id": id, "name": name, "cluster": cluster, "hostname": hostname,
 		"os_version": osv, "agent_version": agentv, "shell_type": shell,
-		"status": status, "last_seen_at": lastSeen,
+		"status": status, "last_seen_at": lastSeen, "platform": platform,
 	}
 }
 
@@ -51,7 +51,7 @@ func (h *handlers) listNodes(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		out = append(out, h.nodeDTO(n.ID.String(), n.Name, n.ClusterName, n.Hostname,
-			n.OsVersion, n.AgentVersion, n.ShellType, status, tsOrNull(n.LastSeenAt)))
+			n.OsVersion, n.AgentVersion, n.ShellType, status, n.Platform, tsOrNull(n.LastSeenAt)))
 	}
 	respondJSON(w, 200, out)
 }
@@ -75,5 +75,5 @@ func (h *handlers) getNode(w http.ResponseWriter, r *http.Request) {
 		status = "offline"
 	}
 	respondJSON(w, 200, h.nodeDTO(n.ID.String(), n.Name, n.ClusterName, n.Hostname,
-		n.OsVersion, n.AgentVersion, n.ShellType, status, tsOrNull(n.LastSeenAt)))
+		n.OsVersion, n.AgentVersion, n.ShellType, status, n.Platform, tsOrNull(n.LastSeenAt)))
 }

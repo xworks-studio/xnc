@@ -64,6 +64,7 @@ type Node struct {
 	CreatedAt     time.Time          `json:"created_at"`
 	TargetRelease pgtype.Text        `json:"target_release"`
 	Channel       string             `json:"channel"`
+	Platform      string             `json:"platform"`
 }
 
 type Relay struct {

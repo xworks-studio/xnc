@@ -110,7 +110,12 @@ type Hello struct {
 	Hostname     string   `json:"hostname"`
 	AgentVersion string   `json:"agentVersion"`
 	ShellType    string   `json:"shellType"`
-	Shells       []string `json:"shells,omitempty"` // 可用 shell 列表（bash/pwsh/powershell/cmd）
+	Shells       []string `json:"shells,omitempty"` // 可用 shell 列表（bash/sh/zsh/pwsh/powershell/cmd）
+	// OS/Arch/OSVersion 节点平台（windows/linux；Linux 节点支持起随
+	// HELLO 上报并落库，OS 空 = 旧 agent，按 windows 处理）。
+	OS        string `json:"os,omitempty"`
+	Arch      string `json:"arch,omitempty"`
+	OSVersion string `json:"osVersion,omitempty"`
 }
 
 // HelloAck 携带目标版本（快速版本检查三通道之一）：agent 比对后若落后，
