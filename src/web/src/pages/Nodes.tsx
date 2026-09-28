@@ -210,6 +210,7 @@ export default function Nodes() {
               <tr>
                 <th>Name</th>
                 <th>Cluster</th>
+                <th>OS</th>
                 <th>Status</th>
                 <th>Agent</th>
                 <th>Last seen</th>
@@ -225,6 +226,7 @@ export default function Nodes() {
                 >
                   <td>{n.name}</td>
                   <td className="dim">{n.cluster}</td>
+                  <td className="dim">{n.platform === "linux" ? "Linux" : "Windows"}</td>
                   <td><StatusBadge status={n.status} /></td>
                   <td className="mono dim">{n.agent_version}</td>
                   <td className="dim">{lastSeen(n.last_seen_at)}</td>
