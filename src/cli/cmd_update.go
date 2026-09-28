@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"runtime"
 
 	"github.com/spf13/cobra"
 
@@ -58,7 +59,7 @@ func runUpdate(cmd *cobra.Command, channelFlag string) error {
 	saveChannel(channelFlag)
 
 	var latest cliLatestInfo
-	path := "/api/cli/latest?channel=" + channelFlag
+	path := "/api/cli/latest?channel=" + channelFlag + "&os=" + runtime.GOOS
 	if err := cl.Do("GET", path, nil, &latest); err != nil {
 		return failAPI(cmd, err)
 	}
@@ -68,8 +69,8 @@ func runUpdate(cmd *cobra.Command, channelFlag string) error {
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "%s -> %s [%s]\n", cliVersion, latest.Version, channelFlag)
 
-	// 2. 下载（Bearer 认证的裸 HTTP）。
-	body, err := downloadAuthenticated(cl, "/api/cli/download?channel="+channelFlag)
+	// 2. 下载（Bearer 认证的裸 HTTP；os 参数选平台制品）。
+	body, err := downloadAuthenticated(cl, "/api/cli/download?channel="+channelFlag+"&os="+runtime.GOOS)
 	if err != nil {
 		return failAPI(cmd, proto.Err(0, "NETWORK", err.Error()))
 	}
