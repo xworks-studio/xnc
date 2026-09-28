@@ -22,10 +22,10 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.work
-      # agent 模块在 linux 存在预存在构建失败（src/agent/session，与新增
-      # 变更无关，见设计 §2.3）——linux 仅测试跨平台模块，agent 由
-      # go-windows 覆盖。mockagent 依赖 src/agent/session 且仅用于 Windows
-      # 负载测试，一并排除。rtvload 依赖 quic-go（跨平台，linux 覆盖）。
+      # agent 的功能测试是 Windows 语义（updater/orchestrate 真实进程等），
+      # 归 go-windows 覆盖；linux 侧 agent+mockagent 只做编译+vet 门禁
+      # （src/agent/session 的预存在 linux 构建失败已随 Linux 节点支持修复）。
+      # rtvload 依赖 quic-go（跨平台，linux 覆盖）。
       - name: test (proto server cli shellsmoke tools)
         run: |
           for m in src/proto src/server src/cli src/shellsmoke src/tools/desktopreport src/tools/nalcheck src/tools/rtvload; do
@@ -35,6 +35,10 @@ jobs:
       - name: build shellhost root (linux 编译门禁)
         run: (cd src/shellhost && go build .)
         # cmd/xnc-shell-probe 依赖 winio（Windows-only），不在 linux 编译。
+      - name: build agent + mockagent (linux 编译门禁)
+        run: |
+          (cd src/agent && go build ./... && go vet ./...)
+          (cd src/mockagent && go build ./... && go vet ./...)
       - name: upload failure logs
         if: failure()
         uses: actions/upload-artifact@v4
