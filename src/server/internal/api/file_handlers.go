@@ -9,8 +9,11 @@ import (
 )
 
 var (
-	// absPathRe：Windows 绝对路径——盘符（C:\...）或 UNC（\\server\...）前缀。
-	absPathRe = regexp.MustCompile(`^[A-Za-z]:\\.+|^\\\\.+`)
+	// absPathRe：绝对路径形态——Windows 盘符（C:\...）/UNC（\\server\...）
+	// 或 POSIX 根路径（/...）。跨平台节点（Windows/Linux）都接受：路径在
+	// 对侧平台不合法时由节点侧自然报错，此处校验仅做 sanity（防相对路径
+	// 逃逸到节点进程 CWD）。
+	absPathRe = regexp.MustCompile(`^[A-Za-z]:\\.+|^\\\\.+|^/`)
 	// sha256Re：64 位小写 hex。
 	sha256Re = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
