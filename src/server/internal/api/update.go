@@ -15,8 +15,11 @@ import (
 	"xnc/server/internal/db/sqlc"
 )
 
-// cliArtifactName — CLI 制品的固定命名。
-const cliArtifactName = "xnc-windows-amd64.exe"
+// CLI 制品的固定命名（按平台）。
+const (
+	cliArtifactName     = "xnc-windows-amd64.exe"
+	cliLinuxArtifactName = "xnc-linux-amd64"
+)
 
 // targetReleaseFor — 节点的目标版本：pin 优先，否则节点所在频道的最新。
 // 无可用 release 时返回 false（不触发更新）。
@@ -54,9 +57,10 @@ func (h *handlers) targetReleaseFor(ctx context.Context, nodeID uuid.UUID) (sqlc
 // 由 agent 强制与 server 同源；拉取 setup.json 是轮询路径（CheckNow）
 // 的清单来源，推送路径不经过。
 //
-// 未上线直采终态（设计 §14）：更新唯一经安装器（setup.exe 制品）编排，
-// 遗留 bundle 通道已移除——release 不含 setup.exe 制品时不推送（仅告警，
-// 发布流水线漏传安装器属配置错误，应修复发布而非降级兜底）。
+// 平台路由（0007）：按 nodes.platform 选制品——windows → setup.exe、
+// linux → xnc-linux-amd64.tar.gz（url 带 platform 参数）。目标 release
+// 不含该平台制品时不推送（仅告警：单平台版本对异平台节点静默跳过属
+// 预期；全缺属发布配置错误，应修复发布而非降级兜底）。
 func (h *handlers) maybeOfferUpdate(ctx context.Context, nodeID uuid.UUID, currentVersion string, send func(proto.Message) error) {
 	if currentVersion == "" {
 		return
@@ -65,19 +69,29 @@ func (h *handlers) maybeOfferUpdate(ctx context.Context, nodeID uuid.UUID, curre
 	if !ok || rel.Version == currentVersion {
 		return
 	}
-	art, err := h.st.Q().GetArtifact(ctx, sqlc.GetArtifactParams{ReleaseID: rel.ID, Name: setupArtifactName})
+	platform := "windows"
+	if node, err := h.st.Q().GetNodeByID(ctx, nodeID); err == nil {
+		platform = node.Platform
+	}
+	artifact, url := setupArtifactName, "/installer?channel="+rel.Channel
+	if platform == "linux" {
+		artifact, url = linuxArtifactName, "/installer?channel="+rel.Channel+"&platform=linux"
+	}
+	art, err := h.st.Q().GetArtifact(ctx, sqlc.GetArtifactParams{ReleaseID: rel.ID, Name: artifact})
 	if err != nil {
-		slog.Warn("update: setup artifact missing; not offering", "version", rel.Version, "err", err)
+		slog.Warn("update: platform artifact missing; not offering",
+			"version", rel.Version, "platform", platform, "err", err)
 		return
 	}
 	push, _ := proto.NewMsg(proto.TypeUpdateAvailable, proto.UpdateAvailable{
 		Version: rel.Version,
-		URL:     "/installer?channel=" + rel.Channel,
+		URL:     url,
 		SHA256:  art.Sha256,
 	})
 	if err := send(push); err != nil {
 		slog.Warn("update: push send failed", "node", nodeID, "err", err)
 	} else {
-		slog.Info("update: pushed", "node", nodeID, "from", currentVersion, "to", rel.Version)
+		slog.Info("update: pushed", "node", nodeID, "platform", platform,
+			"from", currentVersion, "to", rel.Version)
 	}
 }

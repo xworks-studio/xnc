@@ -80,8 +80,26 @@ func TestTunnelTargetWhitelist(t *testing.T) {
 		t.Fatal("no SESSION_OPEN")
 	}
 
+	// ssh 目标（Linux 节点，2026-09-28）→ 202，host/port 展开（重新布防
+	// 捕获：captureSessionOpen 单次消费）。
+	gotOpen2 := captureSessionOpen(t, ctrl)
+	respSsh := postJSON(t, env, "/api/nodes/"+nodeID+"/tunnel", `{"target":"ssh"}`)
+	defer respSsh.Body.Close()
+	require.Equal(t, 202, respSsh.StatusCode)
+	select {
+	case so := <-gotOpen2:
+		assert.Equal(t, proto.KindTunnel, so.Kind)
+		var p map[string]any
+		require.NoError(t, json.Unmarshal(so.Params, &p))
+		assert.Equal(t, "ssh", p["target"])
+		assert.Equal(t, "127.0.0.1", p["host"])
+		assert.Equal(t, float64(22), p["port"])
+	case <-time.After(3 * time.Second):
+		t.Fatal("no SESSION_OPEN for ssh target")
+	}
+
 	// 未知 target → 400
-	resp2 := postJSON(t, env, "/api/nodes/"+nodeID+"/tunnel", `{"target":"ssh"}`)
+	resp2 := postJSON(t, env, "/api/nodes/"+nodeID+"/tunnel", `{"target":"vnc"}`)
 	_ = resp2.Body.Close()
 	assert.Equal(t, 400, resp2.StatusCode)
 }
