@@ -282,9 +282,14 @@ func (ex *Exec) writeScript(sessionID, ext, script string) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", err
 	}
-	// 0o644:shell 经用户令牌运行,须可读(agent SYSTEM 落盘,0644 让
-	// 用户 token 侧的 xnc-shell 能读取)。
-	return path, os.WriteFile(path, []byte(script), 0o644)
+	// 权限:Windows .ps1 经 pwsh `& '<path>'` 调用,读权限即够(0644 让
+	// 用户 token 侧的 xnc-shell 能读取);posix .sh 以命令路径直接执行,
+	// 须带执行位(0755)——0644 会 Permission denied(真机踩过)。
+	mode := os.FileMode(0o644)
+	if ext == ".sh" {
+		mode = 0o755
+	}
+	return path, os.WriteFile(path, []byte(script), mode)
 }
 
 // scriptExtFor 按 shell 词表选脚本扩展名:posix 系 .sh、powershell 系

@@ -126,8 +126,11 @@ func runExecUnified(cmd *cobra.Command, args []string, timeout int, cwd, shell s
 	if e := checkExecTimeout(cmd, timeout); e != nil {
 		return e
 	}
-	if shell != "auto" && shell != "bash" && shell != "pwsh" && shell != "powershell" && shell != "cmd" {
-		return failUsage(cmd, "shell must be auto, bash, pwsh, powershell, or cmd")
+	switch shell {
+	case "auto", "bash", "sh", "zsh", "pwsh", "powershell", "cmd":
+		// sh/zsh 仅 Linux 节点可用（agent 侧 direct 宿主词表）。
+	default:
+		return failUsage(cmd, "shell must be auto, bash, sh, zsh, pwsh, powershell, or cmd")
 	}
 
 	// 解析输入源：--file > "-" stdin > 位置参数（dial 之前——本地校验
