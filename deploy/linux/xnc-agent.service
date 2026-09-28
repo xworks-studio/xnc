@@ -1,0 +1,17 @@
+[Unit]
+Description=XNC Node Agent
+Documentation=https://xnc.app
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# current 符号链接由 install.sh 原子切换（/opt/xnc/versions/<ver>/bin/…）；
+# 换版/回滚 = 切链接后 systemctl restart xnc-agent。
+ExecStart=/opt/xnc/current/bin/xnc-agent run --server https://xnc.app --state-dir /var/lib/xnc
+Restart=always
+RestartSec=5
+# 日志走 stdout → journald（journalctl -u xnc-agent）。
+
+[Install]
+WantedBy=multi-user.target
