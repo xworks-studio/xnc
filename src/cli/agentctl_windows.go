@@ -13,3 +13,6 @@ import (
 func dialAgentCtlPipe(ctx context.Context, pipe string) (net.Conn, error) {
 	return winio.DialPipeContext(ctx, pipe)
 }
+
+// agentctlPipeName Windows 默认管道名（与 agent/agentctl 的 Windows 实现一致）。
+func agentctlPipeName() string { return `\\.\pipe\xnc-agentctl` }

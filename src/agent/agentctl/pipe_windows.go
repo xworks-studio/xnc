@@ -9,14 +9,10 @@
 package agentctl
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
-	"time"
 
 	"github.com/Microsoft/go-winio"
 	"golang.org/x/sys/windows"
@@ -27,6 +23,9 @@ import (
 // 自动携带，服务/网络会话不携带，即「interactive logon via token check」
 // 的 DACL 形态；BUILTIN\Users 不整组授予。
 const pipeSDDL = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)"
+
+// defaultPipeName Windows 默认管道名（CLI/安装器按此连接）。
+func defaultPipeName() string { return `\\.\pipe\xnc-agentctl` }
 
 // Listen 阻塞 accept 循环：一次服务一个连接（op 天然串行；后续连接在管道
 // 排队）。ctx 取消关闭监听并返回（优雅停机）。
@@ -57,58 +56,6 @@ func (s *Server) Listen(ctx context.Context) error {
 		}
 		s.handleConn(ctx, conn)
 	}
-}
-
-// handleConn 服务一条连接：读一行请求 → dispatch → 写一行应答 → 关闭。
-// 读不了请求（超时/坏帧）时无法构造有意义的应答，直接关闭。
-func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
-	defer conn.Close()
-	// 各阶段独立时限：读请求 30s；dispatch（含网络往返）opTimeout；写应答
-	// 30s——不能用单一 deadline（op 可能合法耗时超过它）。
-	_ = conn.SetReadDeadline(time.Now().Add(connTimeout))
-	line, err := readLine(conn)
-	if err != nil {
-		s.logger().Warn("agentctl: read request failed", "err", err)
-		return
-	}
-	var req Request
-	resp := Response{}
-	if err := json.Unmarshal(line, &req); err != nil {
-		resp = Errorf("bad_request: invalid json")
-	} else if req.Op == "" {
-		resp = Errorf("bad_request: missing op")
-	} else {
-		opCtx, cancel := context.WithTimeout(ctx, opTimeout)
-		resp = s.dispatch(opCtx, conn, req)
-		cancel()
-	}
-	_ = conn.SetWriteDeadline(time.Now().Add(connTimeout))
-	if err := writeJSONLine(conn, resp); err != nil {
-		s.logger().Warn("agentctl: write response failed", "err", err)
-	}
-	s.logger().Info("agentctl op", "op", req.Op, "ok", resp.OK)
-}
-
-// readLine 读一行（'\n' 结尾；容许 EOF 无换行的最后一行），超长/超时报错。
-func readLine(conn net.Conn) ([]byte, error) {
-	r := bufio.NewReader(io.LimitReader(conn, maxRequestLine+1))
-	line, err := r.ReadString('\n')
-	if err != nil && !(errors.Is(err, io.EOF) && line != "") {
-		return nil, err
-	}
-	if len(line) > maxRequestLine {
-		return nil, fmt.Errorf("request line exceeds %d bytes", maxRequestLine)
-	}
-	return []byte(line), nil
-}
-
-func writeJSONLine(conn net.Conn, resp Response) error {
-	b, err := json.Marshal(resp)
-	if err != nil {
-		return err
-	}
-	_, err = conn.Write(append(b, '\n'))
-	return err
 }
 
 // connIsAdmin 校验连接方是否为管理员：管道句柄 → 客户端 PID → 打开其进程
@@ -152,24 +99,5 @@ func RoundTrip(ctx context.Context, pipe string, req Request) (Response, error) 
 	if err != nil {
 		return Response{}, fmt.Errorf("agentctl: dial %s: %w", pipe, err)
 	}
-	defer conn.Close()
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	}
-	b, err := json.Marshal(req)
-	if err != nil {
-		return Response{}, err
-	}
-	if _, err := conn.Write(append(b, '\n')); err != nil {
-		return Response{}, fmt.Errorf("agentctl: write request: %w", err)
-	}
-	line, err := readLine(conn)
-	if err != nil {
-		return Response{}, fmt.Errorf("agentctl: read response: %w", err)
-	}
-	var resp Response
-	if err := json.Unmarshal(line, &resp); err != nil {
-		return Response{}, fmt.Errorf("agentctl: decode response: %w", err)
-	}
-	return resp, nil
+	return roundTripJSON(ctx, conn, req)
 }
