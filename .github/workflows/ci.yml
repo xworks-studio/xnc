@@ -39,6 +39,11 @@ jobs:
         run: |
           (cd src/agent && go build ./... && go vet ./...)
           (cd src/mockagent && go build ./... && go vet ./...)
+      # identity 的 Save/Load roundtrip 在 linux 有独立意义（protect 桩与
+      # Windows DPAPI 的缓冲区契约不同——2026-09-28 全零私钥真机事故的
+      # 回归钉子）；machineinfo 同为无外部依赖包。
+      - name: test agent identity/machineinfo (linux)
+        run: (cd src/agent && go test ./identity ./machineinfo)
       - name: upload failure logs
         if: failure()
         uses: actions/upload-artifact@v4
