@@ -130,6 +130,8 @@ build（web dist + 版本镜像）→ `docker save` → SFTP 上 SRV → `docker
 自动出。
 
 - **本地路径**：`powershell deploy/build-server-local.ps1 -ServerVersion <v>`
+  （SRV_HOST 必须是源站 IP：xnc.app 域名现经 Cloudflare 代理，只转 443，
+  域名:22 恒黑洞——2026-10-12 实测根因，此前误记为安全组移除）
   （参数名刻意避开 -Version——powershell.exe -File 会把它吞作引擎参数；
   远端推送经 deploy/push_server_image.py 走 paramiko 密码认证，凭据读
   `deploy/.env` 的 SRV_* 键）。
@@ -291,10 +293,10 @@ vcpkg 无基线锁定，ffmpeg 头漂移（FF_PROFILE_* 枚举缺定义）编译
   宣告；caddy `:8443` 站点块双机已预置（域名证书，非标端口不经备案
   SNI 拦截），**安全组已放行 8443/TCP（2026-09-14 验证：浏览器经
   `wss://r2.xnc.app:8443` 真实终端会话全链通过）；逃生开关 = 改单元
-  `--session-port 8443` + 重启 xnc-relay**（约 30 秒）。**2026-09-14 晚：
-  安全组已移除 22/TCP（TCP 半开、SSH 不可达）——逃生开关与 push_relay.py
-  均依赖 SSH，届时须先经阿里云控制台 Workbench/VNC 恢复 22（建议限源）
-  再操作**。**遗留风险**：
+  `--session-port 8443` + 重启 xnc-relay**（约 30 秒）。**2026-09-14 晚曾移除 22/TCP；2026-10-12 复核：主站 SSH 用源站 IP
+  47.243.209.52 直连可用（xnc.app 域名在 Cloudflare 后、域名 22 黑洞是
+  "半开"假象根因；SRV_HOST/password 已更新进 deploy/.env）——逃生开关与
+  push_relay.py 对 relay 机是否仍受阻未复核，操作前先验证**。**遗留风险**：
   relay 域名证书（LE，至
   2026-12-10）续期 ~11-10 走 80/443 挑战均被备案拦截所阻，需提前改
   dns-01；主站 xnc.app 同域名在大陆，80/443 目前正常但风险同源。
@@ -303,12 +305,14 @@ vcpkg 无基线锁定，ffmpeg 头漂移（FF_PROFILE_* 枚举缺定义）编译
 - **xnc.app 对 `Python-urllib/*` UA 的请求回 403**（2026-09-28 真机发现，
   Go/curl UA 正常）：运维/诊断脚本直调生产 API 必须带 CLI UA（如
   `xnc-cli/0.10.36`），否则排障方向会被带偏。
-- **Linux 分发面平台化（0007+setup/update handlers）已合入 main 分支但
-  生产部署阻塞**：SRV 22 不通（2026-09-14 安全组移除）→ 恢复 22 后
-  `deploy/build-server-local.ps1` 部署 + 上传 linux 制品
-  （multipart 字段 `linux`/`cli-linux`）+ 真机在线升级验收（验收 B）。
-  此前生产 /installer.json 不认 platform 参数、file 会话拒 POSIX 路径、
-  tunnel 无 ssh 目标（已部署 agent 不受影响，纯服务端能力）。
+- **Linux 分发面平台化已上生产（2026-10-12，server 0.11.8 + dev 频道
+  0.10.37 linux 制品）**：/install.sh、/installer(.json)?platform=linux、
+  file POSIX 路径、tunnel ssh、UPDATE_AVAILABLE 平台路由全部真机验收。
+  注意语义：仅含 linux 制品的 release 对 Windows 节点自动跳过推送
+  （artifact missing），dev 频道现无 setup.exe——Windows dev 节点会停在
+  旧版直到下一版带 setup。lab-ubuntu1 已在 0.10.37/dev；**0.10.36→0.10.37
+  的首次升级经 install.sh 手工桥接**（执行位修复随 0.10.37 生效，
+  0.10.38+ 起免手工）。
 - Linux agent 看门狗缺口：新 agent 在控制连接 OnReady 前崩溃循环时，
   无外部看门狗强回滚（systemd Restart 持续拉起 + pending Deadline 兜底；
   Windows schtask 等价物待做，见 updater/orchestrate_linux.go 文件头）。
