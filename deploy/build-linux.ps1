@@ -35,7 +35,11 @@ Invoke-GoBuild "$repo\src\agent" "-X xnc/agent/machineinfo.Version=$Version" (Jo
 Invoke-GoBuild "$repo\src\cli" "-X main.cliVersion=$Version" (Join-Path $stage "bin\xnc") "."
 
 Copy-Item "$repo\deploy\linux\xnc-agent.service" "$stage\systemd\"
-Copy-Item "$repo\deploy\linux\install.sh" "$stage\install.sh"
+# install.sh 强制 LF：git autocrlf 检出会引入 CRLF，"#!/bin/sh\r" 在目标机
+# exec 直接 ENOENT（2026-10-12 0.10.38 发布事故；.gitattributes 同步钉住，
+# 此处双保险）。
+$shSrc = [IO.File]::ReadAllText("$repo\deploy\linux\install.sh")
+[IO.File]::WriteAllText("$stage\install.sh", $shSrc.Replace("`r`n", "`n"))
 
 $out = "$repo\bin\xnc-linux-$Arch-$Version.tar.gz"
 New-Item -ItemType Directory -Force -Path "$repo\bin" | Out-Null

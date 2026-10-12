@@ -58,7 +58,11 @@ case "${1:-}" in
 esac
 [ $# -eq 0 ] || die "usage: sudo ./install.sh [--uninstall [--purge-data]]"
 
-[ -x "$PAYLOAD_DIR/bin/xnc-agent" ] || die "payload bin/xnc-agent missing (run from the extracted tarball root)"
+[ -f "$PAYLOAD_DIR/bin/xnc-agent" ] || die "payload bin/xnc-agent missing (run from the extracted tarball root)"
+
+# 制品可执行位不可信（Windows bsdtar 打包存 0644；curl|bash / 手工解压都
+# 不会先 chmod）：探测版本前先授予。staging 拷贝另有统一 chmod。
+chmod 0755 "$PAYLOAD_DIR/bin/xnc-agent" 2>/dev/null || true
 
 # 版本从制品自读（构建期 ldflags 注入；与 agent 自报同源）。
 VERSION=$("$PAYLOAD_DIR/bin/xnc-agent" --version)
