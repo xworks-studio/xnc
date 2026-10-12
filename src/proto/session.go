@@ -94,7 +94,7 @@ type ExecParams struct {
 	Script     string   `json:"script,omitempty"`
 	TimeoutSec int      `json:"timeoutSec,omitempty"`
 	Cwd        string   `json:"cwd,omitempty"`
-	Shell      string   `json:"shell,omitempty"` // auto|bash|pwsh|powershell|cmd
+	Shell      string   `json:"shell,omitempty"` // auto|bash|sh|zsh|pwsh|powershell|cmd（posix 三者仅 Linux 节点可用）
 	Env        []string `json:"env,omitempty"`   // KEY=VAL 列表
 	System     bool     `json:"system,omitempty"`
 }
@@ -118,7 +118,7 @@ type ExecResult struct {
 type ShellParams struct {
 	Cols   int    `json:"cols,omitempty"`
 	Rows   int    `json:"rows,omitempty"`
-	Shell  string `json:"shell,omitempty"`
+	Shell  string `json:"shell,omitempty"` // 空=平台默认（Windows pwsh/powershell，Linux bash/sh）
 	System bool   `json:"system,omitempty"`
 }
 

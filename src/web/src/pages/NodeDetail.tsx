@@ -74,6 +74,7 @@ export default function NodeDetail() {
     ["Cluster", node.cluster],
     ["Status", <StatusBadge key="s" status={node.status} />],
     ["Hostname", node.hostname],
+    ["Platform", node.platform === "linux" ? "Linux" : "Windows"],
     ["OS", node.os_version],
     ["Agent", node.agent_version],
     ["Shell", node.shell_type],
@@ -86,10 +87,14 @@ export default function NodeDetail() {
       <h1>{node.name}</h1>
       <div className="btn-row">
         <Link className="btn" to={`/terminal/${node.id}`}>Terminal</Link>
-        <Link className="btn" to={`/desktop/${node.id}`}>Live Desktop</Link>
-        <button type="button" onClick={() => setShowRdp((v) => !v)}>
-          {showRdp ? "Hide Windows RDP" : "Windows RDP"}
-        </button>
+        {node.platform !== "linux" && (
+          <>
+            <Link className="btn" to={`/desktop/${node.id}`}>Live Desktop</Link>
+            <button type="button" onClick={() => setShowRdp((v) => !v)}>
+              {showRdp ? "Hide Windows RDP" : "Windows RDP"}
+            </button>
+          </>
+        )}
         {node.status !== "disabled" ? (
           <button type="button" className="danger" disabled={busy} onClick={() => toggleDisabled(false)}>
             Disable

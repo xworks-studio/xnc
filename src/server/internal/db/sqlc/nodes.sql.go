@@ -13,8 +13,8 @@ import (
 
 const adoptNodeIdentity = `-- name: AdoptNodeIdentity :one
 UPDATE nodes SET public_key = $1, hostname = $2, os_version = $3,
-                  agent_version = $4, shell_type = '', last_seen_at = NULL
-WHERE id = $5 RETURNING id, cluster_id, name, machine_id, hostname, os_version, agent_version, shell_type, public_key, status, last_seen_at, created_at, target_release, channel
+                  agent_version = $4, shell_type = '', last_seen_at = NULL, platform = $5
+WHERE id = $6 RETURNING id, cluster_id, name, machine_id, hostname, os_version, agent_version, shell_type, public_key, status, last_seen_at, created_at, target_release, channel, platform
 `
 
 type AdoptNodeIdentityParams struct {
@@ -22,6 +22,7 @@ type AdoptNodeIdentityParams struct {
 	Hostname     string    `json:"hostname"`
 	OsVersion    string    `json:"os_version"`
 	AgentVersion string    `json:"agent_version"`
+	Platform     string    `json:"platform"`
 	ID           uuid.UUID `json:"id"`
 }
 
@@ -36,6 +37,7 @@ func (q *Queries) AdoptNodeIdentity(ctx context.Context, arg AdoptNodeIdentityPa
 		arg.Hostname,
 		arg.OsVersion,
 		arg.AgentVersion,
+		arg.Platform,
 		arg.ID,
 	)
 	var i Node
@@ -54,14 +56,15 @@ func (q *Queries) AdoptNodeIdentity(ctx context.Context, arg AdoptNodeIdentityPa
 		&i.CreatedAt,
 		&i.TargetRelease,
 		&i.Channel,
+		&i.Platform,
 	)
 	return i, err
 }
 
 const createNode = `-- name: CreateNode :one
 INSERT INTO nodes (id, cluster_id, name, machine_id, hostname, os_version,
-                   agent_version, shell_type, public_key)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id, cluster_id, name, machine_id, hostname, os_version, agent_version, shell_type, public_key, status, last_seen_at, created_at, target_release, channel
+                   agent_version, shell_type, public_key, platform)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id, cluster_id, name, machine_id, hostname, os_version, agent_version, shell_type, public_key, status, last_seen_at, created_at, target_release, channel, platform
 `
 
 type CreateNodeParams struct {
@@ -74,6 +77,7 @@ type CreateNodeParams struct {
 	AgentVersion string    `json:"agent_version"`
 	ShellType    string    `json:"shell_type"`
 	PublicKey    string    `json:"public_key"`
+	Platform     string    `json:"platform"`
 }
 
 func (q *Queries) CreateNode(ctx context.Context, arg CreateNodeParams) (Node, error) {
@@ -87,6 +91,7 @@ func (q *Queries) CreateNode(ctx context.Context, arg CreateNodeParams) (Node, e
 		arg.AgentVersion,
 		arg.ShellType,
 		arg.PublicKey,
+		arg.Platform,
 	)
 	var i Node
 	err := row.Scan(
@@ -104,6 +109,7 @@ func (q *Queries) CreateNode(ctx context.Context, arg CreateNodeParams) (Node, e
 		&i.CreatedAt,
 		&i.TargetRelease,
 		&i.Channel,
+		&i.Platform,
 	)
 	return i, err
 }
@@ -145,7 +151,7 @@ func (q *Queries) GetMachineIDConflictCluster(ctx context.Context, arg GetMachin
 }
 
 const getNodeByID = `-- name: GetNodeByID :one
-SELECT id, cluster_id, name, machine_id, hostname, os_version, agent_version, shell_type, public_key, status, last_seen_at, created_at, target_release, channel FROM nodes WHERE id = $1
+SELECT id, cluster_id, name, machine_id, hostname, os_version, agent_version, shell_type, public_key, status, last_seen_at, created_at, target_release, channel, platform FROM nodes WHERE id = $1
 `
 
 func (q *Queries) GetNodeByID(ctx context.Context, id uuid.UUID) (Node, error) {
@@ -166,12 +172,13 @@ func (q *Queries) GetNodeByID(ctx context.Context, id uuid.UUID) (Node, error) {
 		&i.CreatedAt,
 		&i.TargetRelease,
 		&i.Channel,
+		&i.Platform,
 	)
 	return i, err
 }
 
 const getNodeByIdentity = `-- name: GetNodeByIdentity :one
-SELECT id, cluster_id, name, machine_id, hostname, os_version, agent_version, shell_type, public_key, status, last_seen_at, created_at, target_release, channel FROM nodes WHERE cluster_id = $1 AND machine_id = $2
+SELECT id, cluster_id, name, machine_id, hostname, os_version, agent_version, shell_type, public_key, status, last_seen_at, created_at, target_release, channel, platform FROM nodes WHERE cluster_id = $1 AND machine_id = $2
 `
 
 type GetNodeByIdentityParams struct {
@@ -197,12 +204,13 @@ func (q *Queries) GetNodeByIdentity(ctx context.Context, arg GetNodeByIdentityPa
 		&i.CreatedAt,
 		&i.TargetRelease,
 		&i.Channel,
+		&i.Platform,
 	)
 	return i, err
 }
 
 const getNodeByNameInCluster = `-- name: GetNodeByNameInCluster :one
-SELECT id, cluster_id, name, machine_id, hostname, os_version, agent_version, shell_type, public_key, status, last_seen_at, created_at, target_release, channel FROM nodes WHERE cluster_id = $1 AND name = $2
+SELECT id, cluster_id, name, machine_id, hostname, os_version, agent_version, shell_type, public_key, status, last_seen_at, created_at, target_release, channel, platform FROM nodes WHERE cluster_id = $1 AND name = $2
 `
 
 type GetNodeByNameInClusterParams struct {
@@ -228,6 +236,7 @@ func (q *Queries) GetNodeByNameInCluster(ctx context.Context, arg GetNodeByNameI
 		&i.CreatedAt,
 		&i.TargetRelease,
 		&i.Channel,
+		&i.Platform,
 	)
 	return i, err
 }
@@ -261,7 +270,7 @@ func (q *Queries) MoveNodeCluster(ctx context.Context, arg MoveNodeClusterParams
 }
 
 const renameNode = `-- name: RenameNode :one
-UPDATE nodes SET name = $2 WHERE id = $1 RETURNING id, cluster_id, name, machine_id, hostname, os_version, agent_version, shell_type, public_key, status, last_seen_at, created_at, target_release, channel
+UPDATE nodes SET name = $2 WHERE id = $1 RETURNING id, cluster_id, name, machine_id, hostname, os_version, agent_version, shell_type, public_key, status, last_seen_at, created_at, target_release, channel, platform
 `
 
 type RenameNodeParams struct {
@@ -289,6 +298,7 @@ func (q *Queries) RenameNode(ctx context.Context, arg RenameNodeParams) (Node, e
 		&i.CreatedAt,
 		&i.TargetRelease,
 		&i.Channel,
+		&i.Platform,
 	)
 	return i, err
 }

@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -115,6 +116,11 @@ type Updater struct {
 	serviceHealthy       func() error
 	registerWatchdogTask func(runAt time.Time) error
 	deleteWatchdogTask   func() // 删除失败仅记日志（任务一次性，残留不重触发）
+
+	// Linux 回滚缝（orchestrate_linux.go；Windows/其余平台 nil）：版本目录
+	// 即回滚源（install.sh 保留最近版本）——无缓存 tarball 也可更新/回滚。
+	rollbackReady    func(from string) bool
+	rollbackFallback func(from string) error
 }
 
 // New 构造编排器并装配平台实现（Windows 真实现，其他平台报错桩）。
@@ -262,6 +268,15 @@ func (u *Updater) orchestrateTrigger(ctx context.Context, force bool, m *SetupMa
 			"target", m.Version, "self", u.Version)
 		return nil
 	}
+	// 平台门槛：在线编排仅 Windows（Inno 安装器）与 Linux（tar.gz 解包 +
+	// systemd 版本目录切换，orchestrate_linux.go）；其余平台在下载前拒绝。
+	switch runtime.GOOS {
+	case "windows", "linux":
+	default:
+		u.log().Info("update: online orchestration unsupported on this platform",
+			"goos", runtime.GOOS, "target", m.Version)
+		return nil
+	}
 	if reason, bad := Blacklisted(u.StateDir, m.Version); bad {
 		u.log().Info("update: version blacklisted until a new version appears",
 			"version", m.Version, "reason", reason)
@@ -369,6 +384,18 @@ func (u *Updater) Rollback(p *PendingUpdate, reason string) error {
 		src = StagedInstaller(u.StateDir, p.From)
 	}
 	if src == "" {
+		// Linux 兜底：缓存/staging 无 from 版 tarball 时切回版本目录
+		// （install.sh 保留的 from 版目录），语义等同"重跑旧安装器"。
+		if u.rollbackFallback != nil {
+			_ = DeletePending(u.StateDir)
+			u.deleteWatchdogTask()
+			u.log().Warn("update: rolling back to previous version directory",
+				"from", p.From, "brokenTo", p.To, "reason", reason)
+			if err := u.rollbackFallback(p.From); err != nil {
+				return fmt.Errorf("rollback via version dir: %w", err)
+			}
+			return nil
+		}
 		u.log().Error("update: rollback source missing; keeping pending for backstop retry",
 			"from", p.From, "to", p.To)
 		return fmt.Errorf("rollback: no cached installer for %s", p.From)
@@ -491,7 +518,7 @@ func (u *Updater) StartupPendingCheck(ctx context.Context) {
 
 // FetchManifest 拉取 /setup.json?channel=<channel>。
 func (u *Updater) FetchManifest(ctx context.Context) (*SetupManifest, error) {
-	uurl := strings.TrimRight(u.ServerURL, "/") + "/installer.json?channel=" + u.channel()
+	uurl := strings.TrimRight(u.ServerURL, "/") + "/installer.json?channel=" + u.channel() + manifestPlatformParam()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, uurl, nil)
 	if err != nil {
 		return nil, err
@@ -579,6 +606,11 @@ func (u *Updater) ensureRollbackSource(ctx context.Context, target *SetupManifes
 	if CachedInstaller(u.StateDir, u.Version) != "" {
 		return nil
 	}
+	// Linux：版本目录即回滚源（install.sh 保留最近版本目录），无缓存
+	// tarball 也放行——下载补拷只对"目录也没有"的形态才有意义。
+	if u.rollbackReady != nil && u.rollbackReady(u.Version) {
+		return nil
+	}
 	if staged := StagedInstaller(u.StateDir, u.Version); staged != "" {
 		return CopyToCache(u.StateDir, staged)
 	}
@@ -601,20 +633,12 @@ func (u *Updater) ensureRollbackSource(ctx context.Context, target *SetupManifes
 	return CopyToCache(u.StateDir, staged)
 }
 
-// ---- 安装器文件定位（T6 命名契约：XNC-Installer[-dev]-<version>.exe）----
+// ---- 安装器文件定位（命名契约平台化：Windows = XNC-Installer[-dev]-<v>.exe，
+// Linux = xnc-linux-amd64[-dev]-<v>.tar.gz；cacheInstallerName/installerSuffix/
+// manifestPlatformParam 在各平台 orchestrate 文件实现）----
 
-// cacheInstallerName staging/缓存安装器文件名（与安装器
-// OutputBaseFilename 一致：dev 频道带 -dev 后缀）。findInstaller 的后缀
-// 匹配兼容旧命名（xnc-setup-*.exe，0.7.2 及之前），过渡期互认。
-func cacheInstallerName(version, channel string) string {
-	if channel == "dev" {
-		return "XNC-Installer-dev-" + version + ".exe"
-	}
-	return "XNC-Installer-" + version + ".exe"
-}
-
-// findInstaller 在 dir 中查找 version 的安装器（精确候选 + "-<version>.exe"
-// 后缀匹配，容忍未来频道后缀）。
+// findInstaller 在 dir 中查找 version 的安装器（精确候选 + "-<version><后缀>"
+// 匹配，容忍未来频道后缀）。
 func findInstaller(dir, version string) string {
 	cands := []string{
 		cacheInstallerName(version, "stable"),
@@ -629,7 +653,7 @@ func findInstaller(dir, version string) string {
 	if err != nil {
 		return ""
 	}
-	suffix := "-" + version + ".exe"
+	suffix := "-" + version + installerSuffix()
 	for _, e := range entries {
 		if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), strings.ToLower(suffix)) {
 			return filepath.Join(dir, e.Name())
@@ -655,6 +679,10 @@ func CachedRollbackInstaller(stateDir, version string) string {
 func (u *Updater) stashRollbackSource() error {
 	src := CachedInstaller(u.StateDir, u.Version)
 	if src == "" {
+		// Linux 版本目录回滚形态：目录本身即 stash（不会被新安装修剪）。
+		if u.rollbackReady != nil && u.rollbackReady(u.Version) {
+			return nil
+		}
 		return fmt.Errorf("no top-level installer for %s to stash", u.Version)
 	}
 	b, err := os.ReadFile(src)

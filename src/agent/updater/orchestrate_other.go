@@ -1,7 +1,7 @@
-//go:build !windows
+//go:build !windows && !linux
 
-// orchestrate_other.go — 非 Windows 桩：安装器编排仅支持 Windows 服务
-// 形态（与 bundle 期一致）。
+// orchestrate_other.go — 其余平台桩：在线编排仅支持 Windows（Inno 安装器）
+// 与 Linux（tar.gz + systemd 版本目录切换）；本桩保证可移植构建。
 package updater
 
 import (
@@ -15,7 +15,7 @@ import (
 func (u *Updater) platform() {
 	if u.execInstaller == nil {
 		u.execInstaller = func(string) error {
-			return errors.New("installer orchestration not supported on this platform (Windows only)")
+			return errors.New("installer orchestration not supported on this platform")
 		}
 	}
 	if u.serviceHealthy == nil {
@@ -35,3 +35,14 @@ func (u *Updater) platform() {
 func samePath(a, b string) (bool, error) {
 	return strings.EqualFold(filepath.Clean(a), filepath.Clean(b)), nil
 }
+
+// 命名桩：orchestrateTrigger 的平台门槛已拦截，返回 Windows 形态仅保编译。
+func cacheInstallerName(version, channel string) string {
+	if channel == "dev" {
+		return "XNC-Installer-dev-" + version + ".exe"
+	}
+	return "XNC-Installer-" + version + ".exe"
+}
+
+func installerSuffix() string       { return ".exe" }
+func manifestPlatformParam() string { return "" }

@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sync/atomic"
 	"time"
 
@@ -105,14 +106,14 @@ func (ex *Exec) Handle(ctx context.Context, ws *websocket.Conn, sessionID string
 	start := time.Now()
 
 	if p.Script != "" {
-		if _, err := ex.writeScript(sessionID, p.Script); err != nil {
+		if _, err := ex.writeScript(sessionID, scriptExtFor(p.Shell), p.Script); err != nil {
 			ex.logger().Warn("exec write script failed", "session", sessionID, "err", err)
 			ex.result(ctx, ws, nil, false, time.Since(start).Milliseconds(), "", false)
 			return
 		}
-		defer func() { _ = os.Remove(ex.scriptPath(sessionID)) }()
+		defer func() { _ = os.Remove(ex.scriptPath(sessionID, scriptExtFor(p.Shell))) }()
 	}
-	command, profile, err := buildExecCommand(p, ex.scriptPath(sessionID))
+	command, profile, err := buildExecCommand(p, ex.scriptPath(sessionID, scriptExtFor(p.Shell)))
 	if err != nil {
 		ex.logger().Warn("exec build command failed", "session", sessionID, "err", err)
 		ex.result(ctx, ws, nil, false, time.Since(start).Milliseconds(), "BAD_PAYLOAD", false)
@@ -241,8 +242,8 @@ func buildExecCommand(p proto.ExecParams, scriptPath string) (command, profile s
 		shell = shells[0]
 	}
 	switch shell {
-	case "bash":
-		profile = "BASH"
+	case "bash", "sh", "zsh":
+		profile = map[string]string{"bash": "BASH", "sh": "SH", "zsh": "ZSH"}[shell]
 		if p.Script != "" {
 			command = "'" + filepath.ToSlash(scriptPath) + "'"
 		} else {
@@ -266,7 +267,7 @@ func buildExecCommand(p proto.ExecParams, scriptPath string) (command, profile s
 			command = p.Command
 		}
 	default:
-		return "", "", fmt.Errorf("unsupported shell %q (available: bash, pwsh, powershell, cmd)", shell)
+		return "", "", fmt.Errorf("unsupported shell %q (available: bash, sh, zsh, pwsh, powershell, cmd)", shell)
 	}
 	if p.Script == "" && p.Command == "" {
 		return "", "", fmt.Errorf("command or script required")
@@ -274,33 +275,54 @@ func buildExecCommand(p proto.ExecParams, scriptPath string) (command, profile s
 	return command, profile, nil
 }
 
-func (ex *Exec) writeScript(sessionID, script string) (string, error) {
-	path := ex.scriptPath(sessionID)
+func (ex *Exec) writeScript(sessionID, ext, script string) (string, error) {
+	path := ex.scriptPath(sessionID, ext)
 	// 会话脚本归 StateDir\tmp\(2026-09-15 规范 §3.3):目录按需创建,
-	// 崩溃残留被限制在 tmp\ 内(agent 启动清扫 24h 前的 xnc-*.ps1)。
+	// 崩溃残留被限制在 tmp\ 内(agent 启动清扫 24h 前的 xnc-*.ps1/.sh)。
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", err
 	}
-	// 0o644:shell 经用户令牌运行,须可读(agent SYSTEM 落盘,0644 让
-	// 用户 token 侧的 xnc-shell 能读取)。
-	return path, os.WriteFile(path, []byte(script), 0o644)
+	// 权限:Windows .ps1 经 pwsh `& '<path>'` 调用,读权限即够(0644 让
+	// 用户 token 侧的 xnc-shell 能读取);posix .sh 以命令路径直接执行,
+	// 须带执行位(0755)——0644 会 Permission denied(真机踩过)。
+	mode := os.FileMode(0o644)
+	if ext == ".sh" {
+		mode = 0o755
+	}
+	return path, os.WriteFile(path, []byte(script), mode)
 }
 
-func (ex *Exec) scriptPath(sessionID string) string {
+// scriptExtFor 按 shell 词表选脚本扩展名:posix 系 .sh、powershell 系
+// .ps1;auto/未指定按平台默认(Windows .ps1、其余 .sh,与 DetectShells
+// 首选一致)。
+func scriptExtFor(shell string) string {
+	switch shell {
+	case "bash", "sh", "zsh":
+		return ".sh"
+	case "pwsh", "powershell":
+		return ".ps1"
+	}
+	if runtime.GOOS != "windows" {
+		return ".sh"
+	}
+	return ".ps1"
+}
+
+func (ex *Exec) scriptPath(sessionID, ext string) string {
 	if ex.TmpDir != "" {
-		return filepath.Join(ex.TmpDir, "xnc-"+sessionID+".ps1")
+		return filepath.Join(ex.TmpDir, "xnc-"+sessionID+ext)
 	}
 	if ex.StateDir != "" {
 		// 规范 §3.3:会话临时脚本归 StateDir\tmp\(与 staging/、logs/
 		// 同级;不再散落 StateDir 根)。
-		return filepath.Join(ex.StateDir, "tmp", "xnc-"+sessionID+".ps1")
+		return filepath.Join(ex.StateDir, "tmp", "xnc-"+sessionID+ext)
 	}
-	return filepath.Join(os.TempDir(), "xnc-"+sessionID+".ps1")
+	return filepath.Join(os.TempDir(), "xnc-"+sessionID+ext)
 }
 
 // CleanupStaleSessionScripts 清扫会话脚本残留(2026-09-15 规范 §3.3):
-// tmp\ 内 24h 前的 xnc-*.ps1(会话结束/超时本会删除;残留=崩溃/断连遗物),
-// 顺带清扫迁移前散落在 StateDir 根的同名残留。幂等、尽力而为。
+// tmp\ 内 24h 前的 xnc-*.ps1/.sh(会话结束/超时本会删除;残留=崩溃/断连
+// 遗物),顺带清扫迁移前散落在 StateDir 根的 .ps1 残留。幂等、尽力而为。
 func CleanupStaleSessionScripts(stateDir string) {
 	if stateDir == "" {
 		return
@@ -308,6 +330,7 @@ func CleanupStaleSessionScripts(stateDir string) {
 	cutoff := 24 * time.Hour
 	for _, pattern := range []string{
 		filepath.Join(stateDir, "tmp", "xnc-*.ps1"),
+		filepath.Join(stateDir, "tmp", "xnc-*.sh"),
 		filepath.Join(stateDir, "xnc-*.ps1"), // 迁移前的根位置残留
 	} {
 		matches, err := filepath.Glob(pattern)

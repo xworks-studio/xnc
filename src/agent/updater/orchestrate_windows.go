@@ -17,6 +17,22 @@ import (
 	"golang.org/x/sys/windows/svc/mgr"
 )
 
+// cacheInstallerName staging/缓存安装器文件名（与安装器
+// OutputBaseFilename 一致：dev 频道带 -dev 后缀）。findInstaller 的后缀
+// 匹配兼容旧命名（xnc-setup-*.exe，0.7.2 及之前），过渡期互认。
+func cacheInstallerName(version, channel string) string {
+	if channel == "dev" {
+		return "XNC-Installer-dev-" + version + ".exe"
+	}
+	return "XNC-Installer-" + version + ".exe"
+}
+
+// installerSuffix Windows 制品后缀（findInstaller 后缀匹配用）。
+func installerSuffix() string { return ".exe" }
+
+// manifestPlatformParam Windows 是默认制品形态，清单请求无平台参数。
+func manifestPlatformParam() string { return "" }
+
 // installerArgs 静默安装参数（spec §9.3；/DIR 指向安装目录）。
 //
 // /DIR 不带内嵌引号（真机发现的坑，2026-09-03）：Go 的 exec 会把

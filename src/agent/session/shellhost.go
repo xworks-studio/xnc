@@ -30,7 +30,7 @@ func (e *ShellHostError) Error() string {
 // ShellSpec 是一次 shell 创建请求的会话侧形态。
 type ShellSpec struct {
 	System      bool   // true = SYSTEM 令牌(默认用户令牌)
-	Profile     string // POWERSHELL / PWSH / CMD / BASH(白名单名)
+	Profile     string // 白名单名:POWERSHELL/PWSH/CMD(Windows) + BASH/SH/ZSH(posix;Linux direct 宿主)
 	Interactive bool   // false = oneshot(Command 必填)
 	Cols, Rows  int    // interactive 几何
 	Cwd         string

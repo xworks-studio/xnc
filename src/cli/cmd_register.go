@@ -26,8 +26,9 @@ import (
 
 // ---- agentctl 管道客户端（wire 镜像，不 import agent 模块） ----
 
-// agentctlPipeName 固定管道名（与 agent/agentctl.PipeName 一致）。
-const agentctlPipeName = `\\.\pipe\xnc-agentctl`
+// agentctlPipeName() 按平台提供默认管道/socket 名（与 agent/agentctl 的
+// 平台实现一致；Windows named pipe、Linux unix socket，实现在
+// agentctl_{windows,linux,other}.go）。
 
 // 协议 op 与 status 取值（镜像 agent/agentctl 常量）。
 const (
@@ -99,7 +100,7 @@ const agentctlMaxLine = 1 << 20 // 应答行上限（agent 侧应答远小于此
 // agentctlRoundTrip 连接控制管道完成一次单行 JSON 请求/应答（每连接一问
 // 一答后关闭）；ctx 控制拨号与收发时限。
 func agentctlRoundTrip(ctx context.Context, req agentctlReq) (agentctlResp, error) {
-	conn, err := agentctlDial(ctx, agentctlPipeName)
+	conn, err := agentctlDial(ctx, agentctlPipeName())
 	if err != nil {
 		return agentctlResp{}, err
 	}

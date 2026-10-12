@@ -201,6 +201,32 @@ vcpkg 无基线锁定，ffmpeg 头漂移（FF_PROFILE_* 枚举缺定义）编译
 - **卸载**：图形向导（数据默认保留，重装续用身份）或
   `unins000.exe /VERYSILENT /PURGEDATA=true`（彻底清零）。卸载不反注册。
 
+### Linux 节点（2026-09-28 起，Ubuntu 系；实验闭环机 lab-ubuntu1）
+
+- **安装**：`curl -L https://xnc.app/install.sh | sudo bash`（tar.gz + install.sh；
+  幂等：安装=升级=重装）。布局 `/opt/xnc/versions/<ver>/` + `current` 符号链接
+  （保留最近 3 版可回滚：切链 + `systemctl restart xnc-agent`）、systemd 单元
+  `xnc-agent`（日志 journald）、StateDir `/var/lib/xnc`。卸载 `--uninstall`
+  （默认保留状态）`--purge-data`（清零）；构建 `powershell deploy/build-linux.ps1
+  -Version <v>`（制品 `xnc-linux-<arch>-<v>.tar.gz` + .sha256 边车）。
+- **注册**：`sudo xnc register`（agentctl = unix socket
+  `/run/xnc/agentctl.sock`，0700 root-only——对应 Windows 管理员终端约束）。
+  machineId 取 `/etc/machine-id`（改名不孤儿化）。
+- **会话**：exec/shell 走 **direct PTY 宿主**（`session/shellhost_linux.go`，
+  不经 xnc-core/xnc-shell——那是 Windows session-0 令牌问题的解法；root 即
+  执行身份，杀树=进程组 SIGKILL）；shell 词表 bash/sh/zsh；file 接受 POSIX
+  绝对路径；tunnel 白名单含 ssh→22。desktop 恒 refused（桌面采集 Windows
+  专属，Linux X11/Wayland 采集后续立项）。
+- **在线升级**：release store 平台化（同版本多制品：setup.exe +
+  xnc-linux-amd64.tar.gz）；UPDATE_AVAILABLE 按 nodes.platform 路由（0007）；
+  agent 侧编排 = 解包校验（bin 自报版本）→ 版本目录落位 → 原子切 current →
+  systemctl restart；回滚双源（缓存 from 版 tarball / 版本目录切链）。看门狗
+  等价 = systemd Restart + pending 自检；**已知缺口**：新 agent 在 OnReady 前
+  崩溃循环时无外部看门狗强回滚。
+- 实现落点：`machineinfo/linux.go`、`agentctl/pipe_linux.go`、
+  `session/shellhost_linux.go`、`updater/orchestrate_linux.go`、
+  `deploy/linux/`、server `0007_node_platform.sql` + setup/update handlers。
+
 ## 7. 运维要点
 
 - **节点管理**：`DELETE /api/nodes/{id}`（平台管理员）删孤儿/换主记录；
@@ -274,6 +300,18 @@ vcpkg 无基线锁定，ffmpeg 头漂移（FF_PROFILE_* 枚举缺定义）编译
   dns-01；主站 xnc.app 同域名在大陆，80/443 目前正常但风险同源。
   relay 主机 SSH 凭据在 deploy/.env 的 `RELAY1_*/RELAY2_*` 键。
 - web HUD 码率/收包显示累计值（未做每秒差分）；e2e 显示跨时钟偏差。
+- **xnc.app 对 `Python-urllib/*` UA 的请求回 403**（2026-09-28 真机发现，
+  Go/curl UA 正常）：运维/诊断脚本直调生产 API 必须带 CLI UA（如
+  `xnc-cli/0.10.36`），否则排障方向会被带偏。
+- **Linux 分发面平台化（0007+setup/update handlers）已合入 main 分支但
+  生产部署阻塞**：SRV 22 不通（2026-09-14 安全组移除）→ 恢复 22 后
+  `deploy/build-server-local.ps1` 部署 + 上传 linux 制品
+  （multipart 字段 `linux`/`cli-linux`）+ 真机在线升级验收（验收 B）。
+  此前生产 /installer.json 不认 platform 参数、file 会话拒 POSIX 路径、
+  tunnel 无 ssh 目标（已部署 agent 不受影响，纯服务端能力）。
+- Linux agent 看门狗缺口：新 agent 在控制连接 OnReady 前崩溃循环时，
+  无外部看门狗强回滚（systemd Restart 持续拉起 + pending Deadline 兜底；
+  Windows schtask 等价物待做，见 updater/orchestrate_linux.go 文件头）。
 - **显示器休眠（非无输出）→ RTV 采集全黑**（2026-09-14 真机实测）：物理
   屏休眠时 DXGI 采集内容为黑、变化驱动编码器近似零流量（relay ~53s
   idle-timeout 收会话）；IDD auto 策略只认盒盖/无物理输出，不认屏休眠。

@@ -1,11 +1,11 @@
-// shell.go — 会话 kind=shell 的交互终端模式(M2-Slice2 Task 4 起经
-// xnc-core 创建:xnc-shell interactive ConPTY,令牌语义 spec §8.4——
-// 默认用户令牌,System=true 显式 SYSTEM)。pty 输出以 binary 帧裸流
-// 转发,client 键入经 binary 帧写入;text 帧仅接受 SHELL_RESIZE。
-// SHELL_BEGIN 先于任何输出帧;创建失败回 ERROR(SHELL_START_FAILED,
-// message 携带稳定码)后关连接;shell 退出 / 对端断开 / ctx 取消都
-// 触发 Kill(0x0126 杀树 + 核心 KillShell 兜底)。旧直连 ConPTY 路径
-// 已移除(ledger 裁决:无双路径)。
+// shell.go — 会话 kind=shell 的交互终端模式(承载平台分两形态:Windows
+// 经 xnc-core 创建 xnc-shell interactive ConPTY,令牌语义 spec §8.4;
+// Linux 经 direct PTY 宿主 shellhost_linux.go,root 即执行身份)。pty
+// 输出以 binary 帧裸流转发,client 键入经 binary 帧写入;text 帧仅接受
+// SHELL_RESIZE。SHELL_BEGIN 先于任何输出帧;创建失败回 ERROR
+// (SHELL_START_FAILED,message 携带稳定码)后关连接;shell 退出 / 对端
+// 断开 / ctx 取消都触发 Kill(Windows 0x0126 杀树 + KillShell 兜底;
+// Linux 负 PID 组杀)。
 package session
 
 import (
@@ -62,10 +62,6 @@ func (sh *Shell) Handle(ctx context.Context, ws *websocket.Conn, sessionID strin
 	}
 
 	profile := shellProfile(p.Shell)
-	if runtime.GOOS != "windows" {
-		sh.failStart(ctx, ws, "shell sessions require windows agent")
-		return
-	}
 	host := sh.Host
 	if sh.Host == nil {
 		// 未注入(dev 无凭据):走默认,若无凭据即 CORE_UNAVAILABLE。
@@ -163,8 +159,8 @@ func (sh *Shell) failStart(ctx context.Context, ws *websocket.Conn, code string)
 	_ = ws.Close(websocket.StatusInternalError, "shell start failed")
 }
 
-// shellProfile 解析 ShellParams.Shell 为白名单 profile 名;空 = 探测
-// (pwsh 优先,缺则 powershell)。
+// shellProfile 解析 ShellParams.Shell 为白名单 profile 名;空 = 按平台探测
+// (Windows: pwsh 优先缺则 powershell;Linux: bash 缺则 sh)。
 func shellProfile(sh string) string {
 	switch sh {
 	case "pwsh":
@@ -175,11 +171,21 @@ func shellProfile(sh string) string {
 		return "CMD"
 	case "bash":
 		return "BASH"
+	case "sh":
+		return "SH"
+	case "zsh":
+		return "ZSH"
 	}
-	if _, err := exec.LookPath("pwsh"); err == nil {
-		return "PWSH"
+	if runtime.GOOS == "windows" {
+		if _, err := exec.LookPath("pwsh"); err == nil {
+			return "PWSH"
+		}
+		return "POWERSHELL"
 	}
-	return "POWERSHELL"
+	if _, err := exec.LookPath("bash"); err == nil {
+		return "BASH"
+	}
+	return "SH"
 }
 
 // asShellHostError 提取 *ShellHostError(拒绝码)。

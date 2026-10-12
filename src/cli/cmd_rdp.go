@@ -7,8 +7,6 @@ import (
 	"net"
 	"net/url"
 	"os"
-	"os/exec"
-	"strconv"
 	"time"
 
 	"github.com/coder/websocket"
@@ -78,12 +76,15 @@ func runRdp(cmd *cobra.Command, node string, localPort int) error {
 
 	fmt.Fprintf(os.Stderr, "[xnc] tunnel ready: 127.0.0.1:%d → %s (rdp) — Ctrl+C to close\n", port, ref.Name)
 
-	// launch mstsc pointed at the local forward
-	mstsc := exec.Command("mstsc", "/v:127.0.0.1:"+strconv.Itoa(port))
-	if err := mstsc.Start(); err != nil {
-		return failAPI(cmd, proto.Err(250, proto.CodeInternal, "mstsc launch: "+err.Error()))
+	// launch the platform RDP client pointed at the local forward
+	rdpCmd, cerr := rdpClientCmd(port)
+	if cerr != nil {
+		fmt.Fprintf(os.Stderr, "[xnc] %v\n", cerr)
+	} else if err := rdpCmd.Start(); err != nil {
+		return failAPI(cmd, proto.Err(250, proto.CodeInternal, "rdp client launch: "+err.Error()))
+	} else {
+		defer rdpCmd.Process.Kill()
 	}
-	defer mstsc.Process.Kill()
 
 	// accept one connection (mstsc may reconnect; multi-accept is Phase 5)
 	conn, err := ln.Accept()

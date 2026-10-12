@@ -1,7 +1,7 @@
 -- name: CreateNode :one
 INSERT INTO nodes (id, cluster_id, name, machine_id, hostname, os_version,
-                   agent_version, shell_type, public_key)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *;
+                   agent_version, shell_type, public_key, platform)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *;
 
 -- name: GetNodeByIdentity :one
 SELECT * FROM nodes WHERE cluster_id = $1 AND machine_id = $2;
@@ -28,8 +28,8 @@ WHERE n.machine_id = $1 AND n.cluster_id <> $2
 -- 测）、last_seen_at 置空（新 key 尚未连接）。用户可见 name 与 status 不动
 -- （adopt 不改名、不启停）。
 UPDATE nodes SET public_key = $1, hostname = $2, os_version = $3,
-                  agent_version = $4, shell_type = '', last_seen_at = NULL
-WHERE id = $5 RETURNING *;
+                  agent_version = $4, shell_type = '', last_seen_at = NULL, platform = $5
+WHERE id = $6 RETURNING *;
 
 -- name: DeleteNode :execrows
 -- 机器自注销（spec §7：控制连接上 NODE_DELETE，机器身份即凭据）。返回删除

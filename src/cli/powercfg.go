@@ -1,3 +1,5 @@
+//go:build windows
+
 // powercfg.go — xnc register 附带的电源策略设置(2026-09-16 设计)。
 //
 // 远程管理节点的要求:显示器必须保持可见(DXGI 采集依赖),合盖不能触发

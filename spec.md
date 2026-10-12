@@ -2940,6 +2940,13 @@ Windows Server 2019 无 pwsh → powershell.exe 降级
 
 # 60. Linux 支持演进（Phase 8，远期）
 
+> **落实状态（2026-09-28）**：控制面已落地（feature/linux-node）——systemd
+> 宿主 + direct PTY 宿主（`session/shellhost_linux.go`，不经 core）+ tar.gz/
+> install.sh 分发 + release store 平台化（0007 nodes.platform）+ 在线升级编排
+> （`updater/orchestrate_linux.go`）。本节"远期"语义已兑现大半；桌面流
+> （X11/Wayland 采集）仍未立项。真机锚点：lab-ubuntu1（43.160.252.82，
+> Ubuntu 24.04）。
+
 定位：MVP 只交付 Windows Agent，但架构从第一天就跨平台。
 
 现在锁定的设计：

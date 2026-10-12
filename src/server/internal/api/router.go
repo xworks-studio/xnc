@@ -266,6 +266,8 @@ func newRouterWithSession(st *db.Store, cfg config.Config, reg *registry.Registr
 	// 已在上线前整体移除。
 	r.Get("/installer", h.setupDownload)
 	r.Get("/installer.json", h.setupManifest)
+	// Linux 一键安装引导（curl -L /install.sh | sudo bash；平台化分发）。
+	r.Get("/install.sh", h.installScript)
 
 	r.Route("/api/nodes", func(nr chi.Router) {
 		nr.Use(auth.Middleware(cfg.JWTSecret, st))

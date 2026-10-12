@@ -85,6 +85,13 @@ func (h *handlers) agentConnect(w http.ResponseWriter, r *http.Request) {
 		Hostname: hello.Hostname, ShellType: hello.ShellType,
 		AgentVersion: hello.AgentVersion, ID: node.ID,
 	})
+	// 平台元数据（0007）：新 agent 的 HELLO 带 os/osVersion 时刷新；
+	// 旧 agent 空值跳过（不清既有落库）。
+	if hello.OS != "" {
+		_ = h.st.Q().UpdateNodePlatform(ctx, sqlc.UpdateNodePlatformParams{
+			ID: node.ID, Platform: normalizePlatform(hello.OS), OsVersion: hello.OSVersion,
+		})
+	}
 	_ = h.st.Q().SetNodeStatus(ctx, sqlc.SetNodeStatusParams{ID: node.ID, Status: "online"})
 	_ = h.st.Q().TouchNode(ctx, node.ID)
 

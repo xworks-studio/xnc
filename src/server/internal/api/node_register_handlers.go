@@ -25,6 +25,7 @@ type registerReq struct {
 	OSVersion    string  `json:"osVersion"`
 	AgentVersion string  `json:"agentVersion"`
 	PublicKey    string  `json:"publicKey"`
+	Platform     string  `json:"platform"` // windows|linux（0007；空按 windows）
 }
 
 // userRegisterNode 处理 POST /api/clusters/{id}/nodes/register（spec §6.4）：
@@ -91,7 +92,7 @@ func (h *handlers) userRegisterNode(w http.ResponseWriter, r *http.Request) {
 	node, apiErr := h.enrollNode(r.Context(), c.ID, enrollReq{
 		Hostname: req.Hostname, MachineID: req.MachineID,
 		OSVersion: req.OSVersion, AgentVersion: req.AgentVersion,
-		PublicKey: req.PublicKey,
+		PublicKey: req.PublicKey, Platform: req.Platform,
 	}, nil, true, "register", u.ID)
 	if apiErr != nil {
 		respondError(w, apiErr)

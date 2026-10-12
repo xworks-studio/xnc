@@ -1,24 +1,40 @@
-// setup_handlers.go — 安装器分发端点：/installer + /installer.json（设计 §4；
-// 历史端点名 /setup.exe /setup.json 已换轨，handler 文件名保留）。
+// setup_handlers.go — 安装器分发端点：/installer + /installer.json + /install.sh
+// （设计 §4；历史端点名 /setup.exe /setup.json 已换轨，handler 文件名保留）。
 //
-// Inno Setup 安装器存于 release store（与 cli 制品同库同表，固定制品名
-// setup.exe）。/installer 直流最新安装器（200 流式 + X-Xnc-Sha256 完整性
-// 头，交付风格与 cli 制品一致）；/installer.json 动态生成版本清单
-// {version, url, sha256, size, releasedAt}（无需入库），供 xnc upgrade
-// --check、CI 与编排工具消费。两端点均无认证——安装器是产品首次下载入口
-// （官网/README 统一 https://xnc.app/installer）。
+// 制品存于 release store（与 cli 制品同库同表，固定制品名）：Windows =
+// setup.exe（Inno Setup），Linux = xnc-linux-amd64.tar.gz（deploy/
+// build-linux.ps1 产物，2026-09-28 平台化分发）。/installer?platform= 直流
+// 对应平台制品（200 + X-Xnc-Sha256 完整性头）；/installer.json?platform=
+// 动态生成版本清单 {version,url,sha256,size,releasedAt}，供 agent 轮询、
+// CI 与编排工具消费；/install.sh 输出一键安装脚本（curl 本站 tar.gz +
+// sha256 校验 + 执行制品内 install.sh）。端点均无认证——安装器是产品首次
+// 下载入口（官网/README 统一 https://xnc.app/installer）。
 package api
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 
 	"xnc/proto"
 	"xnc/server/internal/db/sqlc"
 )
 
-// setupArtifactName — release 内 Inno Setup 安装器制品的固定命名。
-const setupArtifactName = "setup.exe"
+// 制品固定命名。
+const (
+	setupArtifactName  = "setup.exe"
+	linuxArtifactName  = "xnc-linux-amd64.tar.gz"
+	linuxInstallerBase = "xnc-linux-amd64" // 文件名前缀（Content-Disposition 用）
+)
+
+// installerArtifactFor — 按平台参数选制品名（platform=linux → tar.gz；
+// 缺省/windows → setup.exe，向后兼容旧 agent 与短链）。
+func installerArtifactFor(platform string) string {
+	if platform == "linux" {
+		return linuxArtifactName
+	}
+	return setupArtifactName
+}
 
 // setupChannel 解析 channel 查询参数：缺省 stable；stable|dev 之外的取值
 // 返回 false（该频道从未有 release，按 404 处理，与"无 release"语义一致）。
@@ -33,30 +49,32 @@ func setupChannel(r *http.Request) (string, bool) {
 	return ch, true
 }
 
-// latestSetupArtifact 解析频道 → 最新 release → setup.exe 制品；任一环节
-// 未命中（无 release / 无 setup 制品，如历史 bundle-only release）返回 404。
-func (h *handlers) latestSetupArtifact(ctx context.Context, channel string) (sqlc.Release, sqlc.ReleaseArtifact, *proto.APIError) {
+// latestInstallerArtifact 解析频道 → 最新 release → 指定制品；任一环节
+// 未命中（无 release / 无该平台制品，如仅单平台的 release）返回 404。
+func (h *handlers) latestInstallerArtifact(ctx context.Context, channel, artifact string) (sqlc.Release, sqlc.ReleaseArtifact, *proto.APIError) {
 	rel, err := h.st.Q().GetLatestReleaseByChannel(ctx, channel)
 	if err != nil {
 		return rel, sqlc.ReleaseArtifact{}, proto.Err(404, "NOT_FOUND", "no releases")
 	}
-	art, err := h.st.Q().GetArtifact(ctx, sqlc.GetArtifactParams{ReleaseID: rel.ID, Name: setupArtifactName})
+	art, err := h.st.Q().GetArtifact(ctx, sqlc.GetArtifactParams{ReleaseID: rel.ID, Name: artifact})
 	if err != nil {
-		return rel, sqlc.ReleaseArtifact{}, proto.Err(404, "NOT_FOUND", "no setup artifact")
+		return rel, sqlc.ReleaseArtifact{}, proto.Err(404, "NOT_FOUND", "no "+artifact+" artifact")
 	}
 	return rel, art, nil
 }
 
-// setupDownload — GET /setup.exe?channel=stable|dev：频道最新安装器直流。
-// URL 保持短稳定（agent 更新契约不变），正式文件名经 Content-Disposition
-// 下发（XNC-Setup[-dev]-<version>.exe，浏览器另存为所见即所得）。
+// setupDownload — GET /installer?channel=stable|dev&platform=：频道最新安装
+// 制品直流。URL 保持短稳定（agent 更新契约不变），正式文件名经
+// Content-Disposition 下发（Windows：XNC-Installer[-dev]-<version>.exe；
+// Linux：xnc-linux-amd64[-dev]-<version>.tar.gz）。
 func (h *handlers) setupDownload(w http.ResponseWriter, r *http.Request) {
 	channel, ok := setupChannel(r)
 	if !ok {
 		respondError(w, proto.Err(404, "NOT_FOUND", "unknown channel"))
 		return
 	}
-	rel, art, aerr := h.latestSetupArtifact(r.Context(), channel)
+	platform := r.URL.Query().Get("platform")
+	rel, art, aerr := h.latestInstallerArtifact(r.Context(), channel, installerArtifactFor(platform))
 	if aerr != nil {
 		respondError(w, aerr)
 		return
@@ -65,24 +83,31 @@ func (h *handlers) setupDownload(w http.ResponseWriter, r *http.Request) {
 	if channel == "dev" {
 		suffix = "-dev"
 	}
+	var filename string
+	if platform == "linux" {
+		filename = fmt.Sprintf("%s%s-%s.tar.gz", linuxInstallerBase, suffix, rel.Version)
+	} else {
+		filename = fmt.Sprintf("XNC-Installer%s-%s.exe", suffix, rel.Version)
+	}
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Disposition",
-		`attachment; filename="XNC-Installer`+suffix+`-`+rel.Version+`.exe"`)
+	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
 	w.Header().Set("X-Xnc-Sha256", art.Sha256)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(art.Data)
 }
 
-// setupManifest — GET /setup.json?channel=：动态版本清单。url 为同源绝对
-// 地址（scheme 推导与 wsBaseURL 同法：X-Forwarded-Proto > r.TLS > 明文），
-// 指向 /setup.exe?channel=<ch>，curl -L / 浏览器 / 编排工具可直接消费。
+// setupManifest — GET /installer.json?channel=&platform=：动态版本清单。url
+// 为同源绝对地址（scheme 推导与 wsBaseURL 同法：X-Forwarded-Proto > r.TLS
+// > 明文），指向 /installer?channel=<ch>[&platform=]，curl -L / 浏览器 /
+// 编排工具可直接消费。Linux agent 的 updater 轮询自动带 platform=linux。
 func (h *handlers) setupManifest(w http.ResponseWriter, r *http.Request) {
 	channel, ok := setupChannel(r)
 	if !ok {
 		respondError(w, proto.Err(404, "NOT_FOUND", "unknown channel"))
 		return
 	}
-	rel, art, aerr := h.latestSetupArtifact(r.Context(), channel)
+	platform := r.URL.Query().Get("platform")
+	rel, art, aerr := h.latestInstallerArtifact(r.Context(), channel, installerArtifactFor(platform))
 	if aerr != nil {
 		respondError(w, aerr)
 		return
@@ -93,11 +118,64 @@ func (h *handlers) setupManifest(w http.ResponseWriter, r *http.Request) {
 	} else if r.TLS != nil {
 		scheme = "https"
 	}
+	url := scheme + "://" + r.Host + "/installer?channel=" + channel
+	if platform == "linux" {
+		url += "&platform=linux"
+	}
 	respondJSON(w, http.StatusOK, map[string]any{
 		"version":    rel.Version,
-		"url":        scheme + "://" + r.Host + "/installer?channel=" + channel,
+		"url":        url,
 		"sha256":     art.Sha256,
 		"size":       art.Size,
 		"releasedAt": rel.CreatedAt,
 	})
+}
+
+// installScript — GET /install.sh?channel=：Linux 一键安装脚本（对标
+// `curl -L https://xnc.app/install.sh | sudo bash`）。脚本自含清单拉取 +
+// sha256 校验 + 解压 + 执行制品内 install.sh（幂等：安装=升级）；经
+// /installer.json?platform=linux 动态解析版本，发布后秒级生效。
+func (h *handlers) installScript(w http.ResponseWriter, r *http.Request) {
+	channel, ok := setupChannel(r)
+	if !ok {
+		respondError(w, proto.Err(404, "NOT_FOUND", "unknown channel"))
+		return
+	}
+	scheme := "http"
+	if p := r.Header.Get("X-Forwarded-Proto"); p == "https" {
+		scheme = "https"
+	} else if r.TLS != nil {
+		scheme = "https"
+	}
+	base := scheme + "://" + r.Host
+	script := fmt.Sprintf(`#!/bin/sh
+# xnc Linux installer bootstrap (generated by xnc.app; channel=%s)
+# 用法: curl -L %s/install.sh | sudo bash
+set -eu
+[ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)" >&2; exit 1; }
+command -v curl >/dev/null || command -v wget >/dev/null || { echo "curl or wget required" >&2; exit 1; }
+command -v tar >/dev/null || { echo "tar required" >&2; exit 1; }
+
+TMP=$(mktemp -d /tmp/xnc-install.XXXXXX)
+trap 'rm -rf "$TMP"' EXIT
+
+fetch() {
+	if command -v curl >/dev/null 2>&1; then curl -fsSL "$1" -o "$2"
+	else wget -q "$1" -O "$2"; fi
+}
+
+fetch "%s/installer.json?channel=%s&platform=linux" "$TMP/installer.json"
+VERSION=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TMP/installer.json" | head -1)
+SHA256=$(sed -n 's/.*"sha256"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TMP/installer.json" | head -1)
+[ -n "$VERSION" ] && [ -n "$SHA256" ] || { echo "bad installer manifest" >&2; exit 1; }
+
+fetch "%s/installer?channel=%s&platform=linux" "$TMP/xnc.tar.gz"
+echo "$SHA256  $TMP/xnc.tar.gz" | sha256sum -c - >/dev/null || { echo "sha256 mismatch" >&2; exit 1; }
+
+tar xzf "$TMP/xnc.tar.gz" -C "$TMP"
+sh "$TMP/install.sh"
+`, channel, base, base, channel, base, channel)
+	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(script))
 }

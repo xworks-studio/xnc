@@ -27,10 +27,13 @@ import (
 const maxUploadBytes = 128 << 20 // setup+cli 合计上限
 
 // adminUploadRelease — POST /api/admin/releases（multipart）。
-// 终态形态（未上线直采，设计 §12/§14）：setup（必填，Inno Setup 安装器，
-// 固定制品名 setup.exe，MZ 魔数兜底校验）+ cli（可选
-// xnc-windows-amd64.exe）。bundle 部件已随遗留更新通道退役——仍传入即
-// 400 明确报错（bundle channel retired），避免流水线静默降级到坏形态。
+// 终态形态（未上线直采，设计 §12/§14）：setup（Inno Setup 安装器，固定
+// 制品名 setup.exe，MZ 魔数兜底校验）+ linux（xnc-linux-amd64.tar.gz，
+// gzip 魔数校验，deploy/build-linux.ps1 产物）+ cli（可选
+// xnc-windows-amd64.exe）/ cli-linux（可选裸 xnc 二进制，CLI 自更新用）。
+// setup 与 linux 至少其一（平台化发布：单平台版本允许只带对应制品）。
+// bundle 部件已随遗留更新通道退役——仍传入即 400 明确报错（bundle
+// channel retired），避免流水线静默降级到坏形态。
 func (h *handlers) adminUploadRelease(w http.ResponseWriter, r *http.Request) {
 	u := auth.UserFrom(r.Context())
 	if !u.IsAdmin {
@@ -51,24 +54,26 @@ func (h *handlers) adminUploadRelease(w http.ResponseWriter, r *http.Request) {
 
 	// bundle 部件已退役：明确拒绝而非忽略。
 	if len(r.MultipartForm.File["bundle"]) > 0 {
-		respondError(w, proto.Err(400, proto.CodeInternal, "bundle channel retired; upload setup.exe (installer) only"))
+		respondError(w, proto.Err(400, proto.CodeInternal, "bundle channel retired; upload setup.exe / linux tarball only"))
 		return
 	}
 
-	// setup（必填）：读入并校验先于 CreateRelease——非法输入不留半截 release。
-	sf, _, err := r.FormFile("setup")
-	if err != nil {
-		respondError(w, proto.Err(400, proto.CodeInternal, "setup file required"))
-		return
-	}
-	defer sf.Close()
-	setupBytes, err := io.ReadAll(sf)
-	if err != nil {
-		respondError(w, proto.Err(400, proto.CodeInternal, "read setup: "+err.Error()))
-		return
-	}
-	if len(setupBytes) < 2 || setupBytes[0] != 'M' || setupBytes[1] != 'Z' {
-		respondError(w, proto.Err(400, proto.CodeInternal, "setup is not a Windows executable (MZ)"))
+	// setup（可选，与 linux 至少其一）：读入并校验先于 CreateRelease——
+	// 非法输入不留半截 release。
+	var setupBytes []byte
+	if sf, _, err := r.FormFile("setup"); err == nil {
+		defer sf.Close()
+		setupBytes, err = io.ReadAll(sf)
+		if err != nil {
+			respondError(w, proto.Err(400, proto.CodeInternal, "read setup: "+err.Error()))
+			return
+		}
+		if len(setupBytes) < 2 || setupBytes[0] != 'M' || setupBytes[1] != 'Z' {
+			respondError(w, proto.Err(400, proto.CodeInternal, "setup is not a Windows executable (MZ)"))
+			return
+		}
+	} else if len(r.MultipartForm.File["linux"]) == 0 {
+		respondError(w, proto.Err(400, proto.CodeInternal, "setup or linux file required"))
 		return
 	}
 
@@ -87,16 +92,41 @@ func (h *handlers) adminUploadRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// setup.exe（release 内制品名）是安装/更新的唯一制品面：maybeOfferUpdate
-	// 仅按它推送 UPDATE_AVAILABLE；端点 /installer 与 /installer.json 由
-	// setup_handlers 动态服务该制品。
-	ssum := sha256.Sum256(setupBytes)
-	if err := h.st.Q().PutArtifact(ctx, sqlc.PutArtifactParams{
-		ReleaseID: rel.ID, Name: setupArtifactName,
-		Sha256: hex.EncodeToString(ssum[:]), Size: int64(len(setupBytes)), Data: setupBytes,
-	}); err != nil {
-		respondError(w, proto.Err(500, proto.CodeInternal, "store setup: "+err.Error()))
-		return
+	// setup.exe（release 内制品名）是 Windows 安装/更新的制品面：
+	// maybeOfferUpdate 按节点平台选它或 linux tarball 推送
+	// UPDATE_AVAILABLE；端点 /installer 与 /installer.json 由 setup_handlers
+	// 动态服务。
+	if setupBytes != nil {
+		ssum := sha256.Sum256(setupBytes)
+		if err := h.st.Q().PutArtifact(ctx, sqlc.PutArtifactParams{
+			ReleaseID: rel.ID, Name: setupArtifactName,
+			Sha256: hex.EncodeToString(ssum[:]), Size: int64(len(setupBytes)), Data: setupBytes,
+		}); err != nil {
+			respondError(w, proto.Err(500, proto.CodeInternal, "store setup: "+err.Error()))
+			return
+		}
+	}
+
+	// linux tar.gz（gzip 魔数兜底校验）。
+	if lf, _, err := r.FormFile("linux"); err == nil {
+		defer lf.Close()
+		lb, rerr := io.ReadAll(lf)
+		if rerr != nil {
+			respondError(w, proto.Err(400, proto.CodeInternal, "read linux: "+rerr.Error()))
+			return
+		}
+		if len(lb) < 2 || lb[0] != 0x1f || lb[1] != 0x8b {
+			respondError(w, proto.Err(400, proto.CodeInternal, "linux is not a gzip archive (1f 8b)"))
+			return
+		}
+		lsum := sha256.Sum256(lb)
+		if err := h.st.Q().PutArtifact(ctx, sqlc.PutArtifactParams{
+			ReleaseID: rel.ID, Name: linuxArtifactName,
+			Sha256: hex.EncodeToString(lsum[:]), Size: int64(len(lb)), Data: lb,
+		}); err != nil {
+			respondError(w, proto.Err(500, proto.CodeInternal, "store linux: "+err.Error()))
+			return
+		}
 	}
 
 	if cf, _, cerr := r.FormFile("cli"); cerr == nil {
@@ -112,6 +142,24 @@ func (h *handlers) adminUploadRelease(w http.ResponseWriter, r *http.Request) {
 			Sha256: hex.EncodeToString(csum[:]), Size: int64(len(cliBytes)), Data: cliBytes,
 		}); err != nil {
 			respondError(w, proto.Err(500, proto.CodeInternal, "store cli: "+err.Error()))
+			return
+		}
+	}
+
+	// cli-linux：裸 xnc 二进制（Linux CLI 自更新；chmod 由下载方负责）。
+	if cf, _, cerr := r.FormFile("cli-linux"); cerr == nil {
+		defer cf.Close()
+		cliBytes, rerr := io.ReadAll(cf)
+		if rerr != nil {
+			respondError(w, proto.Err(400, proto.CodeInternal, "read cli-linux: "+rerr.Error()))
+			return
+		}
+		csum := sha256.Sum256(cliBytes)
+		if err := h.st.Q().PutArtifact(ctx, sqlc.PutArtifactParams{
+			ReleaseID: rel.ID, Name: cliLinuxArtifactName,
+			Sha256: hex.EncodeToString(csum[:]), Size: int64(len(cliBytes)), Data: cliBytes,
+		}); err != nil {
+			respondError(w, proto.Err(500, proto.CodeInternal, "store cli-linux: "+err.Error()))
 			return
 		}
 	}
@@ -274,7 +322,16 @@ func (h *handlers) clearAllPins(ctx context.Context) error {
 // pgText — string → pgtype.Text。
 func pgText(s string) pgtype.Text { return pgtype.Text{String: s, Valid: true} }
 
-// cliLatest — GET /api/cli/latest?channel=（用户 JWT）：CLI 自更新元信息。
+// cliArtifactFor — CLI 制品名按平台（os=windows 默认，向后兼容旧 CLI 不带
+// os 参数的请求）。
+func cliArtifactFor(osName string) string {
+	if osName == "linux" {
+		return cliLinuxArtifactName
+	}
+	return cliArtifactName
+}
+
+// cliLatest — GET /api/cli/latest?channel=&os=（用户 JWT）：CLI 自更新元信息。
 func (h *handlers) cliLatest(w http.ResponseWriter, r *http.Request) {
 	channel := r.URL.Query().Get("channel")
 	if channel == "" {
@@ -285,7 +342,8 @@ func (h *handlers) cliLatest(w http.ResponseWriter, r *http.Request) {
 		respondError(w, proto.Err(404, "NOT_FOUND", "no releases"))
 		return
 	}
-	art, err := h.st.Q().GetArtifact(r.Context(), sqlc.GetArtifactParams{ReleaseID: rel.ID, Name: cliArtifactName})
+	art, err := h.st.Q().GetArtifact(r.Context(), sqlc.GetArtifactParams{
+		ReleaseID: rel.ID, Name: cliArtifactFor(r.URL.Query().Get("os"))})
 	if err != nil {
 		respondError(w, proto.Err(404, "NOT_FOUND", "no cli artifact in latest release"))
 		return
@@ -295,7 +353,7 @@ func (h *handlers) cliLatest(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// cliDownload — GET /api/cli/download?channel=（用户 JWT）：CLI 二进制。
+// cliDownload — GET /api/cli/download?channel=&os=（用户 JWT）：CLI 二进制。
 func (h *handlers) cliDownload(w http.ResponseWriter, r *http.Request) {
 	channel := r.URL.Query().Get("channel")
 	if channel == "" {
@@ -306,7 +364,8 @@ func (h *handlers) cliDownload(w http.ResponseWriter, r *http.Request) {
 		respondError(w, proto.Err(404, "NOT_FOUND", "no releases"))
 		return
 	}
-	art, err := h.st.Q().GetArtifact(r.Context(), sqlc.GetArtifactParams{ReleaseID: rel.ID, Name: cliArtifactName})
+	art, err := h.st.Q().GetArtifact(r.Context(), sqlc.GetArtifactParams{
+		ReleaseID: rel.ID, Name: cliArtifactFor(r.URL.Query().Get("os"))})
 	if err != nil {
 		respondError(w, proto.Err(404, "NOT_FOUND", "no cli artifact"))
 		return

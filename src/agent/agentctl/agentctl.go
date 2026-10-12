@@ -1,5 +1,6 @@
-// Package agentctl 实现 agent 本地控制管道 \\.\pipe\xnc-agentctl（spec §6.3，
-// 本规范唯一新本地面）：单行 JSON 请求 → 单行 JSON 应答（与 core 管道的
+// Package agentctl 实现 agent 本地控制面（spec §6.3，本规范唯一新本地面；
+// Windows = \\.\pipe\xnc-agentctl named pipe，Linux = /run/xnc/agentctl.sock
+// unix socket）：单行 JSON 请求 → 单行 JSON 应答（与 core 管道的
 // 单行风格一致），每连接一问一答后关闭。管道只做转发与鉴权门控，业务在
 // agent 编排层（Deps 注入）：
 //
@@ -21,8 +22,8 @@ import (
 	"time"
 )
 
-// PipeName 固定管道名（CLI/安装器按此连接）。
-const PipeName = `\\.\pipe\xnc-agentctl`
+// 默认管道/socket 名按平台提供（defaultPipeName：Windows named pipe、
+// Linux unix socket，实现在各自平台文件；CLI 侧镜像同名约定）。
 
 // 协议 op 与 status 取值。
 const (
@@ -166,7 +167,7 @@ type Server struct {
 
 func (s *Server) name() string {
 	if s.Name == "" {
-		return PipeName
+		return defaultPipeName()
 	}
 	return s.Name
 }

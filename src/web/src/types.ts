@@ -16,6 +16,7 @@ export interface NodeDTO {
   cluster: string;
   hostname: string;
   os_version: string;
+  platform?: string; // windows | linux（旧服务端不带该字段）
   agent_version: string;
   shell_type: string;
   status: "online" | "offline" | "disabled";
