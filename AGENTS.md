@@ -131,7 +131,11 @@ build（web dist + 版本镜像）→ `docker save` → SFTP 上 SRV → `docker
 
 - **本地路径**：`powershell deploy/build-server-local.ps1 -ServerVersion <v>`
   （SRV_HOST 必须是源站 IP：xnc.app 域名现经 Cloudflare 代理，只转 443，
-  域名:22 恒黑洞——2026-10-12 实测根因，此前误记为安全组移除）
+  域名:22 恒黑洞——2026-10-12 实测根因，此前误记为安全组移除）。
+  安装器本机构建环境 2026-10-12 重建：vcpkg @ C:cpkg（x64-windows-static
+  ffmpeg 全特性 + libyuv）、LIBCLANG_PATH=C:\Program Files\LLVMin——
+  工具链升级会作废 cargo 指纹触发 hwcodec 全量重编，VCPKG_ROOT 必须真实
+  存在
   （参数名刻意避开 -Version——powershell.exe -File 会把它吞作引擎参数；
   远端推送经 deploy/push_server_image.py 走 paramiko 密码认证，凭据读
   `deploy/.env` 的 SRV_* 键）。
@@ -305,14 +309,15 @@ vcpkg 无基线锁定，ffmpeg 头漂移（FF_PROFILE_* 枚举缺定义）编译
 - **xnc.app 对 `Python-urllib/*` UA 的请求回 403**（2026-09-28 真机发现，
   Go/curl UA 正常）：运维/诊断脚本直调生产 API 必须带 CLI UA（如
   `xnc-cli/0.10.36`），否则排障方向会被带偏。
-- **Linux 分发面平台化已上生产（2026-10-12，server 0.11.8 + dev 频道
-  0.10.37 linux 制品）**：/install.sh、/installer(.json)?platform=linux、
-  file POSIX 路径、tunnel ssh、UPDATE_AVAILABLE 平台路由全部真机验收。
-  注意语义：仅含 linux 制品的 release 对 Windows 节点自动跳过推送
-  （artifact missing），dev 频道现无 setup.exe——Windows dev 节点会停在
-  旧版直到下一版带 setup。lab-ubuntu1 已在 0.10.37/dev；**0.10.36→0.10.37
-  的首次升级经 install.sh 手工桥接**（执行位修复随 0.10.37 生效，
-  0.10.38+ 起免手工）。
+- **Linux 已进 stable 正式发布（2026-10-12，0.10.40 双平台四制品）**：
+  `curl -L https://xnc.app/install.sh | sudo bash` 真机全链验证。当日
+  连发三版的教训（勿重蹈）：0.10.38 的 tarball 内 install.sh 被 git
+  autocrlf 写成 CRLF（`#!/bin/sh` ENOENT）→ .gitattributes eol=lf +
+  build-linux.ps1 打包清洗；0.10.39 的前置校验用 `-x` 且直接执行 payload
+  探版本，bsdtar 的 0644 过不去 → 改 `-f` + 探测前 chmod。**手工流程先
+  chmod 的测试习惯掩盖了这两层**——发布前必须用裸路径（解压即 sh
+  install.sh）过一遍。坏 dev 0.10.37（CRLF + 未带修复二进制）已删除。
+  Windows 机队当日 0.10.38→0.10.40 两次自动换版验证了安装器推送链。
 - Linux agent 看门狗缺口：新 agent 在控制连接 OnReady 前崩溃循环时，
   无外部看门狗强回滚（systemd Restart 持续拉起 + pending Deadline 兜底；
   Windows schtask 等价物待做，见 updater/orchestrate_linux.go 文件头）。
