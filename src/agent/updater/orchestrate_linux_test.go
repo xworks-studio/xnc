@@ -150,6 +150,54 @@ func TestLinuxPayloadVersionMismatch(t *testing.T) {
 	assert.Equal(t, 0, f.restarts, "no restart on rejected payload")
 }
 
+// TestLinuxUnpackGrantsExecBit：Windows bsdtar 打的制品二进制位为 0644，
+// 编排侧须授予执行位再校验（真机升级演练发现的 EACCES）。
+func TestLinuxUnpackGrantsExecBit(t *testing.T) {
+	f := newLinuxFixt(t, "0.1.0")
+	// 构造 0644 的 tarball（模拟 bsdtar 产物）。
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	script := "#!/bin/sh\necho 0.2.0\n"
+	hdr := &tar.Header{Name: "bin/", Typeflag: tar.TypeDir, Mode: 0o755}
+	require.NoError(t, tw.WriteHeader(hdr))
+	hdr = &tar.Header{Name: "bin/xnc-agent", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len(script))}
+	require.NoError(t, tw.WriteHeader(hdr))
+	_, err := tw.Write([]byte(script))
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+	require.NoError(t, gz.Close())
+	payload := buf.Bytes()
+	sum := sha256.Sum256(payload)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(payload)
+	}))
+	defer srv.Close()
+	stateDir := t.TempDir()
+	u := newLinuxUpdater(t, srv.URL, stateDir, "0.1.0")
+	m := &SetupManifest{Version: "0.2.0", URL: "/", SHA256: hex.EncodeToString(sum[:]), Size: int64(len(payload))}
+	require.NoError(t, u.applyUpdate(context.Background(), m))
+	st, err := os.Stat(filepath.Join(f.versions, "0.2.0", "bin", "xnc-agent"))
+	require.NoError(t, err)
+	assert.NotZero(t, st.Mode()&0o111, "installed binary must be executable")
+	assert.Equal(t, 1, f.restarts)
+}
+
+// TestLinuxRollbackNoOpWhenStillAtFrom：失败发生在切链前（current 仍指
+// from）→ 回滚为幂等 no-op（不重启、不报错），仅清 pending。
+func TestLinuxRollbackNoOpWhenStillAtFrom(t *testing.T) {
+	f := newLinuxFixt(t, "0.1.0")
+	stateDir := t.TempDir()
+	u := newLinuxUpdater(t, "https://xnc.invalid", stateDir, "0.1.0")
+	p := &PendingUpdate{From: "0.1.0", To: "0.2.0",
+		StartedAt: time.Now().UTC(), Deadline: time.Now().Add(15 * time.Minute).UTC()}
+	require.NoError(t, SavePending(stateDir, p))
+	require.NoError(t, u.Rollback(p, "installer failed: unpack rejected"))
+	assert.Equal(t, 0, f.restarts, "no restart for no-op rollback")
+	_, err := os.Stat(filepath.Join(stateDir, pendingName))
+	assert.True(t, os.IsNotExist(err), "pending must be cleared")
+}
+
 func TestLinuxExtractRejectsTraversal(t *testing.T) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)

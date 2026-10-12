@@ -119,6 +119,12 @@ func (u *Updater) execTarballInstaller(staged string) error {
 	if err := extractTarGz(staged, unpack); err != nil {
 		return err
 	}
+	// 制品内可执行位不可信（Windows bsdtar 打包落 0644；install.sh 侧有
+	// 同款 chmod）：统一给 bin/ 常规文件授予执行位再校验，否则 --version
+	// fork/exec 直接 EACCES（2026-10-12 真机升级演练发现）。
+	if err := ensureBinExec(unpack); err != nil {
+		return err
+	}
 	// 制品校验：bin/xnc-agent 存在、可执行、自报版本与文件名一致
 	// （sha256 已在 applyUpdate 校验，这里挡"包对了内容错"的发布事故）。
 	agentBin := filepath.Join(unpack, "bin", "xnc-agent")
@@ -257,8 +263,13 @@ func candidateVersionDir(from string) (string, error) {
 }
 
 // rollbackToVersionDir 回滚 = current 切回旧版本目录 + 重启（秒级，
-// 与 install.sh 手工回滚同一动作）。
+// 与 install.sh 手工回滚同一动作）。失败发生在切链**之前**（解包/校验
+// 阶段，current 仍指向 from 目录）时系统本就在 from 版本——幂等 no-op。
 func rollbackToVersionDir(from string) error {
+	if cur, err := filepath.EvalSymlinks(xncCurrentLink); err == nil &&
+		cur == filepath.Join(xncVersionsDir, from) {
+		return nil // 未切链形态：无事可做（调用方已完成 pending 清理）
+	}
 	dir, err := candidateVersionDir(from)
 	if err != nil {
 		return err
@@ -272,4 +283,18 @@ func rollbackToVersionDir(from string) error {
 		return err
 	}
 	return systemctlRestart()
+}
+
+// ensureBinExec 授予 bin/ 下常规文件执行位（0644 → 0755；已有执行位的
+// 保持原样）。
+func ensureBinExec(dir string) error {
+	return filepath.Walk(filepath.Join(dir, "bin"), func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() || info.Mode()&0o111 != 0 {
+			return nil
+		}
+		return os.Chmod(p, info.Mode().Perm()|0o755)
+	})
 }
